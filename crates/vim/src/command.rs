@@ -1,16 +1,21 @@
 use anyhow::{Result, anyhow};
-use collections::{HashMap, HashSet};
-use command_palette_hooks::{CommandInterceptItem, CommandInterceptResult};
+use collections::HashMap;
+#[cfg(feature = "workspace-integration")]
+use collections::HashSet;
+#[cfg(feature = "workspace-integration")]
+use command_palette_hooks::{
+    CommandInterceptItem, CommandInterceptResult, CommandPaletteInvocationContext,
+};
+#[cfg(feature = "workspace-integration")]
+use editor::actions::{SortLinesCaseInsensitive, SortLinesCaseSensitive};
 use editor::{
-    Bias, Editor, EditorSettings, SelectionEffects, ToPoint,
-    actions::{SortLinesCaseInsensitive, SortLinesCaseSensitive},
-    display_map::ToDisplayPoint,
+    Bias, Editor, EditorSettings, SelectionEffects, ToPoint, display_map::ToDisplayPoint,
 };
 use futures::AsyncWriteExt as _;
-use gpui::{
-    Action, App, AppContext as _, Context, Global, Keystroke, Task, TaskExt, WeakEntity, Window,
-    actions,
-};
+#[cfg(feature = "workspace-integration")]
+use gpui::Global;
+use gpui::{Action, App, AppContext as _, Context, Keystroke, Task, TaskExt, Window, actions};
+#[cfg(feature = "workspace-integration")]
 use itertools::Itertools;
 use language::Point;
 use multi_buffer::MultiBufferRow;
@@ -20,37 +25,39 @@ use schemars::JsonSchema;
 use search::{BufferSearchBar, SearchOptions};
 use serde::Deserialize;
 use settings::{Settings, SettingsStore};
+#[cfg(feature = "workspace-integration")]
+use std::{iter::Peekable, str::Chars, sync::OnceLock};
 use std::{
-    iter::Peekable,
     ops::{Deref, Range},
-    path::{Path, PathBuf},
+    path::Path,
     process::Stdio,
-    str::Chars,
-    sync::OnceLock,
     time::Instant,
 };
 use task::{HideStrategy, RevealStrategy, SaveStrategy, Shell, SpawnInTerminal, TaskId};
 use ui::ActiveTheme;
-use util::{
-    ResultExt,
-    paths::PathStyle,
-    rel_path::{RelPath, RelPathBuf},
-};
-use workspace::{Item, SaveIntent, Workspace, notifications::NotifyResultExt};
+use util::{ResultExt, rel_path::RelPath};
+use workspace::{Item, SaveIntent, notifications::NotifyResultExt};
 use workspace::{SplitDirection, notifications::DetachAndPromptErr};
-use zed_actions::{OpenDocs, RevealTarget};
+#[cfg(feature = "workspace-integration")]
+use zed_actions::OpenDocs;
+use zed_actions::{RevealTarget, command_palette::OpenWithQuery};
 
+#[cfg(feature = "workspace-integration")]
 use crate::{
-    ToggleMarksView, ToggleRegistersView, Vim, VimSettings,
-    motion::{EndOfDocument, Motion, MotionKind, StartOfDocument},
+    ToggleMarksView, ToggleRegistersView,
+    motion::{EndOfDocument, StartOfDocument},
     normal::{
         JoinLines,
         search::{FindCommand, ReplaceCommand, Replacement},
     },
-    object::Object,
     rewrap::Rewrap,
-    state::{Mark, Mode},
     visual::VisualDeleteLine,
+};
+use crate::{
+    Vim, VimSettings,
+    motion::{Motion, MotionKind},
+    object::Object,
+    state::{Mark, Mode},
 };
 
 /// Goes to the specified line number in the editor.
@@ -94,6 +101,7 @@ pub enum VimOption {
 }
 
 impl VimOption {
+    #[cfg(feature = "workspace-integration")]
     fn possible_commands(query: &str) -> Vec<CommandInterceptItem> {
         let mut prefix_of_options = Vec::new();
         let mut options = query.split(" ").collect::<Vec<_>>();
@@ -123,6 +131,7 @@ impl VimOption {
             .collect()
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn possibilities(query: &str) -> impl Iterator<Item = Self> + '_ {
         [
             (None, VimOption::Wrap(true)),
@@ -147,6 +156,7 @@ impl VimOption {
         .map(|(_, option)| option)
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn from(option: &str) -> Option<Self> {
         match option {
             "wrap" => Some(Self::Wrap(true)),
@@ -176,6 +186,7 @@ impl VimOption {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn to_string(&self) -> &'static str {
         match self {
             VimOption::Wrap(true) => "wrap",
@@ -216,6 +227,7 @@ struct VimSplit {
     pub filename: String,
 }
 
+#[cfg(feature = "workspace-integration")]
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = vim, no_json, no_register)]
 enum DeleteMarks {
@@ -264,6 +276,10 @@ struct VimNorm {
 
 #[derive(Debug)]
 struct WrappedAction(Box<dyn Action>);
+
+fn open_command_palette_with_query(query: String, window: &mut Window, cx: &mut App) {
+    window.dispatch_action(OpenWithQuery { query }.boxed_clone(), cx);
+}
 
 impl PartialEq for WrappedAction {
     fn eq(&self, other: &Self) -> bool {
@@ -319,22 +335,12 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             });
         }
     });
-    Vim::action(editor, cx, |vim, _: &VisualCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window, cx) else {
-            return;
-        };
-        workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, "'<,'>", window, cx);
-        })
+    Vim::action(editor, cx, |_, _: &VisualCommand, window, cx| {
+        open_command_palette_with_query("'<,'>".to_string(), window, cx);
     });
 
-    Vim::action(editor, cx, |vim, _: &ShellCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window, cx) else {
-            return;
-        };
-        workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, "'<,'>!", window, cx);
-        })
+    Vim::action(editor, cx, |_, _: &ShellCommand, window, cx| {
+        open_command_palette_with_query("'<,'>!".to_string(), window, cx);
     });
 
     Vim::action(editor, cx, |_, _: &ArgumentRequired, window, cx| {
@@ -572,6 +578,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         })
     });
 
+    #[cfg(feature = "workspace-integration")]
     Vim::action(editor, cx, |vim, action: &DeleteMarks, window, cx| {
         fn err(s: String, window: &mut Window, cx: &mut Context<Editor>) {
             let _ = window.prompt(
@@ -847,10 +854,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         .detach();
     });
 
-    Vim::action(editor, cx, |vim, _: &CountCommand, window, cx| {
-        let Some(workspace) = vim.workspace(window, cx) else {
-            return;
-        };
+    Vim::action(editor, cx, |_, _: &CountCommand, window, cx| {
         let count = Vim::take_count(cx).unwrap_or(1);
         Vim::take_forced_motion(cx);
         let n = if count > 1 {
@@ -858,9 +862,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         } else {
             ".".to_string()
         };
-        workspace.update(cx, |workspace, cx| {
-            command_palette::CommandPalette::toggle(workspace, &n, window, cx);
-        })
+        open_command_palette_with_query(n, window, cx);
     });
 
     Vim::action(editor, cx, |vim, action: &GoToLine, window, cx| {
@@ -977,6 +979,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     })
 }
 
+#[cfg(feature = "workspace-integration")]
 #[derive(Default)]
 struct VimCommand {
     prefix: &'static str,
@@ -1001,12 +1004,14 @@ struct VimCommand {
     has_filename: bool,
 }
 
+#[cfg(feature = "workspace-integration")]
 struct ParsedQuery {
     args: String,
     has_bang: bool,
     has_space: bool,
 }
 
+#[cfg(feature = "workspace-integration")]
 impl VimCommand {
     fn new(pattern: (&'static str, &'static str), action: impl Action) -> Self {
         Self {
@@ -1072,74 +1077,10 @@ impl VimCommand {
 
     fn generate_filename_completions(
         parsed_query: &ParsedQuery,
-        workspace: WeakEntity<Workspace>,
+        invocation_context: &CommandPaletteInvocationContext,
         cx: &mut App,
     ) -> Task<Vec<String>> {
-        let ParsedQuery {
-            args,
-            has_bang: _,
-            has_space: _,
-        } = parsed_query;
-        let Some(workspace) = workspace.upgrade() else {
-            return Task::ready(Vec::new());
-        };
-
-        let (task, args_path) = workspace.update(cx, |workspace, cx| {
-            let prefix = workspace
-                .project()
-                .read(cx)
-                .visible_worktrees(cx)
-                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                .next()
-                .or_else(std::env::home_dir)
-                .unwrap_or_else(|| PathBuf::from(""));
-
-            let rel_path = match RelPath::new(Path::new(&args), PathStyle::local()) {
-                Ok(path) => path.to_rel_path_buf(),
-                Err(_) => {
-                    return (Task::ready(Ok(Vec::new())), RelPathBuf::new());
-                }
-            };
-
-            let rel_path = if args.ends_with(PathStyle::local().primary_separator()) {
-                rel_path
-            } else {
-                rel_path
-                    .parent()
-                    .map(|rel_path| rel_path.to_rel_path_buf())
-                    .unwrap_or(RelPathBuf::new())
-            };
-
-            let task = workspace.project().update(cx, |project, cx| {
-                let path = prefix
-                    .join(rel_path.as_std_path())
-                    .to_string_lossy()
-                    .to_string();
-                project.list_directory(path, cx)
-            });
-
-            (task, rel_path)
-        });
-
-        cx.background_spawn(async move {
-            let directories = task.await.unwrap_or_default();
-            directories
-                .iter()
-                .map(|dir| {
-                    let path = RelPath::new(dir.path.as_path(), PathStyle::local())
-                        .map(|cow| cow.into_owned())
-                        .unwrap_or(RelPathBuf::new());
-                    let mut path_string = args_path
-                        .join(&path)
-                        .display(PathStyle::local())
-                        .to_string();
-                    if dir.is_dir {
-                        path_string.push_str(PathStyle::local().primary_separator());
-                    }
-                    path_string
-                })
-                .collect()
-        })
+        invocation_context.complete_filename(&parsed_query.args, cx)
     }
 
     fn get_parsed_query(&self, query: String) -> Option<ParsedQuery> {
@@ -1418,6 +1359,7 @@ impl CommandRange {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn as_count(&self) -> Option<u32> {
         if let CommandRange {
             start: Position::Line { row, offset: 0 },
@@ -1431,6 +1373,7 @@ impl CommandRange {
     }
 
     /// The `CommandRange` representing the entire buffer.
+    #[cfg(feature = "workspace-integration")]
     fn buffer() -> Self {
         Self {
             start: Position::Line { row: 1, offset: 0 },
@@ -1439,6 +1382,7 @@ impl CommandRange {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 fn generate_commands(_: &App) -> Vec<VimCommand> {
     vec![
         VimCommand::new(
@@ -1789,12 +1733,16 @@ fn generate_commands(_: &App) -> Vec<VimCommand> {
     ]
 }
 
+#[cfg(feature = "workspace-integration")]
 struct VimCommands(Vec<VimCommand>);
 // safety: we only ever access this from the main thread (as ensured by the cx argument)
 // actions are not Sync so we can't otherwise use a OnceLock.
+#[cfg(feature = "workspace-integration")]
 unsafe impl Sync for VimCommands {}
+#[cfg(feature = "workspace-integration")]
 impl Global for VimCommands {}
 
+#[cfg(feature = "workspace-integration")]
 fn commands(cx: &App) -> &Vec<VimCommand> {
     static COMMANDS: OnceLock<VimCommands> = OnceLock::new();
     &COMMANDS
@@ -1802,6 +1750,7 @@ fn commands(cx: &App) -> &Vec<VimCommand> {
         .0
 }
 
+#[cfg(feature = "workspace-integration")]
 fn act_on_range(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn Action>> {
     Some(
         WithRange {
@@ -1813,6 +1762,7 @@ fn act_on_range(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn
     )
 }
 
+#[cfg(feature = "workspace-integration")]
 fn select_range(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn Action>> {
     Some(
         WithRange {
@@ -1824,6 +1774,7 @@ fn select_range(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn
     )
 }
 
+#[cfg(feature = "workspace-integration")]
 fn wrap_count(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn Action>> {
     range.as_count().map(|count| {
         WithCount {
@@ -1834,9 +1785,10 @@ fn wrap_count(action: Box<dyn Action>, range: &CommandRange) -> Option<Box<dyn A
     })
 }
 
+#[cfg(feature = "workspace-integration")]
 pub fn command_interceptor(
     mut input: &str,
-    workspace: WeakEntity<Workspace>,
+    invocation_context: &CommandPaletteInvocationContext,
     cx: &mut App,
 ) -> Task<CommandInterceptResult> {
     while input.starts_with(':') {
@@ -1981,7 +1933,8 @@ pub fn command_interceptor(
     };
 
     if let Some((cmd_idx, parsed_query, display_string, no_args_positions)) = filenames {
-        let filenames = VimCommand::generate_filename_completions(&parsed_query, workspace, cx);
+        let filenames =
+            VimCommand::generate_filename_completions(&parsed_query, invocation_context, cx);
         cx.spawn(async move |cx| {
             let filenames = filenames.await;
             const MAX_RESULTS: usize = 100;
@@ -2038,6 +1991,7 @@ pub fn command_interceptor(
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 fn generate_positions(string: &str, query: &str) -> Vec<usize> {
     let mut positions = Vec::new();
     let mut chars = query.chars();
@@ -2075,6 +2029,7 @@ impl OnMatchingLines {
     // we don't attempt to fully convert between the two regex syntaxes,
     // but we do flip \( and \) to ( and ) (and vice-versa) in the pattern,
     // and convert \0..\9 to $0..$9 in the replacement so that common idioms work.
+    #[cfg(feature = "workspace-integration")]
     pub(crate) fn parse(
         query: &str,
         range: &Option<CommandRange>,
@@ -2356,9 +2311,6 @@ impl Vim {
         cx: &mut Context<Vim>,
     ) {
         self.stop_recording(cx);
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
         let command = self.update_editor(cx, |_, editor, cx| {
             let snapshot = editor.snapshot(window, cx);
             let start = editor
@@ -2385,9 +2337,7 @@ impl Vim {
             }
         });
         if let Some(command) = command {
-            workspace.update(cx, |workspace, cx| {
-                command_palette::CommandPalette::toggle(workspace, &command, window, cx);
-            });
+            open_command_palette_with_query(command, window, cx);
         }
     }
 
@@ -2399,9 +2349,6 @@ impl Vim {
         cx: &mut Context<Vim>,
     ) {
         self.stop_recording(cx);
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
         let command = self.update_editor(cx, |_, editor, cx| {
             let snapshot = editor.snapshot(window, cx);
             let start = editor
@@ -2424,14 +2371,13 @@ impl Vim {
             }
         });
         if let Some(command) = command {
-            workspace.update(cx, |workspace, cx| {
-                command_palette::CommandPalette::toggle(workspace, &command, window, cx);
-            });
+            open_command_palette_with_query(command, window, cx);
         }
     }
 }
 
 impl ShellExec {
+    #[cfg(feature = "workspace-integration")]
     pub fn parse(query: &str, range: Option<CommandRange>) -> Option<Box<dyn Action>> {
         let (before, after) = query.split_once('!')?;
         let before = before.trim();

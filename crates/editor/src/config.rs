@@ -300,6 +300,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn toggle_tab_bar(
         &mut self,
         _: &ToggleTabBar,
@@ -361,7 +362,7 @@ impl Editor {
         self.delegate_open_excerpts = delegate;
     }
 
-    pub(super) fn set_delegate_expand_excerpts(&mut self, delegate: bool) {
+    pub fn set_delegate_expand_excerpts(&mut self, delegate: bool) {
         self.delegate_expand_excerpts = delegate;
     }
 

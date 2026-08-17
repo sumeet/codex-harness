@@ -24,7 +24,10 @@ use smallvec::SmallVec;
 use std::{sync::Arc, time::Duration};
 use sum_tree::SumTree;
 use text::BufferId;
+#[cfg(feature = "workspace-integration")]
 use workspace::Workspace;
+#[cfg(not(feature = "workspace-integration"))]
+pub struct Workspace;
 
 #[derive(Clone, Debug, Default)]
 pub struct GitBlameEntry {

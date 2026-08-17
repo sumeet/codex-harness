@@ -879,7 +879,10 @@ impl ThreadView {
             let metadata = ThreadMetadataStore::try_global(cx)
                 .and_then(|store| store.read(cx).entry(root_thread_id).cloned());
             let initial_title = if parent_session_id.is_none() {
-                metadata.as_ref().and_then(|m| m.title())
+                metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.title())
+                    .or_else(|| thread.read(cx).title())
             } else {
                 thread.read(cx).title()
             }
@@ -4351,7 +4354,8 @@ impl ThreadView {
 
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.list_state.item_count() > 0;
-        let fills_container = !has_messages || editor_expanded;
+        let dock_empty_editor = std::env::var_os("HARNESS_CODEX_MODE").is_some();
+        let fills_container = (!has_messages && !dock_empty_editor) || editor_expanded;
 
         h_flex()
             .py_2()
@@ -4359,7 +4363,7 @@ impl ThreadView {
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
-                if has_messages {
+                if has_messages || dock_empty_editor {
                     this.on_action(cx.listener(Self::expand_message_editor))
                         .border_t_1()
                         .border_color(cx.theme().colors().border)
@@ -12139,6 +12143,7 @@ impl Render for ThreadView {
         self.sync_local_commands(cx);
 
         let has_messages = self.list_state.item_count() > 0;
+        let dock_empty_editor = std::env::var_os("HARNESS_CODEX_MODE").is_some();
         let list_state = self.list_state.clone();
 
         let conversation = v_flex()
@@ -12152,6 +12157,8 @@ impl Render for ThreadView {
                         .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
+                } else if dock_empty_editor {
+                    this.flex_1().size_full().into_any()
                 } else {
                     this.into_any()
                 }

@@ -1174,8 +1174,59 @@
   {
     "context": "MessageEditor > Editor && VimControl",
     "bindings": {
-      "enter": "agent::Chat",
+      "ctrl-enter": "agent::Chat",
+      "ctrl-shift-enter": "agent::SendImmediately",
+      "ctrl-alt-u": "agent::ScrollOutputPageUp",
+      "ctrl-alt-d": "agent::ScrollOutputPageDown",
+      "ctrl-alt-k": "agent::ScrollOutputLineUp",
+      "ctrl-alt-j": "agent::ScrollOutputLineDown",
+      "ctrl-alt-[": "agent::ScrollOutputToPreviousMessage",
+      "ctrl-alt-]": "agent::ScrollOutputToNextMessage",
+      "ctrl-alt-home": "agent::ScrollOutputToTop",
+      "ctrl-alt-end": "agent::ScrollOutputToBottom",
     },
+  },
+  {
+    "context": "MessageEditor > Editor && VimControl && vim_mode == insert",
+    "bindings": {
+      "enter": "editor::Newline",
+    },
+  },
+  {
+    "context": "MessageEditor > Editor && VimControl && (vim_mode == normal || vim_mode == visual)",
+    "bindings": {
+      "enter": "vim::NextLineStart",
+      "ctrl-w k": "agent::FocusCodexTranscript",
+      "ctrl-u": "agent::ScrollOutputPageUp",
+      "ctrl-d": "agent::ScrollOutputPageDown",
+      "ctrl-b": "agent::ScrollOutputPageUp",
+      "ctrl-f": "agent::ScrollOutputPageDown",
+      "g [": "agent::ScrollOutputToPreviousMessage",
+      "g ]": "agent::ScrollOutputToNextMessage",
+    },
+  },
+  {
+    "context": "CodexTranscript",
+    "bindings": {
+      "j": "agent::ScrollOutputLineDown",
+      "k": "agent::ScrollOutputLineUp",
+      "ctrl-e": "agent::ScrollOutputLineDown",
+      "ctrl-y": "agent::ScrollOutputLineUp",
+      "ctrl-d": "agent::ScrollOutputPageDown",
+      "ctrl-u": "agent::ScrollOutputPageUp",
+      "ctrl-f": "agent::ScrollOutputPageDown",
+      "ctrl-b": "agent::ScrollOutputPageUp",
+      "g g": "agent::ScrollOutputToTop",
+      "shift-g": "agent::ScrollOutputToBottom",
+      "enter": "agent::ToggleCodexTranscriptItem",
+      "space": "agent::ToggleCodexTranscriptItem",
+      "y": "agent::YankCodexTranscriptItem",
+      "i": "agent::FocusCodexComposer",
+      "a": "agent::FocusCodexComposer",
+      "o": "agent::FocusCodexComposer",
+      "escape": "agent::FocusCodexComposer",
+      "backslash h": "agent::ToggleCodexSidebar"
+    }
   },
 
   {

@@ -1,14 +1,23 @@
+#[cfg(any(feature = "workspace-integration", test))]
 use editor::{Editor, EditorSettings};
-use gpui::{Action, Context, TaskExt, Window, actions};
+use gpui::{Action, actions};
+#[cfg(any(feature = "workspace-integration", test))]
+use gpui::{Context, TaskExt, Window};
+#[cfg(any(feature = "workspace-integration", test))]
 use language::Point;
 use schemars::JsonSchema;
+#[cfg(any(feature = "workspace-integration", test))]
 use search::{BufferSearchBar, SearchOptions, buffer_search};
 use serde::Deserialize;
+#[cfg(any(feature = "workspace-integration", test))]
 use settings::Settings;
+#[cfg(any(feature = "workspace-integration", test))]
 use std::{iter::Peekable, str::Chars};
 use util::serde::default_true;
+#[cfg(any(feature = "workspace-integration", test))]
 use workspace::{notifications::NotifyResultExt, searchable::Direction};
 
+#[cfg(any(feature = "workspace-integration", test))]
 use crate::{
     Vim, VimSettings,
     command::CommandRange,
@@ -72,14 +81,15 @@ pub(crate) struct SearchUnderCursorPrevious {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Search {
+pub struct Search {
     #[serde(default)]
-    backwards: bool,
+    pub backwards: bool,
     #[serde(default = "default_true")]
-    regex: bool,
+    pub regex: bool,
 }
 
 /// Executes a find command to search for patterns in the buffer.
+#[cfg(any(feature = "workspace-integration", test))]
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
@@ -89,6 +99,7 @@ pub struct FindCommand {
 }
 
 /// Executes a search and replace command within the specified range.
+#[cfg(any(feature = "workspace-integration", test))]
 #[derive(Clone, Debug, PartialEq, Action)]
 #[action(namespace = vim, no_json, no_register)]
 pub struct ReplaceCommand {
@@ -96,6 +107,7 @@ pub struct ReplaceCommand {
     pub(crate) replacement: Replacement,
 }
 
+#[cfg(any(feature = "workspace-integration", test))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Replacement {
     search: String,
@@ -118,6 +130,7 @@ actions!(
     ]
 );
 
+#[cfg(any(feature = "workspace-integration", test))]
 pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::move_to_next);
     Vim::action(editor, cx, Vim::move_to_previous);
@@ -131,6 +144,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::replace_command);
 }
 
+#[cfg(any(feature = "workspace-integration", test))]
 impl Vim {
     fn search_under_cursor(
         &mut self,
@@ -201,6 +215,10 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pane(window, cx).is_none() {
+            cx.propagate();
+            return;
+        }
         self.move_to_match_internal(self.search.direction, window, cx)
     }
 
@@ -210,11 +228,16 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pane(window, cx).is_none() {
+            cx.propagate();
+            return;
+        }
         self.move_to_match_internal(self.search.direction.opposite(), window, cx)
     }
 
     fn search(&mut self, action: &Search, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pane) = self.pane(window, cx) else {
+            cx.propagate();
             return;
         };
         let direction = if action.backwards {
@@ -303,6 +326,7 @@ impl Vim {
         cx.propagate();
     }
 
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub fn search_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.store_visual_marks(window, cx);
         let Some(pane) = self.pane(window, cx) else {
@@ -687,6 +711,7 @@ impl Vim {
     }
 }
 
+#[cfg(any(feature = "workspace-integration", test))]
 impl Replacement {
     // convert a vim query into something more usable by zed.
     // we don't attempt to fully convert between the two regex syntaxes,
@@ -694,6 +719,7 @@ impl Replacement {
     // convert \0..\9 to $0..$9 in the replacement so that common idioms work,
     // and escape literal `$` to `$$` in the replacement so vim's literal `$`
     // is not interpreted as a Rust regex capture-group reference.
+    #[cfg(any(feature = "workspace-integration", test))]
     pub(crate) fn parse(mut chars: Peekable<Chars>) -> Option<Replacement> {
         let delimiter = chars
             .next()

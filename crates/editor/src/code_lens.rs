@@ -58,6 +58,7 @@ impl Default for CodeLensState {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 pub(super) fn try_handle_client_command(
     action: &CodeAction,
     editor: &mut Editor,
@@ -95,6 +96,7 @@ pub(super) fn try_handle_client_command(
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 fn schedule_task(
     task_template: task::TaskTemplate,
     action: &CodeAction,
@@ -662,7 +664,9 @@ fn build_code_lens_renderer(line: CodeLensLine, editor: WeakEntity<Editor>) -> R
                                                 },
                                             );
 
+                                            #[cfg(feature = "workspace-integration")]
                                             let action = action.clone();
+                                            #[cfg(feature = "workspace-integration")]
                                             if let Some(workspace) = editor.workspace() {
                                                 if try_handle_client_command(
                                                     &action, editor, &workspace, window, cx,

@@ -1,6 +1,6 @@
 use editor::{
-    Anchor, Bias, BufferOffset, DisplayPoint, Editor, MultiBufferOffset, RowExt, ToOffset,
-    ToPoint as _,
+    Anchor, Bias, BufferOffset, Direction, DisplayPoint, Editor, MultiBufferOffset, RowExt,
+    ToOffset, ToPoint as _,
     display_map::{DisplayRow, DisplaySnapshot, FoldPoint, ToDisplayPoint},
     movement::{
         self, FindRange, TextLayoutDetails, find_boundary, find_preceding_boundary_display_point,
@@ -12,8 +12,6 @@ use multi_buffer::MultiBufferRow;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{f64, ops::Range};
-
-use workspace::searchable::Direction;
 
 use crate::{
     Vim,
@@ -163,6 +161,7 @@ pub enum Motion {
     // we don't have a good way to run a search synchronously, so
     // we handle search motions by running the search async and then
     // calling back into motion with this
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     ZedSearchResult {
         prior_selections: Vec<Range<Anchor>>,
         new_selections: Vec<Range<Anchor>>,
@@ -690,6 +689,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 }
 
 impl Vim {
+    #[cfg(any(feature = "workspace-integration", test))]
     pub(crate) fn search_motion(&mut self, m: Motion, window: &mut Window, cx: &mut Context<Self>) {
         if let Motion::ZedSearchResult {
             prior_selections, ..
@@ -3320,11 +3320,12 @@ fn section_motion(
         return display_point;
     };
 
+    let editor_direction = direction;
     for _ in 0..times {
         let next_point = if is_start {
-            movement::start_of_excerpt(map, display_point, direction)
+            movement::start_of_excerpt(map, display_point, editor_direction)
         } else {
-            movement::end_of_excerpt(map, display_point, direction)
+            movement::end_of_excerpt(map, display_point, editor_direction)
         };
         if next_point == display_point {
             break;

@@ -1317,10 +1317,19 @@ impl CompletionsMenu {
                 })
                 .on_url_click(move |link, window, cx| {
                     open_markdown_url(
-                        editor
-                            .read_with(cx, |editor, _| editor.workspace())
-                            .ok()
-                            .flatten(),
+                        {
+                            #[cfg(feature = "workspace-integration")]
+                            {
+                                editor
+                                    .read_with(cx, |editor, _| editor.workspace())
+                                    .ok()
+                                    .flatten()
+                            }
+                            #[cfg(not(feature = "workspace-integration"))]
+                            {
+                                ()
+                            }
+                        },
                         link,
                         window,
                         cx,

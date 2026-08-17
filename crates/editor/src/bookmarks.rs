@@ -8,12 +8,14 @@ use rope::Point;
 use text::Bias;
 use ui::{Context, Window};
 use util::ResultExt as _;
-use workspace::{Workspace, searchable::Direction};
+#[cfg(feature = "workspace-integration")]
+use workspace::Workspace;
 
 use crate::display_map::DisplayRow;
 use crate::{
-    EditBookmark, Editor, GoToNextBookmark, GoToPreviousBookmark, MultibufferSelectionMode,
-    SelectionEffects, ToggleBookmark, ToggleBookmarkWithLabel, ViewBookmarks, scroll::Autoscroll,
+    Direction, EditBookmark, Editor, GoToNextBookmark, GoToPreviousBookmark,
+    MultibufferSelectionMode, SelectionEffects, ToggleBookmark, ToggleBookmarkWithLabel,
+    ViewBookmarks, scroll::Autoscroll,
 };
 
 #[derive(Clone, Debug)]
@@ -335,6 +337,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn view_bookmarks(
         workspace: &mut Workspace,
         _: &ViewBookmarks,

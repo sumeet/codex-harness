@@ -2,13 +2,15 @@ mod actions;
 pub(crate) mod autoscroll;
 pub(crate) mod scroll_amount;
 
+use crate::WorkspaceId;
 use crate::editor_settings::ScrollBeyondLastLine;
+#[cfg(feature = "workspace-integration")]
+use crate::persistence::EditorDb;
 use crate::{
     Anchor, DisplayPoint, DisplayRow, Editor, EditorEvent, EditorMode, EditorSettings,
     MultiBufferSnapshot, RowExt, SelectionEffects, SizingBehavior, ToPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     hover_popover::hide_hover,
-    persistence::EditorDb,
 };
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
@@ -23,7 +25,8 @@ use settings::Settings;
 use std::{cmp::Ordering, time::Duration};
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
-use workspace::{ItemId, WorkspaceId};
+#[cfg(feature = "workspace-integration")]
+use workspace::ItemId;
 
 const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -409,6 +412,7 @@ impl ScrollManager {
         });
         cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
         self.show_scrollbars(window, cx);
+        #[cfg(feature = "workspace-integration")]
         if let Some(workspace_id) = workspace_id {
             let item_id = cx.entity().entity_id().as_u64() as ItemId;
             let executor = cx.background_executor().clone();
@@ -724,7 +728,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> WasScrolled {
         hide_hover(self, cx);
-        let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        let workspace_id = self.workspace_database_id();
 
         self.edit_prediction_preview
             .set_previous_scroll_position(None);
@@ -760,7 +764,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         hide_hover(self, cx);
-        let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        let workspace_id = self.workspace_database_id();
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let top_row = scroll_anchor
             .anchor
@@ -785,7 +789,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         hide_hover(self, cx);
-        let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
+        let workspace_id = self.workspace_database_id();
         let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
         if !scroll_anchor.anchor.is_valid(&buffer_snapshot) {
             log::warn!("Invalid scroll anchor: {:?}", scroll_anchor);
@@ -969,6 +973,7 @@ impl Editor {
         Ordering::Greater
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn read_scroll_position_from_db(
         &mut self,
         item_id: u64,

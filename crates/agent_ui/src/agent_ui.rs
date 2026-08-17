@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod codex_harness;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -326,6 +327,16 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Moves keyboard focus from the composer into the direct Codex transcript.
+        FocusCodexTranscript,
+        /// Moves keyboard focus from the transcript back into the composer.
+        FocusCodexComposer,
+        /// Expands or collapses the selected direct Codex transcript item.
+        ToggleCodexTranscriptItem,
+        /// Copies the selected direct Codex transcript item.
+        YankCodexTranscriptItem,
+        /// Toggles the direct Codex task history sidebar.
+        ToggleCodexSidebar,
     ]
 );
 

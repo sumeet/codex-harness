@@ -946,6 +946,10 @@ actions!(
         AlignSelections,
         /// Saves the current location to navigation history.
         SaveLocation,
+        /// Navigates backward through the local editor history.
+        LocalNavigationBack,
+        /// Navigates forward through the local editor history.
+        LocalNavigationForward,
         /// Toggles breadcrumbs display.
         ToggleBreadcrumb,
     ]

@@ -66,7 +66,7 @@ use theme_settings::load_user_theme;
 use util::{ResultExt, maybe};
 use uuid::Uuid;
 use workspace::{
-    AppState, MultiWorkspace, SerializedWorkspaceLocation, SessionWorkspace, Toast,
+    AppState, MultiWorkspace, Panel, SerializedWorkspaceLocation, SessionWorkspace, Toast,
     WorkspaceSettings, WorkspaceStore,
     notifications::{NotificationId, NotifyResultExt},
     restore_multiworkspace,
@@ -1034,9 +1034,39 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
             OpenRequestKind::AgentPanel {
                 external_source_prompt,
             } => {
+                let base_open_options = zed::open_options_for_request(
+                    request.open_behavior,
+                    &workspace::SerializedWorkspaceLocation::Local,
+                    cx,
+                );
                 cx.spawn(async move |cx| {
-                    let multi_workspace =
-                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?;
+                    let multi_workspace = if request.open_paths.is_empty()
+                        && request.diff_paths.is_empty()
+                    {
+                        workspace::get_any_active_multi_workspace(app_state, cx.clone()).await?
+                    } else {
+                        let paths_with_position =
+                            derive_paths_with_position(app_state.fs.as_ref(), request.open_paths)
+                                .await;
+                        let (multi_workspace, results) = open_paths_with_positions(
+                            &paths_with_position,
+                            &request.diff_paths,
+                            request.diff_all,
+                            app_state,
+                            workspace::OpenOptions {
+                                open_in_dev_container: request.dev_container,
+                                ..base_open_options
+                            },
+                            cx,
+                        )
+                        .await?;
+                        for result in results.into_iter().flatten() {
+                            if let Err(error) = result {
+                                log::error!("Error opening path: {error:#}");
+                            }
+                        }
+                        multi_workspace
+                    };
 
                     let panels_task = multi_workspace.update(cx, |multi_workspace, _, cx| {
                         multi_workspace
@@ -1056,6 +1086,9 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
                                         window,
                                         cx,
                                     );
+                                    if !panel.is_zoomed(window, cx) {
+                                        panel.toggle_zoom(&workspace::ToggleZoom, window, cx);
+                                    }
                                 });
                             } else {
                                 log::warn!(

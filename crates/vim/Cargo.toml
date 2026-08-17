@@ -13,6 +13,13 @@ path = "src/vim.rs"
 doctest = false
 
 [features]
+default = ["workspace-integration"]
+workspace-integration = [
+    "editor/workspace-integration",
+    "dep:picker",
+    "dep:search",
+    "dep:workspace",
+]
 neovim = ["nvim-rs", "async-compat", "async-trait", "tokio"]
 
 [dependencies]
@@ -20,10 +27,9 @@ anyhow.workspace = true
 async-compat = { workspace = true, "optional" = true }
 async-trait = { workspace = true, "optional" = true }
 collections.workspace = true
-command_palette.workspace = true
 command_palette_hooks.workspace = true
 db.workspace = true
-editor.workspace = true
+editor = { path = "../editor", default-features = false }
 env_logger.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
@@ -33,11 +39,11 @@ language.workspace = true
 log.workspace = true
 multi_buffer.workspace = true
 nvim-rs = { git = "https://github.com/KillTheMule/nvim-rs", rev = "764dd270c642f77f10f3e19d05cc178a6cbe69f3", features = ["use_tokio"], optional = true }
-picker.workspace = true
+picker = { workspace = true, optional = true }
 project.workspace = true
 regex.workspace = true
 schemars.workspace = true
-search.workspace = true
+search = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
@@ -51,7 +57,7 @@ ui.workspace = true
 util.workspace = true
 util_macros.workspace = true
 vim_mode_setting.workspace = true
-workspace.workspace = true
+workspace = { workspace = true, optional = true }
 zed_actions.workspace = true
 
 [dev-dependencies]

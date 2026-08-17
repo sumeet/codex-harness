@@ -16,4 +16,6 @@ doctest = false
 collections.workspace = true
 derive_more.workspace = true
 gpui.workspace = true
-workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

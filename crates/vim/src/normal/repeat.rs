@@ -8,8 +8,7 @@ use crate::{
     state::{Mode, Operator, RecordedSelection, ReplayableAction, VimGlobals},
 };
 use editor::Editor;
-use gpui::{Action, App, Context, Window, actions};
-use workspace::Workspace;
+use gpui::{Action, App, Context, WeakEntity, Window, actions};
 
 actions!(
     vim,
@@ -90,19 +89,25 @@ pub struct ReplayerState {
 }
 
 #[derive(Clone)]
-pub struct Replayer(Rc<RefCell<ReplayerState>>);
+pub struct Replayer {
+    state: Rc<RefCell<ReplayerState>>,
+    editor: WeakEntity<Editor>,
+}
 
 impl Replayer {
-    pub fn new() -> Self {
-        Self(Rc::new(RefCell::new(ReplayerState {
-            actions: vec![],
-            running: false,
-            ix: 0,
-        })))
+    pub fn new(editor: WeakEntity<Editor>) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(ReplayerState {
+                actions: vec![],
+                running: false,
+                ix: 0,
+            })),
+            editor,
+        }
     }
 
     pub fn replay(&mut self, actions: Vec<ReplayableAction>, window: &mut Window, cx: &mut App) {
-        let mut lock = self.0.borrow_mut();
+        let mut lock = self.state.borrow_mut();
         let range = lock.ix..lock.ix;
         lock.actions.splice(range, actions);
         if lock.running {
@@ -110,16 +115,10 @@ impl Replayer {
         }
         lock.running = true;
         let this = self.clone();
+        let editor = self.editor.clone();
         window.defer(cx, move |window, cx| {
             this.next(window, cx);
-            let Some(workspace) = Workspace::for_window(window, cx) else {
-                return;
-            };
-            let Some(editor) = workspace
-                .read(cx)
-                .active_item(cx)
-                .and_then(|item| item.act_as::<Editor>(cx))
-            else {
+            let Some(editor) = editor.upgrade() else {
                 return;
             };
             editor.update(cx, |editor, cx| {
@@ -130,12 +129,13 @@ impl Replayer {
         })
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     pub fn stop(self) {
-        self.0.borrow_mut().actions.clear()
+        self.state.borrow_mut().actions.clear()
     }
 
     pub fn next(self, window: &mut Window, cx: &mut App) {
-        let mut lock = self.0.borrow_mut();
+        let mut lock = self.state.borrow_mut();
         let action = if lock.ix < 10000 {
             lock.actions.get(lock.ix).cloned()
         } else {
@@ -165,14 +165,7 @@ impl Replayer {
                 text,
                 utf16_range_to_replace,
             } => {
-                let Some(workspace) = Workspace::for_window(window, cx) else {
-                    return;
-                };
-                let Some(editor) = workspace
-                    .read(cx)
-                    .active_item(cx)
-                    .and_then(|item| item.act_as::<Editor>(cx))
-                else {
+                let Some(editor) = self.editor.upgrade() else {
                     return;
                 };
                 editor.update(cx, |editor, cx| {
@@ -226,7 +219,11 @@ impl Vim {
         }
 
         globals.last_replayed_register = Some(register);
-        let mut replayer = globals.replayer.get_or_insert_with(Replayer::new).clone();
+        let editor = self.editor.clone();
+        let mut replayer = globals
+            .replayer
+            .get_or_insert_with(|| Replayer::new(editor))
+            .clone();
         replayer.replay(repeated_actions, window, cx);
     }
 
@@ -405,7 +402,11 @@ impl Vim {
 
         let globals = Vim::globals(cx);
         globals.dot_replaying = true;
-        let mut replayer = globals.replayer.get_or_insert_with(Replayer::new).clone();
+        let editor = self.editor.clone();
+        let mut replayer = globals
+            .replayer
+            .get_or_insert_with(|| Replayer::new(editor))
+            .clone();
 
         replayer.replay(actions, window, cx);
     }

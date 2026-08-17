@@ -31,6 +31,7 @@ use theme_settings::ThemeSettings;
 use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
+#[cfg(feature = "workspace-integration")]
 use workspace::{OpenOptions, OpenVisible, Workspace};
 
 pub const MIN_POPOVER_CHARACTER_WIDTH: f32 = 20.;
@@ -812,6 +813,7 @@ fn parse_file_link(link: &str) -> Option<(PathBuf, Option<String>)> {
     Some((path, fragment))
 }
 
+#[cfg(feature = "workspace-integration")]
 pub fn open_markdown_url(
     workspace: Option<Entity<Workspace>>,
     link: SharedString,
@@ -874,6 +876,11 @@ pub fn open_markdown_url(
     } else {
         cx.open_url(&link);
     }
+}
+
+#[cfg(not(feature = "workspace-integration"))]
+pub fn open_markdown_url(_: (), link: SharedString, _: &mut Window, cx: &mut App) {
+    cx.open_url(&link);
 }
 
 #[derive(Default)]
@@ -1112,10 +1119,19 @@ impl InfoPopover {
                                 })
                                 .on_url_click(move |link, window, cx| {
                                     open_markdown_url(
-                                        this2
-                                            .read_with(cx, |editor, _| editor.workspace())
-                                            .ok()
-                                            .flatten(),
+                                        {
+                                            #[cfg(feature = "workspace-integration")]
+                                            {
+                                                this2
+                                                    .read_with(cx, |editor, _| editor.workspace())
+                                                    .ok()
+                                                    .flatten()
+                                            }
+                                            #[cfg(not(feature = "workspace-integration"))]
+                                            {
+                                                ()
+                                            }
+                                        },
                                         link,
                                         window,
                                         cx,

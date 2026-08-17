@@ -697,11 +697,14 @@ impl Editor {
                 None
             } else {
                 let Ok((mut menu, matches_task)) = editor.update(cx, |editor, cx| {
+                    #[cfg(feature = "workspace-integration")]
                     let languages = editor
                         .workspace
                         .as_ref()
                         .and_then(|(workspace, _)| workspace.upgrade())
                         .map(|workspace| workspace.read(cx).app_state().languages.clone());
+                    #[cfg(not(feature = "workspace-integration"))]
+                    let languages: Option<Arc<LanguageRegistry>> = None;
                     let menu = CompletionsMenu::new(
                         id,
                         requested_source.unwrap_or(if load_provider_completions {
@@ -1089,6 +1092,7 @@ impl Editor {
                     })
                     .await
                     .context("applying post-completion command")?;
+                #[cfg(feature = "workspace-integration")]
                 if let Some(workspace) = editor.read_with(cx, |editor, _| editor.workspace())? {
                     Self::open_project_transaction(
                         &editor,

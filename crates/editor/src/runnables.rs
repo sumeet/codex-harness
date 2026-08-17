@@ -118,6 +118,7 @@ pub(crate) enum RunnableTaskStatus {
     Failed,
 }
 
+#[cfg(feature = "workspace-integration")]
 impl From<workspace::tasks::ScheduledTaskResult> for RunnableTaskStatus {
     fn from(result: workspace::tasks::ScheduledTaskResult) -> Self {
         match result {
@@ -342,6 +343,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn spawn_nearest_task(
         &mut self,
         action: &SpawnNearestTask,

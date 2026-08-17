@@ -387,6 +387,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 
     repeat::register(editor, cx);
     scroll::register(editor, cx);
+    #[cfg(any(feature = "workspace-integration", test))]
     search::register(editor, cx);
     substitute::register(editor, cx);
     increment::register(editor, cx);
@@ -434,7 +435,10 @@ impl Vim {
                 cx,
             ),
             Some(Operator::ShellCommand) => {
-                self.shell_command_motion(motion, times, forced_motion, window, cx)
+                #[cfg(feature = "workspace-integration")]
+                self.shell_command_motion(motion, times, forced_motion, window, cx);
+                #[cfg(not(feature = "workspace-integration"))]
+                self.clear_operator(window, cx);
             }
             Some(Operator::Lowercase) => self.convert_motion(
                 motion,
@@ -521,7 +525,10 @@ impl Vim {
                     self.indent_object(object, around, IndentDirection::Auto, times, window, cx)
                 }
                 Some(Operator::ShellCommand) => {
+                    #[cfg(feature = "workspace-integration")]
                     self.shell_command_object(object, around, window, cx);
+                    #[cfg(not(feature = "workspace-integration"))]
+                    self.clear_operator(window, cx);
                 }
                 Some(Operator::Rewrap) => self.rewrap_object(object, around, times, window, cx),
                 Some(Operator::Lowercase) => {

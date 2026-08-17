@@ -14,6 +14,7 @@
 pub mod actions;
 pub mod blink_manager;
 mod bracket_colorization;
+#[cfg(feature = "workspace-integration")]
 mod clangd_ext;
 pub mod code_context_menus;
 mod code_lens;
@@ -31,20 +32,26 @@ pub mod hover_links;
 pub mod hover_popover;
 mod indent_guides;
 mod inlays;
+#[cfg(feature = "workspace-integration")]
 pub mod items;
 mod jsx_tag_auto_close;
 mod linked_editing_ranges;
 mod lsp_ext;
 mod mouse_context_menu;
 pub mod movement;
+#[cfg(feature = "workspace-integration")]
 mod persistence;
 mod runnables;
+#[cfg(feature = "workspace-integration")]
 mod rust_analyzer_ext;
 pub mod scroll;
 mod selections_collection;
 pub mod semantic_tokens;
+#[cfg(feature = "workspace-integration")]
 mod split;
+#[cfg(feature = "workspace-integration")]
 pub mod split_editor_view;
+mod split_patches;
 
 mod bookmarks;
 #[cfg(test)]
@@ -102,9 +109,11 @@ pub use editor_settings::{
     ScrollBeyondLastLine, ScrollbarAxes, SearchSettings, ShowMinimap,
     ui_scrollbar_settings_from_raw,
 };
+#[cfg(feature = "workspace-integration")]
+pub use element::render_breadcrumb_text;
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
-    file_status_label_color, render_breadcrumb_text,
+    file_status_label_color,
 };
 pub use git::blame::{BlameRenderer, GitBlame};
 pub use git::{
@@ -117,6 +126,7 @@ use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
 pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
+#[cfg(feature = "workspace-integration")]
 pub use items::MAX_TAB_TITLE_LEN;
 pub use linked_editing_ranges::LinkedEdits;
 pub use lsp::CompletionContext;
@@ -126,7 +136,9 @@ pub use multi_buffer::{
     MultiBufferOffset, MultiBufferOffsetUtf16, MultiBufferSnapshot, PathKey, RowInfo, ToOffset,
     ToPoint,
 };
+#[cfg(feature = "workspace-integration")]
 pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
+#[cfg(feature = "workspace-integration")]
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
@@ -201,6 +213,7 @@ use multi_buffer::{
     MultiBufferRow,
 };
 use parking_lot::Mutex;
+#[cfg(feature = "workspace-integration")]
 use persistence::EditorDb;
 use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
@@ -261,6 +274,7 @@ use ui::{
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
+#[cfg(feature = "workspace-integration")]
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
     OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
@@ -269,6 +283,35 @@ use workspace::{
     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
     searchable::SearchEvent,
 };
+
+// Collaboration cursor presentation is editor state, but Zed currently owns
+// these two small identifiers in the workspace crate. Keep the local-buffer
+// build independent until those identifiers move to a lower-level crate.
+#[cfg(not(feature = "workspace-integration"))]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub enum CollaboratorId {
+    PeerId(PeerId),
+    Agent,
+}
+
+#[cfg(not(feature = "workspace-integration"))]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+struct ViewId;
+
+#[cfg(not(feature = "workspace-integration"))]
+type WorkspaceId = ();
+
+#[cfg(not(feature = "workspace-integration"))]
+#[derive(Clone)]
+pub struct NavigationEntry;
+
+#[cfg(not(feature = "workspace-integration"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ItemBufferKind {
+    Multibuffer,
+    Singleton,
+    None,
+}
 pub use zed_actions::editor::RevealInFileManager;
 use zed_actions::editor::{MoveDown, MoveUp};
 
@@ -294,6 +337,8 @@ const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_LINE_LEN: usize = 1024;
 const MIN_NAVIGATION_HISTORY_ROW_DELTA: i64 = 10;
 const MAX_SELECTION_HISTORY_LEN: usize = 1024;
+#[cfg(any(test, not(feature = "workspace-integration")))]
+const LOCAL_NAVIGATION_HISTORY_LIMIT: usize = 1024;
 pub(crate) const CURSORS_VISIBLE_FOR: Duration = Duration::from_millis(2000);
 #[doc(hidden)]
 pub const CODE_ACTIONS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
@@ -349,48 +394,54 @@ impl Navigated {
 
 pub fn init(cx: &mut App) {
     cx.set_global(GlobalBlameRenderer(Arc::new(())));
+    #[cfg(feature = "workspace-integration")]
     cx.set_global(breadcrumbs::RenderBreadcrumbText(render_breadcrumb_text));
 
-    workspace::register_project_item::<Editor>(cx);
-    workspace::FollowableViewRegistry::register::<Editor>(cx);
-    workspace::register_serializable_item::<Editor>(cx);
+    #[cfg(feature = "workspace-integration")]
+    {
+        workspace::register_project_item::<Editor>(cx);
+        workspace::FollowableViewRegistry::register::<Editor>(cx);
+        workspace::register_serializable_item::<Editor>(cx);
 
-    cx.observe_new(
-        |workspace: &mut Workspace, _: Option<&mut Window>, _cx: &mut Context<Workspace>| {
-            workspace.register_action(Editor::new_file);
-            workspace.register_action(Editor::new_file_split);
-            workspace.register_action(Editor::new_file_vertical);
-            workspace.register_action(Editor::new_file_horizontal);
-            workspace.register_action(Editor::cancel_language_server_work);
-            workspace.register_action(Editor::toggle_focus);
-            workspace.register_action(Editor::view_bookmarks);
-        },
-    )
-    .detach();
-
-    cx.on_action(move |_: &workspace::NewFile, cx| {
-        let app_state = workspace::AppState::global(cx);
-        workspace::open_new(
-            Default::default(),
-            app_state,
-            cx,
-            |workspace, window, cx| Editor::new_file(workspace, &Default::default(), window, cx),
-        )
-        .detach_and_log_err(cx);
-    })
-    .on_action(move |_: &workspace::NewWindow, cx| {
-        let app_state = workspace::AppState::global(cx);
-        workspace::open_new(
-            Default::default(),
-            app_state,
-            cx,
-            |workspace, window, cx| {
-                cx.activate(true);
-                Editor::new_file(workspace, &Default::default(), window, cx)
+        cx.observe_new(
+            |workspace: &mut Workspace, _: Option<&mut Window>, _cx: &mut Context<Workspace>| {
+                workspace.register_action(Editor::new_file);
+                workspace.register_action(Editor::new_file_split);
+                workspace.register_action(Editor::new_file_vertical);
+                workspace.register_action(Editor::new_file_horizontal);
+                workspace.register_action(Editor::cancel_language_server_work);
+                workspace.register_action(Editor::toggle_focus);
+                workspace.register_action(Editor::view_bookmarks);
             },
         )
-        .detach_and_log_err(cx);
-    });
+        .detach();
+
+        cx.on_action(move |_: &workspace::NewFile, cx| {
+            let app_state = workspace::AppState::global(cx);
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    Editor::new_file(workspace, &Default::default(), window, cx)
+                },
+            )
+            .detach_and_log_err(cx);
+        })
+        .on_action(move |_: &workspace::NewWindow, cx| {
+            let app_state = workspace::AppState::global(cx);
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    cx.activate(true);
+                    Editor::new_file(workspace, &Default::default(), window, cx)
+                },
+            )
+            .detach_and_log_err(cx);
+        });
+    }
     _ = ui_input::ERASED_EDITOR_FACTORY.set(|window, cx| {
         cx.new(|cx| Editor::single_line(window, cx))
             .update(cx, |editor, cx| editor.erased(cx))
@@ -999,7 +1050,10 @@ pub struct Editor {
     allow_git_diff_scrollbar_markers: bool,
     scrollbar_marker_state: ScrollbarMarkerState,
     active_indent_guides_state: ActiveIndentGuidesState,
+    #[cfg(feature = "workspace-integration")]
     nav_history: Option<ItemNavHistory>,
+    #[cfg(not(feature = "workspace-integration"))]
+    local_navigation_history: LocalNavigationHistory<Anchor>,
     context_menu: RefCell<Option<CodeContextMenu>>,
     context_menu_options: Option<ContextMenuOptions>,
     mouse_context_menu: Option<MouseContextMenu>,
@@ -1031,6 +1085,7 @@ pub struct Editor {
     /// without selecting the matched text.
     collapse_matches: bool,
     autoindent_mode: Option<AutoindentMode>,
+    #[cfg(feature = "workspace-integration")]
     workspace: Option<(WeakEntity<Workspace>, Option<WorkspaceId>)>,
     input_enabled: bool,
     expects_character_input: bool,
@@ -1588,6 +1643,96 @@ pub(crate) struct NavigationData {
     scroll_top_row: u32,
 }
 
+#[cfg(any(test, not(feature = "workspace-integration")))]
+struct LocalNavigationHistory<T> {
+    backward: VecDeque<T>,
+    forward: VecDeque<T>,
+}
+
+#[cfg(any(test, not(feature = "workspace-integration")))]
+impl<T> Default for LocalNavigationHistory<T> {
+    fn default() -> Self {
+        Self {
+            backward: VecDeque::new(),
+            forward: VecDeque::new(),
+        }
+    }
+}
+
+#[cfg(any(test, not(feature = "workspace-integration")))]
+impl<T: std::marker::Copy + PartialEq> LocalNavigationHistory<T> {
+    fn push(&mut self, location: T) {
+        if self.backward.back() != Some(&location) {
+            self.backward.push_back(location);
+            if self.backward.len() > LOCAL_NAVIGATION_HISTORY_LIMIT {
+                self.backward.pop_front();
+            }
+        }
+        self.forward.clear();
+    }
+
+    fn backward(&mut self, current: T, is_valid: impl FnMut(T) -> bool) -> Option<T> {
+        Self::navigate(&mut self.backward, &mut self.forward, current, is_valid)
+    }
+
+    fn forward(&mut self, current: T, is_valid: impl FnMut(T) -> bool) -> Option<T> {
+        Self::navigate(&mut self.forward, &mut self.backward, current, is_valid)
+    }
+
+    fn navigate(
+        source: &mut VecDeque<T>,
+        destination: &mut VecDeque<T>,
+        current: T,
+        mut is_valid: impl FnMut(T) -> bool,
+    ) -> Option<T> {
+        while let Some(target) = source.pop_back() {
+            if target == current || !is_valid(target) {
+                continue;
+            }
+            if destination.back() != Some(&current) {
+                destination.push_back(current);
+                if destination.len() > LOCAL_NAVIGATION_HISTORY_LIMIT {
+                    destination.pop_front();
+                }
+            }
+            return Some(target);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod local_navigation_history_tests {
+    use super::LocalNavigationHistory;
+
+    #[test]
+    fn navigates_backward_and_forward() {
+        let mut history = LocalNavigationHistory::default();
+        history.push(1);
+        history.push(2);
+
+        assert_eq!(history.backward(3, |_| true), Some(2));
+        assert_eq!(history.backward(2, |_| true), Some(1));
+        assert_eq!(history.forward(1, |_| true), Some(2));
+        assert_eq!(history.forward(2, |_| true), Some(3));
+    }
+
+    #[test]
+    fn new_jump_clears_forward_history_and_invalid_entries_are_skipped() {
+        let mut history = LocalNavigationHistory::default();
+        history.push(1);
+        history.push(2);
+        assert_eq!(history.backward(3, |_| true), Some(2));
+
+        history.push(4);
+        assert_eq!(history.forward(5, |_| true), None);
+
+        history.push(6);
+        history.push(7);
+        assert_eq!(history.backward(8, |entry| entry != 7), Some(6));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GotoDefinitionKind {
     Symbol,
@@ -1723,6 +1868,13 @@ impl Render for GutterButtonTooltip {
 }
 
 impl Editor {
+    pub(crate) fn buffer_kind(&self, cx: &App) -> ItemBufferKind {
+        match self.buffer.read(cx).is_singleton() {
+            true => ItemBufferKind::Singleton,
+            false => ItemBufferKind::Multibuffer,
+        }
+    }
+
     pub fn single_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
@@ -2076,6 +2228,7 @@ impl Editor {
                         }
                     }
 
+                    #[cfg(feature = "workspace-integration")]
                     project::Event::EntryRenamed(transaction, project_path, abs_path) => {
                         let Some(workspace) = editor.workspace() else {
                             return;
@@ -2112,6 +2265,7 @@ impl Editor {
                         }
                     }
 
+                    #[cfg(feature = "workspace-integration")]
                     project::Event::WorkspaceEditApplied(transaction) => {
                         let Some(workspace) = editor.workspace() else {
                             return;
@@ -2318,7 +2472,10 @@ impl Editor {
             allow_git_diff_scrollbar_markers: false,
             scrollbar_marker_state: ScrollbarMarkerState::default(),
             active_indent_guides_state: ActiveIndentGuidesState::default(),
+            #[cfg(feature = "workspace-integration")]
             nav_history: None,
+            #[cfg(not(feature = "workspace-integration"))]
+            local_navigation_history: LocalNavigationHistory::default(),
             context_menu: RefCell::new(None),
             context_menu_options: None,
             mouse_context_menu: None,
@@ -2348,6 +2505,7 @@ impl Editor {
             current_line_highlight: None,
             autoindent_mode: Some(AutoindentMode::EachLine),
             collapse_matches: false,
+            #[cfg(feature = "workspace-integration")]
             workspace: None,
             input_enabled: !is_minimap,
             expects_character_input: !is_minimap,
@@ -2521,16 +2679,19 @@ impl Editor {
                     if *local {
                         editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
                         editor.hide_blame_popover(true, cx);
-                        let snapshot = editor.snapshot(window, cx);
-                        let new_anchor = editor
-                            .scroll_manager
-                            .native_anchor(&snapshot.display_snapshot, cx);
-                        editor.update_restoration_data(cx, move |data| {
-                            data.scroll_position = (
-                                new_anchor.top_row(snapshot.buffer_snapshot()),
-                                new_anchor.offset,
-                            );
-                        });
+                        #[cfg(feature = "workspace-integration")]
+                        {
+                            let snapshot = editor.snapshot(window, cx);
+                            let new_anchor = editor
+                                .scroll_manager
+                                .native_anchor(&snapshot.display_snapshot, cx);
+                            editor.update_restoration_data(cx, move |data| {
+                                data.scroll_position = (
+                                    new_anchor.top_row(snapshot.buffer_snapshot()),
+                                    new_anchor.offset,
+                                );
+                            });
+                        }
 
                         editor.update_data_on_scroll(true, window, cx);
                     }
@@ -2847,6 +3008,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn new_file(
         workspace: &mut Workspace,
         _: &workspace::NewFile,
@@ -2867,6 +3029,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn new_in_workspace(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -2886,6 +3049,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn new_file_vertical(
         workspace: &mut Workspace,
         _: &workspace::NewFileSplitVertical,
@@ -2895,6 +3059,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, SplitDirection::vertical(cx), window, cx)
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn new_file_horizontal(
         workspace: &mut Workspace,
         _: &workspace::NewFileSplitHorizontal,
@@ -2904,6 +3069,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, SplitDirection::horizontal(cx), window, cx)
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn new_file_split(
         workspace: &mut Workspace,
         action: &workspace::NewFileSplit,
@@ -2913,6 +3079,7 @@ impl Editor {
         Self::new_file_in_direction(workspace, action.0, window, cx)
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn new_file_in_direction(
         workspace: &mut Workspace,
         direction: SplitDirection,
@@ -2959,6 +3126,7 @@ impl Editor {
         self.project.as_ref()
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn workspace(&self) -> Option<Entity<Workspace>> {
         self.workspace.as_ref()?.0.upgrade()
     }
@@ -2974,19 +3142,40 @@ impl Editor {
         E: std::fmt::Debug + std::fmt::Display + 'static,
         R: 'static,
     {
+        #[cfg(feature = "workspace-integration")]
         if let Some(workspace) = self.workspace() {
             task.detach_and_notify_err(workspace.downgrade(), window, cx);
-        } else {
-            task.detach_and_log_err(cx);
+            return;
         }
+        let _ = window;
+        task.detach_and_log_err(cx);
     }
 
     /// Returns the workspace serialization ID if this editor should be serialized.
+    #[cfg(feature = "workspace-integration")]
     fn workspace_serialization_id(&self, _cx: &App) -> Option<WorkspaceId> {
         self.workspace
             .as_ref()
             .filter(|_| self.should_serialize_buffer())
             .and_then(|workspace| workspace.1)
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn workspace_serialization_id(&self, _: &App) -> Option<WorkspaceId> {
+        None
+    }
+
+    /// Returns the workspace database ID without applying item serialization policy.
+    /// Scroll persistence historically used this raw association even for editors
+    /// whose buffers were excluded from item serialization.
+    #[cfg(feature = "workspace-integration")]
+    fn workspace_database_id(&self) -> Option<WorkspaceId> {
+        self.workspace.as_ref().and_then(|workspace| workspace.1)
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn workspace_database_id(&self) -> Option<WorkspaceId> {
+        None
     }
 
     pub fn title<'a>(&self, cx: &'a App) -> Cow<'a, str> {
@@ -3385,6 +3574,7 @@ impl Editor {
         dismissed
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_transaction_for_hidden_buffers(
         workspace: Entity<Workspace>,
         transaction: ProjectTransaction,
@@ -3431,6 +3621,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub async fn open_project_transaction(
         editor: &WeakEntity<Editor>,
         workspace: WeakEntity<Workspace>,
@@ -5838,6 +6029,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn toggle_read_only(
         &mut self,
         _: &workspace::ToggleReadOnlyFile,
@@ -5866,6 +6058,35 @@ impl Editor {
         self.detach_and_notify_err(task, window, cx);
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    fn reload(
+        &mut self,
+        project: Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let buffer = self.buffer().clone();
+        let buffers = self.buffer.read(cx).all_buffers();
+        let reload_buffers =
+            project.update(cx, |project, cx| project.reload_buffers(buffers, true, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let transaction = reload_buffers.log_err().await;
+            this.update(cx, |editor, cx| {
+                editor.request_autoscroll(Autoscroll::fit(), cx)
+            })?;
+            buffer.update(cx, |buffer, cx| {
+                if let Some(transaction) = transaction
+                    && !buffer.is_singleton()
+                {
+                    buffer.push_transaction(&transaction.0, cx);
+                }
+                cx.notify();
+            });
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "workspace-integration")]
     pub fn open_active_item_in_terminal(
         &mut self,
         _: &OpenInTerminal,
@@ -6487,6 +6708,7 @@ impl Editor {
                 return None;
             };
 
+            #[cfg(feature = "workspace-integration")]
             if let Some(debug_line_pane_id) = debug_line_pane_id {
                 if let Some(workspace) = self
                     .workspace
@@ -8021,6 +8243,7 @@ impl Editor {
         }))
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn confirm_rename(
         &mut self,
         _: &ConfirmRename,
@@ -8386,6 +8609,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn cancel_language_server_work(
         workspace: &mut Workspace,
         _: &actions::CancelLanguageServerWork,
@@ -8496,6 +8720,7 @@ impl Editor {
             .is_some()
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn toggle_focus(
         workspace: &mut Workspace,
         _: &actions::ToggleFocus,
@@ -8878,6 +9103,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn open_selections_in_multibuffer(
         &mut self,
         _: &OpenSelectionsInMultibuffer,
@@ -9699,6 +9925,7 @@ impl Editor {
                 }
 
                 cx.emit(EditorEvent::BufferEdited);
+                #[cfg(feature = "workspace-integration")]
                 cx.emit(SearchEvent::MatchesInvalidated);
 
                 let Some(project) = &self.project else { return };
@@ -10180,27 +10407,36 @@ impl Editor {
             return;
         }
 
-        let Some(workspace) = self.workspace() else {
-            cx.propagate();
-            return;
-        };
+        #[cfg(feature = "workspace-integration")]
+        {
+            let Some(workspace) = self.workspace() else {
+                cx.propagate();
+                return;
+            };
 
-        new_selections_by_buffer
-            .retain(|buffer, _| buffer.read(cx).file().is_none_or(|file| file.can_open()));
+            new_selections_by_buffer
+                .retain(|buffer, _| buffer.read(cx).file().is_none_or(|file| file.can_open()));
 
-        if new_selections_by_buffer.is_empty() {
-            return;
+            if new_selections_by_buffer.is_empty() {
+                return;
+            }
+
+            Self::open_buffers_in_workspace(
+                workspace.downgrade(),
+                new_selections_by_buffer,
+                split,
+                window,
+                cx,
+            );
         }
-
-        Self::open_buffers_in_workspace(
-            workspace.downgrade(),
-            new_selections_by_buffer,
-            split,
-            window,
-            cx,
-        );
+        #[cfg(not(feature = "workspace-integration"))]
+        {
+            let _ = (new_selections_by_buffer, split, window);
+            cx.propagate();
+        }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub(crate) fn open_buffers_in_workspace(
         workspace: WeakEntity<Workspace>,
         new_selections_by_buffer: HashMap<
@@ -10756,6 +10992,7 @@ impl Editor {
         self.load_diff_task.clone()
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn read_metadata_from_db(
         &mut self,
         item_id: u64,

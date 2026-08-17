@@ -5,24 +5,33 @@ mod paste;
 mod select;
 mod surround;
 
+#[cfg(any(feature = "workspace-integration", test))]
+use editor::EditorSettings;
 use editor::display_map::{DisplayRow, DisplaySnapshot};
 use editor::{
-    DisplayPoint, Editor, EditorSettings, MultiBufferOffset, NavigationOverlayLabel,
-    NavigationTargetOverlay, SelectionEffects, ToOffset, ToPoint, movement,
+    DisplayPoint, Editor, MultiBufferOffset, NavigationOverlayLabel, NavigationTargetOverlay,
+    SelectionEffects, ToOffset, ToPoint, movement,
 };
+#[cfg(any(feature = "workspace-integration", test))]
+use gpui::TaskExt;
 use gpui::actions;
-use gpui::{App, Context, Font, Hsla, Pixels, TaskExt, Window, WindowTextSystem};
+use gpui::{App, Context, Font, Hsla, Pixels, Window, WindowTextSystem};
 use language::{CharClassifier, CharKind, Point, Selection};
 use multi_buffer::MultiBufferSnapshot;
+#[cfg(any(feature = "workspace-integration", test))]
 use search::{BufferSearchBar, SearchOptions};
+#[cfg(any(feature = "workspace-integration", test))]
 use settings::Settings;
 use text::{Bias, LineEnding, SelectionGoal};
 use theme::ActiveTheme as _;
 use ui::px;
+#[cfg(any(feature = "workspace-integration", test))]
 use workspace::searchable::{self, Direction, FilteredSearchRange};
 
 use crate::motion::{self, MotionKind};
-use crate::state::{HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, SearchState};
+#[cfg(any(feature = "workspace-integration", test))]
+use crate::state::SearchState;
+use crate::state::{HelixJumpBehaviour, HelixJumpLabel, Mode, Operator};
 use crate::{
     HelixAppendState, PushHelixSurroundAdd, PushHelixSurroundDelete, PushHelixSurroundReplace, Vim,
     motion::{Motion, right},
@@ -80,6 +89,7 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_goto_last_modification);
     Vim::action(editor, cx, Vim::helix_goto_line);
     Vim::action(editor, cx, Vim::helix_paste);
+    #[cfg(any(feature = "workspace-integration", test))]
     Vim::action(editor, cx, Vim::helix_select_regex);
     Vim::action(editor, cx, Vim::helix_keep_newest_selection);
     Vim::action(editor, cx, |vim, _: &HelixDuplicateBelow, window, cx| {
@@ -93,8 +103,11 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     Vim::action(editor, cx, Vim::helix_substitute);
     Vim::action(editor, cx, Vim::helix_substitute_no_yank);
     Vim::action(editor, cx, Vim::helix_jump_to_word);
-    Vim::action(editor, cx, Vim::helix_select_next);
-    Vim::action(editor, cx, Vim::helix_select_previous);
+    #[cfg(any(feature = "workspace-integration", test))]
+    {
+        Vim::action(editor, cx, Vim::helix_select_next);
+        Vim::action(editor, cx, Vim::helix_select_previous);
+    }
     Vim::action(editor, cx, Vim::helix_trim_selections);
     Vim::action(editor, cx, |vim, _: &PushHelixSurroundAdd, window, cx| {
         vim.clear_operator(window, cx);
@@ -662,6 +675,7 @@ impl Vim {
         self.switch_mode(Mode::Insert, false, window, cx);
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     fn helix_select_regex(
         &mut self,
         _: &HelixSelectRegex,
@@ -1069,6 +1083,7 @@ impl Vim {
         self.do_helix_substitute(false, window, cx);
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     fn helix_select_next(
         &mut self,
         _: &HelixSelectNext,
@@ -1078,6 +1093,7 @@ impl Vim {
         self.do_helix_select(Direction::Next, window, cx);
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     fn helix_select_previous(
         &mut self,
         _: &HelixSelectPrevious,
@@ -1087,6 +1103,7 @@ impl Vim {
         self.do_helix_select(Direction::Prev, window, cx);
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     fn do_helix_select(
         &mut self,
         direction: searchable::Direction,

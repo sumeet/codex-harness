@@ -11,6 +11,7 @@ use gpui::{Context, DismissEvent, Entity, Focusable as _, Pixels, Point, Subscri
 use project::DisableAiSettings;
 use std::ops::Range;
 use text::PointUtf16;
+#[cfg(feature = "workspace-integration")]
 use workspace::OpenInTerminal;
 use zed_actions::agent::AddSelectionToThread;
 use zed_actions::preview::{
@@ -300,11 +301,20 @@ pub fn deploy_context_menu(
                 .when(is_svg, |builder| {
                     builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
                 })
-                .action_disabled_when(
-                    !has_reveal_target,
-                    "Open in Terminal",
-                    Box::new(OpenInTerminal),
-                )
+                .when(cfg!(feature = "workspace-integration"), |builder| {
+                    #[cfg(feature = "workspace-integration")]
+                    {
+                        builder.action_disabled_when(
+                            !has_reveal_target,
+                            "Open in Terminal",
+                            Box::new(OpenInTerminal),
+                        )
+                    }
+                    #[cfg(not(feature = "workspace-integration"))]
+                    {
+                        builder
+                    }
+                })
                 .action_disabled_when(
                     !has_git_repo,
                     "Copy Permalink",

@@ -4,6 +4,7 @@
 mod test;
 
 mod change_list;
+#[cfg(any(feature = "workspace-integration", test))]
 mod command;
 mod digraph;
 mod helix;
@@ -28,39 +29,56 @@ use editor::{
     display_map::ToDisplayPoint,
     movement::{self, FindRange},
 };
+#[cfg(feature = "workspace-integration")]
+use gpui::Axis;
+#[cfg(any(feature = "workspace-integration", test))]
+use gpui::Focusable;
+#[cfg(any(feature = "workspace-integration", test))]
+use gpui::Task;
 use gpui::{
-    Action, App, AppContext, Axis, Context, Entity, EventEmitter, Focusable, KeyContext,
-    KeystrokeEvent, Render, Subscription, Task, WeakEntity, Window, actions,
+    Action, App, AppContext, Context, Entity, EventEmitter, KeyContext, KeystrokeEvent, Render,
+    Subscription, WeakEntity, Window, actions,
 };
 use insert::{NormalBefore, TemporaryNormal};
 use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
 use multi_buffer::ToPoint as _;
+#[cfg(feature = "workspace-integration")]
 use normal::search::SearchSubmit;
+pub use normal::search::{MoveToNextMatch, MoveToPreviousMatch, Search};
+// TODO(vim-host-surface): standalone embedders currently own `/`, `?`, `n`, and `N`
+// through the public actions above. Extract a host-neutral command/search surface
+// before claiming full Vim parity: `:` still needs palette history/completion and
+// `*`, `#`, `g*`, `g#`, `gn`, and `gN` still need query/match actions that do not
+// depend on Zed's Workspace toolbar.
 use object::Object;
 use schemars::JsonSchema;
+#[cfg(any(feature = "workspace-integration", test))]
 use search::BufferSearchBar;
 use serde::Deserialize;
 use settings::RegisterSetting;
 pub use settings::{
     ModeContent, Settings, SettingsStore, UseSystemClipboard, update_settings_file,
 };
-use state::{
-    HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, RecordedSelection, SearchState, VimGlobals,
-};
+#[cfg(any(feature = "workspace-integration", test))]
+use state::SearchState;
+use state::{HelixJumpBehaviour, HelixJumpLabel, Mode, Operator, RecordedSelection, VimGlobals};
 use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
+#[cfg(feature = "workspace-integration")]
 use theme_settings::ThemeSettings;
-use ui::{IntoElement, SharedString, px};
+#[cfg(feature = "workspace-integration")]
+use ui::px;
+use ui::{IntoElement, SharedString};
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
+#[cfg(any(feature = "workspace-integration", test))]
 use workspace::{self, Pane, Workspace};
 
-use crate::{
-    normal::{GoToPreviousTab, GoToTab},
-    state::ReplayableAction,
-};
+#[cfg(feature = "workspace-integration")]
+use crate::normal::{GoToPreviousTab, GoToTab};
+use crate::state::ReplayableAction;
 
 enum HelixJumpNavigationOverlay {}
 
@@ -288,6 +306,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(Vim::register).detach();
 
+    #[cfg(feature = "workspace-integration")]
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleVimMode, _, cx| {
             let fs = workspace.app_state().fs.clone();
@@ -533,11 +552,23 @@ pub(crate) struct Vim {
     extended_pending_selection_id: Option<usize>,
 
     selected_register: Option<char>,
+    #[cfg(any(feature = "workspace-integration", test))]
     pub search: SearchState,
+
+    /// Marks owned by a standalone editor that has no Zed Workspace.
+    ///
+    /// Workspace-backed editors continue to use `MarksState`, including its
+    /// cross-buffer/path persistence. Keeping this store on the Vim addon
+    /// gives local, change, yank, and special jump marks the same lifetime as
+    /// their editor without pulling Workspace into embedders.
+    #[cfg(not(feature = "workspace-integration"))]
+    local_marks: LocalMarks,
 
     editor: WeakEntity<Editor>,
 
+    #[cfg(any(feature = "workspace-integration", test))]
     last_command: Option<String>,
+    #[cfg(any(feature = "workspace-integration", test))]
     running_command: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -547,6 +578,38 @@ pub(crate) struct Vim {
 pub(crate) struct HelixAppendState {
     pub(crate) selections_before_append: Vec<Range<Anchor>>,
     pub(crate) cursors_after_append: Vec<Range<Anchor>>,
+}
+
+#[cfg(not(feature = "workspace-integration"))]
+#[derive(Default)]
+struct LocalMarks(HashMap<String, Vec<Anchor>>);
+
+#[cfg(not(feature = "workspace-integration"))]
+impl LocalMarks {
+    fn insert(&mut self, name: String, anchors: Vec<Anchor>) {
+        self.0.insert(name, anchors);
+    }
+
+    fn get(&self, name: &str) -> Option<Vec<Anchor>> {
+        self.0.get(name).cloned()
+    }
+}
+
+#[cfg(all(test, not(feature = "workspace-integration")))]
+mod local_marks_tests {
+    use super::*;
+
+    #[test]
+    fn local_marks_replace_by_name_and_remain_independent() {
+        let mut marks = LocalMarks::default();
+        marks.insert("a".into(), vec![Anchor::Min]);
+        marks.insert("b".into(), vec![Anchor::Max]);
+        marks.insert("a".into(), vec![Anchor::Max]);
+
+        assert_eq!(marks.get("a"), Some(vec![Anchor::Max]));
+        assert_eq!(marks.get("b"), Some(vec![Anchor::Max]));
+        assert_eq!(marks.get("missing"), None);
+    }
 }
 
 // Hack: Vim intercepts events dispatched to a window and updates the view in response.
@@ -565,6 +628,7 @@ impl EventEmitter<VimEvent> for Vim {}
 
 impl Vim {
     /// The namespace for Vim actions.
+    #[cfg(feature = "workspace-integration")]
     const NAMESPACE: &'static str = "vim";
 
     pub fn new(window: &mut Window, cx: &mut Context<Editor>) -> Entity<Self> {
@@ -602,9 +666,14 @@ impl Vim {
 
             status_label: None,
             selected_register: None,
+            #[cfg(any(feature = "workspace-integration", test))]
             search: SearchState::default(),
+            #[cfg(not(feature = "workspace-integration"))]
+            local_marks: LocalMarks::default(),
 
+            #[cfg(any(feature = "workspace-integration", test))]
             last_command: None,
+            #[cfg(any(feature = "workspace-integration", test))]
             running_command: None,
 
             editor: editor.downgrade(),
@@ -995,6 +1064,7 @@ impl Vim {
             insert::register(editor, cx);
             helix::register(editor, cx);
             motion::register(editor, cx);
+            #[cfg(any(feature = "workspace-integration", test))]
             command::register(editor, cx);
             replace::register(editor, cx);
             indent::register(editor, cx);
@@ -1055,10 +1125,12 @@ impl Vim {
         self.editor.upgrade()
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     pub fn workspace(&self, window: &Window, cx: &App) -> Option<Entity<Workspace>> {
         Workspace::for_window(window, cx)
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     pub fn pane(&self, window: &Window, cx: &Context<Self>) -> Option<Entity<Pane>> {
         let pane = self
             .workspace(window, cx)
@@ -1230,6 +1302,7 @@ impl Vim {
         self.mode = mode;
         self.operator_stack.clear();
         self.selected_register.take();
+        #[cfg(any(feature = "workspace-integration", test))]
         self.cancel_running_command(window, cx);
         if mode == Mode::Normal || mode != last_mode {
             self.current_tx.take();
@@ -1546,6 +1619,7 @@ impl Vim {
         // If editor gains focus while search bar is still open (not dismissed),
         // the user has explicitly navigated away - clear prior_selections so we
         // don't restore to the old position if they later dismiss the search.
+        #[cfg(any(feature = "workspace-integration", test))]
         if !self.search.prior_selections.is_empty() {
             if let Some(pane) = self.pane(window, cx) {
                 let search_still_open = pane
@@ -1645,6 +1719,7 @@ impl Vim {
         Some(editor.update(cx, |editor, cx| update(self, editor, cx)))
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     fn editor_selections(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Vec<Range<Anchor>> {
         self.update_editor(cx, |_, editor, _| {
             editor
@@ -1705,6 +1780,7 @@ impl Vim {
         })
     }
 
+    #[cfg(any(feature = "workspace-integration", test))]
     pub fn stop_replaying(&mut self, cx: &mut Context<Self>) {
         let globals = Vim::globals(cx);
         globals.dot_replaying = false;
@@ -2281,10 +2357,15 @@ impl Vim {
     }
 
     fn state_for_editor_settings(&self, cx: &App) -> VimEditorSettingsState {
+        #[cfg(any(feature = "workspace-integration", test))]
+        let cmd_f_search = self.search.cmd_f_search;
+        #[cfg(not(any(feature = "workspace-integration", test)))]
+        let cmd_f_search = false;
+
         VimEditorSettingsState {
             cursor_shape: self.cursor_shape(cx),
             clip_at_line_ends: self.clip_at_line_ends(),
-            collapse_matches: !HelixModeSetting::get_global(cx).0 && !self.search.cmd_f_search,
+            collapse_matches: !HelixModeSetting::get_global(cx).0 && !cmd_f_search,
             input_enabled: self.editor_input_enabled(),
             expects_character_input: self.expects_character_input(),
             autoindent: self.should_autoindent(),
@@ -2337,7 +2418,9 @@ struct VimSettings {
     pub toggle_relative_line_numbers: bool,
     pub use_system_clipboard: settings::UseSystemClipboard,
     pub use_smartcase_find: bool,
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub use_regex_search: bool,
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub gdefault: bool,
     pub custom_digraphs: HashMap<String, Arc<str>>,
     pub highlight_on_yank_duration: u64,

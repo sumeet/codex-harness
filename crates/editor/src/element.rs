@@ -8,13 +8,13 @@ pub(crate) use header::{header_jump_data, render_buffer_header};
 
 use crate::{
     BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
-    ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
-    ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk, DisplayPoint, DisplayRow,
-    EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings, EditorSnapshot,
-    EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown, HalfPageUp,
-    HandleInput, HoveredCursor, InlayHintRefreshReason, LineDown, LineHighlight, LineUp,
-    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
-    SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
+    CollaboratorId, ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs,
+    ConflictsTheirsMarker, ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk,
+    DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings,
+    EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown,
+    HalfPageUp, HandleInput, HoveredCursor, InlayHintRefreshReason, ItemBufferKind, LineDown,
+    LineHighlight, LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt,
+    RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
     display_map::{
@@ -91,10 +91,8 @@ use ui::utils::ensure_minimum_contrast;
 use ui::{ButtonLike, POPOVER_Y_PADDING, Tooltip, prelude::*, scrollbars::ShowScrollbar};
 use unicode_segmentation::UnicodeSegmentation;
 use util::{ResultExt, debug_panic};
-use workspace::{
-    CollaboratorId, ItemHandle, Workspace,
-    item::{Item, ItemBufferKind},
-};
+#[cfg(feature = "workspace-integration")]
+use workspace::{ItemHandle, Workspace};
 
 /// Determines what kinds of highlights should be applied to a lines background.
 #[derive(Clone, Copy, Default)]
@@ -276,8 +274,11 @@ impl EditorElement {
             }
         });
 
-        crate::rust_analyzer_ext::apply_related_actions(editor, window, cx);
-        crate::clangd_ext::apply_related_actions(editor, window, cx);
+        #[cfg(feature = "workspace-integration")]
+        {
+            crate::rust_analyzer_ext::apply_related_actions(editor, window, cx);
+            crate::clangd_ext::apply_related_actions(editor, window, cx);
+        }
 
         register_action(editor, window, Editor::open_context_menu);
         register_action(editor, window, Editor::move_left);
@@ -447,6 +448,7 @@ impl EditorElement {
                 .detach_and_log_err(cx);
         });
         register_action(editor, window, Editor::open_url);
+        #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::open_selected_filename);
         register_action(editor, window, Editor::fold);
         register_action(editor, window, Editor::fold_at_level);
@@ -471,6 +473,11 @@ impl EditorElement {
         register_action(editor, window, Editor::fold_selected_ranges);
         register_action(editor, window, Editor::set_mark);
         register_action(editor, window, Editor::save_location);
+        #[cfg(not(feature = "workspace-integration"))]
+        {
+            register_action(editor, window, Editor::local_navigation_back);
+            register_action(editor, window, Editor::local_navigation_forward);
+        }
         register_action(editor, window, Editor::swap_selection_ends);
         register_action(editor, window, Editor::show_completions);
         register_action(editor, window, Editor::show_word_completions);
@@ -478,6 +485,7 @@ impl EditorElement {
         register_action(editor, window, Editor::open_excerpts);
         register_action(editor, window, Editor::open_excerpts_in_split);
         register_action(editor, window, Editor::toggle_soft_wrap);
+        #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::toggle_tab_bar);
         register_action(editor, window, Editor::toggle_breadcrumb);
         register_action(editor, window, Editor::toggle_line_numbers);
@@ -559,8 +567,12 @@ impl EditorElement {
         register_action(editor, window, Editor::context_menu_next);
         register_action(editor, window, Editor::context_menu_last);
         register_action(editor, window, Editor::display_cursor_names);
-        register_action(editor, window, Editor::open_active_item_in_terminal);
-        register_action(editor, window, Editor::spawn_nearest_task);
+        #[cfg(feature = "workspace-integration")]
+        {
+            register_action(editor, window, Editor::open_active_item_in_terminal);
+            register_action(editor, window, Editor::spawn_nearest_task);
+        }
+        #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::open_selections_in_multibuffer);
         register_action(editor, window, Editor::toggle_bookmark);
         register_action(editor, window, Editor::toggle_bookmark_with_label);
@@ -571,6 +583,7 @@ impl EditorElement {
         register_action(editor, window, Editor::edit_log_breakpoint);
         register_action(editor, window, Editor::enable_breakpoint);
         register_action(editor, window, Editor::disable_breakpoint);
+        #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::toggle_read_only);
         register_action(editor, window, Editor::reload_file);
 
@@ -720,6 +733,7 @@ impl EditorElement {
                     cx.propagate();
                 }
             });
+            #[cfg(feature = "workspace-integration")]
             register_action(editor, window, |editor, action, window, cx| {
                 if let Some(task) = editor.confirm_rename(action, window, cx) {
                     editor.detach_and_notify_err(task, window, cx);
@@ -1391,6 +1405,7 @@ impl EditorElement {
 
         let minimap_settings = EditorSettings::get_global(cx).minimap;
 
+        #[cfg(feature = "workspace-integration")]
         if minimap_settings.on_active_editor() {
             let active_editor = self.editor.read(cx).workspace().and_then(|ws| {
                 ws.read(cx)
@@ -2102,6 +2117,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn layout_blame_popover(
         &self,
         editor_snapshot: &EditorSnapshot,
@@ -2201,6 +2217,18 @@ impl EditorElement {
         }
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    fn layout_blame_popover(
+        &self,
+        _: &EditorSnapshot,
+        _: &Hitbox,
+        _: Pixels,
+        _: &mut Window,
+        _: &mut App,
+    ) {
+    }
+
+    #[cfg(feature = "workspace-integration")]
     fn layout_blame_entries(
         &self,
         buffer_rows: &[RowInfo],
@@ -2271,6 +2299,22 @@ impl EditorElement {
             .collect();
 
         Some(shaped_lines)
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn layout_blame_entries(
+        &self,
+        _: &[RowInfo],
+        _: Pixels,
+        _: gpui::Point<ScrollOffset>,
+        _: DisplayRow,
+        _: Pixels,
+        _: &Hitbox,
+        _: Option<Pixels>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<Vec<AnyElement>> {
+        None
     }
 
     fn layout_indent_guides(
@@ -6753,6 +6797,7 @@ impl Gutter<'_> {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 pub fn render_breadcrumb_text(
     mut segments: Vec<HighlightedText>,
     breadcrumb_font: Option<Font>,
@@ -6962,6 +7007,7 @@ fn render_inline_blame_entry(
     renderer.render_inline_blame_entry(&style.text, blame_entry, cx)
 }
 
+#[cfg(feature = "workspace-integration")]
 fn render_blame_entry_popover(
     blame_entry: BlameEntry,
     scroll_handle: ScrollHandle,
@@ -6994,6 +7040,7 @@ fn render_blame_entry_popover(
     )
 }
 
+#[cfg(feature = "workspace-integration")]
 fn render_blame_entry(
     ix: usize,
     blame: &Entity<GitBlame>,

@@ -1,20 +1,28 @@
-use std::{ops::Range, path::Path, sync::Arc};
+#[cfg(feature = "workspace-integration")]
+use std::path::Path;
+use std::{ops::Range, sync::Arc};
 
 use editor::{
     Anchor, Bias, DisplayPoint, Editor, MultiBuffer,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement,
 };
-use gpui::{Context, Entity, EntityId, TaskExt, UpdateGlobal, Window};
+use gpui::{Context, Entity, Window};
+#[cfg(feature = "workspace-integration")]
+use gpui::{EntityId, TaskExt, UpdateGlobal};
 use language::SelectionGoal;
+#[cfg(feature = "workspace-integration")]
 use text::Point;
 use ui::App;
+#[cfg(feature = "workspace-integration")]
 use workspace::OpenOptions;
 
+#[cfg(feature = "workspace-integration")]
+use crate::state::VimGlobals;
 use crate::{
     Vim,
     motion::{self, Motion},
-    state::{Mark, Mode, VimGlobals},
+    state::{Mark, Mode},
 };
 
 impl Vim {
@@ -73,6 +81,7 @@ impl Vim {
         self.stored_visual_mode.replace((mode, reversed));
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_buffer_mark(
         &mut self,
         line: bool,
@@ -125,6 +134,7 @@ impl Vim {
         });
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_path_mark(
         &mut self,
         line: bool,
@@ -199,10 +209,12 @@ impl Vim {
         let anchors = match mark {
             None => None,
             Some(Mark::Local(anchors)) => Some(anchors),
+            #[cfg(feature = "workspace-integration")]
             Some(Mark::Buffer(entity_id, anchors)) => {
                 self.open_buffer_mark(line, entity_id, anchors, window, cx);
                 return;
             }
+            #[cfg(feature = "workspace-integration")]
             Some(Mark::Path(path, points)) => {
                 self.open_path_mark(line, path, points, window, cx);
                 return;
@@ -272,9 +284,6 @@ impl Vim {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let Some(workspace) = self.workspace(window, cx) else {
-            return;
-        };
         if name == "`" {
             name = "'".to_string();
         }
@@ -282,15 +291,28 @@ impl Vim {
             // Not allowed marks
             return;
         }
-        let entity_id = workspace.entity_id();
-        Vim::update_globals(cx, |vim_globals, cx| {
-            let Some(marks_state) = vim_globals.marks.get(&entity_id) else {
+
+        #[cfg(feature = "workspace-integration")]
+        {
+            let Some(workspace) = self.workspace(window, cx) else {
                 return;
             };
-            marks_state.update(cx, |ms, cx| {
-                ms.set_mark(name.clone(), buffer_entity, anchors, cx);
+            let entity_id = workspace.entity_id();
+            Vim::update_globals(cx, |vim_globals, cx| {
+                let Some(marks_state) = vim_globals.marks.get(&entity_id) else {
+                    return;
+                };
+                marks_state.update(cx, |ms, cx| {
+                    ms.set_mark(name.clone(), buffer_entity, anchors, cx);
+                });
             });
-        });
+        }
+
+        #[cfg(not(feature = "workspace-integration"))]
+        {
+            let _ = (buffer_entity, window, cx);
+            self.local_marks.insert(name, anchors);
+        }
     }
 
     pub fn get_mark(
@@ -323,15 +345,25 @@ impl Vim {
                 .collect::<Vec<Anchor>>();
             return Some(Mark::Local(anchors));
         }
-        VimGlobals::update_global(cx, |globals, cx| {
-            let workspace_id = self.workspace(window, cx)?.entity_id();
-            globals
-                .marks
-                .get_mut(&workspace_id)?
-                .update(cx, |ms, cx| ms.get_mark(name, editor.buffer(), cx))
-        })
+        #[cfg(feature = "workspace-integration")]
+        {
+            VimGlobals::update_global(cx, |globals, cx| {
+                let workspace_id = self.workspace(window, cx)?.entity_id();
+                globals
+                    .marks
+                    .get_mut(&workspace_id)?
+                    .update(cx, |ms, cx| ms.get_mark(name, editor.buffer(), cx))
+            })
+        }
+
+        #[cfg(not(feature = "workspace-integration"))]
+        {
+            let _ = (editor, window, cx);
+            self.local_marks.get(name).map(Mark::Local)
+        }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn delete_mark(
         &self,
         name: String,

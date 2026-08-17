@@ -1,0 +1,2465 @@
+//! The only boundary between Harness and Zed's editor/Vim implementation.
+//!
+//! Keep the public API local-buffer-shaped. Project, workspace, LSP, DAP, Git,
+//! collaboration, and IDE navigation do not belong on this side of the seam.
+
+use std::{collections::BTreeMap, ops::Range, sync::Arc};
+
+use editor::{
+    Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
+    display_map::{
+        BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
+        NavigationOverlayKey, RenderBlock,
+    },
+    scroll::Autoscroll,
+};
+use gpui::{
+    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    FontWeight, HighlightStyle, Hsla, IntoElement, KeyBinding, Render, SharedString, Window, div,
+    point, prelude::*,
+};
+use harness_protocol::{
+    TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
+    find_wrapped_match, minimal_text_edit,
+};
+use language::{Buffer, Point};
+use multi_buffer::{Anchor, MultiBufferOffset, ToOffset as _};
+use settings::{KeybindSource, KeymapFile};
+use ui::{
+    Color, Icon, IconName, IconSize, Label, LabelSize,
+    prelude::{ActiveTheme, LabelCommon as _},
+};
+
+pub use editor::actions::{LocalNavigationBack, LocalNavigationForward};
+pub use vim::Search as VimSearch;
+pub use vim::{
+    ModeIndicator, MoveToNextMatch as VimNextMatch, MoveToPreviousMatch as VimPreviousMatch,
+};
+
+pub fn init(cx: &mut App) -> anyhow::Result<()> {
+    editor::init(cx);
+    vim::init(cx);
+
+    let mut defaults =
+        KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;
+    for binding in &mut defaults {
+        binding.set_meta(KeybindSource::Default.meta());
+    }
+    cx.bind_keys(defaults);
+
+    let mut vim = KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)?;
+    // Local editors have no Zed Workspace panes. Leaving these bindings in the
+    // keymap consumes navigation before the host can provide its own
+    // transcript/composer/task focus graph or editor-local history.
+    const ABSENT_WORKSPACE_ACTIONS: &[&str] = &[
+        "workspace::ActivatePaneLeft",
+        "workspace::ActivatePaneRight",
+        "workspace::ActivatePaneUp",
+        "workspace::ActivatePaneDown",
+        "pane::GoBack",
+        "pane::GoForward",
+    ];
+    vim.retain(|binding| !ABSENT_WORKSPACE_ACTIONS.contains(&binding.action().name()));
+    for binding in &mut vim {
+        binding.set_meta(KeybindSource::Vim.meta());
+    }
+    cx.bind_keys(vim);
+    cx.bind_keys([
+        KeyBinding::new(
+            "ctrl-o",
+            LocalNavigationBack,
+            Some("Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "ctrl-i",
+            LocalNavigationForward,
+            Some("Editor && VimControl && vim_mode == normal"),
+        ),
+    ]);
+    Ok(())
+}
+
+pub struct LocalEditor {
+    editor: Entity<Editor>,
+}
+
+impl LocalEditor {
+    pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(3, 12, window, cx);
+            editor.set_placeholder_text("Ask Codex…", window, cx);
+            editor.set_use_modal_editing(true);
+            editor
+        });
+        Self { editor }
+    }
+
+    pub fn plain_single_line(
+        placeholder: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let placeholder = placeholder.into();
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text(placeholder.as_ref(), window, cx);
+            editor.set_use_modal_editing(false);
+            editor
+        });
+        Self { editor }
+    }
+
+    pub fn text(&self, cx: &App) -> String {
+        self.editor.read(cx).text(cx)
+    }
+
+    pub fn set_text(
+        &mut self,
+        text: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text: SharedString = text.into();
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text(text.to_string(), window, cx)
+        });
+    }
+
+    pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_masked(masked, cx));
+    }
+}
+
+impl Focusable for LocalEditor {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for LocalEditor {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.editor.clone()
+    }
+}
+
+pub struct TranscriptEditor {
+    buffer: Entity<Buffer>,
+    editor: Entity<Editor>,
+    segments: Vec<TranscriptDocumentSegment>,
+    segment_header_texts: Vec<String>,
+    model_item_count: usize,
+    // Segment positions are stable across body-only streaming updates and
+    // append-only growth. Keeping the ids keyed by position lets viewport
+    // shifts retain blocks in the overlap instead of recreating every header.
+    header_blocks: BTreeMap<usize, CustomBlockId>,
+    supplements: BTreeMap<String, MountedTranscriptSupplement>,
+    viewport_decorations: Option<ViewportDecorationWindow>,
+    viewport_refresh_pending: bool,
+    // A streaming body edit can change unified-diff line classes without
+    // moving the viewport. Reparse only the visible Diff bodies on the next
+    // refresh; never rescan the full transcript.
+    diff_highlights_dirty: bool,
+    search: TranscriptSearchState,
+    follow_tail: bool,
+    last_selection_head: Option<Anchor>,
+    pending_tail_intent: Option<PendingTailIntent>,
+}
+
+/// A host-owned rich view anchored to one semantic transcript item.
+///
+/// The transcript editor owns only placement and display-map lifetime. The
+/// embedded view owns its domain state and emits its own events to the host.
+/// Its height is expressed in editor rows so layout remains deterministic.
+#[derive(Clone)]
+pub struct TranscriptSupplement {
+    pub key: String,
+    pub item_key: String,
+    pub rows: u32,
+    pub view: AnyView,
+}
+
+impl TranscriptSupplement {
+    pub fn new(
+        key: impl Into<String>,
+        item_key: impl Into<String>,
+        rows: u32,
+        view: AnyView,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            item_key: item_key.into(),
+            rows: rows.max(1),
+            view,
+        }
+    }
+}
+
+struct MountedTranscriptSupplement {
+    item_key: String,
+    rows: u32,
+    view: AnyView,
+    block_id: Option<CustomBlockId>,
+}
+
+pub struct TranscriptSelectionChanged;
+
+impl EventEmitter<TranscriptSelectionChanged> for TranscriptEditor {}
+
+struct TranscriptHeaderHighlight;
+struct UserTranscriptRows;
+struct ReasoningTranscriptRows;
+struct StructuredTranscriptRows;
+struct ErrorTranscriptRows;
+struct DiffFileHeaderHighlight;
+struct DiffHunkHighlight;
+struct DiffAdditionHighlight;
+struct DiffDeletionHighlight;
+
+#[derive(Default)]
+struct TranscriptSearchState {
+    query: String,
+    backwards: bool,
+    // MultiBuffer anchors follow streaming edits while byte offsets do not.
+    // The highlights remain decorations; Vim's actual selection stays owned
+    // by the Editor and is changed only by explicit match navigation.
+    active_match: Option<Range<Anchor>>,
+    highlights_dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingTailIntent {
+    DirectScroll,
+    Selection { was_following: bool },
+}
+
+// Row highlights are flattened to display rows during paint and native blocks
+// participate in display-map layout. Keep both bounded by the real editor
+// viewport while leaving the full selectable semantic document in the Buffer.
+const VIEWPORT_OVERSCAN_ROWS: u32 = 64;
+const FOLLOW_TAIL_SLOP_ROWS: f64 = 1.;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ViewportDecorationWindow {
+    byte_range: Range<usize>,
+    header_segment_range: Range<usize>,
+}
+
+fn overscanned_point_range(
+    visible_range: Range<Point>,
+    max_point: Point,
+    overscan_rows: u32,
+) -> Range<Point> {
+    let start_row = visible_range.start.row.saturating_sub(overscan_rows);
+    let end_row = visible_range
+        .end
+        .row
+        .saturating_add(overscan_rows)
+        .saturating_add(1);
+    let start = if start_row >= max_point.row {
+        Point::new(max_point.row, 0).min(max_point)
+    } else {
+        Point::new(start_row, 0)
+    };
+    let end = if end_row > max_point.row {
+        max_point
+    } else {
+        Point::new(end_row, 0)
+    };
+    start..end.max(start)
+}
+
+fn header_segments_intersecting(
+    segments: &[TranscriptDocumentSegment],
+    byte_range: &Range<usize>,
+) -> Range<usize> {
+    if byte_range.is_empty() {
+        return 0..0;
+    }
+    let start = segments.partition_point(|segment| segment.header_range.end <= byte_range.start);
+    let end = segments.partition_point(|segment| segment.header_range.start < byte_range.end);
+    start.min(end)..end
+}
+
+fn header_window_delta(
+    mounted_positions: impl IntoIterator<Item = usize>,
+    desired: Range<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut mounted = mounted_positions.into_iter().collect::<Vec<_>>();
+    mounted.sort_unstable();
+    mounted.dedup();
+    let remove = mounted
+        .iter()
+        .copied()
+        .filter(|position| !desired.contains(position))
+        .collect();
+    let insert = desired
+        .filter(|position| mounted.binary_search(position).is_err())
+        .collect();
+    (remove, insert)
+}
+
+fn segments_intersecting(
+    segments: &[TranscriptDocumentSegment],
+    byte_range: &Range<usize>,
+) -> Range<usize> {
+    if byte_range.is_empty() {
+        return 0..0;
+    }
+    let start = segments.partition_point(|segment| segment.whole_range.end <= byte_range.start);
+    let end = segments.partition_point(|segment| segment.whole_range.start < byte_range.end);
+    start.min(end)..end
+}
+
+fn intersect_ranges(left: &Range<usize>, right: &Range<usize>) -> Option<Range<usize>> {
+    let intersection = left.start.max(right.start)..left.end.min(right.end);
+    (!intersection.is_empty()).then_some(intersection)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DiffHighlightRanges {
+    file_headers: Vec<Range<usize>>,
+    hunks: Vec<Range<usize>>,
+    additions: Vec<Range<usize>>,
+    deletions: Vec<Range<usize>>,
+    parsed_bytes: usize,
+}
+
+impl DiffHighlightRanges {
+    fn parse_body(&mut self, text: &str, base_offset: usize) {
+        self.parsed_bytes += text.len();
+        let mut line_offset = 0;
+        for raw_line in text.split_inclusive('\n') {
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let line_range = base_offset + line_offset..base_offset + line_offset + line.len();
+            line_offset += raw_line.len();
+            if line_range.is_empty() {
+                continue;
+            }
+
+            if is_diff_file_header(line) {
+                self.file_headers.push(line_range);
+            } else if line.starts_with("@@") {
+                self.hunks.push(line_range);
+            } else if line.starts_with('+') {
+                self.additions.push(line_range);
+            } else if line.starts_with('-') {
+                self.deletions.push(line_range);
+            }
+        }
+    }
+}
+
+fn is_diff_file_header(line: &str) -> bool {
+    [
+        "diff --git ",
+        "--- ",
+        "+++ ",
+        "index ",
+        "Index: ",
+        "new file mode ",
+        "deleted file mode ",
+        "old mode ",
+        "new mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+        "GIT binary patch",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
+fn visible_diff_body_ranges(
+    segments: &[TranscriptDocumentSegment],
+    viewport: &Range<usize>,
+) -> Vec<Range<usize>> {
+    let visible_segments = segments_intersecting(segments, viewport);
+    segments[visible_segments]
+        .iter()
+        .filter(|segment| segment.kind == TranscriptKind::Diff)
+        .filter_map(|segment| intersect_ranges(&segment.body_range, viewport))
+        .collect()
+}
+
+/// Return overlapping ASCII-case-insensitive literal matches in one already
+/// bounded text window. ASCII folding preserves the source's UTF-8 offsets;
+/// non-ASCII characters continue to match exactly.
+fn literal_match_ranges(text: &str, query: &str, base_offset: usize) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let haystack = text.to_ascii_lowercase();
+    let needle = query.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    let mut search_start = 0;
+    while search_start <= haystack.len() {
+        let Some(relative_start) = haystack[search_start..].find(&needle) else {
+            break;
+        };
+        let start = search_start + relative_start;
+        let end = start + needle.len();
+        matches.push(base_offset + start..base_offset + end);
+        search_start = next_char_boundary(text, start);
+    }
+    matches
+}
+
+fn next_char_boundary(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len();
+    }
+    offset + text[offset..].chars().next().map_or(1, char::len_utf8)
+}
+
+fn repeated_search_backwards(original_backwards: bool, reverse: bool) -> bool {
+    original_backwards ^ reverse
+}
+
+fn direct_scroll_can_change_follow_tail(local: bool, autoscroll: bool) -> bool {
+    local && !autoscroll
+}
+
+fn viewport_bottom_is_near_tail(scroll_top: f64, visible_rows: f64, max_display_row: f64) -> bool {
+    let viewport_bottom = scroll_top.max(0.) + visible_rows.max(0.);
+    let document_bottom = max_display_row.max(0.) + 1.;
+    viewport_bottom + FOLLOW_TAIL_SLOP_ROWS >= document_bottom
+}
+
+fn follow_tail_after_selection(
+    was_following: bool,
+    previous_offset: Option<usize>,
+    current_offset: usize,
+    document_len: usize,
+) -> bool {
+    current_offset == document_len
+        || (was_following && previous_offset.is_some_and(|previous| current_offset >= previous))
+}
+
+fn should_request_tail_autoscroll(follow_tail: bool, content_changed: bool) -> bool {
+    follow_tail && content_changed
+}
+
+fn user_transcript_background(cx: &App) -> Hsla {
+    cx.theme().colors().element_background.opacity(0.56)
+}
+
+fn reasoning_transcript_background(cx: &App) -> Hsla {
+    cx.theme()
+        .colors()
+        .editor_highlighted_line_background
+        .opacity(0.46)
+}
+
+fn structured_transcript_background(cx: &App) -> Hsla {
+    cx.theme().colors().editor_subheader_background.opacity(0.5)
+}
+
+fn error_transcript_background(cx: &App) -> Hsla {
+    cx.theme().status().error.opacity(0.1)
+}
+
+fn transcript_icon(kind: TranscriptKind) -> IconName {
+    match kind {
+        TranscriptKind::User => IconName::Person,
+        TranscriptKind::Agent => IconName::AiOpenAi,
+        TranscriptKind::Reasoning => IconName::ToolThink,
+        TranscriptKind::Plan => IconName::ListTodo,
+        TranscriptKind::Command => IconName::ToolTerminal,
+        TranscriptKind::FileChange => IconName::FileDiff,
+        TranscriptKind::Tool => IconName::ToolHammer,
+        TranscriptKind::Diff => IconName::Diff,
+        TranscriptKind::Image => IconName::Image,
+        TranscriptKind::Subagent => IconName::UserGroup,
+        TranscriptKind::Web => IconName::ToolWeb,
+        TranscriptKind::Review => IconName::Eye,
+        TranscriptKind::Trace => IconName::Code,
+        TranscriptKind::Error => IconName::Warning,
+        TranscriptKind::Approval => IconName::Lock,
+    }
+}
+
+fn transcript_icon_color(kind: TranscriptKind, selected: bool) -> Color {
+    if selected {
+        return Color::Accent;
+    }
+    match kind {
+        TranscriptKind::Error => Color::Error,
+        TranscriptKind::User | TranscriptKind::Agent => Color::Default,
+        _ => Color::Muted,
+    }
+}
+
+fn native_header_text(text: &str) -> &str {
+    text.strip_prefix("━━━━ ")
+        .and_then(|text| text.strip_suffix(" ━━━━"))
+        .unwrap_or(text)
+}
+
+/// Whether an edit can retain the native header blocks' existing anchors.
+///
+/// Edits wholly contained by one semantic body are the common streaming case:
+/// anchors before and after that body move with the buffer without losing
+/// their identity. Everything structural is deliberately conservative. In
+/// particular, a single minimal replacement may span two dirty bodies and the
+/// unchanged header between them; anchors attached to that deleted header must
+/// be rebuilt from the new document.
+#[cfg(test)]
+fn edit_invalidates_native_header_blocks(
+    old_range: &Range<usize>,
+    segments: &[TranscriptDocumentSegment],
+) -> bool {
+    if old_range.start > old_range.end {
+        return true;
+    }
+
+    !segments.iter().any(|segment| {
+        segment.body_range.start <= old_range.start && old_range.end <= segment.body_range.end
+    })
+}
+
+fn item_body_start_at_offset(
+    requested_offset: usize,
+    segments: &[TranscriptDocumentSegment],
+) -> usize {
+    segments
+        .iter()
+        .find(|segment| {
+            segment.whole_range.start == requested_offset
+                || segment.whole_range.contains(&requested_offset)
+        })
+        .map_or(requested_offset, |segment| segment.body_range.start)
+}
+
+fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -> bool {
+    let segment = &projection.segment;
+    segment.whole_range == (0..projection.text.len())
+        && segment.header_range.start <= segment.header_range.end
+        && segment.header_range.end <= projection.text.len()
+        && segment.body_range.start <= segment.body_range.end
+        && segment.body_range.end <= projection.text.len()
+        && segment.header_range.end <= segment.body_range.start
+}
+
+fn shift_range(range: &mut Range<usize>, delta: isize) -> bool {
+    let Some(start) = range.start.checked_add_signed(delta) else {
+        return false;
+    };
+    let Some(end) = range.end.checked_add_signed(delta) else {
+        return false;
+    };
+    range.start = start;
+    range.end = end;
+    true
+}
+
+fn range_at_offset(range: &Range<usize>, offset: usize) -> Range<usize> {
+    range.start + offset..range.end + offset
+}
+
+/// Apply the length/offset effects of one already-validated item projection.
+/// Callers process items from the end of the document toward the beginning.
+fn apply_projected_segment_shape(
+    segments: &mut [TranscriptDocumentSegment],
+    segment_position: usize,
+    projected: &TranscriptDocumentSegment,
+) -> bool {
+    let Some(current) = segments.get(segment_position) else {
+        return false;
+    };
+    let current_body_offset = current.body_range.start - current.whole_range.start;
+    let projected_body_offset = projected.body_range.start - projected.whole_range.start;
+    if current_body_offset != projected_body_offset {
+        return false;
+    }
+
+    let old_whole_len = current.whole_range.len();
+    let new_whole_len = projected.whole_range.len();
+    let delta = new_whole_len as isize - old_whole_len as isize;
+    let body_start = current.body_range.start;
+    let whole_start = current.whole_range.start;
+    let new_body_end = body_start + projected.body_range.len();
+    let new_whole_end = whole_start + new_whole_len;
+
+    let current = &mut segments[segment_position];
+    current.body_range.end = new_body_end;
+    current.whole_range.end = new_whole_end;
+    for later in &mut segments[segment_position + 1..] {
+        if !shift_range(&mut later.whole_range, delta)
+            || !shift_range(&mut later.header_range, delta)
+            || !shift_range(&mut later.body_range, delta)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn native_header_block(
+    placement: std::ops::RangeInclusive<Anchor>,
+    kind: TranscriptKind,
+    label: SharedString,
+) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Replace(placement),
+        height: Some(1),
+        // Spacer blocks scroll with the document but do not reserve the hidden
+        // editor gutter, which makes the header read as part of the transcript.
+        style: BlockStyle::Spacer,
+        render: Arc::new(move |cx: &mut BlockContext| {
+            let icon_color = transcript_icon_color(kind, cx.selected);
+            let colors = cx.theme().colors();
+            let background = if cx.selected {
+                colors.editor_highlighted_line_background
+            } else {
+                colors.editor_subheader_background.opacity(0.56)
+            };
+            let rail = if kind == TranscriptKind::Error {
+                cx.theme().status().error.opacity(0.72)
+            } else if cx.selected {
+                colors.text_accent.opacity(0.82)
+            } else {
+                colors.border_variant.opacity(0.78)
+            };
+
+            div()
+                .id(cx.block_id)
+                .h(cx.line_height)
+                .w_full()
+                .min_w_0()
+                .pl_2()
+                .pr_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .overflow_hidden()
+                .border_l_2()
+                .border_color(rail)
+                .bg(background)
+                .child(
+                    Icon::new(transcript_icon(kind))
+                        .size(IconSize::XSmall)
+                        .color(icon_color),
+                )
+                .child(
+                    Label::new(label.clone())
+                        .size(LabelSize::XSmall)
+                        .color(if cx.selected {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        })
+                        .truncate(),
+                )
+                .into_any_element()
+        }),
+        priority: 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SupplementUpdate {
+    Unchanged,
+    Resize,
+    ReplaceRenderer,
+    ResizeAndReplaceRenderer,
+    Reanchor,
+}
+
+fn supplement_update(
+    item_changed: bool,
+    rows_changed: bool,
+    view_changed: bool,
+) -> SupplementUpdate {
+    if item_changed {
+        SupplementUpdate::Reanchor
+    } else {
+        match (rows_changed, view_changed) {
+            (false, false) => SupplementUpdate::Unchanged,
+            (true, false) => SupplementUpdate::Resize,
+            (false, true) => SupplementUpdate::ReplaceRenderer,
+            (true, true) => SupplementUpdate::ResizeAndReplaceRenderer,
+        }
+    }
+}
+
+fn supplement_anchor_offset(
+    item_key: &str,
+    segments: &[TranscriptDocumentSegment],
+) -> Option<usize> {
+    segments
+        .iter()
+        .find(|segment| segment.item_key == item_key)
+        .map(|segment| segment.body_range.end)
+}
+
+fn scroll_top_after_supplement_removal(
+    block_row: f64,
+    block_rows: u32,
+    scroll_top: f64,
+) -> Option<f64> {
+    (block_row + f64::from(block_rows) <= scroll_top)
+        .then(|| (scroll_top - f64::from(block_rows)).max(0.))
+}
+
+fn supplemental_renderer(view: AnyView) -> RenderBlock {
+    Arc::new(move |cx: &mut BlockContext| {
+        div()
+            .id(cx.block_id)
+            .size_full()
+            .min_w_0()
+            .block_mouse_except_scroll()
+            .child(view.clone())
+            .into_any_element()
+    })
+}
+
+fn supplemental_block(placement: Anchor, rows: u32, view: AnyView) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Below(placement),
+        height: Some(rows.max(1)),
+        style: BlockStyle::Spacer,
+        render: supplemental_renderer(view),
+        priority: 0,
+    }
+}
+
+impl TranscriptEditor {
+    pub fn read_only(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let buffer = cx.new(|cx| Buffer::local("", cx));
+        let editor = cx.new({
+            let buffer = buffer.clone();
+            |cx| {
+                let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                editor.set_read_only(true);
+                editor.set_use_modal_editing(true);
+                editor.set_current_line_highlight(None);
+                editor.set_soft_wrap();
+                editor.set_show_gutter(false, cx);
+                editor.set_show_horizontal_scrollbar(false, cx);
+                editor.disable_mouse_wheel_zoom();
+                editor
+            }
+        });
+        cx.subscribe_in(&editor, window, |transcript, _, event, window, cx| {
+            if matches!(event, EditorEvent::SelectionsChanged { local: true }) {
+                cx.emit(TranscriptSelectionChanged);
+                transcript.note_local_selection_for_follow_tail();
+                transcript.schedule_viewport_refresh(window, cx);
+            }
+            if let EditorEvent::ScrollPositionChanged { local, autoscroll } = event {
+                if direct_scroll_can_change_follow_tail(*local, *autoscroll) {
+                    transcript.follow_tail = false;
+                    transcript.pending_tail_intent = Some(PendingTailIntent::DirectScroll);
+                }
+                transcript.schedule_viewport_refresh(window, cx);
+            }
+        })
+        .detach();
+        // A bounds observer gives viewport decoration one post-layout refresh
+        // for a real resize. Do not request a frame from `Render`: GPUI's
+        // next-frame callback itself creates frame demand, so doing that on
+        // every render keeps an otherwise-idle transcript pumping frames.
+        cx.observe_window_bounds(window, |transcript, window, cx| {
+            transcript.schedule_viewport_refresh(window, cx);
+        })
+        .detach();
+        Self {
+            buffer,
+            editor,
+            segments: Vec::new(),
+            segment_header_texts: Vec::new(),
+            model_item_count: 0,
+            header_blocks: BTreeMap::new(),
+            supplements: BTreeMap::new(),
+            viewport_decorations: None,
+            viewport_refresh_pending: false,
+            diff_highlights_dirty: true,
+            search: TranscriptSearchState::default(),
+            follow_tail: false,
+            last_selection_head: None,
+            pending_tail_intent: None,
+        }
+    }
+
+    pub fn text(&self, cx: &App) -> String {
+        self.buffer.read(cx).text()
+    }
+
+    pub fn cursor_offset(&self, cx: &mut App) -> usize {
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<MultiBufferOffset>(&snapshot)
+                .head()
+                .0
+        })
+    }
+
+    pub fn selected_item(&self, cx: &mut App) -> Option<usize> {
+        let cursor_offset = self.cursor_offset(cx);
+        let segment_index = self
+            .segments
+            .partition_point(|segment| segment.whole_range.end <= cursor_offset)
+            .min(self.segments.len().saturating_sub(1));
+        self.segments
+            .get(segment_index)
+            .or_else(|| {
+                self.segments
+                    .iter()
+                    .rev()
+                    .find(|segment| segment.whole_range.start <= cursor_offset)
+            })
+            .map(|segment| segment.item_index)
+    }
+
+    pub fn edit(&mut self, old_range: Range<usize>, replacement: String, cx: &mut Context<Self>) {
+        let text_changed = !old_range.is_empty() || !replacement.is_empty();
+        self.buffer.update(cx, |buffer, cx| {
+            buffer.edit([(old_range, replacement)], None, cx);
+        });
+        self.search.highlights_dirty = true;
+        if should_request_tail_autoscroll(self.follow_tail, text_changed) {
+            self.request_tail_autoscroll(cx);
+        }
+    }
+
+    /// Insert or update a rich view below the selectable body of an item.
+    ///
+    /// Resizing and replacing the host view retain the existing Editor block
+    /// id. Moving the same logical supplement to a different item deliberately
+    /// re-anchors it. If its item is not projected yet, the spec remains queued
+    /// and mounts as soon as that segment is appended or the document rebuilds.
+    pub fn upsert_supplement(&mut self, supplement: TranscriptSupplement, cx: &mut Context<Self>) {
+        let key = supplement.key;
+        let was_present = self.supplements.contains_key(&key);
+        let rows = supplement.rows.max(1);
+        let mut mounted =
+            self.supplements
+                .remove(&key)
+                .unwrap_or_else(|| MountedTranscriptSupplement {
+                    item_key: supplement.item_key.clone(),
+                    rows,
+                    view: supplement.view.clone(),
+                    block_id: None,
+                });
+        let update = supplement_update(
+            mounted.item_key != supplement.item_key,
+            mounted.rows != rows,
+            mounted.view != supplement.view,
+        );
+        let display_changed = !was_present || update != SupplementUpdate::Unchanged;
+        mounted.item_key = supplement.item_key;
+        mounted.rows = rows;
+        mounted.view = supplement.view;
+
+        if let Some(block_id) = mounted.block_id {
+            match update {
+                SupplementUpdate::Unchanged => {}
+                SupplementUpdate::Resize => {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx)
+                    });
+                }
+                SupplementUpdate::ReplaceRenderer => {
+                    let renderer = supplemental_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        )
+                    });
+                }
+                SupplementUpdate::ResizeAndReplaceRenderer => {
+                    let renderer = supplemental_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx);
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        );
+                    });
+                }
+                SupplementUpdate::Reanchor => {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.remove_blocks([block_id].into_iter().collect(), None, cx)
+                    });
+                    mounted.block_id = None;
+                }
+            }
+        }
+        self.supplements.insert(key, mounted);
+        self.mount_unmounted_supplements(cx);
+        if should_request_tail_autoscroll(self.follow_tail, display_changed) {
+            self.request_tail_autoscroll(cx);
+        }
+    }
+
+    /// Remove one logical supplement without disturbing the buffer selection.
+    /// If the block is wholly above a paused viewport, preserve the same
+    /// visible buffer content by compensating for the removed display rows.
+    pub fn remove_supplement(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(supplement) = self.supplements.remove(key) else {
+            return false;
+        };
+        let Some(block_id) = supplement.block_id else {
+            return true;
+        };
+        let was_following_tail = self.follow_tail;
+        self.editor.update(cx, |editor, cx| {
+            let scroll_position = editor.scroll_position(cx);
+            let adjusted_scroll_top = (!was_following_tail)
+                .then(|| editor.row_for_block(block_id, cx))
+                .flatten()
+                .and_then(|row| {
+                    scroll_top_after_supplement_removal(
+                        row.0 as f64,
+                        supplement.rows,
+                        scroll_position.y,
+                    )
+                });
+            editor.remove_blocks([block_id].into_iter().collect(), None, cx);
+            if let Some(scroll_top) = adjusted_scroll_top {
+                editor.set_scroll_position(point(scroll_position.x, scroll_top), window, cx);
+            }
+        });
+        if was_following_tail {
+            self.request_tail_autoscroll(cx);
+        }
+        true
+    }
+
+    /// Drop all host-owned supplemental views and their mounted blocks.
+    pub fn clear_supplements(&mut self, cx: &mut Context<Self>) {
+        let block_ids = self
+            .supplements
+            .values()
+            .filter_map(|supplement| supplement.block_id)
+            .collect::<Vec<_>>();
+        self.supplements.clear();
+        if !block_ids.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
+            });
+            if self.follow_tail {
+                self.request_tail_autoscroll(cx);
+            }
+        }
+    }
+
+    /// Reveal an already-mounted supplement without changing the transcript
+    /// cursor or selection. Tall blocks align to the top; shorter blocks move
+    /// only enough to fit inside the current Editor viewport.
+    pub fn reveal_supplement(
+        &mut self,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(supplement) = self.supplements.get(key) else {
+            return false;
+        };
+        let Some(block_id) = supplement.block_id else {
+            return false;
+        };
+        let rows = f64::from(supplement.rows);
+        self.editor.update(cx, |editor, cx| {
+            let Some(block_row) = editor.row_for_block(block_id, cx).map(|row| row.0 as f64) else {
+                return false;
+            };
+            let visible_rows = editor.visible_line_count().unwrap_or(1.).max(1.);
+            let scroll_position = editor.scroll_position(cx);
+            let scroll_bottom = scroll_position.y + visible_rows;
+            let target = if rows >= visible_rows || block_row < scroll_position.y {
+                Some(block_row)
+            } else if block_row + rows > scroll_bottom {
+                Some(block_row + rows - visible_rows)
+            } else {
+                None
+            };
+            if let Some(scroll_top) = target {
+                editor.set_scroll_position(
+                    point(scroll_position.x, scroll_top.max(0.)),
+                    window,
+                    cx,
+                );
+            }
+            true
+        })
+    }
+
+    fn unmount_all_supplements(&mut self, cx: &mut Context<Self>) {
+        let block_ids = self
+            .supplements
+            .values_mut()
+            .filter_map(|supplement| supplement.block_id.take())
+            .collect::<Vec<_>>();
+        if !block_ids.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
+            });
+        }
+    }
+
+    fn mount_unmounted_supplements(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .supplements
+            .iter()
+            .filter(|(_, supplement)| supplement.block_id.is_none())
+            .filter_map(|(key, supplement)| {
+                Some((
+                    key.clone(),
+                    supplement_anchor_offset(&supplement.item_key, &self.segments)?,
+                    supplement.rows,
+                    supplement.view.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        let block_ids = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let blocks = pending.iter().map(|(_, offset, rows, view)| {
+                supplemental_block(
+                    snapshot.anchor_after(MultiBufferOffset(*offset)),
+                    *rows,
+                    view.clone(),
+                )
+            });
+            editor.insert_blocks(blocks, None, cx)
+        });
+        debug_assert_eq!(pending.len(), block_ids.len());
+        for ((key, _, _, _), block_id) in pending.into_iter().zip(block_ids) {
+            if let Some(supplement) = self.supplements.get_mut(&key) {
+                supplement.block_id = Some(block_id);
+            }
+        }
+    }
+
+    /// Explicitly opt into streaming tail-follow for an initial/full thread
+    /// open. This scrolls by an Editor display-map anchor and leaves Vim's
+    /// cursor, visual selection, and registers untouched.
+    pub fn reveal_tail(&mut self, cx: &mut Context<Self>) {
+        self.follow_tail = true;
+        self.pending_tail_intent = None;
+        self.last_selection_head = Some(self.editor.update(cx, |editor, cx| {
+            let current = editor.selections.newest_anchor().head();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let tail = snapshot.anchor_after(snapshot.len());
+            editor.request_autoscroll(Autoscroll::bottom().for_anchor(tail), cx);
+            current
+        }));
+    }
+
+    fn request_tail_autoscroll(&mut self, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let tail = snapshot.anchor_after(snapshot.len());
+            editor.request_autoscroll(Autoscroll::bottom().for_anchor(tail), cx);
+        });
+    }
+
+    fn note_local_selection_for_follow_tail(&mut self) {
+        let was_following = match self.pending_tail_intent {
+            Some(PendingTailIntent::Selection { was_following }) => was_following,
+            _ => self.follow_tail,
+        };
+        // Pause synchronously so a streaming update arriving before the next
+        // layout cannot pull a reader back to the bottom.
+        self.follow_tail = false;
+        self.pending_tail_intent = Some(PendingTailIntent::Selection { was_following });
+    }
+
+    fn apply_pending_tail_intent(&mut self, cx: &mut Context<Self>) {
+        let Some(intent) = self.pending_tail_intent.take() else {
+            return;
+        };
+        match intent {
+            PendingTailIntent::DirectScroll => {
+                self.follow_tail = self.editor.update(cx, |editor, cx| {
+                    let Some(visible_rows) = editor.visible_line_count() else {
+                        return false;
+                    };
+                    let display_snapshot = editor.display_snapshot(cx);
+                    viewport_bottom_is_near_tail(
+                        editor.scroll_position(cx).y,
+                        visible_rows,
+                        display_snapshot.max_point().row().as_f64(),
+                    )
+                });
+            }
+            PendingTailIntent::Selection { was_following } => {
+                let previous = self.last_selection_head.take();
+                let (current, previous_offset, current_offset, document_len) =
+                    self.editor.update(cx, |editor, cx| {
+                        let current = editor.selections.newest_anchor().head();
+                        let snapshot = editor.buffer().read(cx).snapshot(cx);
+                        let previous_offset = previous
+                            .as_ref()
+                            .map(|anchor| anchor.to_offset(&snapshot).0);
+                        let current_offset = current.to_offset(&snapshot).0;
+                        (current, previous_offset, current_offset, snapshot.len().0)
+                    });
+                self.last_selection_head = Some(current);
+                self.follow_tail = follow_tail_after_selection(
+                    was_following,
+                    previous_offset,
+                    current_offset,
+                    document_len,
+                );
+            }
+        }
+    }
+
+    fn schedule_viewport_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.viewport_refresh_pending {
+            return;
+        }
+        self.viewport_refresh_pending = true;
+        cx.on_next_frame(window, |transcript, _, cx| {
+            transcript.viewport_refresh_pending = false;
+            transcript.apply_pending_tail_intent(cx);
+            transcript.refresh_viewport_decorations(cx);
+        });
+    }
+
+    fn current_viewport_decoration_window(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> ViewportDecorationWindow {
+        let byte_range = self.editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let visible_range = editor.multi_buffer_visible_range(&display_snapshot, cx);
+            let buffer_snapshot = display_snapshot.buffer_snapshot();
+            let point_range = overscanned_point_range(
+                visible_range,
+                buffer_snapshot.max_point(),
+                VIEWPORT_OVERSCAN_ROWS,
+            );
+            point_range.start.to_offset(buffer_snapshot).0
+                ..point_range.end.to_offset(buffer_snapshot).0
+        });
+        let header_segment_range = header_segments_intersecting(&self.segments, &byte_range);
+        ViewportDecorationWindow {
+            byte_range,
+            header_segment_range,
+        }
+    }
+
+    fn refresh_viewport_decorations(&mut self, cx: &mut Context<Self>) {
+        let desired = self.current_viewport_decoration_window(cx);
+        let rebuild_headers = self
+            .viewport_decorations
+            .as_ref()
+            .is_none_or(|current| current.header_segment_range != desired.header_segment_range);
+        let rebuild_rows = self
+            .viewport_decorations
+            .as_ref()
+            .is_none_or(|current| current.byte_range != desired.byte_range);
+        let rebuild_diff_highlights = rebuild_rows || self.diff_highlights_dirty;
+        let rebuild_search_highlights = rebuild_rows || self.search.highlights_dirty;
+        if !rebuild_headers
+            && !rebuild_rows
+            && !rebuild_diff_highlights
+            && !rebuild_search_highlights
+        {
+            return;
+        }
+
+        let (header_positions_to_remove, header_positions_to_insert) = if rebuild_headers {
+            header_window_delta(
+                self.header_blocks.keys().copied(),
+                desired.header_segment_range.clone(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let header_segments = header_positions_to_insert
+            .iter()
+            .map(|position| self.segments[*position].clone())
+            .collect::<Vec<_>>();
+        let header_texts = header_positions_to_insert
+            .iter()
+            .map(|position| self.segment_header_texts[*position].clone())
+            .collect::<Vec<_>>();
+        let row_segment_range = segments_intersecting(&self.segments, &desired.byte_range);
+        let row_segments = rebuild_rows
+            .then(|| self.segments[row_segment_range].to_vec())
+            .unwrap_or_default();
+        let row_byte_range = desired.byte_range.clone();
+        let diff_highlights = rebuild_diff_highlights.then(|| {
+            let body_ranges = visible_diff_body_ranges(&self.segments, &desired.byte_range);
+            let buffer = self.buffer.read(cx);
+            let mut highlights = DiffHighlightRanges::default();
+            for body_range in body_ranges {
+                let body = buffer
+                    .text_for_range(body_range.clone())
+                    .collect::<String>();
+                highlights.parse_body(&body, body_range.start);
+            }
+            highlights
+        });
+        let search_highlights = rebuild_search_highlights.then(|| {
+            if self.search.query.is_empty() {
+                None
+            } else {
+                let buffer = self.buffer.read(cx);
+                let text = buffer
+                    .text_for_range(desired.byte_range.clone())
+                    .collect::<String>();
+                Some(literal_match_ranges(
+                    &text,
+                    &self.search.query,
+                    desired.byte_range.start,
+                ))
+            }
+        });
+        let active_search_match = self.search.active_match.clone();
+        let header_blocks_to_remove = header_positions_to_remove
+            .iter()
+            .filter_map(|position| self.header_blocks.remove(position))
+            .collect::<Vec<_>>();
+
+        let inserted_header_blocks = self.editor.update(cx, |editor, cx| {
+            if !header_blocks_to_remove.is_empty() {
+                editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
+            }
+
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let native_headers: Vec<_> = header_segments
+                .iter()
+                .zip(header_texts)
+                .map(|(segment, header_text)| {
+                    native_header_block(
+                        snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
+                            ..=snapshot.anchor_after(MultiBufferOffset(segment.header_range.end)),
+                        segment.kind,
+                        native_header_text(&header_text).into(),
+                    )
+                })
+                .collect();
+            let inserted_header_blocks = if !header_segments.is_empty() {
+                editor.insert_blocks(native_headers, None, cx)
+            } else {
+                Vec::new()
+            };
+
+            if rebuild_rows {
+                editor.clear_row_highlights::<UserTranscriptRows>();
+                editor.clear_row_highlights::<ReasoningTranscriptRows>();
+                editor.clear_row_highlights::<StructuredTranscriptRows>();
+                editor.clear_row_highlights::<ErrorTranscriptRows>();
+                let options = RowHighlightOptions {
+                    include_gutter: false,
+                    ..RowHighlightOptions::default()
+                };
+                for segment in row_segments {
+                    let Some(range) = intersect_ranges(&segment.whole_range, &row_byte_range)
+                    else {
+                        continue;
+                    };
+                    let anchors = snapshot.anchor_before(MultiBufferOffset(range.start))
+                        ..snapshot.anchor_after(MultiBufferOffset(range.end));
+                    match segment.kind {
+                        TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
+                            anchors,
+                            user_transcript_background,
+                            options,
+                            cx,
+                        ),
+                        TranscriptKind::Reasoning | TranscriptKind::Plan => editor
+                            .highlight_rows::<ReasoningTranscriptRows>(
+                            anchors,
+                            reasoning_transcript_background,
+                            options,
+                            cx,
+                        ),
+                        TranscriptKind::Error => editor.highlight_rows::<ErrorTranscriptRows>(
+                            anchors,
+                            error_transcript_background,
+                            options,
+                            cx,
+                        ),
+                        TranscriptKind::Agent | TranscriptKind::Trace => {}
+                        _ => editor.highlight_rows::<StructuredTranscriptRows>(
+                            anchors,
+                            structured_transcript_background,
+                            options,
+                            cx,
+                        ),
+                    }
+                }
+            }
+
+            if let Some(diff_highlights) = diff_highlights {
+                let DiffHighlightRanges {
+                    file_headers,
+                    hunks,
+                    additions,
+                    deletions,
+                    parsed_bytes: _,
+                } = diff_highlights;
+                let anchors = |ranges: Vec<Range<usize>>| {
+                    ranges
+                        .into_iter()
+                        .map(|range| {
+                            snapshot.anchor_before(MultiBufferOffset(range.start))
+                                ..snapshot.anchor_after(MultiBufferOffset(range.end))
+                        })
+                        .collect::<Vec<_>>()
+                };
+
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        DiffFileHeaderHighlight,
+                    >()),
+                    anchors(file_headers),
+                    HighlightStyle {
+                        color: Some(cx.theme().colors().text_muted),
+                        font_weight: Some(FontWeight::BOLD),
+                        background_color: Some(
+                            cx.theme()
+                                .colors()
+                                .editor_subheader_background
+                                .opacity(0.36),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        DiffHunkHighlight,
+                    >()),
+                    anchors(hunks),
+                    HighlightStyle {
+                        color: Some(cx.theme().status().modified),
+                        font_weight: Some(FontWeight::BOLD),
+                        background_color: Some(
+                            cx.theme().status().modified_background.opacity(0.16),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        DiffAdditionHighlight,
+                    >()),
+                    anchors(additions),
+                    HighlightStyle {
+                        color: Some(cx.theme().status().created),
+                        background_color: Some(
+                            cx.theme().status().created_background.opacity(0.14),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        DiffDeletionHighlight,
+                    >()),
+                    anchors(deletions),
+                    HighlightStyle {
+                        color: Some(cx.theme().status().deleted),
+                        background_color: Some(
+                            cx.theme().status().deleted_background.opacity(0.14),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+            }
+
+            if let Some(search_highlights) = search_highlights {
+                if let Some(search_highlights) = search_highlights {
+                    let active_search_match = active_search_match.map(|range| {
+                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                    });
+                    let active_match_index = active_search_match.as_ref().and_then(|active| {
+                        search_highlights
+                            .iter()
+                            .position(|candidate| candidate == active)
+                    });
+                    let anchors = search_highlights
+                        .into_iter()
+                        .map(|range| {
+                            snapshot.anchor_before(MultiBufferOffset(range.start))
+                                ..snapshot.anchor_after(MultiBufferOffset(range.end))
+                        })
+                        .collect::<Vec<_>>();
+                    editor.highlight_background(
+                        HighlightKey::BufferSearchHighlights,
+                        &anchors,
+                        move |index, theme| {
+                            if active_match_index == Some(*index) {
+                                theme.colors().search_active_match_background
+                            } else {
+                                theme.colors().search_match_background
+                            }
+                        },
+                        cx,
+                    );
+                } else {
+                    editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+                }
+            }
+            inserted_header_blocks
+        });
+        debug_assert_eq!(
+            header_positions_to_insert.len(),
+            inserted_header_blocks.len()
+        );
+        for (position, block_id) in header_positions_to_insert
+            .into_iter()
+            .zip(inserted_header_blocks)
+        {
+            self.header_blocks.insert(position, block_id);
+        }
+        self.viewport_decorations = Some(desired);
+        self.diff_highlights_dirty = false;
+        self.search.highlights_dirty = false;
+    }
+
+    /// Apply semantic hierarchy without replacing selectable transcript bodies.
+    ///
+    /// Message bodies remain real buffer ranges, so Zed's cursor, visual
+    /// selections, registers, and yank continue to operate across items. The
+    /// compact native headers only replace the ornamental header rows in the
+    /// display map; their source text remains in the Buffer and in yanked ranges.
+    /// Zed treats a cursor that enters a replacement block as selecting that
+    /// whole underlying row, so headers intentionally do not have character-level
+    /// visual selection; every body on either side still does.
+    pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) {
+        // A full document rebuild can replace the anchors under a supplement.
+        // Keep the logical specs and host views, but remount their Editor blocks
+        // against the new per-item body ranges below.
+        self.unmount_all_supplements(cx);
+        self.segments.clone_from(&document.segments);
+        self.segment_header_texts = document
+            .segments
+            .iter()
+            .map(|segment| document.text[segment.header_range.clone()].to_owned())
+            .collect();
+        self.model_item_count = document.item_rows.len();
+        let previous_header_blocks = std::mem::take(&mut self.header_blocks);
+        self.viewport_decorations = None;
+        self.diff_highlights_dirty = true;
+        self.search.highlights_dirty = true;
+        self.editor.update(cx, |editor, cx| {
+            if !previous_header_blocks.is_empty() {
+                editor.remove_blocks(previous_header_blocks.into_values().collect(), None, cx);
+            }
+            editor.clear_row_highlights::<UserTranscriptRows>();
+            editor.clear_row_highlights::<ReasoningTranscriptRows>();
+            editor.clear_row_highlights::<StructuredTranscriptRows>();
+            editor.clear_row_highlights::<ErrorTranscriptRows>();
+
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let headers = document
+                .segments
+                .iter()
+                .map(|segment| {
+                    snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
+                        ..snapshot.anchor_after(MultiBufferOffset(segment.header_range.end))
+                })
+                .collect();
+            let header_key = HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                TranscriptHeaderHighlight,
+            >());
+            editor.highlight_text(
+                header_key,
+                headers,
+                HighlightStyle {
+                    color: Some(cx.theme().colors().text_muted),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+        });
+        self.mount_unmounted_supplements(cx);
+        self.refresh_viewport_decorations(cx);
+    }
+
+    /// Apply per-item document projections without rebuilding the full buffer.
+    ///
+    /// Existing updates must preserve item identity, kind, and header text; only
+    /// their selectable body/tail may change. New model items are represented in
+    /// order by `appended`, with `None` for trace-only items. Any structural
+    /// ambiguity returns `false` before mutating the buffer so the caller can
+    /// perform an explicit full rebuild.
+    pub fn apply_item_projections(
+        &mut self,
+        old_model_item_count: usize,
+        existing_updates: &[(usize, Option<TranscriptItemProjection>)],
+        appended: &[Option<TranscriptItemProjection>],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.model_item_count != old_model_item_count
+            || self.segment_header_texts.len() != self.segments.len()
+            || self.buffer.read(cx).len()
+                != self
+                    .segments
+                    .last()
+                    .map_or(0, |segment| segment.whole_range.end)
+        {
+            return false;
+        }
+
+        let mut updates = Vec::with_capacity(existing_updates.len());
+        for (item_index, projection) in existing_updates {
+            if *item_index >= old_model_item_count {
+                return false;
+            }
+            let segment_position = self
+                .segments
+                .binary_search_by_key(item_index, |segment| segment.item_index)
+                .ok();
+            match (segment_position, projection) {
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => return false,
+                (Some(segment_position), Some(projection)) => {
+                    if !projection_has_valid_relative_ranges(projection)
+                        || projection.segment.item_index != *item_index
+                    {
+                        return false;
+                    }
+                    let current = &self.segments[segment_position];
+                    if current.item_key != projection.segment.item_key
+                        || current.kind != projection.segment.kind
+                        || self.segment_header_texts[segment_position] != projection.header_text()
+                    {
+                        return false;
+                    }
+                    updates.push((segment_position, projection));
+                }
+            }
+        }
+        updates.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
+        if updates.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return false;
+        }
+
+        let mut appended_projections = Vec::new();
+        for (offset, projection) in appended.iter().enumerate() {
+            let item_index = old_model_item_count + offset;
+            let Some(projection) = projection else {
+                continue;
+            };
+            if !projection_has_valid_relative_ranges(projection)
+                || projection.segment.item_index != item_index
+                || self
+                    .segments
+                    .iter()
+                    .any(|segment| segment.item_key == projection.segment.item_key)
+                || appended_projections
+                    .iter()
+                    .any(|previous: &&TranscriptItemProjection| {
+                        previous.segment.item_key == projection.segment.item_key
+                    })
+            {
+                return false;
+            }
+            appended_projections.push(projection);
+        }
+        let diff_bodies_changed = updates.iter().any(|(segment_position, _)| {
+            self.segments[*segment_position].kind == TranscriptKind::Diff
+        }) || appended_projections
+            .iter()
+            .any(|projection| projection.segment.kind == TranscriptKind::Diff);
+
+        struct PendingEdit {
+            old_range: Range<usize>,
+            replacement: String,
+        }
+
+        let mut pending_edits = Vec::with_capacity(updates.len());
+        {
+            let buffer = self.buffer.read(cx);
+            for (segment_position, projection) in &updates {
+                let current = &self.segments[*segment_position];
+                let old_tail = buffer
+                    .text_for_range(current.body_range.start..current.whole_range.end)
+                    .collect::<String>();
+                let new_tail = &projection.text
+                    [projection.segment.body_range.start..projection.segment.whole_range.end];
+                let (local_range, replacement) = minimal_text_edit(&old_tail, new_tail);
+                pending_edits.push(PendingEdit {
+                    old_range: current.body_range.start + local_range.start
+                        ..current.body_range.start + local_range.end,
+                    replacement,
+                });
+            }
+        }
+
+        let mut next_segments = self.segments.clone();
+        for (segment_position, projection) in &updates {
+            if !apply_projected_segment_shape(
+                &mut next_segments,
+                *segment_position,
+                &projection.segment,
+            ) {
+                return false;
+            }
+        }
+
+        let mut append_text = String::new();
+        let mut appended_segments = Vec::with_capacity(appended_projections.len());
+        let mut appended_headers = Vec::with_capacity(appended_projections.len());
+        let mut next_offset = next_segments
+            .last()
+            .map_or(0, |segment| segment.whole_range.end);
+        for projection in appended_projections {
+            appended_segments.push(TranscriptDocumentSegment {
+                item_index: projection.segment.item_index,
+                item_key: projection.segment.item_key.clone(),
+                kind: projection.segment.kind,
+                whole_range: range_at_offset(&projection.segment.whole_range, next_offset),
+                header_range: range_at_offset(&projection.segment.header_range, next_offset),
+                body_range: range_at_offset(&projection.segment.body_range, next_offset),
+            });
+            appended_headers.push(projection.header_text().to_owned());
+            next_offset += projection.text.len();
+            append_text.push_str(&projection.text);
+        }
+
+        let search_text_changed = pending_edits
+            .iter()
+            .any(|edit| !edit.old_range.is_empty() || !edit.replacement.is_empty())
+            || !append_text.is_empty();
+        self.buffer.update(cx, |buffer, cx| {
+            for edit in pending_edits {
+                buffer.edit([(edit.old_range, edit.replacement)], None, cx);
+            }
+            if !append_text.is_empty() {
+                let end = buffer.len();
+                buffer.edit([(end..end, append_text)], None, cx);
+            }
+        });
+
+        let appended_segment_start = next_segments.len();
+        next_segments.extend(appended_segments);
+        self.segments = next_segments;
+        self.segment_header_texts.extend(appended_headers);
+        self.model_item_count = old_model_item_count + appended.len();
+        self.diff_highlights_dirty |= diff_bodies_changed;
+        self.search.highlights_dirty |= search_text_changed;
+        if self.segments.len() > appended_segment_start {
+            self.decorate_appended_segments(appended_segment_start, cx);
+        }
+        self.mount_unmounted_supplements(cx);
+        self.refresh_viewport_decorations(cx);
+        if should_request_tail_autoscroll(self.follow_tail, search_text_changed) {
+            self.request_tail_autoscroll(cx);
+        }
+        true
+    }
+
+    fn decorate_appended_segments(
+        &mut self,
+        appended_segment_start: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let segments = self.segments[appended_segment_start..].to_vec();
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mut headers = Vec::with_capacity(segments.len());
+            for segment in &segments {
+                headers.push(
+                    snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
+                        ..snapshot.anchor_after(MultiBufferOffset(segment.header_range.end)),
+                );
+            }
+
+            let header_key = HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                TranscriptHeaderHighlight,
+            >());
+            editor.highlight_text_key(
+                header_key,
+                headers,
+                HighlightStyle {
+                    color: Some(cx.theme().colors().text_muted),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..HighlightStyle::default()
+                },
+                true,
+                cx,
+            );
+        });
+    }
+
+    pub fn set_cursor_row(&mut self, row: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.buffer.read(cx).text();
+        let requested_offset = point_to_offset(&text, Point::new(row, 0));
+        // `item_rows` points at the ornamental header. Enter the selectable
+        // body instead, so the first Vim motion does not touch a replacement
+        // block and expand to its hidden source row.
+        let target_offset = item_body_start_at_offset(requested_offset, &self.segments);
+        let point = offset_to_point(&text, target_offset);
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([point..point]);
+            });
+        });
+    }
+
+    /// Re-enter Vim normal mode after focus is transferred by a Harness keybinding.
+    ///
+    /// This is intentionally deferred by the caller: the keystroke that opens the
+    /// transcript buffer (Shift-V) must finish dispatching before Zed's Vim layer
+    /// sees the editor, or that same keystroke can start a visual-line selection.
+    pub fn enter_normal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::SwitchToNormalMode", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    /// Persist a transcript query and repaint its viewport-local matches without
+    /// moving or replacing the Editor's Vim selection.
+    pub fn set_search_query(&mut self, query: &str, backwards: bool, cx: &mut Context<Self>) {
+        if query.is_empty() {
+            self.clear_search(cx);
+            return;
+        }
+        let query_changed = self.search.query != query;
+        self.search.backwards = backwards;
+        if query_changed {
+            self.search.query.clear();
+            self.search.query.push_str(query);
+            self.search.active_match = None;
+            self.search.highlights_dirty = true;
+            self.refresh_viewport_decorations(cx);
+        }
+    }
+
+    /// Clear native match decoration without touching the cursor, visual
+    /// selection, registers, or selectable transcript text.
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search = TranscriptSearchState::default();
+        self.editor.update(cx, |editor, cx| {
+            editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+        });
+    }
+
+    pub fn search_query(&self) -> Option<&str> {
+        (!self.search.query.is_empty()).then_some(self.search.query.as_str())
+    }
+
+    /// Repeat in the original `/` or `?` direction. `reverse` implements Vim's
+    /// `N`; a false value implements `n`.
+    pub fn repeat_search(
+        &mut self,
+        reverse: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let backwards = repeated_search_backwards(self.search.backwards, reverse);
+        self.move_search_in_direction(backwards, window, cx)
+    }
+
+    /// Compatibility entry point for the current Harness search bar. New
+    /// callers should set the query once and use `repeat_search` for n/N.
+    pub fn search(
+        &mut self,
+        query: &str,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if query.is_empty() {
+            self.clear_search(cx);
+            return false;
+        }
+        let query_changed = self.search.query != query;
+        self.search.backwards = backwards;
+        if query_changed {
+            self.search.query.clear();
+            self.search.query.push_str(query);
+            self.search.active_match = None;
+            self.search.highlights_dirty = true;
+        }
+        self.move_search_in_direction(backwards, window, cx)
+    }
+
+    fn move_search_in_direction(
+        &mut self,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.search.query.is_empty() {
+            return false;
+        }
+        let text = self.buffer.read(cx).text();
+        let cursor = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        });
+        let cursor_offset = point_to_offset(&text, cursor);
+        let match_offset = find_wrapped_match(&text, &self.search.query, cursor_offset, backwards);
+        let Some(match_offset) = match_offset else {
+            self.search.active_match = None;
+            self.search.highlights_dirty = true;
+            self.refresh_viewport_decorations(cx);
+            return false;
+        };
+        let match_range = match_offset..match_offset + self.search.query.len();
+        let point = offset_to_point(&text, match_offset);
+        self.search.active_match = Some(self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchored_match = snapshot.anchor_before(MultiBufferOffset(match_range.start))
+                ..snapshot.anchor_after(MultiBufferOffset(match_range.end));
+            editor.change_selections(
+                SelectionEffects::default().from_search(true),
+                window,
+                cx,
+                |selections| selections.select_ranges([point..point]),
+            );
+            anchored_match
+        }));
+        self.search.highlights_dirty = true;
+        self.refresh_viewport_decorations(cx);
+        // Autoscroll is applied during layout. Refresh once more on the next
+        // frame so a far-away active match receives emphasis after reveal.
+        self.schedule_viewport_refresh(window, cx);
+        true
+    }
+}
+
+fn previous_char_boundary(text: &str, offset: usize) -> usize {
+    (0..=offset.min(text.len()))
+        .rev()
+        .find(|candidate| text.is_char_boundary(*candidate))
+        .unwrap_or(0)
+}
+
+fn point_to_offset(text: &str, point: Point) -> usize {
+    let mut offset = 0;
+    for _ in 0..point.row {
+        let Some(line_end) = text[offset..].find('\n') else {
+            return text.len();
+        };
+        offset += line_end + 1;
+    }
+    let requested = offset.saturating_add(point.column as usize).min(text.len());
+    previous_char_boundary(text, requested).max(offset)
+}
+
+fn offset_to_point(text: &str, offset: usize) -> Point {
+    let offset = offset.min(text.len());
+    let prefix = &text[..offset];
+    let row = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32;
+    let column = prefix
+        .rfind('\n')
+        .map_or(offset, |line_end| offset - line_end - 1) as u32;
+    Point::new(row, column)
+}
+
+impl Focusable for TranscriptEditor {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.editor.focus_handle(cx)
+    }
+}
+
+impl Render for TranscriptEditor {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        self.editor.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcript_render_does_not_create_idle_frame_demand() {
+        // This is deliberately a source-level invariant. Scheduling a
+        // next-frame callback from Render looks harmless, but GPUI treats the
+        // callback as platform frame demand; it caused an unfocused 10k-item
+        // transcript to keep the UI thread active at the inactive-window frame
+        // rate. Scroll and bounds observers are the event-driven refresh path.
+        let source = include_str!("lib.rs");
+        let render_impl = source
+            .split_once("impl Render for TranscriptEditor")
+            .and_then(|(_, after)| after.split_once("#[cfg(test)]"))
+            .map(|(render_impl, _)| render_impl)
+            .expect("TranscriptEditor Render implementation must precede its tests");
+
+        assert!(!render_impl.contains("schedule_viewport_refresh"));
+        assert!(!render_impl.contains("on_next_frame"));
+    }
+
+    #[test]
+    fn persistent_search_uses_edit_stable_anchors_and_stream_dirtying() {
+        // Search painting deliberately keeps no document-wide byte-range
+        // index. Only the active range needs to survive streaming edits, and
+        // Zed's anchors already provide the required edit semantics.
+        let source = include_str!("lib.rs");
+        let search_state = source
+            .split_once("struct TranscriptSearchState")
+            .and_then(|(_, after)| after.split_once("const VIEWPORT_OVERSCAN_ROWS"))
+            .map(|(state, _)| state)
+            .expect("search state must precede viewport decoration constants");
+        assert!(search_state.contains("active_match: Option<Range<Anchor>>"));
+        assert!(!search_state.contains("active_match: Option<Range<usize>>"));
+        assert!(
+            source.contains("self.search.highlights_dirty |= search_text_changed"),
+            "streaming edits must invalidate only the next viewport search paint"
+        );
+    }
+
+    #[test]
+    fn literal_search_is_ascii_case_insensitive_and_utf8_exact() {
+        let prefix = "before 🧭\n";
+        let window = "🦀 Code café CODE code";
+        let text = format!("{prefix}{window}");
+        let matches = literal_match_ranges(window, "cOdE", prefix.len());
+
+        assert_eq!(
+            highlighted_text(&text, &matches),
+            vec!["Code", "CODE", "code"]
+        );
+        assert!(matches.iter().all(|range| {
+            text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+        }));
+        // Non-ASCII matching remains exact rather than changing byte lengths
+        // through full Unicode case folding.
+        assert!(literal_match_ranges(window, "CAFÉ", prefix.len()).is_empty());
+        assert_eq!(
+            highlighted_text(&text, &literal_match_ranges(window, "café", prefix.len())),
+            vec!["café"]
+        );
+    }
+
+    #[test]
+    fn literal_search_keeps_overlapping_matches() {
+        assert_eq!(
+            literal_match_ranges("aaaa", "aa", 20),
+            vec![20..22, 21..23, 22..24]
+        );
+    }
+
+    #[test]
+    fn repeat_search_respects_original_question_mark_direction() {
+        assert!(!repeated_search_backwards(false, false));
+        assert!(repeated_search_backwards(false, true));
+        assert!(repeated_search_backwards(true, false));
+        assert!(!repeated_search_backwards(true, true));
+    }
+
+    #[test]
+    fn ten_thousand_item_search_paint_scans_only_viewport_text() {
+        let item = "match filler payload\n";
+        let transcript = item.repeat(10_000);
+        let viewport = 8_000 * item.len()..8_050 * item.len();
+        let viewport_text = &transcript[viewport.clone()];
+
+        let matches = literal_match_ranges(viewport_text, "MATCH", viewport.start);
+
+        assert_eq!(matches.len(), 50);
+        assert!(
+            matches
+                .iter()
+                .all(|range| viewport.start <= range.start && range.end <= viewport.end)
+        );
+        assert_eq!(viewport_text.len(), 50 * item.len());
+        assert!(viewport_text.len() < transcript.len() / 100);
+    }
+
+    #[test]
+    fn direct_scroll_away_pauses_streaming_tail_follow() {
+        assert!(direct_scroll_can_change_follow_tail(true, false));
+        assert!(!viewport_bottom_is_near_tail(8_000., 50., 9_999.));
+
+        let following_after_scroll = viewport_bottom_is_near_tail(8_000., 50., 9_999.);
+        assert!(!should_request_tail_autoscroll(
+            following_after_scroll,
+            true
+        ));
+    }
+
+    #[test]
+    fn direct_scroll_back_to_threshold_repins_tail() {
+        assert!(viewport_bottom_is_near_tail(9_949., 50., 9_999.));
+        assert!(!viewport_bottom_is_near_tail(9_947., 50., 9_999.));
+        assert!(should_request_tail_autoscroll(true, true));
+        assert!(!should_request_tail_autoscroll(true, false));
+    }
+
+    #[test]
+    fn backward_vim_motion_pauses_but_forward_motion_retains_pin() {
+        assert!(!follow_tail_after_selection(true, Some(900), 800, 1_000));
+        assert!(follow_tail_after_selection(true, Some(800), 900, 1_000));
+        assert!(!follow_tail_after_selection(false, Some(800), 900, 1_000));
+        assert!(follow_tail_after_selection(false, Some(900), 1_000, 1_000));
+    }
+
+    #[test]
+    fn autoscroll_events_do_not_self_pause_or_create_a_frame_loop() {
+        assert!(!direct_scroll_can_change_follow_tail(true, true));
+        assert!(!direct_scroll_can_change_follow_tail(false, false));
+
+        let source = include_str!("lib.rs");
+        let request = source
+            .split_once("fn request_tail_autoscroll")
+            .and_then(|(_, after)| after.split_once("fn note_local_selection_for_follow_tail"))
+            .map(|(request, _)| request)
+            .expect("tail request must precede selection intent handling");
+        assert!(!request.contains("schedule_viewport_refresh"));
+        assert!(!request.contains("on_next_frame"));
+    }
+
+    #[test]
+    fn body_and_supplement_updates_request_tail_at_most_once() {
+        let source = include_str!("lib.rs");
+        let edit = source
+            .split_once("pub fn edit(")
+            .and_then(|(_, after)| after.split_once("pub fn upsert_supplement"))
+            .map(|(edit, _)| edit)
+            .expect("edit must precede supplement upsert");
+        let upsert = source
+            .split_once("pub fn upsert_supplement")
+            .and_then(|(_, after)| after.split_once("pub fn remove_supplement"))
+            .map(|(upsert, _)| upsert)
+            .expect("upsert must precede supplement removal");
+        let projections = source
+            .split_once("pub fn apply_item_projections")
+            .and_then(|(_, after)| after.split_once("fn decorate_appended_segments"))
+            .map(|(projections, _)| projections)
+            .expect("projection updates must precede appended decoration");
+
+        for update_path in [edit, upsert, projections] {
+            assert_eq!(
+                update_path.matches("request_tail_autoscroll(cx)").count(),
+                1
+            );
+        }
+    }
+
+    fn segment(
+        item_index: usize,
+        whole_range: Range<usize>,
+        header_range: Range<usize>,
+        body_range: Range<usize>,
+    ) -> TranscriptDocumentSegment {
+        segment_with_kind(
+            item_index,
+            TranscriptKind::Agent,
+            whole_range,
+            header_range,
+            body_range,
+        )
+    }
+
+    fn segment_with_kind(
+        item_index: usize,
+        kind: TranscriptKind,
+        whole_range: Range<usize>,
+        header_range: Range<usize>,
+        body_range: Range<usize>,
+    ) -> TranscriptDocumentSegment {
+        TranscriptDocumentSegment {
+            item_index,
+            item_key: format!("item-{item_index}"),
+            kind,
+            whole_range,
+            header_range,
+            body_range,
+        }
+    }
+
+    fn highlighted_text<'a>(text: &'a str, ranges: &[Range<usize>]) -> Vec<&'a str> {
+        ranges.iter().map(|range| &text[range.clone()]).collect()
+    }
+
+    #[test]
+    fn diff_highlights_are_exact_utf8_byte_ranges() {
+        let prefix = "before 🧭\n";
+        let body = concat!(
+            "diff --git a/café.rs b/café.rs\r\n",
+            "index 123..456 100644\n",
+            "--- a/café.rs\n",
+            "+++ b/café.rs\n",
+            "@@ -1,2 +1,2 @@ fn café()\n",
+            " unchanged\n",
+            "-old 🦀\n",
+            "+new 🌱\n",
+            "\\ No newline at end of file"
+        );
+        let text = format!("{prefix}{body}");
+        let mut highlights = DiffHighlightRanges::default();
+        highlights.parse_body(body, prefix.len());
+
+        assert_eq!(
+            highlighted_text(&text, &highlights.file_headers),
+            vec![
+                "diff --git a/café.rs b/café.rs",
+                "index 123..456 100644",
+                "--- a/café.rs",
+                "+++ b/café.rs",
+            ]
+        );
+        assert_eq!(
+            highlighted_text(&text, &highlights.hunks),
+            vec!["@@ -1,2 +1,2 @@ fn café()"]
+        );
+        assert_eq!(
+            highlighted_text(&text, &highlights.deletions),
+            vec!["-old 🦀"]
+        );
+        assert_eq!(
+            highlighted_text(&text, &highlights.additions),
+            vec!["+new 🌱"]
+        );
+        assert_eq!(highlights.parsed_bytes, body.len());
+        for range in highlights
+            .file_headers
+            .iter()
+            .chain(&highlights.hunks)
+            .chain(&highlights.deletions)
+            .chain(&highlights.additions)
+        {
+            assert!(text.is_char_boundary(range.start));
+            assert!(text.is_char_boundary(range.end));
+            assert!(!highlighted_text(&text, std::slice::from_ref(range))[0].contains('\n'));
+            assert!(!highlighted_text(&text, std::slice::from_ref(range))[0].contains('\r'));
+        }
+    }
+
+    #[test]
+    fn diff_headers_are_not_misclassified_as_changed_lines() {
+        let body = concat!(
+            "--- a/file.rs\n",
+            "+++ b/file.rs\n",
+            "@@@ -1,1 -1,1 +1,1 @@@\n",
+            "-removed\n",
+            "+added\n"
+        );
+        let mut highlights = DiffHighlightRanges::default();
+        highlights.parse_body(body, 0);
+
+        assert_eq!(
+            highlighted_text(body, &highlights.file_headers),
+            vec!["--- a/file.rs", "+++ b/file.rs"]
+        );
+        assert_eq!(
+            highlighted_text(body, &highlights.hunks),
+            vec!["@@@ -1,1 -1,1 +1,1 @@@"]
+        );
+        assert_eq!(
+            highlighted_text(body, &highlights.deletions),
+            vec!["-removed"]
+        );
+        assert_eq!(
+            highlighted_text(body, &highlights.additions),
+            vec!["+added"]
+        );
+    }
+
+    #[test]
+    fn streaming_diff_reclassification_replaces_prior_ranges() {
+        let mut before = DiffHighlightRanges::default();
+        before.parse_body("+draft", 100);
+        let mut after = DiffHighlightRanges::default();
+        after.parse_body("-old\n+final", 100);
+
+        assert_eq!(before.additions, vec![100..106]);
+        assert!(before.deletions.is_empty());
+        assert_eq!(after.deletions, vec![100..104]);
+        assert_eq!(after.additions, vec![105..111]);
+    }
+
+    #[test]
+    fn body_only_edits_retain_native_header_anchors() {
+        let segments = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+
+        assert!(!edit_invalidates_native_header_blocks(&(12..18), &segments));
+        assert!(!edit_invalidates_native_header_blocks(&(28..28), &segments));
+        assert!(!edit_invalidates_native_header_blocks(&(40..40), &segments));
+    }
+
+    #[test]
+    fn structural_and_multi_body_edits_rebuild_native_headers() {
+        let segments = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+
+        assert!(edit_invalidates_native_header_blocks(&(2..6), &segments));
+        assert!(edit_invalidates_native_header_blocks(&(8..8), &segments));
+        assert!(edit_invalidates_native_header_blocks(&(20..44), &segments));
+        assert!(edit_invalidates_native_header_blocks(&(30..30), &segments));
+        assert!(edit_invalidates_native_header_blocks(&(28..30), &segments));
+        assert!(edit_invalidates_native_header_blocks(&(20..10), &segments));
+    }
+
+    #[test]
+    fn item_entry_offsets_resolve_to_selectable_body_starts() {
+        let segments = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+
+        assert_eq!(item_body_start_at_offset(0, &segments), 10);
+        assert_eq!(item_body_start_at_offset(4, &segments), 10);
+        assert_eq!(item_body_start_at_offset(30, &segments), 40);
+        assert_eq!(item_body_start_at_offset(60, &segments), 60);
+    }
+
+    #[test]
+    fn supplemental_updates_keep_block_identity_until_the_item_changes() {
+        assert_eq!(
+            supplement_update(false, false, false),
+            SupplementUpdate::Unchanged
+        );
+        assert_eq!(
+            supplement_update(false, true, false),
+            SupplementUpdate::Resize
+        );
+        assert_eq!(
+            supplement_update(false, false, true),
+            SupplementUpdate::ReplaceRenderer
+        );
+        assert_eq!(
+            supplement_update(false, true, true),
+            SupplementUpdate::ResizeAndReplaceRenderer
+        );
+        assert_eq!(
+            supplement_update(true, false, false),
+            SupplementUpdate::Reanchor
+        );
+        assert_eq!(
+            supplement_update(true, true, true),
+            SupplementUpdate::Reanchor
+        );
+    }
+
+    #[test]
+    fn supplemental_anchor_follows_its_item_across_document_rebuilds() {
+        let before = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+        let after = [
+            segment(0, 0..75, 0..8, 10..73),
+            segment(1, 75..105, 75..83, 85..103),
+        ];
+
+        assert_eq!(supplement_anchor_offset("item-1", &before), Some(58));
+        assert_eq!(supplement_anchor_offset("item-1", &after), Some(103));
+        assert_eq!(supplement_anchor_offset("missing", &after), None);
+    }
+
+    #[test]
+    fn removing_supplement_above_paused_viewport_preserves_visible_rows() {
+        assert_eq!(scroll_top_after_supplement_removal(10., 4, 30.), Some(26.));
+        assert_eq!(scroll_top_after_supplement_removal(10., 4, 14.), Some(10.));
+        assert_eq!(scroll_top_after_supplement_removal(0., 4, 4.), Some(0.));
+
+        assert_eq!(scroll_top_after_supplement_removal(10., 4, 12.), None);
+        assert_eq!(scroll_top_after_supplement_removal(20., 4, 12.), None);
+    }
+
+    #[test]
+    fn multiple_nonadjacent_body_updates_shift_segments_without_overlap() {
+        let mut segments = vec![
+            segment(0, 0..20, 0..5, 7..18),
+            segment(1, 20..40, 20..25, 27..38),
+            segment(2, 40..60, 40..45, 47..58),
+        ];
+        let projected_last = segment(2, 0..25, 0..5, 7..23);
+        let projected_first = segment(0, 0..23, 0..5, 7..21);
+
+        assert!(apply_projected_segment_shape(
+            &mut segments,
+            2,
+            &projected_last
+        ));
+        assert!(apply_projected_segment_shape(
+            &mut segments,
+            0,
+            &projected_first
+        ));
+
+        assert_eq!(segments[0].whole_range, 0..23);
+        assert_eq!(segments[0].body_range, 7..21);
+        assert_eq!(segments[1].whole_range, 23..43);
+        assert_eq!(segments[1].header_range, 23..28);
+        assert_eq!(segments[1].body_range, 30..41);
+        assert_eq!(segments[2].whole_range, 43..68);
+        assert_eq!(segments[2].header_range, 43..48);
+        assert_eq!(segments[2].body_range, 50..66);
+        assert!(
+            segments
+                .windows(2)
+                .all(|pair| pair[0].whole_range.end == pair[1].whole_range.start)
+        );
+    }
+
+    #[test]
+    fn overscanned_window_tracks_viewport_size_and_document_edges() {
+        assert_eq!(
+            overscanned_point_range(
+                Point::new(200, 3)..Point::new(220, 8),
+                Point::new(1_000, 12),
+                64,
+            ),
+            Point::new(136, 0)..Point::new(285, 0)
+        );
+        assert_eq!(
+            overscanned_point_range(
+                Point::new(240, 0)..Point::new(250, 12),
+                Point::new(250, 12),
+                64,
+            ),
+            Point::new(176, 0)..Point::new(250, 12)
+        );
+        assert_eq!(
+            overscanned_point_range(Point::new(0, 0)..Point::new(0, 0), Point::new(0, 100), 64,),
+            Point::new(0, 0)..Point::new(0, 100)
+        );
+    }
+
+    #[test]
+    fn ten_thousand_items_keep_native_headers_viewport_bounded() {
+        let segments = (0..10_000)
+            .map(|item_index| {
+                let start = item_index * 20;
+                segment(
+                    item_index,
+                    start..start + 20,
+                    start..start + 6,
+                    start + 8..start + 18,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let early = header_segments_intersecting(&segments, &(2_000..3_000));
+        let late = header_segments_intersecting(&segments, &(160_000..161_000));
+        assert_eq!(early, 100..150);
+        assert_eq!(late, 8_000..8_050);
+        assert!(early.len() < 100);
+        assert!(late.len() < 100);
+
+        let mut appended = segments.clone();
+        appended.push(segment(
+            10_000,
+            200_000..200_020,
+            200_000..200_006,
+            200_008..200_018,
+        ));
+        assert_eq!(
+            header_segments_intersecting(&appended, &(160_000..161_000)),
+            late
+        );
+    }
+
+    #[test]
+    fn ten_thousand_diff_bodies_keep_parsing_viewport_bounded() {
+        const ITEM_BYTES: usize = 64;
+        let segments = (0..10_000)
+            .map(|item_index| {
+                let start = item_index * ITEM_BYTES;
+                segment_with_kind(
+                    item_index,
+                    TranscriptKind::Diff,
+                    start..start + ITEM_BYTES,
+                    start..start + 8,
+                    start + 10..start + 62,
+                )
+            })
+            .collect::<Vec<_>>();
+        let viewport = 8_000 * ITEM_BYTES..8_050 * ITEM_BYTES;
+
+        let body_ranges = visible_diff_body_ranges(&segments, &viewport);
+        let parsed_bytes = body_ranges.iter().map(Range::len).sum::<usize>();
+
+        assert_eq!(body_ranges.len(), 50);
+        assert_eq!(parsed_bytes, 50 * 52);
+        assert!(body_ranges.iter().all(|range| {
+            viewport.start <= range.start && range.end <= viewport.end && range.len() <= ITEM_BYTES
+        }));
+        assert!(parsed_bytes < 10_000 * ITEM_BYTES / 100);
+
+        let mut mixed = segments;
+        mixed[8_025].kind = TranscriptKind::Agent;
+        assert_eq!(visible_diff_body_ranges(&mixed, &viewport).len(), 49);
+    }
+
+    #[test]
+    fn viewport_shift_retains_overlapping_header_block_positions() {
+        let (remove, insert) = header_window_delta(8_000..8_050, 8_025..8_075);
+
+        assert_eq!(remove, (8_000..8_025).collect::<Vec<_>>());
+        assert_eq!(insert, (8_050..8_075).collect::<Vec<_>>());
+        assert!(
+            (8_025..8_050)
+                .all(|position| { !remove.contains(&position) && !insert.contains(&position) })
+        );
+    }
+
+    #[test]
+    fn append_and_stream_updates_do_not_churn_stable_viewport_headers() {
+        let mounted = [100, 101, 102, 103];
+
+        assert_eq!(
+            header_window_delta(mounted, 100..104),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            header_window_delta(mounted, 100..105),
+            (Vec::new(), vec![104])
+        );
+    }
+
+    #[test]
+    fn body_streaming_keeps_header_window_identity_stable() {
+        let mut segments = vec![
+            segment(0, 0..1_000, 0..10, 12..998),
+            segment(1, 1_000..1_200, 1_000..1_010, 1_012..1_198),
+        ];
+        let before = header_segments_intersecting(&segments, &(950..1_100));
+        let longer_first = segment(0, 0..1_100, 0..10, 12..1_098);
+        assert!(apply_projected_segment_shape(
+            &mut segments,
+            0,
+            &longer_first
+        ));
+        let after = header_segments_intersecting(&segments, &(1_050..1_200));
+
+        assert_eq!(before, 1..2);
+        assert_eq!(after, before);
+        assert_eq!(segments[1].header_range, 1_100..1_110);
+    }
+
+    #[test]
+    fn row_highlights_are_clipped_even_for_one_huge_item() {
+        assert_eq!(
+            intersect_ranges(&(0..100_000), &(50_000..50_200)),
+            Some(50_000..50_200)
+        );
+        assert_eq!(intersect_ranges(&(0..10), &(20..30)), None);
+
+        let segments = [segment(0, 0..100_000, 0..10, 12..99_998)];
+        assert_eq!(segments_intersecting(&segments, &(50_000..50_200)), 0..1);
+    }
+}

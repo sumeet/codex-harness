@@ -385,7 +385,18 @@ pub mod toast {
 }
 
 pub mod command_palette {
-    use gpui::actions;
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    /// Opens the command palette with the given query.
+    #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
+    #[action(namespace = command_palette)]
+    #[serde(deny_unknown_fields)]
+    pub struct OpenWithQuery {
+        /// The initial command palette query.
+        pub query: String,
+    }
 
     actions!(
         command_palette,
@@ -394,6 +405,20 @@ pub mod command_palette {
             Toggle,
         ]
     );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn open_with_query_keeps_command_palette_action_identity() {
+            let action = OpenWithQuery {
+                query: "write".to_owned(),
+            };
+
+            assert_eq!(action.name(), "command_palette::OpenWithQuery");
+        }
+    }
 }
 
 pub mod text_finder {

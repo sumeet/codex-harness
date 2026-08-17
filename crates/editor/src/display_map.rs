@@ -279,9 +279,9 @@ impl Companion {
         bounds: Range<MultiBufferPoint>,
     ) -> Vec<CompanionExcerptPatch> {
         if self.is_rhs(display_map_id) {
-            crate::split::patches_for_rhs_range(companion_snapshot, our_snapshot, bounds)
+            crate::split_patches::patches_for_rhs_range(companion_snapshot, our_snapshot, bounds)
         } else {
-            crate::split::patches_for_lhs_range(companion_snapshot, our_snapshot, bounds)
+            crate::split_patches::patches_for_lhs_range(companion_snapshot, our_snapshot, bounds)
         }
     }
 
@@ -293,9 +293,17 @@ impl Companion {
         point: MultiBufferPoint,
     ) -> Range<MultiBufferPoint> {
         let patches = if self.is_rhs(display_map_id) {
-            crate::split::patches_for_lhs_range(our_snapshot, companion_snapshot, point..point)
+            crate::split_patches::patches_for_lhs_range(
+                our_snapshot,
+                companion_snapshot,
+                point..point,
+            )
         } else {
-            crate::split::patches_for_rhs_range(our_snapshot, companion_snapshot, point..point)
+            crate::split_patches::patches_for_rhs_range(
+                our_snapshot,
+                companion_snapshot,
+                point..point,
+            )
         };
 
         let Some(excerpt) = patches.into_iter().next() else {
@@ -318,9 +326,17 @@ impl Companion {
         point: MultiBufferPoint,
     ) -> Range<MultiBufferPoint> {
         let patches = if self.is_rhs(display_map_id) {
-            crate::split::patches_for_rhs_range(companion_snapshot, our_snapshot, point..point)
+            crate::split_patches::patches_for_rhs_range(
+                companion_snapshot,
+                our_snapshot,
+                point..point,
+            )
         } else {
-            crate::split::patches_for_lhs_range(companion_snapshot, our_snapshot, point..point)
+            crate::split_patches::patches_for_lhs_range(
+                companion_snapshot,
+                our_snapshot,
+                point..point,
+            )
         };
 
         let Some(excerpt) = patches.into_iter().next() else {

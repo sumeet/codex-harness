@@ -37,6 +37,7 @@ use zed_actions::{
 use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
+use crate::codex_harness::CodexHarness;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
@@ -127,6 +128,12 @@ const KNOWN_TERMINAL_AGENT_COMMANDS: &[&str] = &[
     "pi",
     "qwen",
 ];
+
+fn harness_default_agent() -> Option<Agent> {
+    std::env::var_os("HARNESS_CODEX_MODE")
+        .is_some()
+        .then(|| Agent::from(AgentId::new("codex-acp")))
+}
 
 fn is_known_terminal_agent_command(command: &str) -> bool {
     KNOWN_TERMINAL_AGENT_COMMANDS.contains(&command)
@@ -1161,6 +1168,7 @@ pub struct AgentPanel {
     thread_store: Entity<ThreadStore>,
     connection_store: Entity<AgentConnectionStore>,
     context_server_registry: Entity<ContextServerRegistry>,
+    codex_harness: Entity<CodexHarness>,
     focus_handle: FocusHandle,
     base_view: BaseView,
     last_created_entry_kind: AgentPanelEntryKind,
@@ -1406,6 +1414,7 @@ impl AgentPanel {
 
                 panel.update(cx, |panel, cx| {
                     let is_via_collab = panel.project.read(cx).is_via_collab();
+                    let is_harness_codex_mode = harness_default_agent().is_some();
                     // Collab workspaces only support NativeAgent; clamp any
                     // non-native choice so `set_active` can't bypass the
                     // collab guard in `external_thread`.
@@ -1419,10 +1428,12 @@ impl AgentPanel {
                     let global_fallback =
                         global_last_used_agent.filter(|agent| !is_via_collab || agent.is_native());
 
-                    if let Some(serialized_panel) = &serialized_panel {
-                        panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
-                    } else if let Some(entry_kind) = global_last_created_entry_kind {
-                        panel.last_created_entry_kind = entry_kind;
+                    if !is_harness_codex_mode {
+                        if let Some(serialized_panel) = &serialized_panel {
+                            panel.last_created_entry_kind = serialized_panel.last_created_entry_kind;
+                        } else if let Some(entry_kind) = global_last_created_entry_kind {
+                            panel.last_created_entry_kind = entry_kind;
+                        }
                     }
 
                     // The thread being restored may have been bound to an
@@ -1432,45 +1443,49 @@ impl AgentPanel {
                     // so the draft survives reload bound to the right
                     // backend; otherwise fall back to the serialized
                     // selection, then the global last-used agent.
-                    let initial_agent = match &thread_to_restore {
-                        Some((info, _)) => Some(clamp(info.agent_type.clone())),
-                        None => serialized_panel
-                            .as_ref()
-                            .and_then(|p| p.selected_agent.clone())
-                            .map(clamp)
-                            .or(global_fallback),
-                    };
+                    let initial_agent = harness_default_agent().or_else(|| {
+                        match &thread_to_restore {
+                            Some((info, _)) => Some(clamp(info.agent_type.clone())),
+                            None => serialized_panel
+                                .as_ref()
+                                .and_then(|p| p.selected_agent.clone())
+                                .map(clamp)
+                                .or(global_fallback),
+                        }
+                    });
                     if let Some(agent) = initial_agent {
                         panel.selected_agent = agent;
                     }
 
-                    if let Some(metadata) = terminal_to_restore {
-                        panel.restore_terminal_for_panel_load(
-                            metadata,
-                            false,
-                            AgentThreadSource::AgentPanel,
-                            Some(workspace),
-                            window,
-                            cx,
-                        );
-                    } else if let Some((info, thread_id)) = thread_to_restore {
-                        let agent = panel.selected_agent.clone();
-                        panel.load_agent_thread(
-                            agent,
-                            thread_id,
-                            info.work_dirs.as_ref().map(PathList::deserialize),
-                            info.title.clone().map(Into::into),
-                            false,
-                            AgentThreadSource::AgentPanel,
-                            window,
-                            cx,
-                        );
-                    }
-                    if let Some(new_draft_thread_id) = serialized_panel
-                        .as_ref()
-                        .and_then(|p| p.new_draft_thread_id)
-                    {
-                        panel.restore_new_draft(new_draft_thread_id, window, cx);
+                    if !is_harness_codex_mode {
+                        if let Some(metadata) = terminal_to_restore {
+                            panel.restore_terminal_for_panel_load(
+                                metadata,
+                                false,
+                                AgentThreadSource::AgentPanel,
+                                Some(workspace),
+                                window,
+                                cx,
+                            );
+                        } else if let Some((info, thread_id)) = thread_to_restore {
+                            let agent = panel.selected_agent.clone();
+                            panel.load_agent_thread(
+                                agent,
+                                thread_id,
+                                info.work_dirs.as_ref().map(PathList::deserialize),
+                                info.title.clone().map(Into::into),
+                                false,
+                                AgentThreadSource::AgentPanel,
+                                window,
+                                cx,
+                            );
+                        }
+                        if let Some(new_draft_thread_id) = serialized_panel
+                            .as_ref()
+                            .and_then(|p| p.new_draft_thread_id)
+                        {
+                            panel.restore_new_draft(new_draft_thread_id, window, cx);
+                        }
                     }
                     cx.notify();
                 });
@@ -1482,7 +1497,7 @@ impl AgentPanel {
         })
     }
 
-    pub(crate) fn new(workspace: &Workspace, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: &Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let fs = workspace.app_state().fs.clone();
         let user_store = workspace.app_state().user_store.clone();
         let project = workspace.project();
@@ -1493,8 +1508,28 @@ impl AgentPanel {
 
         let context_server_registry =
             cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
-
         let thread_store = ThreadStore::global(cx);
+        let cwd = project
+            .read(cx)
+            .visible_worktrees(cx)
+            .next()
+            .map(|worktree| worktree.read(cx).abs_path().to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        let codex_harness = cx.new(|cx| {
+            CodexHarness::new(
+                workspace.clone(),
+                project.downgrade(),
+                thread_store.clone(),
+                cwd,
+                window,
+                cx,
+            )
+        });
 
         let base_view = BaseView::Uninitialized;
 
@@ -1566,6 +1601,7 @@ impl AgentPanel {
             connection_store,
             focus_handle: cx.focus_handle(),
             context_server_registry,
+            codex_harness,
             draft_thread: None,
             retained_threads: HashMap::default(),
             terminals: HashMap::default(),
@@ -1579,7 +1615,7 @@ impl AgentPanel {
             pending_serialization: None,
             new_user_onboarding: onboarding,
             thread_store,
-            selected_agent: Agent::default(),
+            selected_agent: harness_default_agent().unwrap_or_default(),
             _thread_view_subscription: None,
             _active_thread_focus_subscription: None,
             new_user_onboarding_upsell_dismissed: AtomicBool::new(OnboardingUpsell::dismissed(cx)),
@@ -1774,6 +1810,13 @@ impl AgentPanel {
         cx: &mut Context<Self>,
     ) {
         if !self.has_open_project(cx) {
+            return;
+        }
+
+        if std::env::var_os("HARNESS_CODEX_MODE").is_some() {
+            self.codex_harness.update(cx, |harness, cx| {
+                harness.new_thread(window, cx);
+            });
             return;
         }
 
@@ -4633,8 +4676,10 @@ impl AgentPanel {
     }
 
     fn active_thread_has_messages(&self, cx: &App) -> bool {
-        self.active_agent_thread(cx)
-            .is_some_and(|thread| !thread.read(cx).entries().is_empty())
+        self.active_thread_view(cx).is_some_and(|view| {
+            let view = view.read(cx);
+            !view.thread.read(cx).entries().is_empty()
+        })
     }
 
     /// Whether the active view is in the **ephemeral** new-draft slot
@@ -4953,6 +4998,10 @@ impl Panel for AgentPanel {
     }
 
     fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if std::env::var_os("HARNESS_CODEX_MODE").is_some() {
+            return self.codex_harness.read(cx).composer_focus_handle(cx);
+        }
+
         match self.visible_surface() {
             VisibleSurface::Uninitialized => self.focus_handle.clone(),
             VisibleSurface::AgentThread(conversation_view) => {
@@ -6186,6 +6235,10 @@ impl AgentPanel {
     }
 
     fn should_render_new_user_onboarding(&mut self, cx: &mut Context<Self>) -> bool {
+        if std::env::var_os("HARNESS_CODEX_MODE").is_some() {
+            return false;
+        }
+
         if self
             .new_user_onboarding_upsell_dismissed
             .load(Ordering::Acquire)
@@ -6431,6 +6484,13 @@ impl AgentPanel {
 
 impl Render for AgentPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::env::var_os("HARNESS_CODEX_MODE").is_some() {
+            return div()
+                .size_full()
+                .child(self.codex_harness.clone())
+                .into_any();
+        }
+
         // WARNING: Changes to this element hierarchy can have
         // non-obvious implications to the layout of children.
         //

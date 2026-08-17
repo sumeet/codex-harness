@@ -1,43 +1,75 @@
+#[cfg(feature = "workspace-integration")]
+use crate::VimAddon;
+#[cfg(feature = "workspace-integration")]
 use crate::command::command_interceptor;
 use crate::motion::MotionKind;
 use crate::normal::repeat::Replayer;
 use crate::surrounds::SurroundsType;
-use crate::{ToggleMarksView, ToggleRegistersView, UseSystemClipboard, Vim, VimAddon, VimSettings};
+#[cfg(feature = "workspace-integration")]
+use crate::{ToggleMarksView, ToggleRegistersView};
+use crate::{UseSystemClipboard, Vim, VimSettings};
 use crate::{motion::Motion, object::Object};
+#[cfg(feature = "workspace-integration")]
 use anyhow::Result;
 use collections::HashMap;
+#[cfg(feature = "workspace-integration")]
 use command_palette_hooks::{CommandPaletteFilter, GlobalCommandPaletteInterceptor};
+#[cfg(feature = "workspace-integration")]
 use db::{
     sqlez::{domain::Domain, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
+#[cfg(feature = "workspace-integration")]
+use editor::MultiBuffer;
+#[cfg(feature = "workspace-integration")]
+use editor::ToPoint as EditorToPoint;
+#[cfg(feature = "workspace-integration")]
 use editor::display_map::{is_invisible, replacement};
-use editor::{Anchor, ClipboardSelection, Editor, MultiBuffer, ToPoint as EditorToPoint};
+use editor::{Anchor, ClipboardSelection, Editor};
+#[cfg(feature = "workspace-integration")]
+use gpui::AppContext;
 use gpui::{
-    Action, App, AppContext, BorrowAppContext, ClipboardEntry, ClipboardItem, DismissEvent, Entity,
-    EntityId, Global, HighlightStyle, StyledText, Subscription, Task, TaskExt, TextStyle,
-    WeakEntity,
+    Action, App, BorrowAppContext, ClipboardEntry, ClipboardItem, Entity, Global, WeakEntity,
 };
-use language::{Buffer, BufferEvent, BufferId, Chunk, LanguageAwareStyling, Point};
+#[cfg(feature = "workspace-integration")]
+use gpui::{DismissEvent, HighlightStyle, StyledText, Task, TextStyle};
+#[cfg(feature = "workspace-integration")]
+use gpui::{EntityId, Subscription, TaskExt};
+#[cfg(feature = "workspace-integration")]
+use language::{Buffer, BufferEvent, BufferId, Point};
+#[cfg(feature = "workspace-integration")]
+use language::{Chunk, LanguageAwareStyling};
 
+#[cfg(feature = "workspace-integration")]
 use multi_buffer::MultiBufferRow;
+#[cfg(feature = "workspace-integration")]
 use picker::{Picker, PickerDelegate};
+#[cfg(feature = "workspace-integration")]
 use project::{Project, ProjectItem, ProjectPath};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
 use std::borrow::BorrowMut;
+#[cfg(feature = "workspace-integration")]
 use std::collections::HashSet;
+#[cfg(feature = "workspace-integration")]
 use std::path::Path;
 use std::{fmt::Display, ops::Range, sync::Arc};
+#[cfg(feature = "workspace-integration")]
 use text::{Bias, ToPoint};
+#[cfg(feature = "workspace-integration")]
 use theme_settings::ThemeSettings;
+#[cfg(feature = "workspace-integration")]
 use ui::{
-    ActiveTheme, Context, Div, FluentBuilder, KeyBinding, ParentElement, SharedString, Styled,
-    StyledTypography, Window, h_flex, rems,
+    ActiveTheme, Div, FluentBuilder, ParentElement, Styled, StyledTypography, Window, h_flex, rems,
 };
+use ui::{Context, KeyBinding, SharedString};
+#[cfg(feature = "workspace-integration")]
 use util::ResultExt;
+#[cfg(feature = "workspace-integration")]
 use util::rel_path::RelPath;
+#[cfg(any(feature = "workspace-integration", test))]
 use workspace::searchable::Direction;
+#[cfg(feature = "workspace-integration")]
 use workspace::{MultiWorkspace, Workspace, WorkspaceDb, WorkspaceId};
 
 #[derive(Clone, Copy, Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -285,9 +317,11 @@ pub struct VimGlobals {
 
     pub focused_vim: Option<WeakEntity<Vim>>,
 
+    #[cfg(feature = "workspace-integration")]
     pub marks: HashMap<EntityId, Entity<MarksState>>,
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct MarksState {
     workspace: WeakEntity<Workspace>,
 
@@ -301,6 +335,7 @@ pub struct MarksState {
     _subscription: Subscription,
 }
 
+#[cfg(feature = "workspace-integration")]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum MarkLocation {
     Buffer(EntityId),
@@ -309,10 +344,13 @@ pub enum MarkLocation {
 
 pub enum Mark {
     Local(Vec<Anchor>),
+    #[cfg(feature = "workspace-integration")]
     Buffer(EntityId, Vec<Anchor>),
+    #[cfg(feature = "workspace-integration")]
     Path(Arc<Path>, Vec<Point>),
 }
 
+#[cfg(feature = "workspace-integration")]
 impl MarksState {
     pub fn new(workspace: &Workspace, cx: &mut App) -> Entity<MarksState> {
         cx.new(|cx| {
@@ -764,11 +802,13 @@ impl VimGlobals {
         })
         .detach();
 
+        #[cfg(feature = "workspace-integration")]
         cx.observe_new(|workspace: &mut Workspace, window, _| {
             RegistersView::register(workspace, window);
         })
         .detach();
 
+        #[cfg(feature = "workspace-integration")]
         cx.observe_new(move |workspace: &mut Workspace, window, _| {
             MarksView::register(workspace, window);
         })
@@ -784,41 +824,52 @@ impl VimGlobals {
             was_enabled = Some(is_enabled);
             if is_enabled {
                 KeyBinding::set_vim_mode(cx, true);
-                CommandPaletteFilter::update_global(cx, |filter, _| {
-                    filter.show_namespace(Vim::NAMESPACE);
-                });
-                GlobalCommandPaletteInterceptor::set(cx, command_interceptor);
-                for window in cx.windows() {
-                    if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
-                        multi_workspace
-                            .update(cx, |multi_workspace, _, cx| {
-                                for workspace in multi_workspace.workspaces() {
-                                    workspace.update(cx, |workspace, cx| {
-                                        Vim::update_globals(cx, |globals, cx| {
-                                            globals.register_workspace(workspace, cx)
+                #[cfg(feature = "workspace-integration")]
+                {
+                    CommandPaletteFilter::update_global(cx, |filter, _| {
+                        filter.show_namespace(Vim::NAMESPACE);
+                    });
+                    GlobalCommandPaletteInterceptor::set(cx, command_interceptor);
+                }
+                #[cfg(feature = "workspace-integration")]
+                {
+                    for window in cx.windows() {
+                        if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
+                            multi_workspace
+                                .update(cx, |multi_workspace, _, cx| {
+                                    for workspace in multi_workspace.workspaces() {
+                                        workspace.update(cx, |workspace, cx| {
+                                            Vim::update_globals(cx, |globals, cx| {
+                                                globals.register_workspace(workspace, cx)
+                                            });
                                         });
-                                    });
-                                }
-                            })
-                            .ok();
+                                    }
+                                })
+                                .ok();
+                        }
                     }
                 }
             } else {
                 KeyBinding::set_vim_mode(cx, false);
                 *Vim::globals(cx) = VimGlobals::default();
-                GlobalCommandPaletteInterceptor::clear(cx);
-                CommandPaletteFilter::update_global(cx, |filter, _| {
-                    filter.hide_namespace(Vim::NAMESPACE);
-                });
+                #[cfg(feature = "workspace-integration")]
+                {
+                    GlobalCommandPaletteInterceptor::clear(cx);
+                    CommandPaletteFilter::update_global(cx, |filter, _| {
+                        filter.hide_namespace(Vim::NAMESPACE);
+                    });
+                }
             }
         })
         .detach();
+        #[cfg(feature = "workspace-integration")]
         cx.observe_new(|workspace: &mut Workspace, _, cx| {
             Vim::update_globals(cx, |globals, cx| globals.register_workspace(workspace, cx));
         })
         .detach()
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn register_workspace(&mut self, workspace: &Workspace, cx: &mut Context<Workspace>) {
         let entity_id = cx.entity_id();
         self.marks.insert(entity_id, MarksState::new(workspace, cx));
@@ -1058,15 +1109,19 @@ impl Clone for ReplayableAction {
     }
 }
 
+#[cfg(any(feature = "workspace-integration", test))]
 #[derive(Default, Debug)]
 pub struct SearchState {
     pub direction: Direction,
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub count: usize,
     pub cmd_f_search: bool,
 
     pub prior_selections: Vec<Range<Anchor>>,
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub prior_operator: Option<Operator>,
     pub prior_mode: Mode,
+    #[cfg_attr(not(feature = "workspace-integration"), allow(dead_code))]
     pub helix_select: bool,
     pub _dismiss_subscription: Option<gpui::Subscription>,
 }
@@ -1251,16 +1306,19 @@ impl Operator {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 struct RegisterMatch {
     name: char,
     contents: SharedString,
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct RegistersViewDelegate {
     selected_index: usize,
     matches: Vec<RegisterMatch>,
 }
 
+#[cfg(feature = "workspace-integration")]
 impl PickerDelegate for RegistersViewDelegate {
     type ListItem = Div;
 
@@ -1373,8 +1431,10 @@ impl PickerDelegate for RegistersViewDelegate {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct RegistersView {}
 
+#[cfg(feature = "workspace-integration")]
 impl RegistersView {
     fn register(workspace: &mut Workspace, _window: Option<&mut Window>) {
         workspace.register_action(|workspace, _: &ToggleRegistersView, window, cx| {
@@ -1437,6 +1497,7 @@ impl RegistersView {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 enum MarksMatchInfo {
     Path(Arc<Path>),
     Title(String),
@@ -1446,6 +1507,7 @@ enum MarksMatchInfo {
     },
 }
 
+#[cfg(feature = "workspace-integration")]
 impl MarksMatchInfo {
     fn from_chunks<'a>(chunks: impl Iterator<Item = Chunk<'a>>, cx: &App) -> Self {
         let mut line = String::new();
@@ -1464,12 +1526,14 @@ impl MarksMatchInfo {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 struct MarksMatch {
     name: String,
     position: Point,
     info: MarksMatchInfo,
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct MarksViewDelegate {
     selected_index: usize,
     matches: Vec<MarksMatch>,
@@ -1477,6 +1541,7 @@ pub struct MarksViewDelegate {
     workspace: WeakEntity<Workspace>,
 }
 
+#[cfg(feature = "workspace-integration")]
 impl PickerDelegate for MarksViewDelegate {
     type ListItem = Div;
 
@@ -1770,8 +1835,10 @@ impl PickerDelegate for MarksViewDelegate {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct MarksView {}
 
+#[cfg(feature = "workspace-integration")]
 impl MarksView {
     fn register(workspace: &mut Workspace, _window: Option<&mut Window>) {
         workspace.register_action(|workspace, _: &ToggleMarksView, window, cx| {
@@ -1802,8 +1869,10 @@ impl MarksView {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 pub struct VimDb(ThreadSafeConnection);
 
+#[cfg(feature = "workspace-integration")]
 impl Domain for VimDb {
     const NAME: &str = stringify!(VimDb);
 
@@ -1829,14 +1898,17 @@ impl Domain for VimDb {
     ];
 }
 
+#[cfg(feature = "workspace-integration")]
 db::static_connection!(VimDb, [WorkspaceDb]);
 
+#[cfg(feature = "workspace-integration")]
 struct SerializedMark {
     path: Arc<Path>,
     name: String,
     points: Vec<Point>,
 }
 
+#[cfg(feature = "workspace-integration")]
 impl VimDb {
     pub(crate) async fn set_marks(
         &self,

@@ -31,11 +31,13 @@ members = [
     "crates/cloud_api_client",
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
+    "crates/codex_app_server_client",
     "crates/codestral",
     "crates/collab",
     "crates/collab_ui",
     "crates/collections",
     "crates/command_palette",
+    "crates/command_palette_core",
     "crates/command_palette_hooks",
     "crates/component",
     "crates/component_preview",
@@ -87,6 +89,9 @@ members = [
     "crates/git_hosting_providers",
     "crates/git_ui",
     "crates/git_ui_core",
+    "crates/harness_app",
+    "crates/harness_editor",
+    "crates/harness_protocol",
     "crates/go_to_line",
     "crates/google_ai",
     "crates/grammars",
@@ -302,10 +307,15 @@ clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
+codex_app_server_client = { path = "crates/codex_app_server_client" }
+harness_app = { path = "crates/harness_app" }
+harness_editor = { path = "crates/harness_editor" }
+harness_protocol = { path = "crates/harness_protocol" }
 collab = { path = "crates/collab" }
 collab_ui = { path = "crates/collab_ui" }
 collections = { path = "crates/collections", version = "0.1.0" }
 command_palette = { path = "crates/command_palette" }
+command_palette_core = { path = "crates/command_palette_core" }
 command_palette_hooks = { path = "crates/command_palette_hooks" }
 compliance = { path = "tooling/compliance" }
 component = { path = "crates/component" }
@@ -1028,6 +1038,7 @@ assets = { codegen-units = 1 }
 breadcrumbs = { codegen-units = 1 }
 collections = { codegen-units = 1 }
 command_palette = { codegen-units = 1 }
+command_palette_core = { codegen-units = 1 }
 command_palette_hooks = { codegen-units = 1 }
 feature_flags = { codegen-units = 1 }
 file_icons = { codegen-units = 1 }

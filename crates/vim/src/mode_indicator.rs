@@ -1,8 +1,9 @@
 use gpui::{
     App, Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div,
 };
-use ui::text_for_keystrokes;
-use workspace::{HideStatusItem, StatusItemView, item::ItemHandle, ui::prelude::*};
+use ui::{prelude::*, text_for_keystrokes};
+#[cfg(feature = "workspace-integration")]
+use workspace::{HideStatusItem, StatusItemView, item::ItemHandle};
 
 use crate::{Vim, VimEvent, VimGlobals};
 
@@ -180,6 +181,7 @@ impl Render for ModeIndicator {
     }
 }
 
+#[cfg(feature = "workspace-integration")]
 impl StatusItemView for ModeIndicator {
     fn set_active_pane_item(
         &mut self,

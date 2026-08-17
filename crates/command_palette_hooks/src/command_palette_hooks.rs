@@ -6,8 +6,7 @@ use std::{any::TypeId, rc::Rc};
 
 use collections::{HashSet, TypeIdHashSet};
 use derive_more::{Deref, DerefMut};
-use gpui::{Action, App, BorrowAppContext, Global, Task, WeakEntity};
-use workspace::Workspace;
+use gpui::{Action, App, BorrowAppContext, Global, Task};
 
 /// Initializes the command palette hooks.
 pub fn init(cx: &mut App) {
@@ -113,10 +112,55 @@ pub struct CommandInterceptResult {
     pub exclusive: bool,
 }
 
+/// Provides asynchronous filename completions for a command palette invocation.
+#[derive(Clone)]
+pub struct FilenameCompletionProvider(Rc<dyn Fn(&str, &mut App) -> Task<Vec<String>>>);
+
+impl FilenameCompletionProvider {
+    /// Creates a filename completion provider.
+    pub fn new(provider: impl Fn(&str, &mut App) -> Task<Vec<String>> + 'static) -> Self {
+        Self(Rc::new(provider))
+    }
+
+    fn complete(&self, query: &str, cx: &mut App) -> Task<Vec<String>> {
+        (self.0)(query, cx)
+    }
+}
+
+/// Host-provided services available while intercepting a command palette query.
+///
+/// The context is created for each command palette invocation so interceptors do
+/// not need to depend on a particular application host, workspace, or project.
+#[derive(Clone, Default)]
+pub struct CommandPaletteInvocationContext {
+    filename_completion_provider: Option<FilenameCompletionProvider>,
+}
+
+impl CommandPaletteInvocationContext {
+    /// Adds a filename completion provider to this invocation.
+    pub fn with_filename_completion_provider(
+        mut self,
+        provider: FilenameCompletionProvider,
+    ) -> Self {
+        self.filename_completion_provider = Some(provider);
+        self
+    }
+
+    /// Returns asynchronous filename completions for the given query.
+    ///
+    /// Hosts that do not provide filename completion return no candidates.
+    pub fn complete_filename(&self, query: &str, cx: &mut App) -> Task<Vec<String>> {
+        self.filename_completion_provider
+            .as_ref()
+            .map(|provider| provider.complete(query, cx))
+            .unwrap_or_else(|| Task::ready(Vec::new()))
+    }
+}
+
 /// An interceptor for the command palette.
 #[derive(Clone)]
 pub struct GlobalCommandPaletteInterceptor(
-    Rc<dyn Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>>,
+    Rc<dyn Fn(&str, &CommandPaletteInvocationContext, &mut App) -> Task<CommandInterceptResult>>,
 );
 
 impl Global for GlobalCommandPaletteInterceptor {}
@@ -127,7 +171,11 @@ impl GlobalCommandPaletteInterceptor {
     /// This will override the previous interceptor, if it exists.
     pub fn set(
         cx: &mut App,
-        interceptor: impl Fn(&str, WeakEntity<Workspace>, &mut App) -> Task<CommandInterceptResult>
+        interceptor: impl Fn(
+            &str,
+            &CommandPaletteInvocationContext,
+            &mut App,
+        ) -> Task<CommandInterceptResult>
         + 'static,
     ) {
         cx.set_global(Self(Rc::new(interceptor)));
@@ -143,11 +191,51 @@ impl GlobalCommandPaletteInterceptor {
     /// Intercepts the given query from the command palette.
     pub fn intercept(
         query: &str,
-        workspace: WeakEntity<Workspace>,
+        invocation_context: &CommandPaletteInvocationContext,
         cx: &mut App,
     ) -> Option<Task<CommandInterceptResult>> {
         let interceptor = cx.try_global::<Self>()?;
         let handler = interceptor.0.clone();
-        Some(handler(query, workspace, cx))
+        Some(handler(query, invocation_context, cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use gpui::TestAppContext;
+
+    use super::*;
+
+    #[gpui::test]
+    async fn invocation_context_uses_host_filename_provider(cx: &mut TestAppContext) {
+        let queries = Rc::new(RefCell::new(Vec::new()));
+        let provider_queries = queries.clone();
+        let context = CommandPaletteInvocationContext::default().with_filename_completion_provider(
+            FilenameCompletionProvider::new(move |query, _| {
+                provider_queries.borrow_mut().push(query.to_owned());
+                Task::ready(vec![format!("{query}.rs")])
+            }),
+        );
+
+        let completions = cx
+            .update(|cx| context.complete_filename("src/main", cx))
+            .await;
+
+        assert_eq!(&*queries.borrow(), &["src/main".to_owned()]);
+        assert_eq!(completions, ["src/main.rs".to_owned()]);
+    }
+
+    #[gpui::test]
+    async fn invocation_context_without_provider_has_no_filename_completions(
+        cx: &mut TestAppContext,
+    ) {
+        let context = CommandPaletteInvocationContext::default();
+        let completions = cx
+            .update(|cx| context.complete_filename("src/main", cx))
+            .await;
+
+        assert!(completions.is_empty());
     }
 }

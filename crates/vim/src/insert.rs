@@ -1,11 +1,10 @@
 use crate::{Vim, state::Mode};
-use editor::{Bias, Editor};
+use editor::{Bias, Direction, Editor};
 use gpui::{Action, Context, Window, actions};
 use language::SelectionGoal;
 use settings::Settings;
 use text::Point;
 use vim_mode_setting::HelixModeSetting;
-use workspace::searchable::Direction;
 
 actions!(
     vim,

@@ -633,11 +633,7 @@ impl Editor {
             |s| {
                 s.move_with(&mut |map, selection| {
                     selection.collapse_to(
-                        movement::comment_paragraph(
-                            map,
-                            selection.head(),
-                            workspace::searchable::Direction::Next,
-                        ),
+                        movement::comment_paragraph(map, selection.head(), Direction::Next),
                         SelectionGoal::None,
                     )
                 });
@@ -664,11 +660,7 @@ impl Editor {
             |s| {
                 s.move_with(&mut |map, selection| {
                     selection.collapse_to(
-                        movement::comment_paragraph(
-                            map,
-                            selection.head(),
-                            workspace::searchable::Direction::Prev,
-                        ),
+                        movement::comment_paragraph(map, selection.head(), Direction::Prev),
                         SelectionGoal::None,
                     )
                 });
@@ -729,11 +721,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::start_of_excerpt(
-                        map,
-                        selection.head(),
-                        workspace::searchable::Direction::Prev,
-                    ),
+                    movement::start_of_excerpt(map, selection.head(), Direction::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -754,11 +742,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::start_of_excerpt(
-                        map,
-                        selection.head(),
-                        workspace::searchable::Direction::Next,
-                    ),
+                    movement::start_of_excerpt(map, selection.head(), Direction::Next),
                     SelectionGoal::None,
                 )
             });
@@ -778,11 +762,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::end_of_excerpt(
-                        map,
-                        selection.head(),
-                        workspace::searchable::Direction::Next,
-                    ),
+                    movement::end_of_excerpt(map, selection.head(), Direction::Next),
                     SelectionGoal::None,
                 )
             });
@@ -802,11 +782,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::end_of_excerpt(
-                        map,
-                        selection.head(),
-                        workspace::searchable::Direction::Prev,
-                    ),
+                    movement::end_of_excerpt(map, selection.head(), Direction::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -826,7 +802,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::start_of_excerpt(map, head, workspace::searchable::Direction::Prev),
+                    movement::start_of_excerpt(map, head, Direction::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -846,7 +822,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::start_of_excerpt(map, head, workspace::searchable::Direction::Next),
+                    movement::start_of_excerpt(map, head, Direction::Next),
                     SelectionGoal::None,
                 )
             });
@@ -866,7 +842,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::end_of_excerpt(map, head, workspace::searchable::Direction::Next),
+                    movement::end_of_excerpt(map, head, Direction::Next),
                     SelectionGoal::None,
                 )
             });
@@ -886,7 +862,7 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, _| {
                 (
-                    movement::end_of_excerpt(map, head, workspace::searchable::Direction::Prev),
+                    movement::end_of_excerpt(map, head, Direction::Prev),
                     SelectionGoal::None,
                 )
             });
@@ -932,6 +908,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn set_nav_history(&mut self, nav_history: Option<ItemNavHistory>) {
         self.nav_history = nav_history;
     }
@@ -1166,6 +1143,7 @@ impl Editor {
         url_finder.detach();
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn open_selected_filename(
         &mut self,
         _: &OpenSelectedFilename,
@@ -1216,8 +1194,12 @@ impl Editor {
         let multi_buffer = self.buffer.read(cx);
 
         let (buffer, text_head) = multi_buffer.text_anchor_for_position(head, cx)?;
+        #[cfg(feature = "workspace-integration")]
         let workspace = self.workspace()?;
+        #[cfg(feature = "workspace-integration")]
         let project = workspace.read(cx).project().clone();
+        #[cfg(not(feature = "workspace-integration"))]
+        let project = self.project.clone()?;
         let references =
             project.update(cx, |project, cx| project.references(&buffer, text_head, cx));
         Some(cx.spawn_in(window, async move |editor, cx| -> Result<()> {
@@ -1360,6 +1342,7 @@ impl Editor {
         Some(cx.spawn(async move |_, _| Ok(references.await?.unwrap_or_default())))
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn find_all_references(
         &mut self,
         action: &FindAllReferences,
@@ -1535,6 +1518,17 @@ impl Editor {
         }))
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn find_all_references(
+        &mut self,
+        _: &FindAllReferences,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Task<Result<Navigated>>> {
+        None
+    }
+
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn navigation_entry(
         &self,
         cursor_anchor: Anchor,
@@ -1547,6 +1541,16 @@ impl Editor {
         Some(history.navigation_entry(Some(Arc::new(data) as Arc<dyn Any + Send + Sync>)))
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    pub(super) fn navigation_entry(
+        &self,
+        _: Anchor,
+        _: &mut Context<Self>,
+    ) -> Option<NavigationEntry> {
+        None
+    }
+
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn push_to_nav_history(
         &mut self,
         cursor_anchor: Anchor,
@@ -1571,6 +1575,82 @@ impl Editor {
                 is_deactivate,
             })
         }
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    pub(super) fn push_to_nav_history(
+        &mut self,
+        cursor_anchor: Anchor,
+        new_position: Option<Point>,
+        is_deactivate: bool,
+        always: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        if let Some(new_position) = new_position {
+            let cursor_position = cursor_anchor.to_point(&snapshot);
+            let row_delta = (new_position.row as i64 - cursor_position.row as i64).abs();
+            if row_delta == 0 || (row_delta < MIN_NAVIGATION_HISTORY_ROW_DELTA && !always) {
+                return;
+            }
+        }
+
+        self.local_navigation_history.push(cursor_anchor);
+        cx.emit(EditorEvent::PushedToNavHistory {
+            anchor: cursor_anchor,
+            is_deactivate,
+        });
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn local_navigation_back(
+        &mut self,
+        _: &LocalNavigationBack,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_local_history(Direction::Prev, window, cx);
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn local_navigation_forward(
+        &mut self,
+        _: &LocalNavigationForward,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigate_local_history(Direction::Next, window, cx);
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn navigate_local_history(
+        &mut self,
+        direction: Direction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.selections.newest_anchor().head();
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let target = match direction {
+            Direction::Prev => self
+                .local_navigation_history
+                .backward(current, |anchor| anchor.is_valid(&snapshot)),
+            Direction::Next => self
+                .local_navigation_history
+                .forward(current, |anchor| anchor.is_valid(&snapshot)),
+        };
+        let Some(target) = target else {
+            return;
+        };
+
+        self.unfold_ranges(&[target..target], false, false, cx);
+        let autoscroll = Autoscroll::for_go_to_definition(self.cursor_top_offset(cx), cx);
+        self.change_selections(
+            SelectionEffects::scroll(autoscroll).nav_history(false),
+            window,
+            cx,
+            |selections| selections.select_anchor_ranges([target..target]),
+        );
     }
 
     pub(super) fn expand_excerpt(
@@ -1697,6 +1777,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub fn navigate_to_hover_links(
         &mut self,
         kind: Option<GotoDefinitionKind>,
@@ -2031,6 +2112,19 @@ impl Editor {
         })
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn navigate_to_hover_links(
+        &mut self,
+        _: Option<GotoDefinitionKind>,
+        _: Vec<HoverLink>,
+        _: Option<NavigationEntry>,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) -> Task<Result<Navigated>> {
+        Task::ready(Ok(Navigated::No))
+    }
+
     pub(super) fn go_to_next_reference(
         &mut self,
         _: &GoToNextReference,
@@ -2183,6 +2277,7 @@ impl Editor {
     }
 
     /// Opens a multibuffer with the given project locations in it.
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn open_locations_in_multibuffer(
         workspace: &mut Workspace,
         locations: std::collections::HashMap<Entity<Buffer>, Vec<Range<Point>>>,

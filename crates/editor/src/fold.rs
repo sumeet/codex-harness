@@ -803,6 +803,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn folds_did_change(&mut self, cx: &mut Context<Self>) {
         use text::ToOffset as _;
 
@@ -898,6 +899,9 @@ impl Editor {
         });
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    pub(super) fn folds_did_change(&mut self, _: &mut Context<Self>) {}
+
     pub(super) fn refresh_single_line_folds(
         &mut self,
         window: &mut Window,
@@ -976,6 +980,7 @@ impl Editor {
 
     /// Load folds from the file_folds database table by file path.
     /// Used when manually opening a file that was previously closed.
+    #[cfg(feature = "workspace-integration")]
     pub(super) fn load_folds_from_db(
         &mut self,
         workspace_id: WorkspaceId,

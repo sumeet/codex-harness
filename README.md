@@ -1,49 +1,107 @@
-# Zed
+# Codex Harness
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
+Codex Harness is a standalone, keyboard-first native client for
+`codex app-server`. It reuses Zed's real GPUI `Editor`, Vim implementation,
+theme tokens, and icon system without booting Zed's workspace, project UI,
+tabs, login shell, or IDE chrome.
 
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+The product target is one full-width transcript that looks like a rich GUI
+timeline while behaving like a native Vim buffer: character motions, visual
+selection, yank, search, folds, fast scrolling, and a real modal composer below
+the history.
 
----
+This is an active development checkpoint, not a finished release. The current
+tree includes the standalone app, direct App Server protocol client, segmented
+incremental transcript model, rich Editor decorations and supplemental views,
+and the ongoing extraction of Zed's command-palette behavior.
 
-### Installation
+## Build
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Install the normal Zed Linux build prerequisites, Rust through `rustup`, and a
+recent CMake. The repository pins its Rust toolchain. The `codex` executable
+must be installed and authenticated because Harness starts `codex app-server`
+locally.
 
-Other platforms are not yet available:
+Builds and launches are deliberately separate; launching never invokes Cargo:
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+```sh
+./script/build-standalone.sh
+./script/run-standalone.sh
+```
 
-### Developing Zed
+The build wrapper serializes Rust compilation, refuses to build when less than
+4 GiB of memory is available, and caps an individual compiler process. For an
+optimized non-LTO test build:
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+```sh
+HARNESS_PROFILE=release-fast ./script/build-standalone.sh
+HARNESS_PROFILE=release-fast ./script/run-standalone.sh
+```
 
-### Contributing
+Replay fixtures do not require a live App Server and are useful for UI QA:
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+```sh
+./script/run-standalone.sh --replay 12
+./script/run-standalone.sh --replay 10000
+```
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+## Current architecture
 
-### Licensing
+- `crates/harness_app`: the standalone GPUI window and host-owned rich
+  transcript surfaces.
+- `crates/harness_protocol`: direct App Server projection, persistence,
+  semantic request summaries, segmented document state, and fast protocol
+  tests.
+- `crates/harness_editor`: the application-facing boundary to Zed's real local
+  `Editor` and Vim engine.
+- `crates/codex_app_server_client`: App Server process/JSON-RPC client and safe
+  infrastructure request handling.
+- `crates/command_palette_core`: host-neutral Zed palette matching, history,
+  interceptor merge, and confirmation behavior.
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+Normal streaming updates edit only dirty transcript items. Rich headers, diff
+styling, and search highlights are viewport-bounded; underlying message text
+remains real selectable Buffer text. Interactive approvals, permissions,
+request-user-input forms, MCP forms, and image previews mount as supplemental
+Editor blocks and share the transcript's single scrollbar.
 
-License information for third party dependencies must be correctly provided for CI to pass.
+## Honest status
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+The Editor-backed transcript is the migration target, but the old rich list is
+still temporarily reachable as a comparison fixture. Before deleting it we are
+validating streaming follow-tail behavior, mouse/keyboard focus transitions,
+image parity, and the always-visible composer in a real tall window. Native
+folds, final `:` palette UI, additional media surfaces, settings controls, and
+live/reopen endurance testing remain active work.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+The stripped standalone graph no longer pulls Zed Workspace, Search, Picker,
+or command-palette UI through Vim. The fork still contains upstream Zed source
+because Harness deliberately reuses and extracts its Editor/Vim behavior rather
+than rewriting it.
 
-## Sponsorship
+## Validation
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+Fast focused checks:
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+```sh
+CARGO_BUILD_JOBS=1 cargo test --offline -p harness_protocol
+CARGO_BUILD_JOBS=1 cargo test --offline -p harness_editor
+CARGO_BUILD_JOBS=1 cargo test --offline -p harness_app --bin harness
+```
+
+Use `./script/clippy` for repository linting, following the upstream Zed
+guidelines in `AGENTS.md`.
+
+## Upstream
+
+The implementation is GPL-compatible and derived from
+[Zed](https://github.com/zed-industries/zed). The development checkout retains
+the upstream history locally; the private checkpoint repository uses compact
+snapshot history so other machines do not need to download all of Zed's Git
+history. Add upstream when needed:
+
+```sh
+git remote add upstream https://github.com/zed-industries/zed.git
+git fetch upstream --filter=blob:none
+```
 

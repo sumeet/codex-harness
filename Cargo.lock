@@ -476,6 +476,7 @@ dependencies = [
  "client",
  "clock",
  "cloud_api_types",
+ "codex_app_server_client",
  "collections",
  "command_palette_hooks",
  "component",
@@ -3403,6 +3404,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex_app_server_client"
+version = "0.1.0"
+dependencies = [
+ "async-channel 2.5.0",
+ "async-process",
+ "futures 0.3.32",
+ "futures-lite 1.13.0",
+ "log",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "smol",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "collab"
 version = "0.44.0"
 dependencies = [
@@ -3586,11 +3603,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "client",
- "collections",
+ "command_palette_core",
  "command_palette_hooks",
  "db",
  "editor",
- "fuzzy_nucleo",
  "go_to_line",
  "gpui",
  "language",
@@ -3612,13 +3628,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "command_palette_core"
+version = "0.1.0"
+dependencies = [
+ "command_palette_hooks",
+ "fuzzy_nucleo",
+ "gpui",
+]
+
+[[package]]
 name = "command_palette_hooks"
 version = "0.1.0"
 dependencies = [
  "collections",
  "derive_more",
  "gpui",
- "workspace",
 ]
 
 [[package]]
@@ -8296,6 +8320,56 @@ dependencies = [
  "core_maths",
  "read-fonts 0.37.0",
  "smallvec",
+]
+
+[[package]]
+name = "harness_app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "assets",
+ "codex_app_server_client",
+ "env_logger 0.11.8",
+ "gpui",
+ "gpui_platform",
+ "harness_editor",
+ "harness_protocol",
+ "log",
+ "markdown",
+ "release_channel",
+ "semver",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+]
+
+[[package]]
+name = "harness_editor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "harness_protocol",
+ "language",
+ "multi_buffer",
+ "settings",
+ "ui",
+ "vim",
+]
+
+[[package]]
+name = "harness_protocol"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "codex_app_server_client",
+ "pulldown-cmark 0.13.0",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

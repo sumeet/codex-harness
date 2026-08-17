@@ -416,6 +416,7 @@ impl Editor {
                 }
             }
             EditPrediction::MoveOutside { snapshot, target } => {
+                #[cfg(feature = "workspace-integration")]
                 if let Some(workspace) = self.workspace() {
                     Self::open_editor_at_anchor(snapshot, *target, &workspace, window, cx)
                         .detach_and_log_err(cx);
@@ -1646,6 +1647,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_editor_at_anchor(
         snapshot: &language::BufferSnapshot,
         target: language::Anchor,

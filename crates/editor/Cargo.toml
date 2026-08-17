@@ -13,7 +13,15 @@ path = "src/editor.rs"
 doctest = false
 
 [features]
+default = ["workspace-integration"]
+workspace-integration = [
+    "dep:breadcrumbs",
+    "dep:db",
+    "dep:fs",
+    "dep:workspace",
+]
 test-support = [
+    "workspace-integration",
     "text/test-support",
     "language/test-support",
     "gpui/test-support",
@@ -35,13 +43,13 @@ aho-corasick.workspace = true
 anyhow.workspace = true
 assets.workspace = true
 base64.workspace = true
-breadcrumbs.workspace = true
+breadcrumbs = { workspace = true, optional = true }
 client.workspace = true
 clock.workspace = true
 collections.workspace = true
 convert_case.workspace = true
 dap.workspace = true
-db.workspace = true
+db = { workspace = true, optional = true }
 buffer_diff.workspace = true
 emojis.workspace = true
 feature_flags.workspace = true
@@ -49,7 +57,7 @@ file_icons.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 fuzzy.workspace = true
-fs.workspace = true
+fs = { workspace = true, optional = true }
 git.workspace = true
 gpui.workspace = true
 indoc.workspace = true
@@ -102,7 +110,7 @@ urlencoding.workspace = true
 util.workspace = true
 uuid.workspace = true
 vim_mode_setting.workspace = true
-workspace.workspace = true
+workspace = { workspace = true, optional = true }
 zed_actions.workspace = true
 zlog.workspace = true
 

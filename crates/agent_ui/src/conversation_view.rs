@@ -2727,6 +2727,12 @@ impl ConversationView {
                     .then(|| self.create_copy_button(message.clone()).into_any_element());
                 ("Failed to Launch", message.into(), action_slot)
             }
+            LoadError::Other(msg) if msg.contains("already has an active writer") => (
+                "Thread Open Elsewhere",
+                "This thread is currently active in ChatGPT or another Codex client. Close it there, then select it again—or choose another thread."
+                    .into(),
+                None,
+            ),
             LoadError::Other(msg) => (
                 "Failed to Launch",
                 msg.into(),

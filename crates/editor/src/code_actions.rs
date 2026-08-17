@@ -4,6 +4,7 @@ impl Editor {
     /// Toggles an action selection menu for the latest selection.
     /// May show LSP code actions, code lens' command, runnables and potentially more entities applicable as actions.
     /// Previous menu toggled with this method will be closed.
+    #[cfg(feature = "workspace-integration")]
     pub fn toggle_code_actions(
         &mut self,
         action: &ToggleCodeActions,
@@ -186,6 +187,17 @@ impl Editor {
         })
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn toggle_code_actions(
+        &mut self,
+        _: &ToggleCodeActions,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.propagate();
+    }
+
+    #[cfg(feature = "workspace-integration")]
     pub fn confirm_code_action(
         &mut self,
         action: &ConfirmCodeAction,
@@ -293,6 +305,16 @@ impl Editor {
                 Some(Task::ready(Ok(())))
             }
         }
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    pub fn confirm_code_action(
+        &mut self,
+        _: &ConfirmCodeAction,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        None
     }
 
     fn runnable_task_key_for_source(

@@ -749,6 +749,7 @@ pub struct ResolvedFileTarget {
 
 impl ResolvedFileTarget {
     /// After opening a file, navigate the editor to the row/column position if present.
+    #[cfg(feature = "workspace-integration")]
     pub fn navigate_item_to_position(
         &self,
         item: Box<dyn crate::ItemHandle>,

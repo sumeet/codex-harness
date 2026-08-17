@@ -1659,6 +1659,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let permalink_task = self.get_permalink_to_line(cx);
+        #[cfg(feature = "workspace-integration")]
         let workspace = self.workspace();
 
         cx.spawn_in(window, async move |_, cx| match permalink_task.await {
@@ -1673,6 +1674,7 @@ impl Editor {
 
                 anyhow::Result::<()>::Err(err).log_err();
 
+                #[cfg(feature = "workspace-integration")]
                 if let Some(workspace) = workspace {
                     workspace
                         .update_in(cx, |workspace, _, cx| {
@@ -1700,6 +1702,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let permalink_task = self.get_permalink_to_line(cx);
+        #[cfg(feature = "workspace-integration")]
         let workspace = self.workspace();
 
         cx.spawn_in(window, async move |_, cx| match permalink_task.await {
@@ -1714,6 +1717,7 @@ impl Editor {
 
                 anyhow::Result::<()>::Err(err).log_err();
 
+                #[cfg(feature = "workspace-integration")]
                 if let Some(workspace) = workspace {
                     workspace.update(cx, |workspace, cx| {
                         struct OpenPermalinkToLine;
@@ -1870,6 +1874,7 @@ impl Editor {
             });
         }
 
+        #[cfg(feature = "workspace-integration")]
         if let Some(project) = self.project.clone() {
             self.save(
                 SaveOptions {
@@ -1919,6 +1924,7 @@ impl Editor {
             }
         });
 
+        #[cfg(feature = "workspace-integration")]
         if let Some(project) = self.project.clone() {
             self.save(
                 SaveOptions {
@@ -2268,6 +2274,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_git_blame_commit_internal(
         &mut self,
         window: &mut Window,
@@ -2277,6 +2284,15 @@ impl Editor {
         let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
         let workspace = self.workspace()?.downgrade();
         renderer.open_blame_commit(blame_entry, repo, workspace, window, cx);
+        None
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn open_git_blame_commit_internal(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<()> {
         None
     }
 
@@ -2358,6 +2374,7 @@ impl Editor {
         self.open_blame_revision(path, revision, repository, window, cx);
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn open_blame_revision(
         &mut self,
         path: RepoPath,
@@ -2380,6 +2397,18 @@ impl Editor {
         );
     }
 
+    #[cfg(not(feature = "workspace-integration"))]
+    fn open_blame_revision(
+        &mut self,
+        _: RepoPath,
+        _: Oid,
+        _: Entity<Repository>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    #[cfg(feature = "workspace-integration")]
     fn show_blame_revision_toast(&self, message: &str, cx: &mut Context<Self>) {
         struct BlameRevisionToast;
         if let Some(workspace) = self.workspace() {
@@ -2393,6 +2422,11 @@ impl Editor {
                 );
             });
         }
+    }
+
+    #[cfg(not(feature = "workspace-integration"))]
+    fn show_blame_revision_toast(&self, message: &str, _: &mut Context<Self>) {
+        log::warn!("{message}");
     }
 
     fn has_blame_entries(&self, cx: &App) -> bool {

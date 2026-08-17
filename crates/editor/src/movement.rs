@@ -3,14 +3,13 @@
 
 use super::{Bias, DisplayPoint, DisplaySnapshot, SelectionGoal, ToDisplayPoint};
 use crate::{
-    DisplayRow, EditorStyle, ToOffset, ToPoint,
+    Direction, DisplayRow, EditorStyle, ToOffset, ToPoint,
     scroll::{ScrollOffset, SharedScrollAnchor},
 };
 use gpui::{Pixels, WindowTextSystem};
 use language::{CharClassifier, Point};
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
-use workspace::searchable::Direction;
 
 use std::{ops::Range, sync::Arc};
 

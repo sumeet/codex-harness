@@ -1690,9 +1690,11 @@ impl Editor {
 
         cx.emit(EditorEvent::SelectionsChanged { local });
 
+        #[cfg(feature = "workspace-integration")]
         let selections = &self.selections.disjoint_anchors_arc();
+        #[cfg(feature = "workspace-integration")]
         if local && let Some(buffer_snapshot) = buffer.as_singleton() {
-            let inmemory_selections = selections
+            let inmemory_selections: Vec<_> = selections
                 .iter()
                 .map(|s| {
                     let start = s.range().start.text_anchor_in(buffer_snapshot);
