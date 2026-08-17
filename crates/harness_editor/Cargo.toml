@@ -1,0 +1,20 @@
+[package]
+name = "harness_editor"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+editor = { path = "../editor", default-features = false }
+gpui.workspace = true
+harness_protocol.workspace = true
+language.workspace = true
+multi_buffer.workspace = true
+settings.workspace = true
+ui.workspace = true
+vim = { path = "../vim", default-features = false }
