@@ -161,11 +161,37 @@ struct PersistedTranscript {
 
 impl TranscriptItem {
     pub fn display_status(&self) -> Option<&str> {
-        self.status.as_deref().filter(|status| {
-            !matches!(self.kind, TranscriptKind::User | TranscriptKind::Agent)
-                || !matches!(*status, "completed" | "sent" | "replay")
-        })
+        self.status
+            .as_deref()
+            .filter(|status| !is_routine_terminal_status(status))
     }
+
+    /// Whether this item has anything useful to occupy transcript space.
+    /// Raw protocol history remains available even when an empty terminal
+    /// reasoning placeholder is omitted from both reading surfaces.
+    pub fn is_presentationally_visible(&self) -> bool {
+        self.kind != TranscriptKind::Reasoning
+            || !self.content.trim().is_empty()
+            || self.pending_request.is_some()
+            || self.display_status().is_some()
+    }
+}
+
+fn is_routine_terminal_status(status: &str) -> bool {
+    [
+        "complete",
+        "completed",
+        "idle",
+        "inactive",
+        "ready",
+        "replay",
+        "resolved",
+        "sent",
+        "succeeded",
+        "success",
+    ]
+    .iter()
+    .any(|routine| status.eq_ignore_ascii_case(routine))
 }
 
 #[derive(Clone, Debug)]
@@ -336,7 +362,7 @@ fn project_transcript_item(
     item_index: usize,
     item: &TranscriptItem,
 ) -> Option<TranscriptItemProjection> {
-    if item.kind == TranscriptKind::Trace {
+    if item.kind == TranscriptKind::Trace || !item.is_presentationally_visible() {
         return None;
     }
 
@@ -1332,7 +1358,7 @@ impl TranscriptModel {
                 content: String::new(),
                 raw: bounded_raw_payload(params.clone()),
                 event_count: 0,
-                expanded: kind != TranscriptKind::Reasoning,
+                expanded: kind != TranscriptKind::Trace,
                 pending_request: None,
             })
         };
@@ -1363,7 +1389,7 @@ impl TranscriptModel {
                 content: String::new(),
                 raw: bounded_raw_payload(raw.clone()),
                 event_count: 0,
-                expanded: kind != TranscriptKind::Reasoning,
+                expanded: kind != TranscriptKind::Trace,
                 pending_request: None,
             })
         };
@@ -1395,14 +1421,12 @@ impl TranscriptModel {
                 item.status = incoming.status;
                 item.raw = incoming.raw;
                 item.event_count += 1;
-                item.expanded = false;
                 self.item_indices.insert(protocol_id, index);
                 return Some(index);
             }
 
             let mut item = item_from_protocol(value, completed);
             item.key = aggregate_key;
-            item.expanded = false;
             let index = self.push_without_splice(item);
             self.item_indices.insert(protocol_id, index);
             return Some(index);
@@ -1413,11 +1437,7 @@ impl TranscriptModel {
             let pending_request = self.items[index].pending_request.clone();
             let mut item = item_from_protocol(value, completed);
             item.event_count = old_events + 1;
-            item.expanded = if item.kind == TranscriptKind::Reasoning {
-                false
-            } else {
-                expanded
-            };
+            item.expanded = expanded;
             item.pending_request = pending_request;
             self.items[index] = item;
             return Some(index);
@@ -2511,7 +2531,7 @@ fn kind_from_protocol(kind: &str) -> TranscriptKind {
     }
 }
 
-fn default_expanded(kind: TranscriptKind, completed: bool) -> bool {
+fn default_expanded(kind: TranscriptKind, _completed: bool) -> bool {
     match kind {
         TranscriptKind::User
         | TranscriptKind::Agent
@@ -2520,13 +2540,14 @@ fn default_expanded(kind: TranscriptKind, completed: bool) -> bool {
         | TranscriptKind::Diff
         | TranscriptKind::Image
         | TranscriptKind::Error
-        | TranscriptKind::Approval => true,
-        TranscriptKind::Command
+        | TranscriptKind::Approval
+        | TranscriptKind::Command
         | TranscriptKind::Tool
         | TranscriptKind::Subagent
         | TranscriptKind::Web
-        | TranscriptKind::Review => !completed,
-        TranscriptKind::Reasoning | TranscriptKind::Trace => false,
+        | TranscriptKind::Review
+        | TranscriptKind::Reasoning => true,
+        TranscriptKind::Trace => false,
     }
 }
 
@@ -4080,6 +4101,91 @@ mod tests {
     }
 
     #[test]
+    fn routine_terminal_statuses_stay_out_of_every_transcript_kind() {
+        for status in [
+            "completed",
+            "COMPLETED",
+            "sent",
+            "replay",
+            "success",
+            "succeeded",
+            "idle",
+            "inactive",
+            "ready",
+            "resolved",
+        ] {
+            let mut item = replay_item(
+                0,
+                TranscriptKind::Reasoning,
+                "Reasoning",
+                "A useful step",
+                json!(null),
+            );
+            item.status = Some(status.into());
+            assert_eq!(item.display_status(), None, "status {status}");
+        }
+
+        for status in [
+            "streaming",
+            "running",
+            "waiting",
+            "responding",
+            "failed",
+            "interrupted",
+            "offline",
+        ] {
+            let mut item =
+                replay_item(0, TranscriptKind::Command, "Command", "output", json!(null));
+            item.status = Some(status.into());
+            assert_eq!(item.display_status(), Some(status), "status {status}");
+        }
+    }
+
+    #[test]
+    fn empty_terminal_reasoning_has_no_false_document_disclosure() {
+        let mut model = TranscriptModel::default();
+        let mut item = replay_item(
+            0,
+            TranscriptKind::Reasoning,
+            "Reasoning",
+            "",
+            json!({"type": "reasoning"}),
+        );
+        item.status = Some("completed".into());
+        model.push_without_splice(item);
+
+        assert!(!model.items[0].is_presentationally_visible());
+        assert!(model.item_projection(0).is_none());
+        assert!(model.full_document().text.is_empty());
+        assert_eq!(model.raw_events.len(), 0);
+
+        model.items[0].status = Some("running".into());
+        assert!(model.items[0].is_presentationally_visible());
+        assert!(model.item_projection(0).is_some());
+    }
+
+    #[test]
+    fn meaningful_items_start_expanded_even_after_completion() {
+        for kind in [
+            TranscriptKind::Reasoning,
+            TranscriptKind::Plan,
+            TranscriptKind::Command,
+            TranscriptKind::FileChange,
+            TranscriptKind::Tool,
+            TranscriptKind::Diff,
+            TranscriptKind::Image,
+            TranscriptKind::Subagent,
+            TranscriptKind::Web,
+            TranscriptKind::Review,
+            TranscriptKind::Error,
+            TranscriptKind::Approval,
+        ] {
+            assert!(default_expanded(kind, true), "kind {kind:?}");
+        }
+        assert!(!default_expanded(TranscriptKind::Trace, false));
+    }
+
+    #[test]
     fn per_item_projection_matches_its_full_document_segment() {
         let model = TranscriptModel::replay(24);
         let document = model.full_document();
@@ -4560,7 +4666,7 @@ mod tests {
             model.items[0].content,
             "Evaluating location\n\nPlanning retrieval\n\nDesigning scheduler"
         );
-        assert!(!model.items[0].expanded);
+        assert!(model.items[0].expanded);
         assert_eq!(model.items[0].event_count, 2);
         assert_eq!(model.raw_events.len(), 2);
     }

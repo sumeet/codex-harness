@@ -26,9 +26,9 @@ use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
-    Disableable, Disclosure, Icon, IconButton, IconButtonShape, IconName, IconSize, Label,
-    LabelCommon, LabelSize, ListItem, ListItemSpacing, SelectableButton, ThreadItem, TintColor,
-    Toggleable,
+    ContextMenu, ContextMenuEntry, Disableable, Disclosure, Icon, IconButton, IconButtonShape,
+    IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing, SelectableButton,
+    ThreadItem, TintColor, Toggleable, right_click_menu,
 };
 
 mod image_surface;
@@ -250,6 +250,7 @@ impl HarnessApp {
         cwd: String,
         replay_count: Option<usize>,
         start_in_text_view: bool,
+        initial_thread_id: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -317,7 +318,7 @@ impl HarnessApp {
             replay_count,
             client: None,
             threads: Vec::new(),
-            selected_thread_id: None,
+            selected_thread_id: initial_thread_id,
             connecting: false,
             loading_thread: false,
             thread_read_only_reason: None,
@@ -2179,6 +2180,9 @@ impl HarnessApp {
             if !item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning {
                 return;
             }
+            if item.content.trim().is_empty() {
+                return;
+            }
             item.expanded = !item.expanded;
             self.list_state
                 .splice(self.selected_item..self.selected_item + 1, 1);
@@ -2384,6 +2388,12 @@ impl HarnessApp {
     fn render_task(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let thread = &self.threads[index];
+        let thread_id = thread.id.clone();
+        let thread_cwd = if thread.cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            thread.cwd.clone()
+        };
         let selected = self.selected_thread_id.as_deref() == Some(thread.id.as_str());
         let cursor = self.focus_mode == FocusMode::Tasks && self.selected_task == index;
         let title = thread_title(thread);
@@ -2406,7 +2416,7 @@ impl HarnessApp {
             AgentThreadStatus::Completed
         };
         let weak = cx.weak_entity();
-        ThreadItem::new(("task", index), title)
+        let thread_item = ThreadItem::new(("task", index), title)
             .icon(IconName::AiOpenAi)
             .project_name(project)
             .timestamp(relative_time(thread.updated_at))
@@ -2420,6 +2430,29 @@ impl HarnessApp {
                     this.open_thread(index, cx);
                 })
                 .ok();
+            })
+            .into_any_element();
+
+        right_click_menu(format!("thread-context-menu-{index}"))
+            .trigger(move |_, _, _| thread_item)
+            .menu(move |window, cx| {
+                let thread_id = thread_id.clone();
+                let thread_cwd = thread_cwd.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.item(ContextMenuEntry::new("Open in New Window").handler({
+                        let thread_id = thread_id.clone();
+                        let thread_cwd = thread_cwd.clone();
+                        move |_, cx| {
+                            open_harness_window(
+                                thread_cwd.clone(),
+                                None,
+                                false,
+                                Some(thread_id.clone()),
+                                cx,
+                            );
+                        }
+                    }))
+                })
             })
             .into_any_element()
     }
@@ -2555,13 +2588,12 @@ impl HarnessApp {
             })
             .filter(|line| !line.is_empty())
             .collect::<Vec<_>>();
-        let hidden_count = steps.len().saturating_sub(24);
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .children(steps.into_iter().skip(hidden_count).map(|step| {
+            .children(steps.into_iter().map(|step| {
                 div()
                     .w_full()
                     .flex()
@@ -2579,17 +2611,6 @@ impl HarnessApp {
                     )
                     .child(div().min_w_0().flex_1().child(step))
             }))
-            .when(hidden_count > 0, |this| {
-                this.child(
-                    div()
-                        .pl_4()
-                        .text_xs()
-                        .text_color(colors.text_muted)
-                        .child(format!(
-                            "{hidden_count} earlier steps · Shift-V opens text-buffer view"
-                        )),
-                )
-            })
             .into_any_element()
     }
 
@@ -3173,6 +3194,9 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let item = self.model.items[index].clone();
+        if !item.is_presentationally_visible() {
+            return div().into_any_element();
+        }
         let cursor = matches!(
             self.focus_mode,
             FocusMode::Transcript | FocusMode::Request | FocusMode::Approval
@@ -3268,11 +3292,8 @@ impl HarnessApp {
             && !item.expanded
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
-        let visible_status = if pending_method.is_some() && !request_is_live {
-            Some("inactive".to_string())
-        } else {
-            item.display_status().map(ToOwned::to_owned)
-        };
+        let visible_status = item.display_status().map(ToOwned::to_owned);
+        let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = item.kind != model::TranscriptKind::Agent || item.title != "Codex";
         let disclosure_weak = cx.weak_entity();
 
@@ -3304,7 +3325,8 @@ impl HarnessApp {
                 )
             })
             .when(
-                item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning,
+                has_collapsible_content
+                    && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning),
                 |this| {
                     this.child(
                         Disclosure::new(("item-disclosure", index), item.expanded).on_click(
@@ -5452,12 +5474,50 @@ mod tests {
     }
 }
 
+fn open_harness_window(
+    cwd: String,
+    replay_count: Option<usize>,
+    start_in_text_view: bool,
+    initial_thread_id: Option<String>,
+    cx: &mut App,
+) {
+    let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
+    if let Err(error) = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(720.), px(520.))),
+            titlebar: None,
+            app_id: Some("dev.harness.app".into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            window.set_window_title("Harness");
+            theme_settings::setup_ui_font(window, cx);
+            cx.new(|cx| {
+                HarnessApp::new(
+                    cwd,
+                    replay_count,
+                    start_in_text_view,
+                    initial_thread_id,
+                    window,
+                    cx,
+                )
+            })
+        },
+    ) {
+        log::error!("failed to open Harness window: {error}");
+    }
+}
+
 fn main() {
     env_logger::builder()
         .filter_level(log::LevelFilter::Warn)
         .init();
     let replay_count = replay_count();
     let start_in_text_view = std::env::args().any(|argument| argument == "--text");
+    let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")
+        .ok()
+        .filter(|thread_id| !thread_id.trim().is_empty());
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -5487,24 +5547,7 @@ fn main() {
         palette::init(cx);
         load_harness_keymaps(cx);
 
-        let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
-        if let Err(error) = cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(720.), px(520.))),
-                titlebar: None,
-                app_id: Some("dev.harness.app".into()),
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.set_window_title("Harness");
-                theme_settings::setup_ui_font(window, cx);
-                cx.new(|cx| HarnessApp::new(cwd, replay_count, start_in_text_view, window, cx))
-            },
-        ) {
-            log::error!("failed to open Harness window: {error}");
-            return;
-        }
+        open_harness_window(cwd, replay_count, start_in_text_view, initial_thread_id, cx);
         cx.activate(true);
     });
 }
