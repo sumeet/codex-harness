@@ -512,6 +512,7 @@ fn is_valid_json(content: &str) -> bool {
     serde_json::from_str::<Box<serde_json::value::RawValue>>(content).is_ok()
 }
 
+#[cfg(test)]
 fn json_tokens(content: &str) -> Option<Vec<JsonToken>> {
     is_valid_json(content).then_some(())?;
     Some(json_tokens_unchecked(content))
@@ -3816,7 +3817,14 @@ impl HarnessApp {
                     ) {
                         log::warn!("could not persist command palette state: {error}");
                     }
-                    window.dispatch_action(command.action, cx);
+                    // Palette events are delivered while `HarnessApp` is already being
+                    // updated. Dispatching a root action synchronously here attempts to
+                    // update the same entity again and panics in GPUI's entity map.
+                    // Return the current update first, then route the confirmed action
+                    // through the normal window action path.
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_action(command.action, cx);
+                    });
                 }
                 cx.notify();
             },
@@ -3889,6 +3897,34 @@ impl HarnessApp {
         });
     }
 
+    fn dispatch_performance_j_keys(
+        generation: u64,
+        keys: Vec<Keystroke>,
+        failure_reason: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `dispatch_keystroke` may synchronously draw the window. A frame callback
+        // entered through `Context<Self>::on_next_frame` still holds HarnessApp's
+        // entity lease, so dispatching there would make the draw try to render an
+        // already-updating root entity. Defer only the actual input dispatch; once
+        // it returns, reacquire HarnessApp to advance the frame-paced state machine.
+        let this = cx.weak_entity();
+        window.defer(cx, move |window, cx| {
+            let handled = keys
+                .into_iter()
+                .all(|keystroke| window.dispatch_keystroke(keystroke, cx));
+            this.update(cx, |this, cx| {
+                if handled {
+                    Self::schedule_performance_j_step(generation, window, cx);
+                } else {
+                    this.cancel_performance_j(generation, failure_reason, cx);
+                }
+            })
+            .ok();
+        });
+    }
+
     fn cancel_performance_j(&mut self, generation: u64, reason: &str, cx: &mut Context<Self>) {
         if self
             .performance_j_run
@@ -3935,16 +3971,18 @@ impl HarnessApp {
                     self.cancel_performance_j(generation, "Vim gg key was unavailable", cx);
                     return;
                 };
-                if !window.dispatch_keystroke(g.clone(), cx) || !window.dispatch_keystroke(g, cx) {
-                    self.cancel_performance_j(generation, "Vim gg was not handled", cx);
-                    return;
-                }
                 self.set_performance_status(
                     format!("Running {PERFORMANCE_J_STEPS}-frame Vim j performance sample…"),
                     None,
                     cx,
                 );
-                Self::schedule_performance_j_step(generation, window, cx);
+                Self::dispatch_performance_j_keys(
+                    generation,
+                    vec![g.clone(), g],
+                    "Vim gg was not handled",
+                    window,
+                    cx,
+                );
             }
             PerformanceJStep::Baseline => {
                 self.performance_reporter.mark_baseline(window);
@@ -3955,11 +3993,13 @@ impl HarnessApp {
                     self.cancel_performance_j(generation, "Vim j key was unavailable", cx);
                     return;
                 };
-                if !window.dispatch_keystroke(j, cx) {
-                    self.cancel_performance_j(generation, "Vim j was not handled", cx);
-                    return;
-                }
-                Self::schedule_performance_j_step(generation, window, cx);
+                Self::dispatch_performance_j_keys(
+                    generation,
+                    vec![j],
+                    "Vim j was not handled",
+                    window,
+                    cx,
+                );
             }
             PerformanceJStep::Report => {
                 self.performance_j_run = None;
