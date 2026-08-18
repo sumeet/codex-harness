@@ -13,6 +13,10 @@ path = "src/language.rs"
 doctest = false
 
 [features]
+# Zed extension grammars are WASM modules. Small embedders that register only
+# native grammars can disable this to avoid linking the Wasmtime compiler.
+default = ["wasm-grammars"]
+wasm-grammars = ["tree-sitter/wasm"]
 test-support = [
     "rand",
     "collections/test-support",
@@ -72,7 +76,7 @@ tree-sitter-md = { workspace = true, optional = true }
 tree-sitter-python = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
 tree-sitter-typescript = { workspace = true, optional = true }
-tree-sitter = { workspace = true, features = ["wasm"] }
+tree-sitter.workspace = true
 unicase = "2.6"
 util.workspace = true
 watch.workspace = true

@@ -62,7 +62,7 @@ http_client = { workspace = true, features = ["github-download"] }
 image.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
-language.workspace = true
+language = { path = "../language", default-features = false }
 log.workspace = true
 lsp.workspace = true
 markdown.workspace = true

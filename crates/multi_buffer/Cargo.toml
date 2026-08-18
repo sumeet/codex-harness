@@ -30,7 +30,7 @@ futures-lite.workspace = true
 buffer_diff.workspace = true
 gpui.workspace = true
 itertools.workspace = true
-language.workspace = true
+language = { path = "../language", default-features = false }
 log.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
@@ -41,7 +41,7 @@ smallvec.workspace = true
 sum_tree.workspace = true
 text.workspace = true
 theme.workspace = true
-tree-sitter = { workspace = true, features = ["wasm"] }
+tree-sitter.workspace = true
 ztracing.workspace = true
 tracing.workspace = true
 util.workspace = true

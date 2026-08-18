@@ -15,5 +15,5 @@ path = "src/edit_prediction_types.rs"
 client.workspace = true
 gpui.workspace = true
 icons.workspace = true
-language.workspace = true
+language = { path = "../language", default-features = false }
 text.workspace = true

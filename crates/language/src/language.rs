@@ -94,7 +94,9 @@ pub use toolchain::{
     LanguageToolchainStore, LocalLanguageToolchainStore, Toolchain, ToolchainList, ToolchainLister,
     ToolchainMetadata, ToolchainScope,
 };
-use tree_sitter::{self, QueryCursor, WasmStore, wasmtime};
+use tree_sitter::{self, QueryCursor};
+#[cfg(feature = "wasm-grammars")]
+use tree_sitter::{WasmStore, wasmtime};
 use util::rel_path::RelPath;
 
 pub use available_languages::AvailableLanguage;
@@ -132,10 +134,15 @@ where
     F: FnOnce(&mut Parser) -> R,
 {
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
-        let mut parser = Parser::new();
-        parser
-            .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
-            .unwrap();
+        let parser = Parser::new();
+        #[cfg(feature = "wasm-grammars")]
+        let parser = {
+            let mut parser = parser;
+            parser
+                .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
+                .unwrap();
+            parser
+        };
         parser
     });
     // Tree-sitter auto-resets the parser at the end of a successful parse,
@@ -158,6 +165,7 @@ where
     func(cursor.deref_mut())
 }
 
+#[cfg(feature = "wasm-grammars")]
 static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
     wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
 });

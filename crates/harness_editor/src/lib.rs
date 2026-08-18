@@ -2478,6 +2478,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_language_profile_parses_without_a_wasm_store() {
+        let language = tree_sitter_json::LANGUAGE.into();
+        language::with_parser(|parser| {
+            parser.set_language(&language).unwrap();
+            let tree = parser.parse(r#"{"native": true}"#, None).unwrap();
+            assert!(!tree.root_node().has_error());
+        });
+    }
+
+    #[test]
     fn typography_profile_transition_is_stable_and_idempotent() {
         assert!(!typography_profile_changed(
             TranscriptTypographyProfile::Buffer,
