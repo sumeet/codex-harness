@@ -143,3 +143,27 @@ Still open: pinned and paused streaming against a real turn; a live
 approval/form response including failure recovery; Rich/Text selection and
 tail-position transfer under longer real histories; and longer exploratory
 multi-window use.
+
+### 2026-08-18 — real streaming pause and semantic tool authority
+
+- A fresh Harness-owned App Server thread
+  `01a013e1-79db-7131-8327-adbccf814d71` ran two harmless shell commands that
+  emitted 40 lines over roughly eight seconds and 80 lines over roughly sixteen
+  seconds. The first turn followed the live tail. During the second turn, Text
+  mode moved to the top with `gg`; later output chunks and final completion did
+  not snap the viewport away from the reading position.
+- The same thread exposed duplicate provider-level `custom_tool_call` wrappers
+  beside the typed `commandExecution` item. Raw response items are now retained
+  only in the bounded diagnostic journal; typed App Server items are the sole
+  transcript presentation authority. A migration filters these obsolete cards
+  from version-1 local snapshots, and a rebuilt real-window replay showed one
+  syntax-highlighted Command card with its output and no `Tool · Exec` or
+  `write_stdin` implementation cards.
+- Focused protocol tests passed 57/57 and app tests passed 38/38; the standalone
+  app binary rebuilt successfully. Only the known warnings from the reduced
+  upstream Editor feature slice remain.
+
+Still open: verify automatic re-pin after returning to exact tail; a live
+approval/form response including failure recovery; Rich/Text selection and
+tail-position transfer under longer real histories; and longer exploratory
+multi-window use.
