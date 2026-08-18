@@ -97,6 +97,8 @@ const SIDEBAR_WIDTH: f32 = 252.;
 const COMPACT_SIDEBAR_THRESHOLD: f32 = 1100.;
 const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
+const READ_ONLY_ACTIVE_REFRESH: Duration = Duration::from_millis(900);
+const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 14;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_800;
@@ -689,6 +691,7 @@ struct HarnessApp {
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
     selected_thread_id: Option<String>,
+    loaded_thread_updated_at: Option<i64>,
     connecting: bool,
     loading_thread: bool,
     thread_read_only_reason: Option<SharedString>,
@@ -733,6 +736,7 @@ struct HarnessApp {
     server_task: Task<()>,
     request_task: Task<()>,
     reconnect_task: Task<()>,
+    read_only_refresh_task: Task<()>,
     reconnect_attempts: u8,
 }
 
@@ -810,6 +814,7 @@ impl HarnessApp {
             client: None,
             threads: Vec::new(),
             selected_thread_id: initial_thread_id,
+            loaded_thread_updated_at: None,
             connecting: false,
             loading_thread: false,
             thread_read_only_reason: None,
@@ -858,6 +863,7 @@ impl HarnessApp {
             server_task: Task::ready(()),
             request_task: Task::ready(()),
             reconnect_task: Task::ready(()),
+            read_only_refresh_task: Task::ready(()),
             reconnect_attempts: 0,
         };
         if start_in_text_view {
@@ -1020,6 +1026,7 @@ impl HarnessApp {
             .collect::<Vec<_>>();
         self.client = None;
         self.connecting = false;
+        self.read_only_refresh_task = Task::ready(());
         self.model.current_turn_id = None;
         self.thread_read_only_reason = None;
         self.error = Some("Codex app server disconnected.".into());
@@ -1569,6 +1576,192 @@ impl HarnessApp {
         });
     }
 
+    fn schedule_read_only_refresh(&mut self, mut active: bool, cx: &mut Context<Self>) {
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        self.read_only_refresh_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(if active {
+                        READ_ONLY_ACTIVE_REFRESH
+                    } else {
+                        READ_ONLY_IDLE_REFRESH
+                    })
+                    .await;
+
+                let Ok((still_selected, loaded_updated_at)) = this.update(cx, |this, _| {
+                    (
+                        this.selected_thread_id.as_deref() == Some(thread_id.as_str())
+                            && this.thread_read_only_reason.is_some()
+                            && this
+                                .client
+                                .as_ref()
+                                .is_some_and(|current| Rc::ptr_eq(current, &client)),
+                        this.loaded_thread_updated_at,
+                    )
+                }) else {
+                    return;
+                };
+                if !still_selected {
+                    return;
+                }
+
+                if !active {
+                    let response = match client.list_threads(THREAD_LIMIT, None).await {
+                        Ok(response) => response,
+                        Err(error) => {
+                            log::debug!("could not check read-only task freshness: {error}");
+                            continue;
+                        }
+                    };
+                    let selected_updated_at = response
+                        .data
+                        .iter()
+                        .find(|thread| thread.id == thread_id)
+                        .map(|thread| thread.updated_at);
+                    let should_read = selected_updated_at
+                        .is_some_and(|updated_at| Some(updated_at) != loaded_updated_at);
+                    let Ok(still_selected) = this.update(cx, |this, cx| {
+                        if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
+                            || this.thread_read_only_reason.is_none()
+                        {
+                            return false;
+                        }
+                        if this.threads != response.data {
+                            let selected_task_id = this
+                                .threads
+                                .get(this.selected_task)
+                                .map(|thread| thread.id.clone());
+                            let old_len = this.threads.len();
+                            this.threads = response.data;
+                            this.task_list_state.splice(0..old_len, this.threads.len());
+                            this.selected_task = selected_task_id
+                                .as_deref()
+                                .and_then(|selected_id| {
+                                    this.threads
+                                        .iter()
+                                        .position(|thread| thread.id == selected_id)
+                                })
+                                .unwrap_or_else(|| {
+                                    this.selected_task.min(this.threads.len().saturating_sub(1))
+                                });
+                            cx.notify();
+                        }
+                        true
+                    }) else {
+                        return;
+                    };
+                    if !still_selected {
+                        return;
+                    }
+                    if !should_read {
+                        continue;
+                    }
+                }
+
+                let thread = match client.read_thread(&thread_id).await {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        log::debug!("could not refresh read-only task {thread_id}: {error}");
+                        continue;
+                    }
+                };
+                active = thread_has_active_turn(&thread);
+                if this
+                    .update(cx, |this, cx| {
+                        this.apply_read_only_thread_refresh(thread, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn apply_read_only_thread_refresh(&mut self, thread: CodexThread, cx: &mut Context<Self>) {
+        if self.selected_thread_id.as_deref() != Some(thread.id.as_str())
+            || self.thread_read_only_reason.is_none()
+        {
+            return;
+        }
+
+        let was_following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            self.list_state.is_following_tail()
+        };
+        let selected_key = self
+            .model
+            .items
+            .get(self.selected_item)
+            .map(|item| item.key.clone());
+        self.loaded_thread_updated_at = Some(thread.updated_at);
+        if !thread.cwd.is_empty() {
+            self.cwd = thread.cwd.clone();
+        }
+
+        let outcome = self.model.refresh_thread(&thread);
+        let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
+        dirty_items.sort_unstable();
+        if !outcome.reset && outcome.old_len == outcome.new_len && dirty_items.is_empty() {
+            return;
+        }
+
+        if outcome.reset {
+            self.list_state.splice(0..outcome.old_len, outcome.new_len);
+        } else {
+            if outcome.new_len > outcome.old_len {
+                self.list_state.splice(
+                    outcome.old_len..outcome.old_len,
+                    outcome.new_len - outcome.old_len,
+                );
+            }
+            for index in &dirty_items {
+                if *index < outcome.old_len {
+                    self.list_state.splice(*index..*index + 1, 1);
+                }
+            }
+        }
+
+        for index in &dirty_items {
+            if let Some(item) = self.model.items.get(*index) {
+                self.markdown_cache.remove(&item.key);
+            }
+        }
+        self.track_image_surface_updates(outcome.old_len, outcome.new_len, &dirty_items);
+        mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
+
+        self.selected_item = if was_following_tail {
+            self.model.items.len().saturating_sub(1)
+        } else {
+            selected_key
+                .as_deref()
+                .and_then(|key| self.model.items.iter().position(|item| item.key == key))
+                .unwrap_or_else(|| {
+                    self.selected_item
+                        .min(self.model.items.len().saturating_sub(1))
+                })
+        };
+        if !self.search_query.is_empty() {
+            self.rebuild_search_matches();
+        }
+
+        if self.buffer_view {
+            let incrementally_applied = !outcome.reset
+                && self.sync_transcript_item_updates(outcome.old_len, &dirty_items, cx);
+            if !incrementally_applied {
+                drop(self.sync_transcript_document(cx));
+            }
+        } else if was_following_tail {
+            self.list_state.scroll_to_end();
+        }
+        cx.notify();
+    }
+
     fn open_thread(&mut self, index: usize, cx: &mut Context<Self>) {
         let Some(thread) = self.threads.get(index) else {
             return;
@@ -1579,7 +1772,9 @@ impl HarnessApp {
         };
 
         self.reject_pending_requests(cx);
+        self.read_only_refresh_task = Task::ready(());
         self.selected_thread_id = Some(thread_id.clone());
+        self.loaded_thread_updated_at = None;
         self.loading_thread = true;
         self.thread_read_only_reason = None;
         self.error = None;
@@ -1622,8 +1817,13 @@ impl HarnessApp {
                     this.loading_thread = false;
                     match result {
                         Ok((thread, warning)) => {
+                            let read_only = warning.is_some();
+                            let active = thread_has_active_turn(&thread);
                             this.load_thread(thread, cx);
                             this.thread_read_only_reason = warning.map(Into::into);
+                            if read_only {
+                                this.schedule_read_only_refresh(active, cx);
+                            }
                             this.error = None;
                         }
                         Err(error) => {
@@ -1646,6 +1846,7 @@ impl HarnessApp {
     fn load_thread(&mut self, thread: CodexThread, cx: &mut Context<Self>) {
         let old_len = self.model.items.len();
         self.selected_thread_id = Some(thread.id.clone());
+        self.loaded_thread_updated_at = Some(thread.updated_at);
         if !thread.cwd.is_empty() {
             self.cwd = thread.cwd.clone();
         }
@@ -1680,6 +1881,7 @@ impl HarnessApp {
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reject_pending_requests(cx);
+        self.read_only_refresh_task = Task::ready(());
         let old_len = self.model.items.len();
         self.model.clear();
         self.mark_all_image_surfaces_dirty();
@@ -1693,6 +1895,7 @@ impl HarnessApp {
         self.retire_all_request_surfaces();
         self.list_state.splice(0..old_len, 0);
         self.selected_thread_id = None;
+        self.loaded_thread_updated_at = None;
         self.selected_item = 0;
         self.thread_read_only_reason = None;
         self.error = None;
@@ -5875,6 +6078,23 @@ fn thread_title(thread: &CodexThread) -> String {
         .replace('\n', " ")
 }
 
+fn thread_has_active_turn(thread: &CodexThread) -> bool {
+    let Some(turn) = thread.turns.last() else {
+        return false;
+    };
+    let status = turn
+        .status
+        .as_str()
+        .or_else(|| turn.status.get("type").and_then(Value::as_str))
+        .or_else(|| turn.status.get("status").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "active" | "inprogress" | "in_progress" | "running" | "streaming"
+    )
+}
+
 fn relative_time(timestamp: i64) -> String {
     let timestamp = if timestamp > 10_000_000_000 {
         timestamp / 1000
@@ -6036,6 +6256,30 @@ mod tests {
         assert_eq!(reconnect_delay(2), Some(Duration::from_secs(4)));
         assert_eq!(reconnect_delay(3), None);
         assert_eq!(reconnect_delay(u8::MAX), None);
+    }
+
+    #[test]
+    fn read_only_refresh_rate_follows_the_latest_turn_state() {
+        use codex_app_server_client::CodexTurn;
+
+        let thread = |status: Value| CodexThread {
+            id: "thread-1".into(),
+            name: None,
+            preview: String::new(),
+            cwd: String::new(),
+            updated_at: 1,
+            turns: vec![CodexTurn {
+                id: "turn-1".into(),
+                status,
+                items: Vec::new(),
+            }],
+        };
+        assert!(thread_has_active_turn(&thread(json!("inProgress"))));
+        assert!(thread_has_active_turn(&thread(
+            json!({"status": "running"})
+        )));
+        assert!(!thread_has_active_turn(&thread(json!("completed"))));
+        assert!(!thread_has_active_turn(&thread(json!("interrupted"))));
     }
 
     #[test]
