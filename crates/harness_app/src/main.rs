@@ -163,8 +163,13 @@ fn composer_height(text: &str, available_width: f32) -> f32 {
     78. + 20. * visual_rows.saturating_sub(1) as f32
 }
 
-fn composer_send_blocked(composer_empty: bool, loading_thread: bool, read_only: bool) -> bool {
-    composer_empty || loading_thread || read_only
+fn composer_send_blocked(
+    composer_empty: bool,
+    loading_thread: bool,
+    read_only: bool,
+    transport_available: bool,
+) -> bool {
+    composer_empty || loading_thread || read_only || !transport_available
 }
 
 fn mark_unbacked_requests_inactive(
@@ -428,7 +433,58 @@ impl HarnessApp {
                     break;
                 }
             }
+            _ = this.update(cx, |this, cx| this.handle_server_disconnect(&client, cx));
         });
+    }
+
+    fn handle_server_disconnect(
+        &mut self,
+        disconnected_client: &Rc<Client>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_current_client = self
+            .client
+            .as_ref()
+            .is_some_and(|client| Rc::ptr_eq(client, disconnected_client));
+        if !is_current_client {
+            return;
+        }
+
+        let dirty_requests = self
+            .model
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                (item
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| !request.resolved)
+                    && self.live_request_keys.contains(&item.key))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        self.client = None;
+        self.connecting = false;
+        self.model.current_turn_id = None;
+        self.thread_read_only_reason = None;
+        self.error = Some(
+            "Codex app server disconnected. Refresh the task list to reconnect."
+                .to_string()
+                .into(),
+        );
+        self.retire_all_request_surfaces();
+        mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
+        for index in &dirty_requests {
+            self.list_state.splice(*index..*index + 1, 1);
+        }
+        if self.buffer_view && !dirty_requests.is_empty() {
+            let item_count = self.model.items.len();
+            if !self.sync_transcript_item_updates(item_count, &dirty_requests, cx) {
+                drop(self.sync_transcript_document(cx));
+            }
+        }
+        cx.notify();
     }
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
@@ -1108,6 +1164,7 @@ impl HarnessApp {
             text.is_empty(),
             self.loading_thread,
             self.thread_read_only_reason.is_some(),
+            self.client.is_some() || self.replay_count.is_some(),
         ) {
             return;
         }
@@ -3384,6 +3441,7 @@ impl Render for HarnessApp {
             composer_empty,
             self.loading_thread,
             self.thread_read_only_reason.is_some(),
+            self.client.is_some() || self.replay_count.is_some(),
         );
         let available_composer_width = f32::from(window.viewport_size().width)
             - if sidebar_visible { SIDEBAR_WIDTH } else { 0. };
@@ -3945,6 +4003,12 @@ impl Render for HarnessApp {
                                             "Loading task history…"
                                         } else if self.thread_read_only_reason.is_some() {
                                             "Read-only task · Ctrl-N starts a new task"
+                                        } else if self.connecting {
+                                            "Connecting to Codex…"
+                                        } else if self.client.is_none()
+                                            && self.replay_count.is_none()
+                                        {
+                                            "Offline · refresh tasks to reconnect"
                                         } else {
                                             "Ctrl-Enter send"
                                         })
@@ -3987,6 +4051,10 @@ impl Render for HarnessApp {
                                                     "Wait for task history to finish loading"
                                                 } else if self.thread_read_only_reason.is_some() {
                                                     "This task is open read-only"
+                                                } else if self.client.is_none()
+                                                    && self.replay_count.is_none()
+                                                {
+                                                    "Reconnect to Codex before sending"
                                                 } else if composer_empty {
                                                     "Type a prompt to send"
                                                 } else {
@@ -5419,10 +5487,11 @@ mod tests {
 
     #[test]
     fn composer_send_is_blocked_while_loading_or_read_only() {
-        assert!(composer_send_blocked(true, false, false));
-        assert!(composer_send_blocked(false, true, false));
-        assert!(composer_send_blocked(false, false, true));
-        assert!(!composer_send_blocked(false, false, false));
+        assert!(composer_send_blocked(true, false, false, true));
+        assert!(composer_send_blocked(false, true, false, true));
+        assert!(composer_send_blocked(false, false, true, true));
+        assert!(composer_send_blocked(false, false, false, false));
+        assert!(!composer_send_blocked(false, false, false, true));
     }
 
     #[test]
