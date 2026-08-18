@@ -94,3 +94,27 @@ agent client.
 Any gate not yet exercised is reported as remaining work. “Done” is reserved
 for a checkpoint that passes these checks and has survived a fresh visual and
 interaction review without obvious rough edges.
+
+## Checkpoint evidence
+
+### 2026-08-17 — transcript lifecycle and standalone Vim parity
+
+- Focused app tests passed: 22/22. The serialized standalone build completed
+  without pulling in the Zed workspace application.
+- A full-height Rich replay was inspected at 1920×1080/1.5× scale. The reading
+  surface remained full-width, historical requests were visibly inert, and the
+  composer stayed compact below the transcript.
+- A 10,000-item Rich replay used 382,624 KiB RSS versus 363,420 KiB for the
+  120-item replay. Hidden on another workspace, it consumed 0 CPU ticks over
+  five seconds. Focused, it consumed 40 ticks over five seconds versus 43 for
+  the smaller replay, so no item-count-scaled frame loop was observed.
+- Manual smoke testing found no immediate crash, focus trap, or palette/mode
+  failure in this checkpoint.
+- The real Helium history was opened repeatedly in Rich mode without the
+  previously suspected panic. Its active-writer conflict now degrades to an
+  explicit read-only state with sending disabled instead of a red error and an
+  apparently live composer.
+
+Still open: a separate fresh Text-mode visual pass; pinned and paused streaming
+against a real turn; a live approval/form response including failure recovery;
+thread disconnect/reconnect; and longer exploratory use across real histories.
