@@ -3,7 +3,11 @@
 //! Keep the public API local-buffer-shaped. Project, workspace, LSP, DAP, Git,
 //! collaboration, and IDE navigation do not belong on this side of the seam.
 
-use std::{collections::BTreeMap, ops::Range, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    sync::Arc,
+};
 
 use editor::{
     Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
@@ -683,6 +687,71 @@ fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -
         && projection.text.is_char_boundary(segment.body_range.start)
         && projection.text.is_char_boundary(segment.body_range.end)
         && segment.header_range.end <= segment.body_range.start
+}
+
+/// Validate the semantic byte index before any range is sliced or converted
+/// into display-map anchors. The underlying Buffer remains the source of truth
+/// for selectable text; malformed metadata must only disable decoration, never
+/// panic the UI or attach a header/tool surface to the wrong message.
+fn document_has_valid_segment_ranges(document: &TranscriptDocument) -> bool {
+    let text_len = document.text.len();
+    if document
+        .item_rows
+        .iter()
+        .filter(|row| row.is_some())
+        .count()
+        != document.segments.len()
+    {
+        return false;
+    }
+
+    let mut previous_item_index = None;
+    let mut previous_whole_end = 0;
+    let mut previous_row = None;
+    let mut item_keys = BTreeSet::new();
+    for segment in &document.segments {
+        let Some(row) = document
+            .item_rows
+            .get(segment.item_index)
+            .copied()
+            .flatten()
+        else {
+            return false;
+        };
+        if previous_item_index.is_some_and(|previous| previous >= segment.item_index)
+            || previous_row.is_some_and(|previous| previous >= row)
+            || previous_whole_end > segment.whole_range.start
+            || !item_keys.insert(segment.item_key.as_str())
+        {
+            return false;
+        }
+
+        let ranges_are_ordered = segment.whole_range.start < segment.whole_range.end
+            && segment.header_range.start == segment.whole_range.start
+            && segment.header_range.start <= segment.header_range.end
+            && segment.header_range.end <= segment.body_range.start
+            && segment.body_range.start <= segment.body_range.end
+            && segment.body_range.end <= segment.whole_range.end
+            && segment.whole_range.end <= text_len;
+        let boundaries_are_utf8 = [
+            segment.whole_range.start,
+            segment.whole_range.end,
+            segment.header_range.start,
+            segment.header_range.end,
+            segment.body_range.start,
+            segment.body_range.end,
+        ]
+        .into_iter()
+        .all(|offset| document.text.is_char_boundary(offset));
+        if !ranges_are_ordered || !boundaries_are_utf8 {
+            return false;
+        }
+
+        previous_item_index = Some(segment.item_index);
+        previous_whole_end = segment.whole_range.end;
+        previous_row = Some(row);
+    }
+    true
 }
 
 fn shift_range(range: &mut Range<usize>, delta: isize) -> bool {
@@ -1675,7 +1744,42 @@ impl TranscriptEditor {
     /// Zed treats a cursor that enters a replacement block as selecting that
     /// whole underlying row, so headers intentionally do not have character-level
     /// visual selection; every body on either side still does.
-    pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) {
+    pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) -> bool {
+        if !document_has_valid_segment_ranges(document) {
+            // Keep the raw Buffer readable/selectable, but discard every
+            // decoration whose semantic ownership can no longer be proven.
+            // A later valid full sync remounts the retained logical supplement
+            // specs against fresh ranges.
+            self.unmount_all_supplements(cx);
+            self.segments.clear();
+            self.segment_header_texts.clear();
+            self.model_item_count = document.item_rows.len();
+            let previous_header_blocks = std::mem::take(&mut self.header_blocks);
+            self.viewport_decorations = None;
+            self.diff_highlights_dirty = false;
+            self.search.highlights_dirty = true;
+            self.editor.update(cx, |editor, cx| {
+                if !previous_header_blocks.is_empty() {
+                    editor.remove_blocks(previous_header_blocks.into_values().collect(), None, cx);
+                }
+                editor.clear_row_highlights::<UserTranscriptRows>();
+                editor.clear_row_highlights::<ReasoningTranscriptRows>();
+                editor.clear_row_highlights::<StructuredTranscriptRows>();
+                editor.clear_row_highlights::<ErrorTranscriptRows>();
+                for key in [
+                    NavigationOverlayKey::unique::<TranscriptHeaderHighlight>(),
+                    NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
+                    NavigationOverlayKey::unique::<DiffHunkHighlight>(),
+                    NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
+                    NavigationOverlayKey::unique::<DiffDeletionHighlight>(),
+                ] {
+                    editor.clear_highlights(HighlightKey::NavigationOverlay(key), cx);
+                }
+                editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+            });
+            return false;
+        }
+
         // A full document rebuild can replace the anchors under a supplement.
         // Keep the logical specs and host views, but remount their Editor blocks
         // against the new per-item body ranges below.
@@ -1722,6 +1826,7 @@ impl TranscriptEditor {
         });
         self.mount_unmounted_supplements(cx);
         self.refresh_viewport_decorations(cx);
+        true
     }
 
     /// Apply per-item document projections without rebuilding the full buffer.
@@ -2207,6 +2312,69 @@ mod tests {
             ..valid
         };
         assert!(!projection_has_valid_relative_ranges(&invalid));
+    }
+
+    fn indexed_document(
+        text: &str,
+        segments: Vec<TranscriptDocumentSegment>,
+    ) -> TranscriptDocument {
+        let mut item_rows = vec![None; segments.last().map_or(0, |segment| segment.item_index + 1)];
+        for (row, segment) in segments.iter().enumerate() {
+            item_rows[segment.item_index] = Some(row as u32 * 3);
+        }
+        TranscriptDocument {
+            text: text.into(),
+            item_rows,
+            segments,
+        }
+    }
+
+    #[test]
+    fn full_document_ranges_are_a_strict_utf8_semantic_index() {
+        let text = "界 head\nbody\nnext\n";
+        let first_end = "界 head\nbody\n".len();
+        let valid = indexed_document(
+            text,
+            vec![
+                TranscriptDocumentSegment {
+                    item_index: 0,
+                    item_key: "first".into(),
+                    kind: TranscriptKind::Agent,
+                    whole_range: 0..first_end,
+                    header_range: 0.."界 head".len(),
+                    body_range: "界 head\n".len().."界 head\nbody".len(),
+                },
+                TranscriptDocumentSegment {
+                    item_index: 1,
+                    item_key: "second".into(),
+                    kind: TranscriptKind::Command,
+                    whole_range: first_end..text.len(),
+                    header_range: first_end..first_end + "next".len(),
+                    body_range: text.len()..text.len(),
+                },
+            ],
+        );
+        assert!(document_has_valid_segment_ranges(&valid));
+
+        let mut invalid = indexed_document(text, valid.segments.clone());
+        invalid.segments[0].header_range.end = 1;
+        assert!(!document_has_valid_segment_ranges(&invalid));
+
+        let mut invalid = indexed_document(text, valid.segments.clone());
+        invalid.segments[1].whole_range.start = first_end - 1;
+        assert!(!document_has_valid_segment_ranges(&invalid));
+
+        let mut invalid = indexed_document(text, valid.segments.clone());
+        invalid.segments[1].item_index = invalid.item_rows.len();
+        assert!(!document_has_valid_segment_ranges(&invalid));
+
+        let mut invalid = indexed_document(text, valid.segments.clone());
+        invalid.segments[1].item_key = "first".into();
+        assert!(!document_has_valid_segment_ranges(&invalid));
+
+        let mut invalid = indexed_document(text, valid.segments.clone());
+        invalid.segments[1].whole_range.end = text.len() + 1;
+        assert!(!document_has_valid_segment_ranges(&invalid));
     }
 
     #[test]
