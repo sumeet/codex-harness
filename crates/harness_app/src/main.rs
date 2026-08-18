@@ -538,6 +538,10 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
     }
 }
 
+fn rich_search_match_needs_context(item: &TranscriptItem, output_expanded: bool) -> bool {
+    !item.expanded || (transcript_output_is_expandable(item) && !output_expanded)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WebResultPresentation {
     title: String,
@@ -3271,6 +3275,7 @@ impl HarnessApp {
     fn jump_to_search_match(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.search_matches.get(self.active_search_match).copied() {
             self.selected_item = index;
+            self.list_state.pause_following_tail();
             self.list_state.scroll_to_reveal_item(index);
             cx.notify();
         }
@@ -4797,7 +4802,7 @@ impl HarnessApp {
         let search_context = (self.search_visible
             && active_search_item
             && is_disclosure
-            && !item.expanded
+            && rich_search_match_needs_context(&item, self.expanded_output.contains(&item.key))
             && !item
                 .title
                 .to_lowercase()
@@ -6658,6 +6663,29 @@ mod tests {
     }
 
     #[test]
+    fn rich_search_exposes_matches_hidden_by_output_previews() {
+        let mut item = TranscriptItem {
+            key: "tool-1".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Tool,
+            title: "Tool".into(),
+            status: None,
+            content: std::iter::repeat_n("output", STRUCTURED_OUTPUT_PREVIEW_LINES + 1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(rich_search_match_needs_context(&item, false));
+        assert!(!rich_search_match_needs_context(&item, true));
+        item.expanded = false;
+        assert!(rich_search_match_needs_context(&item, true));
+    }
+
+    #[test]
     fn tool_activity_sections_preserve_result_paragraphs() {
         assert_eq!(
             activity_text_sections(
@@ -6713,6 +6741,24 @@ mod tests {
         reconcile_sorted_search_match(&mut matches, 9, true);
         reconcile_sorted_search_match(&mut matches, 12, false);
         assert_eq!(matches, vec![1, 3, 9]);
+    }
+
+    #[test]
+    fn rich_search_pauses_tail_follow_before_revealing_a_match() {
+        let source = include_str!("main.rs");
+        let jump = source
+            .split_once("fn jump_to_search_match")
+            .and_then(|(_, after)| after.split_once("fn move_search_match"))
+            .map(|(jump, _)| jump)
+            .expect("search jump must precede match movement");
+        let pause = jump
+            .find("pause_following_tail")
+            .expect("search jumps must pause tail-follow");
+        let reveal = jump
+            .find("scroll_to_reveal_item")
+            .expect("search jumps must reveal their item");
+
+        assert!(pause < reveal);
     }
 
     #[test]
