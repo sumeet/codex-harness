@@ -32,7 +32,7 @@ use util::{
 use workspace::{ModalView, Workspace, WorkspaceSettings};
 use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
-pub use command_palette_core::normalize_action_query;
+pub use command_palette_core::{humanize_action_name, normalize_action_query};
 pub use zed_actions::command_palette::OpenWithQuery;
 
 pub fn init(cx: &mut App) {
@@ -565,73 +565,6 @@ impl PickerDelegate for CommandPaletteDelegate {
                 .into_any(),
         )
     }
-}
-
-pub fn humanize_action_name(name: &str) -> String {
-    let chars = name.chars().collect::<Vec<_>>();
-    let capacity = name.len() + chars.iter().filter(|c| c.is_uppercase()).count();
-    let mut result = String::with_capacity(capacity);
-    let mut index = 0;
-
-    while index < chars.len() {
-        let char = chars[index];
-        if char == ':' {
-            if result.ends_with(':') {
-                result.push(' ');
-            } else {
-                result.push(':');
-            }
-            index += 1;
-        } else if char == '_' {
-            result.push(' ');
-            index += 1;
-        } else if char.is_uppercase() {
-            let start = index;
-            index += 1;
-            while chars
-                .get(index)
-                .is_some_and(|next_char| next_char.is_uppercase())
-            {
-                index += 1;
-            }
-
-            let uppercase_run = &chars[start..index];
-            if uppercase_run.len() > 1 {
-                let split_before_last = chars
-                    .get(index)
-                    .is_some_and(|next_char| next_char.is_lowercase());
-                let acronym_end = if split_before_last {
-                    uppercase_run.len() - 1
-                } else {
-                    uppercase_run.len()
-                };
-
-                if acronym_end > 0 {
-                    if !result.ends_with(' ') {
-                        result.push(' ');
-                    }
-                    result.extend(&uppercase_run[..acronym_end]);
-                }
-
-                if split_before_last {
-                    if !result.ends_with(' ') {
-                        result.push(' ');
-                    }
-                    result.extend(uppercase_run[acronym_end].to_lowercase());
-                }
-            } else {
-                if !result.ends_with(' ') {
-                    result.push(' ');
-                }
-                result.extend(char.to_lowercase());
-            }
-        } else {
-            result.push(char);
-            index += 1;
-        }
-    }
-
-    result
 }
 
 #[cfg(test)]

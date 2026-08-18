@@ -5,10 +5,19 @@ Codex Harness is a standalone, keyboard-first native client for
 theme tokens, and icon system without booting Zed's workspace, project UI,
 tabs, login shell, or IDE chrome.
 
-The product target is one full-width transcript that looks like a rich GUI
-timeline while behaving like a native Vim buffer: character motions, visual
-selection, yank, search, folds, fast scrolling, and a real modal composer below
-the history.
+The product has two coordinated, full-width projections of one transcript:
+
+- **Rich** is the default reading surface: proportional Markdown, Zed-native
+  cards and icons, diff styling, images, tool activity, and interactive request
+  controls.
+- **Text** is a real Zed `Editor`/`Buffer` driven by Zed's Vim engine: character
+  motions, text objects, visual selection, registers, yank, search, and fast
+  keyboard navigation over the complete selectable history.
+
+Both retain the same semantic item, use one history scrollbar at a time, and
+keep a real modal composer below the history. Product acceptance is defined in
+[`docs/quality-gates.md`](docs/quality-gates.md); a compiling slice is not by
+itself considered finished.
 
 This is an active development checkpoint, not a finished release. The current
 tree includes the standalone app, direct App Server protocol client, segmented
@@ -59,20 +68,23 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 - `crates/command_palette_core`: host-neutral Zed palette matching, history,
   interceptor merge, and confirmation behavior.
 
-Normal streaming updates edit only dirty transcript items. Rich headers, diff
-styling, and search highlights are viewport-bounded; underlying message text
-remains real selectable Buffer text. Interactive approvals, permissions,
-request-user-input forms, MCP forms, and image previews mount as supplemental
-Editor blocks and share the transcript's single scrollbar.
+Normal Text-mode streaming updates edit only dirty transcript items. Rich
+headers, diff styling, and search highlights are viewport-bounded; underlying
+message text remains real selectable Buffer text. Approvals, permissions,
+request-user-input forms, MCP forms, and image previews are stable shared GPUI
+entities: Rich renders them inline, while Text anchors the same entities as
+supplemental Editor blocks. Neither projection introduces a nested vertical
+history scrollbar.
 
 ## Honest status
 
-The Editor-backed transcript is the migration target, but the old rich list is
-still temporarily reachable as a comparison fixture. Before deleting it we are
-validating streaming follow-tail behavior, mouse/keyboard focus transitions,
-image parity, and the always-visible composer in a real tall window. Native
-folds, final `:` palette UI, additional media surfaces, settings controls, and
-live/reopen endurance testing remain active work.
+Rich and Text are intentional product modes, not old/new implementations.
+Current work is validating mode-to-mode semantic position and tail-follow
+transfer, consolidating every interactive surface across both projections,
+and polishing long diffs, tools, reasoning, images, and the always-visible
+composer in real windows. The standalone `:` palette UI, additional media
+surfaces, settings controls, and live/reopen endurance testing remain active
+work.
 
 The stripped standalone graph no longer pulls Zed Workspace, Search, Picker,
 or command-palette UI through Vim. The fork still contains upstream Zed source
@@ -104,4 +116,3 @@ history. Add upstream when needed:
 git remote add upstream https://github.com/zed-industries/zed.git
 git fetch upstream --filter=blob:none
 ```
-

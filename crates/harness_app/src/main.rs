@@ -10,8 +10,8 @@ use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
     FontWeight, IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render,
-    SharedString, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, div, list,
-    prelude::*, px, relative, size,
+    SharedString, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div,
+    list, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -32,6 +32,7 @@ use ui::{
 };
 
 mod image_surface;
+mod palette;
 mod request_surface;
 
 use image_surface::{
@@ -39,10 +40,12 @@ use image_surface::{
     keys_to_sync as image_surface_keys_to_sync, supplement_key as image_supplement_key,
     surface_sync_decision as image_surface_sync_decision,
 };
+use palette::{PaletteEvent, PaletteOverlay};
 use request_surface::{
     RequestSurface, Respond as RequestSurfaceRespond, ReturnToTranscript, SurfaceSyncDecision,
     surface_sync_decision,
 };
+use zed_actions::command_palette::{OpenWithQuery, Toggle as ToggleCommandPalette};
 
 actions!(
     harness,
@@ -77,6 +80,8 @@ actions!(
         SubmitRequest,
         EditRequest,
         ToggleBufferView,
+        ShowRichTranscript,
+        ShowTextTranscript,
         NormalEscape,
         ChooseApproval,
         OpenRequestSurface,
@@ -174,6 +179,9 @@ struct HarnessApp {
     live_request_keys: HashSet<String>,
     dirty_request_surfaces: HashSet<String>,
     request_surfaces: HashMap<String, LiveRequestSurface>,
+    command_palette: Option<Entity<PaletteOverlay>>,
+    command_palette_history: Vec<String>,
+    command_palette_usage: HashMap<String, u16>,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
     list_state: ListState,
@@ -286,6 +294,9 @@ impl HarnessApp {
             live_request_keys: HashSet::default(),
             dirty_request_surfaces: HashSet::default(),
             request_surfaces: HashMap::default(),
+            command_palette: None,
+            command_palette_history: Vec::new(),
+            command_palette_usage: HashMap::default(),
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             sidebar_open: true,
@@ -704,7 +715,7 @@ impl HarnessApp {
     ) {
         if let Some(entry) = self.request_surfaces.remove(item_key) {
             if entry.entity.read(cx).contains_focus(window, cx) {
-                self.focus_buffer_transcript(window, cx);
+                self.focus_transcript(window, cx);
             }
             self.transcript_editor.update(cx, |editor, cx| {
                 editor.remove_supplement(&request_supplement_key(item_key), window, cx);
@@ -755,8 +766,8 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.request_surfaces.contains_key(&event.item_key) && self.buffer_view {
-            self.focus_buffer_transcript(window, cx);
+        if self.request_surfaces.contains_key(&event.item_key) {
+            self.focus_transcript(window, cx);
         }
     }
 
@@ -776,14 +787,13 @@ impl HarnessApp {
     }
 
     fn focus_selected_request_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.buffer_view {
-            return;
-        }
-        let item_index = self
-            .transcript_editor
-            .update(cx, |editor, cx| editor.selected_item(cx));
-        if let Some(item_index) = item_index {
-            self.selected_item = item_index;
+        if self.buffer_view {
+            let item_index = self
+                .transcript_editor
+                .update(cx, |editor, cx| editor.selected_item(cx));
+            if let Some(item_index) = item_index {
+                self.selected_item = item_index;
+            }
         }
         let Some(item_key) = self
             .model
@@ -802,20 +812,23 @@ impl HarnessApp {
         } else {
             FocusMode::Request
         };
-        self.transcript_editor.update(cx, |editor, cx| {
-            editor.reveal_supplement(&request_supplement_key(&item_key), window, cx);
-        });
+        if self.buffer_view {
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.reveal_supplement(&request_supplement_key(&item_key), window, cx);
+            });
+        } else {
+            self.list_state.scroll_to_reveal_item(self.selected_item);
+        }
         surface.update(cx, |surface, cx| surface.focus(window, cx));
         cx.notify();
     }
 
     fn return_from_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry
                 .entity
@@ -1270,12 +1283,11 @@ impl HarnessApp {
     }
 
     fn move_request_question(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry
                 .entity
@@ -1305,12 +1317,11 @@ impl HarnessApp {
     }
 
     fn move_request_option(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry
                 .entity
@@ -1355,12 +1366,11 @@ impl HarnessApp {
     }
 
     fn choose_current_request_option(&mut self, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry.entity.update(cx, |surface, cx| surface.choose(cx));
             return;
@@ -1405,12 +1415,11 @@ impl HarnessApp {
     }
 
     fn move_approval_option(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry
                 .entity
@@ -1441,12 +1450,11 @@ impl HarnessApp {
     }
 
     fn choose_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry.entity.update(cx, |surface, cx| surface.choose(cx));
             return;
@@ -1475,12 +1483,11 @@ impl HarnessApp {
     }
 
     fn edit_current_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry
                 .entity
@@ -1609,12 +1616,11 @@ impl HarnessApp {
     }
 
     fn submit_active_request(&mut self, cx: &mut Context<Self>) {
-        if self.buffer_view
-            && let Some(entry) = self
-                .model
-                .items
-                .get(self.selected_item)
-                .and_then(|item| self.request_surfaces.get(&item.key))
+        if let Some(entry) = self
+            .model
+            .items
+            .get(self.selected_item)
+            .and_then(|item| self.request_surfaces.get(&item.key))
         {
             entry.entity.update(cx, |surface, cx| surface.submit(cx));
             return;
@@ -1748,6 +1754,86 @@ impl HarnessApp {
                     .update(cx, |editor, cx| editor.enter_normal_mode(window, cx));
             }
         });
+        cx.notify();
+    }
+
+    fn show_text_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.buffer_view {
+            self.toggle_buffer_view(window, cx);
+        } else {
+            self.focus_buffer_transcript(window, cx);
+        }
+    }
+
+    fn open_command_palette(
+        &mut self,
+        initial_query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.command_palette.is_some() {
+            self.close_command_palette(window, cx);
+            return;
+        }
+        let previous_focus = window
+            .focused(cx)
+            .unwrap_or_else(|| self.transcript_focus.clone());
+        let palette = cx.new(|cx| {
+            PaletteOverlay::new(
+                initial_query,
+                previous_focus,
+                self.command_palette_history.clone(),
+                self.command_palette_usage.clone(),
+                window,
+                cx,
+            )
+        });
+        cx.subscribe_in(
+            &palette,
+            window,
+            |this, palette, event: &PaletteEvent, window, cx| {
+                let previous_focus = palette.read(cx).previous_focus();
+                let confirmed = (*event == PaletteEvent::Confirmed)
+                    .then(|| palette.update(cx, |palette, _| palette.take_confirmed()))
+                    .flatten();
+                this.command_palette = None;
+                window.focus(&previous_focus, cx);
+                if let Some(command) = confirmed {
+                    if !command.resolved_query.is_empty() {
+                        this.command_palette_history
+                            .retain(|query| query != &command.resolved_query);
+                        this.command_palette_history.push(command.resolved_query);
+                        if this.command_palette_history.len() > 100 {
+                            this.command_palette_history.remove(0);
+                        }
+                    }
+                    let next_usage = this
+                        .command_palette_usage
+                        .get(&command.name)
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    this.command_palette_usage.insert(command.name, next_usage);
+                    window.dispatch_action(command.action, cx);
+                }
+                cx.notify();
+            },
+        )
+        .detach();
+        self.command_palette = Some(palette.clone());
+        palette.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let previous_focus = self
+            .command_palette
+            .as_ref()
+            .map(|palette| palette.read(cx).previous_focus());
+        self.command_palette = None;
+        if let Some(previous_focus) = previous_focus {
+            window.focus(&previous_focus, cx);
+        }
         cx.notify();
     }
 
@@ -2906,9 +2992,14 @@ impl HarnessApp {
             .filter(|request| !request.resolved)
             .map(|request| request_choices(&request.method, &item.raw))
             .unwrap_or_default();
-        let has_approval = !response_choices.is_empty();
         let has_elicitation = pending_method == Some("mcpServer/elicitation/request");
         let has_user_input = pending_method == Some("item/tool/requestUserInput");
+        let request_surface = self
+            .request_surfaces
+            .get(&item.key)
+            .map(|entry| entry.entity.clone());
+        let uses_shared_request_surface = request_surface.is_some();
+        let has_approval = !uses_shared_request_surface && !response_choices.is_empty();
         let approval_focused =
             self.focus_mode == FocusMode::Approval && index == self.selected_item;
         let approval_cursor = self.approval_cursor;
@@ -2928,11 +3019,12 @@ impl HarnessApp {
             && !item.content.is_empty())
         .then(|| self.markdown_for(&item.key, &item.content, cx));
         let icon = icon_for_kind(item.kind);
-        let user_input =
-            has_user_input.then(|| self.render_user_input_request(index, &item, window, cx));
-        let mcp_elicitation =
-            has_elicitation.then(|| self.render_mcp_elicitation(index, &item, window, cx));
+        let user_input = (!uses_shared_request_surface && has_user_input)
+            .then(|| self.render_user_input_request(index, &item, window, cx));
+        let mcp_elicitation = (!uses_shared_request_surface && has_elicitation)
+            .then(|| self.render_mcp_elicitation(index, &item, window, cx));
         let pending_summary = request_method
+            .filter(|_| !uses_shared_request_surface)
             .filter(|method| {
                 !matches!(
                     *method,
@@ -2942,6 +3034,7 @@ impl HarnessApp {
             .map(|_| Self::render_pending_request_summary(&item, cx));
         let choice_buttons = response_choices
             .into_iter()
+            .filter(|_| !uses_shared_request_surface)
             .enumerate()
             .map(|(choice_index, choice)| {
                 let (icon, color) = request_choice_visual(choice.tone);
@@ -3110,6 +3203,7 @@ impl HarnessApp {
                 })
                 .when(compact_trace, |this| this.px_1().py_1())
                 .child(header)
+                .when_some(request_surface, |this, surface| this.child(surface))
                 .when_some(body, |this, body| this.child(body))
                 .when_some(raw, |this, raw| this.child(raw))
                 .when_some(pending_summary, |this, summary| this.child(summary))
@@ -3182,6 +3276,7 @@ impl Render for HarnessApp {
         let turn_active = self.model.current_turn_id.is_some();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
+        let command_palette = self.command_palette.clone();
         let task_body = if self.replay_count.is_some() {
             div()
                 .flex_1()
@@ -3305,7 +3400,7 @@ impl Render for HarnessApp {
                 "j/k extend · y copy · v cancel"
             }
             FocusMode::Transcript => "j/k blocks · Shift-V text view · / find",
-            FocusMode::Composer => "Ctrl-Enter send · Ctrl-W K transcript",
+            FocusMode::Composer => "Ctrl-W K transcript",
             FocusMode::Search if self.search_returns_to_buffer => "Enter jump · Esc cancel",
             FocusMode::Search => "Enter jump · Esc close",
             FocusMode::Request
@@ -3382,6 +3477,22 @@ impl Render for HarnessApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleBufferView, window, cx| {
                 this.toggle_buffer_view(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowRichTranscript, window, cx| {
+                if this.buffer_view {
+                    this.show_rich_transcript(window, cx);
+                } else {
+                    this.focus_transcript(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ShowTextTranscript, window, cx| {
+                this.show_text_transcript(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
+                this.open_command_palette("", window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &OpenWithQuery, window, cx| {
+                this.open_command_palette(&action.query, window, cx)
             }))
             .on_action(cx.listener(|this, _: &GoTop, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
@@ -3760,6 +3871,31 @@ impl Render for HarnessApp {
                             ),
                     ),
             )
+            .when_some(command_palette, |this, command_palette| {
+                this.child(deferred(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .pt(px(56.))
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .bg(gpui::black().opacity(0.16))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                this.close_command_palette(window, cx)
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(relative(0.64))
+                                .min_w(px(420.))
+                                .max_w(px(780.))
+                                .child(command_palette),
+                        ),
+                ))
+            })
     }
 }
 
@@ -5085,6 +5221,8 @@ fn main() {
             log::error!("failed to load editor keymaps: {error}");
             return;
         }
+        command_palette_hooks::init(cx);
+        palette::init(cx);
         load_harness_keymaps(cx);
 
         let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);

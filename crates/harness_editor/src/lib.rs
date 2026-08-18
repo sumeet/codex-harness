@@ -83,6 +83,11 @@ pub struct LocalEditor {
     editor: Entity<Editor>,
 }
 
+/// Emitted whenever a host-owned local editor's Buffer text changes.
+pub struct LocalEditorChanged;
+
+impl EventEmitter<LocalEditorChanged> for LocalEditor {}
+
 impl LocalEditor {
     pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
@@ -91,6 +96,12 @@ impl LocalEditor {
             editor.set_use_modal_editing(true);
             editor
         });
+        cx.subscribe(&editor, |_, _, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.emit(LocalEditorChanged);
+            }
+        })
+        .detach();
         Self { editor }
     }
 
@@ -106,6 +117,12 @@ impl LocalEditor {
             editor.set_use_modal_editing(false);
             editor
         });
+        cx.subscribe(&editor, |_, _, event, cx| {
+            if matches!(event, EditorEvent::BufferEdited) {
+                cx.emit(LocalEditorChanged);
+            }
+        })
+        .detach();
         Self { editor }
     }
 
