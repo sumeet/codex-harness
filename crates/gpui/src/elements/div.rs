@@ -3202,6 +3202,15 @@ impl Interactivity {
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    if event.is_lifecycle_only() {
+                        if let Some(ongoing_scroll) = &ongoing_scroll {
+                            let mut delta = event.delta.pixel_delta(line_height);
+                            ongoing_scroll
+                                .borrow_mut()
+                                .filter(&mut delta, event.touch_phase);
+                        }
+                        return;
+                    }
                     let mut scroll_offset = scroll_offset.borrow_mut();
                     let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);

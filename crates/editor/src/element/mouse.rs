@@ -508,6 +508,16 @@ impl EditorElement {
 
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    if event.is_lifecycle_only() {
+                        if let ScrollDelta::Pixels(mut pixels) = event.delta {
+                            editor.update(cx, |editor, _| {
+                                editor
+                                    .scroll_manager
+                                    .filter_scroll_delta(&mut pixels, event.touch_phase);
+                            });
+                        }
+                        return;
+                    }
                     delta = delta.coalesce(event.delta);
 
                     if event.modifiers.secondary()

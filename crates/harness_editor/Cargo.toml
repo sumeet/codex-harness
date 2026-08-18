@@ -12,9 +12,16 @@ workspace = true
 anyhow.workspace = true
 editor = { path = "../editor", default-features = false }
 gpui.workspace = true
+grammars.workspace = true
 harness_protocol.workspace = true
 language.workspace = true
 multi_buffer.workspace = true
 settings.workspace = true
+theme_settings.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-rust.workspace = true
 ui.workspace = true
 vim = { path = "../vim", default-features = false }
