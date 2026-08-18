@@ -932,6 +932,7 @@ impl HarnessApp {
         } else {
             composer.focus_handle(cx).focus(window, cx);
         }
+        let palette_state = palette::load_state();
 
         let mut this = Self {
             cwd,
@@ -979,8 +980,8 @@ impl HarnessApp {
             dirty_request_surfaces: HashSet::default(),
             request_surfaces: HashMap::default(),
             command_palette: None,
-            command_palette_history: Vec::new(),
-            command_palette_usage: HashMap::default(),
+            command_palette_history: palette_state.history,
+            command_palette_usage: palette_state.usage,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             sidebar_open: true,
@@ -2794,8 +2795,10 @@ impl HarnessApp {
         self.transcript_editor.focus_handle(cx).focus(window, cx);
         cx.defer_in(window, |this, window, cx| {
             if this.buffer_view {
-                this.transcript_editor
-                    .update(cx, |editor, cx| editor.enter_normal_mode(window, cx));
+                this.transcript_editor.update(cx, |editor, cx| {
+                    editor.enter_normal_mode(window, cx);
+                    editor.refresh_after_becoming_visible(cx);
+                });
             }
         });
         cx.notify();
@@ -2858,6 +2861,12 @@ impl HarnessApp {
                         .unwrap_or(0)
                         .saturating_add(1);
                     this.command_palette_usage.insert(command.name, next_usage);
+                    if let Err(error) = palette::save_state(
+                        &this.command_palette_history,
+                        &this.command_palette_usage,
+                    ) {
+                        log::warn!("could not persist command palette state: {error}");
+                    }
                     window.dispatch_action(command.action, cx);
                 }
                 cx.notify();
@@ -5443,30 +5452,6 @@ impl Render for HarnessApp {
                                 .text_color(cx.theme().status().error)
                                 .truncate()
                                 .child(error),
-                        )
-                    })
-                    .when_some(self.thread_read_only_reason.clone(), |this, reason| {
-                        this.child(
-                            div()
-                                .flex_none()
-                                .px_4()
-                                .py_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(cx.theme().status().warning_border)
-                                .bg(cx.theme().status().warning_background.opacity(0.18))
-                                .child(
-                                    Icon::new(IconName::Lock)
-                                        .size(IconSize::Small)
-                                        .color(Color::Warning),
-                                )
-                                .child(
-                                    Label::new(reason)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Warning),
-                                ),
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))

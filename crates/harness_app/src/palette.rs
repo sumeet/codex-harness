@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs, path::PathBuf};
 
+use anyhow::Context as _;
 use command_palette_core::{
     CommandPaletteSession, ConfirmedCommand, HistoryDirection, PaletteCommand, humanize_action_name,
 };
@@ -11,6 +12,7 @@ use gpui::{
     KeyBinding as GpuiKeyBinding, Render, Window, actions, div, prelude::*, px,
 };
 use harness_editor::{LocalEditor, LocalEditorChanged};
+use serde_json::{Value, json};
 use ui::{
     Color, HighlightedLabel, Icon, IconName, IconSize, KeyBinding, Label, LabelCommon, LabelSize,
     ListItem, ListItemSpacing, Toggleable, prelude::ActiveTheme,
@@ -19,6 +21,74 @@ use ui::{
 actions!(harness_palette, [MoveUp, MoveDown, Confirm, Dismiss]);
 
 const MAX_VISIBLE_MATCHES: usize = 12;
+const MAX_HISTORY_ENTRIES: usize = 100;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct PaletteState {
+    pub(crate) history: Vec<String>,
+    pub(crate) usage: HashMap<String, u16>,
+}
+
+fn palette_state_path() -> Option<PathBuf> {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|directory| directory.join("codex-harness").join("palette.json"))
+}
+
+fn palette_state_from_value(value: &Value) -> PaletteState {
+    let history = value
+        .get("history")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|query| !query.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .rev()
+        .take(MAX_HISTORY_ENTRIES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let usage = value
+        .get("usage")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(command, count)| {
+            let count = count.as_u64()?;
+            (count > 0).then_some((command.clone(), count.min(u16::MAX as u64) as u16))
+        })
+        .collect();
+    PaletteState { history, usage }
+}
+
+pub(crate) fn load_state() -> PaletteState {
+    let Some(path) = palette_state_path() else {
+        return PaletteState::default();
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return PaletteState::default();
+    };
+    serde_json::from_str(&contents)
+        .ok()
+        .as_ref()
+        .map(palette_state_from_value)
+        .unwrap_or_default()
+}
+
+pub(crate) fn save_state(history: &[String], usage: &HashMap<String, u16>) -> anyhow::Result<()> {
+    let Some(path) = palette_state_path() else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .context("palette state path has no parent directory")?;
+    fs::create_dir_all(parent).context("create Harness state directory")?;
+    let value = json!({ "history": history, "usage": usage });
+    let contents = serde_json::to_vec_pretty(&value).context("encode palette state")?;
+    fs::write(path, contents).context("write palette state")
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PaletteEvent {
@@ -342,5 +412,27 @@ mod tests {
         );
         assert_eq!(harness_alias("w"), None);
         assert_eq!(harness_alias("q"), None);
+    }
+
+    #[test]
+    fn persisted_palette_state_is_bounded_and_rejects_invalid_usage() {
+        let history = (0..105)
+            .map(|index| Value::String(format!("query-{index}")))
+            .collect::<Vec<_>>();
+        let state = palette_state_from_value(&json!({
+            "history": history,
+            "usage": {
+                "harness: show rich transcript": 7,
+                "zero": 0,
+                "too-large": 100000,
+                "wrong-type": "4"
+            }
+        }));
+        assert_eq!(state.history.len(), MAX_HISTORY_ENTRIES);
+        assert_eq!(state.history.first().map(String::as_str), Some("query-5"));
+        assert_eq!(state.usage.get("harness: show rich transcript"), Some(&7));
+        assert_eq!(state.usage.get("too-large"), Some(&u16::MAX));
+        assert!(!state.usage.contains_key("zero"));
+        assert!(!state.usage.contains_key("wrong-type"));
     }
 }

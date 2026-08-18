@@ -174,6 +174,7 @@ pub struct TranscriptEditor {
     supplements: BTreeMap<String, MountedTranscriptSupplement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
+    refresh_when_rendered: bool,
     // A streaming body edit can change unified-diff line classes without
     // moving the viewport. Reparse only the visible Diff bodies on the next
     // refresh; never rescan the full transcript.
@@ -940,6 +941,7 @@ impl TranscriptEditor {
             supplements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
+            refresh_when_rendered: false,
             diff_highlights_dirty: true,
             search: TranscriptSearchState::default(),
             follow_tail: false,
@@ -1270,6 +1272,28 @@ impl TranscriptEditor {
             let anchor = snapshot.anchor_before(MultiBufferOffset(offset));
             editor.request_autoscroll(Autoscroll::top().for_anchor(anchor), cx);
         });
+    }
+
+    /// Refresh viewport-scoped decorations once the host has made this Editor
+    /// visible and GPUI has laid it out. Hidden transcript projections can
+    /// retain a valid cache for their previous viewport, so restoring their
+    /// scroll position alone is not sufficient to mount the newly visible
+    /// native headers.
+    pub fn refresh_after_becoming_visible(&mut self, cx: &mut Context<Self>) {
+        let stale_header_blocks = std::mem::take(&mut self.header_blocks);
+        self.viewport_decorations = None;
+        if !stale_header_blocks.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(stale_header_blocks.into_values().collect(), None, cx);
+            });
+        }
+        // Schedule from the first Render in which the Editor is actually a
+        // visible child. Scheduling before that point observes its stale hidden
+        // layout and can leave ornamental Buffer headers exposed until the user
+        // scrolls. `Render` consumes this flag, so this requests exactly one
+        // frame rather than creating perpetual frame demand.
+        self.refresh_when_rendered = true;
+        cx.notify();
     }
 
     fn request_tail_autoscroll(&mut self, cx: &mut Context<Self>) {
@@ -2134,7 +2158,10 @@ impl Focusable for TranscriptEditor {
 }
 
 impl Render for TranscriptEditor {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.refresh_when_rendered) {
+            self.schedule_viewport_refresh(window, cx);
+        }
         self.editor.clone()
     }
 }
@@ -2183,7 +2210,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_render_does_not_create_idle_frame_demand() {
+    fn transcript_render_only_schedules_a_bounded_visibility_refresh() {
         // This is deliberately a source-level invariant. Scheduling a
         // next-frame callback from Render looks harmless, but GPUI treats the
         // callback as platform frame demand; it caused an unfocused 10k-item
@@ -2196,8 +2223,25 @@ mod tests {
             .map(|(render_impl, _)| render_impl)
             .expect("TranscriptEditor Render implementation must precede its tests");
 
-        assert!(!render_impl.contains("schedule_viewport_refresh"));
+        assert_eq!(render_impl.matches("schedule_viewport_refresh").count(), 1);
+        assert!(render_impl.contains("std::mem::take(&mut self.refresh_when_rendered)"));
         assert!(!render_impl.contains("on_next_frame"));
+    }
+
+    #[test]
+    fn becoming_visible_requests_only_one_event_driven_refresh() {
+        let source = include_str!("lib.rs");
+        let method = source
+            .split_once("pub fn refresh_after_becoming_visible")
+            .and_then(|(_, after)| after.split_once("fn request_tail_autoscroll"))
+            .map(|(method, _)| method)
+            .expect("visibility refresh must precede tail autoscroll");
+
+        assert_eq!(method.matches("schedule_viewport_refresh").count(), 0);
+        assert_eq!(method.matches("cx.on_next_frame").count(), 0);
+        assert!(method.contains("std::mem::take(&mut self.header_blocks)"));
+        assert!(method.contains("self.viewport_decorations = None"));
+        assert!(method.contains("self.refresh_when_rendered = true"));
     }
 
     #[test]

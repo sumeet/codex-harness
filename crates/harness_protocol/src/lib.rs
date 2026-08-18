@@ -424,6 +424,17 @@ fn selectable_transcript_body(item: &TranscriptItem) -> String {
     }
 }
 
+/// Match the normalization performed by Zed's text Buffer for every inserted
+/// edit. Transcript byte ranges are consumed directly by that Buffer, so the
+/// protocol projection must use the same coordinate space or every CRLF after
+/// the first one shifts semantic headers, search matches, and diff styling.
+fn normalize_buffer_line_endings(mut text: String) -> String {
+    if text.contains('\r') {
+        text = text.replace("\r\n", "\n").replace('\r', "\n");
+    }
+    text
+}
+
 fn project_transcript_item(
     item_index: usize,
     item: &TranscriptItem,
@@ -435,17 +446,17 @@ fn project_transcript_item(
     let mut text = String::new();
     let header_start = text.len();
     text.push_str("━━━━ ");
-    text.push_str(&item.title);
+    text.push_str(&normalize_buffer_line_endings(item.title.clone()));
     if let Some(status) = item.display_status() {
         text.push_str(" · ");
-        text.push_str(status);
+        text.push_str(&normalize_buffer_line_endings(status.to_owned()));
     }
     text.push_str(" ━━━━");
     let header_end = text.len();
     text.push_str("\n\n");
 
     let body_start = text.len();
-    let body = selectable_transcript_body(item);
+    let body = normalize_buffer_line_endings(selectable_transcript_body(item));
     if !body.is_empty() {
         text.push_str(&body);
         text.push('\n');
@@ -4510,6 +4521,31 @@ mod tests {
         let completed = model.item_projection(0).unwrap();
         assert_eq!(completed.body_text(), "A real Vim composer");
         assert!(!completed.body_text().contains("**"));
+    }
+
+    #[test]
+    fn document_offsets_match_zed_buffer_line_ending_normalization() {
+        let mut model = TranscriptModel::default();
+        model.push_without_splice(replay_item(
+            0,
+            TranscriptKind::Command,
+            "Command",
+            "first\r\nsecond\rthird\nfourth\r\n",
+            json!(null),
+        ));
+
+        let projection = model.item_projection(0).unwrap();
+        assert_eq!(projection.body_text(), "first\nsecond\nthird\nfourth");
+        assert!(!projection.text.contains('\r'));
+        assert_eq!(projection.segment.whole_range.end, projection.text.len());
+
+        let document = model.full_document();
+        assert_eq!(document.text, projection.text);
+        assert_eq!(document.segments[0].whole_range.end, document.text.len());
+        assert_eq!(
+            &document.text[document.segments[0].body_range.clone()],
+            "first\nsecond\nthird\nfourth"
+        );
     }
 
     #[test]
