@@ -18,7 +18,8 @@ use gpui::{
 use gpui_platform::application;
 use harness_editor::{
     LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged,
-    TranscriptSupplement, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious,
+    TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch,
+    VimWordNext, VimWordPrevious,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -86,6 +87,8 @@ actions!(
         ToggleBufferView,
         ShowRichTranscript,
         ShowTextTranscript,
+        UseBufferTypography,
+        UseReadingTypography,
         NormalEscape,
         ChooseApproval,
         OpenRequestSurface,
@@ -3358,6 +3361,18 @@ impl HarnessApp {
         }
     }
 
+    fn use_transcript_typography(
+        &mut self,
+        profile: TranscriptTypographyProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_typography_profile(profile, window, cx);
+        });
+        self.show_text_transcript(window, cx);
+    }
+
     fn open_command_palette(
         &mut self,
         initial_query: &str,
@@ -5748,6 +5763,12 @@ impl Render for HarnessApp {
             }))
             .on_action(cx.listener(|this, _: &ShowTextTranscript, window, cx| {
                 this.show_text_transcript(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseBufferTypography, window, cx| {
+                this.use_transcript_typography(TranscriptTypographyProfile::Buffer, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &UseReadingTypography, window, cx| {
+                this.use_transcript_typography(TranscriptTypographyProfile::Reading, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.open_command_palette("", window, cx)

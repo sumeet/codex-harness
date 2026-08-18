@@ -388,6 +388,8 @@ fn harness_alias(query: &str) -> Option<String> {
         "new" | "enew" => Some("harness: new task".into()),
         "text" => Some("harness: show text transcript".into()),
         "rich" => Some("harness: show rich transcript".into()),
+        "mono" => Some("harness: use buffer typography".into()),
+        "reading" => Some("harness: use reading typography".into()),
         "compose" => Some("harness: focus composer".into()),
         "tasks" => Some("harness: toggle sidebar".into()),
         "stop" => Some("harness: stop".into()),
@@ -409,6 +411,14 @@ mod tests {
         assert_eq!(
             harness_alias("rich").as_deref(),
             Some("harness: show rich transcript")
+        );
+        assert_eq!(
+            harness_alias("mono").as_deref(),
+            Some("harness: use buffer typography")
+        );
+        assert_eq!(
+            harness_alias("reading").as_deref(),
+            Some("harness: use reading typography")
         );
         assert_eq!(harness_alias("w"), None);
         assert_eq!(harness_alias("q"), None);
