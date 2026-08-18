@@ -3215,6 +3215,7 @@ impl HarnessApp {
             self.focus_mode == FocusMode::Approval && index == self.selected_item;
         let approval_cursor = self.approval_cursor;
         let colors = cx.theme().colors().clone();
+        let narrow = window.viewport_size().width < px(720.);
         let narrative = matches!(
             item.kind,
             model::TranscriptKind::User
@@ -3277,6 +3278,7 @@ impl HarnessApp {
 
         let header = div()
             .w_full()
+            .min_w_0()
             .flex()
             .items_center()
             .gap_2()
@@ -3286,18 +3288,21 @@ impl HarnessApp {
                 Color::Muted
             }))
             .child(
-                Label::new(item.title.clone())
-                    .size(LabelSize::Small)
-                    .color(if cursor { Color::Default } else { Color::Muted }),
+                div().flex_1().min_w_0().truncate().child(
+                    Label::new(item.title.clone())
+                        .size(LabelSize::Small)
+                        .color(if cursor { Color::Default } else { Color::Muted }),
+                ),
             )
             .when_some(visible_status, |this, status| {
                 this.child(
-                    Label::new(status)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                    div().flex_none().child(
+                        Label::new(status)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
                 )
             })
-            .child(div().flex_1())
             .when(
                 item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning,
                 |this| {
@@ -3412,11 +3417,15 @@ impl HarnessApp {
                 .flex_col()
                 .gap_2()
                 .when(!compact_trace, |this| {
-                    this.rounded_lg()
+                    let this = this
                         .border_1()
                         .border_color(colors.border_variant)
-                        .bg(colors.element_background.opacity(0.72))
-                        .p_3()
+                        .bg(colors.element_background.opacity(0.72));
+                    if narrow {
+                        this.rounded_md().px_3().py_2()
+                    } else {
+                        this.rounded_lg().p_3()
+                    }
                 })
                 .when(compact_trace, |this| this.px_1().py_1())
                 .child(header)
@@ -3445,8 +3454,14 @@ impl HarnessApp {
         div()
             .id(("transcript-item", index))
             .w_full()
-            .px_6()
-            .py(if compact_trace { px(3.) } else { px(12.) })
+            .px(if narrow { px(12.) } else { px(24.) })
+            .py(if compact_trace {
+                px(3.)
+            } else if narrow && !narrative {
+                px(8.)
+            } else {
+                px(12.)
+            })
             .border_l_2()
             .border_color(if cursor {
                 colors.text_accent
@@ -4009,27 +4024,32 @@ impl Render for HarnessApp {
                     )
                     .when(!sidebar_visible, |this| {
                         this.child(
-                            div()
-                                .absolute()
-                                .top(px(6.))
-                                .left(px(6.))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border)
-                                .bg(colors.panel_background.opacity(0.92))
-                                .child(
-                                    IconButton::new(
-                                        "show-sidebar",
-                                        IconName::ThreadsSidebarLeftClosed,
-                                    )
-                                    .shape(IconButtonShape::Square)
-                                    .size(ButtonSize::Default)
-                                    .style(ButtonStyle::Subtle)
-                                    .aria_label("Show thread list")
-                                    .on_click(cx.listener(
-                                        |this, _, window, cx| this.toggle_sidebar(window, cx),
-                                    )),
-                                ),
+                            deferred(
+                                div()
+                                    .absolute()
+                                    .top(px(6.))
+                                    .left(px(6.))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(colors.border)
+                                    .bg(colors.panel_background.opacity(0.92))
+                                    .child(
+                                        IconButton::new(
+                                            "show-sidebar",
+                                            IconName::ThreadsSidebarLeftClosed,
+                                        )
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Default)
+                                        .style(ButtonStyle::Subtle)
+                                        .aria_label("Show thread list")
+                                        .on_click(
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_sidebar(window, cx)
+                                            }),
+                                        ),
+                                    ),
+                            )
+                            .with_priority(1),
                         )
                     }),
             )
