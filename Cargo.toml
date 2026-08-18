@@ -1079,7 +1079,10 @@ zed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
-debug = "full"
+# Full DWARF made large settings crates spend hours asleep inside rustc while
+# producing an artifact that Harness does not need for frame-time QA. Limited
+# line information keeps useful profiles/backtraces without that codegen cliff.
+debug = "limited"
 lto = false
 codegen-units = 16
 
