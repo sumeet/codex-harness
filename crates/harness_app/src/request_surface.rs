@@ -848,7 +848,7 @@ impl Render for RequestSurface {
             .id(format!("request-surface-{}", self.item_key))
             .key_context("RequestSurface")
             .track_focus(&self.focus_handle)
-            .size_full()
+            .w_full()
             .min_w_0()
             .px_3()
             .py_2()
@@ -862,6 +862,13 @@ impl Render for RequestSurface {
                 colors.border_variant
             })
             .bg(colors.editor_background.opacity(0.35))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(body)
             .when_some(self.validation_error.clone(), |this, error| {
                 this.child(

@@ -461,6 +461,79 @@ pub fn normalize_action_query(input: &str) -> String {
     result
 }
 
+/// Converts a GPUI action name into the human-readable label used by Zed's
+/// command palette.
+pub fn humanize_action_name(name: &str) -> String {
+    let chars = name.chars().collect::<Vec<_>>();
+    let capacity = name.len()
+        + chars
+            .iter()
+            .filter(|character| character.is_uppercase())
+            .count();
+    let mut result = String::with_capacity(capacity);
+    let mut index = 0;
+
+    while index < chars.len() {
+        let character = chars[index];
+        if character == ':' {
+            if result.ends_with(':') {
+                result.push(' ');
+            } else {
+                result.push(':');
+            }
+            index += 1;
+        } else if character == '_' {
+            result.push(' ');
+            index += 1;
+        } else if character.is_uppercase() {
+            let start = index;
+            index += 1;
+            while chars
+                .get(index)
+                .is_some_and(|next_character| next_character.is_uppercase())
+            {
+                index += 1;
+            }
+
+            let uppercase_run = &chars[start..index];
+            if uppercase_run.len() > 1 {
+                let split_before_last = chars
+                    .get(index)
+                    .is_some_and(|next_character| next_character.is_lowercase());
+                let acronym_end = if split_before_last {
+                    uppercase_run.len() - 1
+                } else {
+                    uppercase_run.len()
+                };
+
+                if acronym_end > 0 {
+                    if !result.ends_with(' ') {
+                        result.push(' ');
+                    }
+                    result.extend(&uppercase_run[..acronym_end]);
+                }
+
+                if split_before_last {
+                    if !result.ends_with(' ') {
+                        result.push(' ');
+                    }
+                    result.extend(uppercase_run[acronym_end].to_lowercase());
+                }
+            } else {
+                if !result.ends_with(' ') {
+                    result.push(' ');
+                }
+                result.extend(character.to_lowercase());
+            }
+        } else {
+            result.push(character);
+            index += 1;
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -476,6 +549,27 @@ mod tests {
             PaletteCommand::new("beta".to_owned(), Beta.boxed_clone()),
             PaletteCommand::new("gamma".to_owned(), Gamma.boxed_clone()),
         ]
+    }
+
+    #[test]
+    fn action_names_use_zeds_palette_labels() {
+        assert_eq!(
+            humanize_action_name("editor::GoToDefinition"),
+            "editor: go to definition"
+        );
+        assert_eq!(
+            humanize_action_name("go_to_line::Deploy"),
+            "go to line: deploy"
+        );
+        assert_eq!(
+            humanize_action_name("agent::OpenGlobalAGENTS.mdRules"),
+            "agent: open global AGENTS.md rules"
+        );
+        assert_eq!(humanize_action_name("editor::OpenURL"), "editor: open URL");
+        assert_eq!(
+            humanize_action_name("editor::OpenURLParser"),
+            "editor: open URL parser"
+        );
     }
 
     fn history() -> Vec<String> {
