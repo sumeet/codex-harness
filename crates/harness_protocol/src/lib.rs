@@ -177,10 +177,11 @@ impl TranscriptItem {
     /// Raw protocol history remains available even when an empty terminal
     /// reasoning placeholder is omitted from both reading surfaces.
     pub fn is_presentationally_visible(&self) -> bool {
-        self.kind != TranscriptKind::Reasoning
-            || !self.content.trim().is_empty()
-            || self.pending_request.is_some()
-            || self.display_status().is_some()
+        self.kind != TranscriptKind::Trace
+            && (self.kind != TranscriptKind::Reasoning
+                || !self.content.trim().is_empty()
+                || self.pending_request.is_some()
+                || self.display_status().is_some())
     }
 
     /// Extract the stable invocation and the changing output from a command
@@ -2649,7 +2650,7 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
         title: title_from_protocol(protocol_kind, &raw),
         status: raw
             .get("status")
-            .map(protocol_status)
+            .and_then(protocol_status)
             .or_else(|| completed.then(|| "completed".into()))
             .or_else(|| Some("running".into())),
         content: content_from_protocol(protocol_kind, &raw),
@@ -3359,12 +3360,17 @@ fn compact_json(value: &Value) -> String {
     }
 }
 
-fn protocol_status(value: &Value) -> String {
-    value
-        .as_str()
-        .map(humanize_identifier)
-        .map(|status| status.to_lowercase())
-        .unwrap_or_else(|| compact_json(value))
+fn protocol_status(value: &Value) -> Option<String> {
+    match value {
+        Value::String(status) => {
+            let status = protocol_status_text(status);
+            (!status.is_empty()).then_some(status)
+        }
+        Value::Object(object) => ["type", "status", "state"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(protocol_status)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) => None,
+    }
 }
 
 fn protocol_status_text(value: &str) -> String {
@@ -4388,6 +4394,105 @@ mod tests {
             item.status = Some(status.into());
             assert_eq!(item.display_status(), Some(status), "status {status}");
         }
+    }
+
+    #[test]
+    fn object_statuses_are_semantic_and_opaque_shapes_never_render_as_json() {
+        assert_eq!(
+            protocol_status(&json!({"type": "completed"})),
+            Some("completed".into())
+        );
+        assert_eq!(
+            protocol_status(&json!({"state": {"status": "inProgress"}})),
+            Some("in progress".into())
+        );
+        assert_eq!(protocol_status(&json!({"phaseCode": 7})), None);
+        assert_eq!(protocol_status(&json!(["completed"])), None);
+
+        let completed = item_from_protocol(
+            json!({
+                "id": "agent-completed",
+                "type": "agentMessage",
+                "text": "Finished work",
+                "status": {"type": "completed"}
+            }),
+            false,
+        );
+        assert_eq!(completed.status.as_deref(), Some("completed"));
+        assert_eq!(completed.display_status(), None);
+
+        let running = item_from_protocol(
+            json!({
+                "id": "agent-running",
+                "type": "agentMessage",
+                "text": "Working",
+                "status": {"state": {"status": "inProgress"}}
+            }),
+            false,
+        );
+        assert_eq!(running.display_status(), Some("in progress"));
+
+        let opaque = item_from_protocol(
+            json!({
+                "id": "agent-opaque",
+                "type": "agentMessage",
+                "text": "Still working",
+                "status": {"phaseCode": 7, "metadata": []}
+            }),
+            false,
+        );
+        assert_eq!(opaque.status.as_deref(), Some("running"));
+        let projection = project_transcript_item(0, &opaque).unwrap();
+        assert!(!projection.header_text().contains('{'));
+        assert!(!projection.header_text().contains("phaseCode"));
+    }
+
+    #[test]
+    fn trace_items_remain_diagnostic_but_never_enter_either_reading_surface() {
+        let mut model = TranscriptModel::default();
+        model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/completed".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "future-item-1",
+                            "type": "futureDiagnosticItem",
+                            "status": "completed",
+                            "details": {"message": "retained for diagnostics"}
+                        }
+                    }),
+                },
+                Event::UnmatchedResponse {
+                    id: json!(99),
+                    result: Some(json!({"unexpected": true})),
+                    error: None,
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.raw_events.len(), 2);
+        assert_eq!(model.raw_events[0].method, "item/completed");
+        assert_eq!(model.raw_events[1].method, "unmatchedResponse");
+        assert_eq!(model.items.len(), 2);
+        assert!(
+            model
+                .items
+                .iter()
+                .all(|item| item.kind == TranscriptKind::Trace)
+        );
+        assert!(
+            model
+                .items
+                .iter()
+                .all(|item| !item.is_presentationally_visible())
+        );
+        assert!(model.item_projection(0).is_none());
+        assert!(model.item_projection(1).is_none());
+        assert!(model.full_document().text.is_empty());
     }
 
     #[test]

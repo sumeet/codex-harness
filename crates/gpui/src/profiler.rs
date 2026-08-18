@@ -831,6 +831,9 @@ pub enum FrameEvent {
 pub struct FrameDurationSnapshot {
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
+    /// Histogram of intervals between consecutive input-driven presented
+    /// frames, in nanoseconds.
+    pub input_driven_present_interval_histogram: Histogram<u64>,
     /// Histogram of intervals between consecutively presented frames while the
     /// window was animating, in nanoseconds.
     pub present_interval_histogram: Histogram<u64>,
@@ -866,12 +869,14 @@ pub struct WindowProfiler {
     window_id: WindowId,
     active_activities: SmallVec<[WindowActivity; 4]>,
     draw_duration_histogram: Histogram<u64>,
+    input_driven_present_interval_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
     pending_input_count: u64,
     input_latency_histogram: Histogram<u64>,
     events_per_frame_histogram: Histogram<u64>,
     mid_draw_events_dropped: u64,
+    last_input_driven_present_at: Option<Instant>,
     last_present_at: Option<Instant>,
     animating_at_last_present: bool,
     drew_since_last_present: bool,
@@ -887,6 +892,9 @@ impl WindowProfiler {
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
             })?,
+            input_driven_present_interval_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create input-driven present interval histogram: {error}")
+            })?,
             present_interval_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create present interval histogram: {error}")
             })?,
@@ -899,6 +907,7 @@ impl WindowProfiler {
                 anyhow::anyhow!("Failed to create events per frame histogram: {error}")
             })?,
             mid_draw_events_dropped: 0,
+            last_input_driven_present_at: None,
             last_present_at: None,
             animating_at_last_present: false,
             drew_since_last_present: false,
@@ -995,6 +1004,9 @@ impl WindowProfiler {
     pub fn frame_duration_snapshot(&self) -> FrameDurationSnapshot {
         FrameDurationSnapshot {
             draw_duration_histogram: self.draw_duration_histogram.clone(),
+            input_driven_present_interval_histogram: self
+                .input_driven_present_interval_histogram
+                .clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
         }
     }
@@ -1005,6 +1017,7 @@ impl WindowProfiler {
         window_active: bool,
         next_frame_scheduled: bool,
     ) {
+        let input_driven = self.pending_input_count > 0;
         if let Some(first_input_at) = self.first_input_at.take() {
             let latency_nanos = presented_at.duration_since(first_input_at).as_nanos() as u64;
             self.input_latency_histogram.record(latency_nanos).ok();
@@ -1018,6 +1031,22 @@ impl WindowProfiler {
 
         if !std::mem::take(&mut self.drew_since_last_present) {
             return;
+        }
+
+        if input_driven {
+            if let Some(last_present_at) = self.last_input_driven_present_at {
+                let interval = presented_at.duration_since(last_present_at);
+                if interval <= INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT
+                    && let Err(error) = self
+                        .input_driven_present_interval_histogram
+                        .record(interval.as_nanos() as u64)
+                {
+                    log::error!("failed to record input-driven present interval: {error}");
+                }
+            }
+            self.last_input_driven_present_at = Some(presented_at);
+        } else {
+            self.last_input_driven_present_at = None;
         }
 
         let animation_interval = if self.animating_at_last_present && window_active {
@@ -1050,6 +1079,11 @@ impl WindowProfiler {
         self.drew_since_last_present = true;
     }
 }
+
+// Do not turn the pause between two input bursts into a cadence sample. This
+// remains high enough to preserve visibly stalled frames within one gesture.
+#[cfg(feature = "profiler")]
+const INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT: Duration = Duration::from_millis(250);
 
 // Allow 16MiB of frame event entries.
 #[cfg(feature = "profiler")]
@@ -1349,6 +1383,77 @@ mod tests {
     }
 
     #[test]
+    fn records_input_driven_intervals_without_animation_callbacks() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(8)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        input_draw_and_present(&mut window_profiler, start);
+        input_draw_and_present(&mut window_profiler, start + FRAME);
+
+        let snapshot = window_profiler.frame_duration_snapshot();
+        assert_eq!(snapshot.input_driven_present_interval_histogram.len(), 1);
+        assert!(
+            snapshot.input_driven_present_interval_histogram.max()
+                >= (FRAME * 3 / 4).as_nanos() as u64
+        );
+        assert!(snapshot.present_interval_histogram.is_empty());
+    }
+
+    #[test]
+    fn non_input_frame_breaks_the_input_driven_interval_chain() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(9)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        input_draw_and_present(&mut window_profiler, start);
+        draw_and_present(&mut window_profiler, start + FRAME, true, false);
+        input_draw_and_present(&mut window_profiler, start + FRAME * 2);
+        assert!(
+            window_profiler
+                .input_driven_present_interval_histogram
+                .is_empty()
+        );
+
+        input_draw_and_present(&mut window_profiler, start + FRAME * 3);
+        assert_eq!(
+            window_profiler
+                .input_driven_present_interval_histogram
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn idle_gap_breaks_the_input_driven_interval_chain() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(10)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        input_draw_and_present(&mut window_profiler, start);
+        input_draw_and_present(
+            &mut window_profiler,
+            start + INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT + FRAME,
+        );
+        assert!(
+            window_profiler
+                .input_driven_present_interval_histogram
+                .is_empty()
+        );
+
+        input_draw_and_present(
+            &mut window_profiler,
+            start + INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT + FRAME * 2,
+        );
+        assert_eq!(
+            window_profiler
+                .input_driven_present_interval_histogram
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn excludes_input_that_arrives_during_a_draw() {
         let mut window_profiler =
             WindowProfiler::new(WindowId::from(7)).expect("window profiler should initialize");
@@ -1430,5 +1535,11 @@ mod tests {
     ) {
         window_profiler.record_draw_duration(Duration::from_millis(2));
         window_profiler.record_present_at(presented_at, window_active, next_frame_scheduled);
+    }
+
+    fn input_draw_and_present(window_profiler: &mut WindowProfiler, presented_at: Instant) {
+        begin_input_at(window_profiler, presented_at);
+        window_profiler.end_input(true);
+        draw_and_present(window_profiler, presented_at, true, false);
     }
 }

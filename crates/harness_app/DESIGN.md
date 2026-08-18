@@ -11,8 +11,10 @@ Zed workspaces, ACP, account state, extensions, or a general-purpose code editor
 - Reasoning and plans are annotated document sections.
 - Commands, diffs, file changes, tools, images, approvals, and subagents use purpose-built
   structured blocks.
-- App Server frames are journaled losslessly. Semantic deltas update a stable block; unknown frames
-  remain visible as trace blocks. The raw payload for any block is one keystroke away.
+- App Server frames are retained in a bounded runtime diagnostic journal. Semantic deltas update a
+  stable block; telemetry, routine lifecycle noise, unknown notifications, and unknown item types
+  do not become conversation rows. Diagnostic retention is intentionally not described as
+  permanent or lossless because the journal is bounded and is not persisted with the transcript.
 - The task rail and transcript are virtualized independently.
 
 ## Keyboard model

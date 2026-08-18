@@ -73,12 +73,23 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 - Rich uses `j`/`k`, `gg`/`G`, `/`, disclosures, and blockwise selection/yank.
   `Shift-V` enters Text at the same semantic item.
 - Text is Zed's modal Editor. Its normal/visual motions, registers, yank,
-  `/ ? n N`, `* # g* g#`, jumplist, and `:` palette operate on real Buffer
-  text. `:rich`, `:text`, `:compose`, `:tasks`, `:new`, and `:stop` are Harness
-  aliases. `--text` starts directly in Text for repeatable QA; the code icon in
-  the thread-rail toolbar switches modes with the mouse.
+  `/ ? n N`, jumplist, and `:` palette operate on real Buffer text. `:rich`,
+  `:text`, `:reading`, `:mono`, `:compose`, `:tasks`, `:new`, `:stop`, and
+  `:perf` are Harness aliases. `:perf` copies a delta performance report rather
+  than adding permanent profiler chrome. `--text` starts directly in Text for
+  repeatable QA; the code icon in the thread-rail toolbar switches modes with
+  the mouse. Standalone `* # g* g# gn gN` search semantics are still active
+  work rather than being silently claimed here.
 - `Enter` on an interactive request in Text focuses its shared form/approval
   surface; `Escape` returns to the transcript.
+
+The composer is a real plaintext Zed Editor with Markdown and fenced-language
+syntax highlighting. Markdown punctuation remains visible and editable, and
+Vim operations always address the exact source text; it is not a WYSIWYG field.
+Colors, emphasis, and common Bash/Rust/JSON fence injections are enabled today.
+Mixed proportional-prose and monospace-code font families require a deeper
+Editor layout extension so wrapping, cursor geometry, clicks, and Vim selection
+all agree, and are deliberately not simulated with unselectable UI fragments.
 
 ## Current architecture
 

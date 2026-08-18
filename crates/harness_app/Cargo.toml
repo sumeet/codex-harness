@@ -16,10 +16,11 @@ command_palette_core.workspace = true
 command_palette_hooks.workspace = true
 dirs.workspace = true
 env_logger.workspace = true
-gpui.workspace = true
+gpui = { workspace = true, features = ["profiler"] }
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
 harness_editor.workspace = true
 harness_protocol.workspace = true
+hdrhistogram.workspace = true
 log.workspace = true
 markdown.workspace = true
 release_channel.workspace = true

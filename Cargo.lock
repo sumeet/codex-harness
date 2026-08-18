@@ -8337,6 +8337,7 @@ dependencies = [
  "gpui_platform",
  "harness_editor",
  "harness_protocol",
+ "hdrhistogram",
  "log",
  "markdown",
  "release_channel",
