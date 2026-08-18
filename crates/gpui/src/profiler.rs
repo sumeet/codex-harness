@@ -846,6 +846,11 @@ pub struct FrameDurationSnapshot {
 pub struct InputLatencySnapshot {
     /// Histogram of input-to-frame latency samples, in nanoseconds.
     pub latency_histogram: Histogram<u64>,
+    /// Histogram of intervals between consecutive invalidating input dispatch
+    /// starts, in nanoseconds.
+    pub input_arrival_interval_histogram: Histogram<u64>,
+    /// Histogram of invalidating input dispatch durations, in nanoseconds.
+    pub input_dispatch_duration_histogram: Histogram<u64>,
     /// Histogram of input events coalesced per rendered frame.
     pub events_per_frame_histogram: Histogram<u64>,
     /// Count of input events that arrived mid-draw and were excluded from
@@ -874,8 +879,11 @@ pub struct WindowProfiler {
     first_input_at: Option<Instant>,
     pending_input_count: u64,
     input_latency_histogram: Histogram<u64>,
+    input_arrival_interval_histogram: Histogram<u64>,
+    input_dispatch_duration_histogram: Histogram<u64>,
     events_per_frame_histogram: Histogram<u64>,
     mid_draw_events_dropped: u64,
+    last_invalidating_input_at: Option<Instant>,
     last_input_driven_present_at: Option<Instant>,
     last_present_at: Option<Instant>,
     animating_at_last_present: bool,
@@ -903,10 +911,17 @@ impl WindowProfiler {
             input_latency_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create input latency histogram: {error}")
             })?,
+            input_arrival_interval_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create input arrival interval histogram: {error}")
+            })?,
+            input_dispatch_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create input dispatch duration histogram: {error}")
+            })?,
             events_per_frame_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create events per frame histogram: {error}")
             })?,
             mid_draw_events_dropped: 0,
+            last_invalidating_input_at: None,
             last_input_driven_present_at: None,
             last_present_at: None,
             animating_at_last_present: false,
@@ -923,6 +938,10 @@ impl WindowProfiler {
 
     /// Records the end of an input dispatch.
     pub fn end_input(&mut self, caused_invalidation: bool) {
+        self.end_input_at(caused_invalidation, Instant::now());
+    }
+
+    fn end_input_at(&mut self, caused_invalidation: bool, ended_at: Instant) {
         let Some(WindowActivity::Input { started_at }) = self.active_activities.pop() else {
             debug_assert!(false, "input activity must be the current window activity");
             return;
@@ -931,6 +950,21 @@ impl WindowProfiler {
         if !caused_invalidation {
             return;
         }
+
+        if let Some(dispatch_duration) = ended_at.checked_duration_since(started_at) {
+            self.input_dispatch_duration_histogram
+                .record(dispatch_duration.as_nanos() as u64)
+                .ok();
+        }
+        if let Some(last_input_at) = self.last_invalidating_input_at
+            && let Some(interval) = started_at.checked_duration_since(last_input_at)
+            && interval <= INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT
+        {
+            self.input_arrival_interval_histogram
+                .record(interval.as_nanos() as u64)
+                .ok();
+        }
+        self.last_invalidating_input_at = Some(started_at);
 
         let arrived_during_draw = self
             .active_activities
@@ -995,6 +1029,8 @@ impl WindowProfiler {
     pub fn input_latency_snapshot(&self) -> InputLatencySnapshot {
         InputLatencySnapshot {
             latency_histogram: self.input_latency_histogram.clone(),
+            input_arrival_interval_histogram: self.input_arrival_interval_histogram.clone(),
+            input_dispatch_duration_histogram: self.input_dispatch_duration_histogram.clone(),
             events_per_frame_histogram: self.events_per_frame_histogram.clone(),
             mid_draw_events_dropped: self.mid_draw_events_dropped,
         }
@@ -1009,6 +1045,20 @@ impl WindowProfiler {
                 .clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
         }
+    }
+
+    /// Starts a new measurement interval without discarding accumulated
+    /// histograms. Temporal anchors and any unpresented input bookkeeping are
+    /// cleared so the first sample after the boundary cannot span preparation
+    /// work from before the caller's histogram snapshot.
+    pub fn begin_measurement(&mut self) {
+        self.first_input_at = None;
+        self.pending_input_count = 0;
+        self.last_invalidating_input_at = None;
+        self.last_input_driven_present_at = None;
+        self.last_present_at = None;
+        self.animating_at_last_present = false;
+        self.drew_since_last_present = false;
     }
 
     fn record_present_at(
@@ -1365,18 +1415,26 @@ mod tests {
         let presented_at = first_input_at + Duration::from_millis(12);
 
         begin_input_at(&mut window_profiler, first_input_at);
-        window_profiler.end_input(true);
-        begin_input_at(
-            &mut window_profiler,
-            first_input_at + Duration::from_millis(2),
-        );
-        window_profiler.end_input(true);
+        window_profiler.end_input_at(true, first_input_at + Duration::from_micros(200));
+        let second_input_at = first_input_at + Duration::from_millis(2);
+        begin_input_at(&mut window_profiler, second_input_at);
+        window_profiler.end_input_at(true, second_input_at + Duration::from_micros(300));
         window_profiler.record_draw_duration(Duration::from_millis(2));
         window_profiler.record_present_at(presented_at, true, false);
 
         let snapshot = window_profiler.input_latency_snapshot();
         assert_eq!(snapshot.latency_histogram.len(), 1);
         assert!(snapshot.latency_histogram.max() >= Duration::from_millis(12).as_nanos() as u64);
+        assert_eq!(snapshot.input_arrival_interval_histogram.len(), 1);
+        assert!(
+            snapshot.input_arrival_interval_histogram.max()
+                >= Duration::from_millis(2).as_nanos() as u64
+        );
+        assert_eq!(snapshot.input_dispatch_duration_histogram.len(), 2);
+        assert!(
+            snapshot.input_dispatch_duration_histogram.max()
+                >= Duration::from_micros(300).as_nanos() as u64
+        );
         assert_eq!(snapshot.events_per_frame_histogram.len(), 1);
         assert_eq!(snapshot.events_per_frame_histogram.max(), 2);
         assert_eq!(snapshot.mid_draw_events_dropped, 0);
@@ -1398,6 +1456,117 @@ mod tests {
                 >= (FRAME * 3 / 4).as_nanos() as u64
         );
         assert!(snapshot.present_interval_histogram.is_empty());
+    }
+
+    #[test]
+    fn batched_input_arrival_is_distinct_from_present_cadence() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(11)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        for frame in 0..2 {
+            let frame_start = start + FRAME * frame;
+            for event in 0..4 {
+                let started_at = frame_start + Duration::from_millis(4) * event;
+                begin_input_at(&mut window_profiler, started_at);
+                window_profiler.end_input_at(true, started_at + Duration::from_micros(250));
+            }
+            window_profiler.record_draw_duration(Duration::from_millis(2));
+            window_profiler.record_present_at(frame_start + Duration::from_millis(15), true, false);
+        }
+
+        let input = window_profiler.input_latency_snapshot();
+        let frames = window_profiler.frame_duration_snapshot();
+        assert_eq!(input.input_arrival_interval_histogram.len(), 7);
+        assert!(
+            input
+                .input_arrival_interval_histogram
+                .value_at_quantile(0.5)
+                >= Duration::from_millis(4).as_nanos() as u64
+        );
+        assert_eq!(input.input_dispatch_duration_histogram.len(), 8);
+        assert!(
+            input.input_dispatch_duration_histogram.max()
+                >= Duration::from_micros(250).as_nanos() as u64
+        );
+        assert_eq!(input.events_per_frame_histogram.len(), 2);
+        assert_eq!(input.events_per_frame_histogram.max(), 4);
+        assert_eq!(frames.input_driven_present_interval_histogram.len(), 1);
+        assert!(
+            frames.input_driven_present_interval_histogram.max()
+                >= Duration::from_millis(16).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn measurement_boundary_excludes_preparation_timing_from_first_sample() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(14)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        begin_input_at(&mut window_profiler, start);
+        window_profiler.end_input_at(true, start + Duration::from_micros(100));
+        draw_and_present(&mut window_profiler, start + FRAME, true, true);
+
+        window_profiler.begin_measurement();
+
+        begin_input_at(
+            &mut window_profiler,
+            start + FRAME * 2 - Duration::from_millis(1),
+        );
+        window_profiler.end_input_at(true, start + FRAME * 2 - Duration::from_micros(900));
+        draw_and_present(&mut window_profiler, start + FRAME * 2, true, true);
+        begin_input_at(
+            &mut window_profiler,
+            start + FRAME * 3 - Duration::from_millis(1),
+        );
+        window_profiler.end_input_at(true, start + FRAME * 3 - Duration::from_micros(900));
+        draw_and_present(&mut window_profiler, start + FRAME * 3, true, false);
+
+        let input = window_profiler.input_latency_snapshot();
+        let frames = window_profiler.frame_duration_snapshot();
+        assert_eq!(input.input_arrival_interval_histogram.len(), 1);
+        assert_eq!(frames.input_driven_present_interval_histogram.len(), 1);
+        assert_eq!(frames.present_interval_histogram.len(), 1);
+    }
+
+    #[test]
+    fn non_invalidating_inputs_do_not_change_input_dispatch_histograms() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(12)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        begin_input_at(&mut window_profiler, start);
+        window_profiler.end_input_at(false, start + Duration::from_millis(2));
+        begin_input_at(&mut window_profiler, start + Duration::from_millis(4));
+        window_profiler.end_input_at(true, start + Duration::from_millis(5));
+
+        let snapshot = window_profiler.input_latency_snapshot();
+        assert!(snapshot.input_arrival_interval_histogram.is_empty());
+        assert_eq!(snapshot.input_dispatch_duration_histogram.len(), 1);
+        assert!(
+            snapshot.input_dispatch_duration_histogram.max()
+                >= Duration::from_millis(1).as_nanos() as u64
+        );
+    }
+
+    #[test]
+    fn idle_gap_breaks_the_input_arrival_interval_chain() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(13)).expect("window profiler should initialize");
+        let start = Instant::now();
+        let after_idle = start + INPUT_DRIVEN_PRESENT_IDLE_TIMEOUT + FRAME;
+
+        begin_input_at(&mut window_profiler, start);
+        window_profiler.end_input_at(true, start + Duration::from_micros(100));
+        begin_input_at(&mut window_profiler, after_idle);
+        window_profiler.end_input_at(true, after_idle + Duration::from_micros(100));
+        begin_input_at(&mut window_profiler, after_idle + FRAME);
+        window_profiler.end_input_at(true, after_idle + FRAME + Duration::from_micros(100));
+
+        let snapshot = window_profiler.input_latency_snapshot();
+        assert_eq!(snapshot.input_arrival_interval_histogram.len(), 1);
+        assert!(snapshot.input_arrival_interval_histogram.max() >= FRAME.as_nanos() as u64);
     }
 
     #[test]
@@ -1459,12 +1628,14 @@ mod tests {
             WindowProfiler::new(WindowId::from(7)).expect("window profiler should initialize");
 
         window_profiler.begin_draw();
-        begin_input_at(&mut window_profiler, Instant::now());
-        window_profiler.end_input(true);
+        let started_at = Instant::now();
+        begin_input_at(&mut window_profiler, started_at);
+        window_profiler.end_input_at(true, started_at + Duration::from_micros(100));
         window_profiler.end_draw(None, 0);
 
         let snapshot = window_profiler.input_latency_snapshot();
         assert!(snapshot.latency_histogram.is_empty());
+        assert_eq!(snapshot.input_dispatch_duration_histogram.len(), 1);
         assert!(snapshot.events_per_frame_histogram.is_empty());
         assert_eq!(snapshot.mid_draw_events_dropped, 1);
     }
@@ -1538,8 +1709,9 @@ mod tests {
     }
 
     fn input_draw_and_present(window_profiler: &mut WindowProfiler, presented_at: Instant) {
-        begin_input_at(window_profiler, presented_at);
-        window_profiler.end_input(true);
+        let started_at = presented_at - Duration::from_millis(1);
+        begin_input_at(window_profiler, started_at);
+        window_profiler.end_input_at(true, started_at + Duration::from_micros(100));
         draw_and_present(window_profiler, presented_at, true, false);
     }
 }

@@ -391,6 +391,7 @@ fn harness_alias(query: &str) -> Option<String> {
         "mono" => Some("harness: use buffer typography".into()),
         "reading" => Some("harness: use reading typography".into()),
         "perf" => Some("harness: copy performance report".into()),
+        "perf-j" => Some("harness: run performance benchmark".into()),
         "compose" => Some("harness: focus composer".into()),
         "tasks" => Some("harness: toggle sidebar".into()),
         "stop" => Some("harness: stop".into()),
@@ -424,6 +425,10 @@ mod tests {
         assert_eq!(
             harness_alias(":perf").as_deref(),
             Some("harness: copy performance report")
+        );
+        assert_eq!(
+            harness_alias(":perf-j").as_deref(),
+            Some("harness: run performance benchmark")
         );
         assert_eq!(harness_alias("w"), None);
         assert_eq!(harness_alias("q"), None);
