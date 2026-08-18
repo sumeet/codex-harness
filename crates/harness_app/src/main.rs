@@ -2992,6 +2992,12 @@ impl HarnessApp {
     fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_mode = FocusMode::Composer;
         self.composer.focus_handle(cx).focus(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            if this.focus_mode == FocusMode::Composer {
+                this.composer
+                    .update(cx, |composer, cx| composer.enter_insert_mode(window, cx));
+            }
+        });
         cx.notify();
     }
 
@@ -6614,6 +6620,21 @@ fn load_harness_keymaps(cx: &mut App) {
             "ctrl-w j",
             FocusComposer,
             Some("Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "i",
+            FocusComposer,
+            Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "a",
+            FocusComposer,
+            Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "o",
+            FocusComposer,
+            Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
         ),
         KeyBinding::new(
             "enter",

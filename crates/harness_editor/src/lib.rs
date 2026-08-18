@@ -10,7 +10,7 @@ use std::{
 };
 
 use editor::{
-    Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
+    Addon, Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
         NavigationOverlayKey, RenderBlock,
@@ -19,8 +19,8 @@ use editor::{
 };
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, HighlightStyle, Hsla, IntoElement, KeyBinding, Render, SharedString, Window, div,
-    point, prelude::*,
+    FontWeight, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render, SharedString,
+    Window, div, point, prelude::*,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -151,6 +151,16 @@ impl LocalEditor {
         self.editor
             .update(cx, |editor, cx| editor.set_masked(masked, cx));
     }
+
+    /// Put a modal host input into Vim Insert mode after focus transfer.
+    ///
+    /// Hosts defer this until the focusing keybinding finishes dispatching so
+    /// the same `i`/`a`/`o` keystroke cannot also edit the newly focused input.
+    pub fn enter_insert_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::SwitchToInsertMode", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
 }
 
 impl Focusable for LocalEditor {
@@ -187,6 +197,25 @@ pub struct TranscriptEditor {
     follow_tail: bool,
     last_selection_head: Option<Anchor>,
     pending_tail_intent: Option<PendingTailIntent>,
+}
+
+/// Marks only the transcript's Zed Editor in its intrinsic key context.
+///
+/// An active Editor installs its own window key context, so a context placed
+/// on Harness's parent element is not visible to bindings while the transcript
+/// has focus. Using Zed's addon seam keeps transcript-only bindings such as
+/// `i`/`a`/`o` more specific than stock Vim without leaking them into the
+/// composer or other local Editors.
+struct TranscriptKeyContextAddon;
+
+impl Addon for TranscriptKeyContextAddon {
+    fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
+        key_context.add("HarnessBuffer");
+    }
+
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// A host-owned rich view anchored to one semantic transcript item.
@@ -974,6 +1003,7 @@ impl TranscriptEditor {
                 editor.set_show_gutter(false, cx);
                 editor.set_show_horizontal_scrollbar(false, cx);
                 editor.disable_mouse_wheel_zoom();
+                editor.register_addon(TranscriptKeyContextAddon);
                 editor
             }
         });
