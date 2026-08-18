@@ -8331,6 +8331,7 @@ dependencies = [
  "codex_app_server_client",
  "command_palette_core",
  "command_palette_hooks",
+ "dirs",
  "env_logger 0.11.8",
  "gpui",
  "gpui_platform",
