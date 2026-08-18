@@ -97,6 +97,32 @@ const COMPACT_SIDEBAR_THRESHOLD: f32 = 1100.;
 const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
+const STRUCTURED_OUTPUT_MAX_HEIGHT: f32 = 240.;
+const STRUCTURED_OUTPUT_MAX_LINES: usize = 18;
+const STRUCTURED_OUTPUT_MAX_BYTES: usize = 2_400;
+
+fn structured_output_needs_viewport(content: &str) -> bool {
+    content.lines().count() > STRUCTURED_OUTPUT_MAX_LINES
+        || content.len() > STRUCTURED_OUTPUT_MAX_BYTES
+}
+
+fn command_output_for_display(output: &str) -> &str {
+    output.trim_end_matches(['\r', '\n'])
+}
+
+fn shell_capture_priority(capture_name: &str) -> u8 {
+    match capture_name {
+        "function" => 60,
+        "variable" | "variable.special" => 55,
+        "keyword" | "keyword.control" | "keyword.operator" => 50,
+        "operator" => 45,
+        "constant" | "number" => 40,
+        "comment" | "keyword.directive" => 35,
+        "embedded" | "punctuation.special" => 30,
+        "punctuation.delimiter" | "punctuation.bracket" => 20,
+        _ => 10,
+    }
+}
 
 fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
     static QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
@@ -138,13 +164,16 @@ fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
 }
 
 fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
-    let mut byte_styles = vec![None; command.len()];
+    let mut byte_styles = vec![(0_u8, None); command.len()];
     for (range, capture_name) in shell_capture_ranges(command) {
         let Some(style) = cx.theme().syntax().style_for_name(&capture_name) else {
             continue;
         };
+        let priority = shell_capture_priority(&capture_name);
         for byte_style in &mut byte_styles[range] {
-            *byte_style = Some(style);
+            if priority >= byte_style.0 {
+                *byte_style = (priority, Some(style));
+            }
         }
     }
 
@@ -156,7 +185,10 @@ fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::Highlig
         .map(|(offset, _)| offset)
         .chain(std::iter::once(command.len()))
     {
-        let style = byte_styles.get(offset).copied().flatten();
+        let style = byte_styles
+            .get(offset)
+            .and_then(|(_, style)| style.as_ref())
+            .copied();
         if style != active_style {
             if let Some(style) = active_style {
                 highlights.push((active_start..offset, style));
@@ -2624,11 +2656,11 @@ impl HarnessApp {
         div()
             .id(("diff-scroll", index))
             .w_full()
-            .overflow_x_scroll()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
+            .min_w_0()
+            .overflow_scroll()
+            .when(line_count > STRUCTURED_OUTPUT_MAX_LINES, |this| {
+                this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
+            })
             .children(lines)
             .when(line_count > 1_200, |this| {
                 this.child(
@@ -2689,14 +2721,16 @@ impl HarnessApp {
 
     fn render_terminal(content: String, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let bounded = structured_output_needs_viewport(&content);
         div()
             .id(("terminal-scroll", index))
             .w_full()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
-            .p_3()
+            .min_w_0()
+            .when(bounded, |this| {
+                this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .pr_1()
+            })
             .font_buffer(cx)
             .text_ui_sm(cx)
             .line_height(relative(1.45))
@@ -2713,79 +2747,48 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let highlighted_command = StyledText::new(command.command.clone())
             .with_highlights(shell_highlights(&command.command, cx));
+        let output = command_output_for_display(&command.output).to_string();
+        let bounded_output = structured_output_needs_viewport(&output);
 
         div()
             .id(("command-output", index))
             .w_full()
             .min_w_0()
-            .overflow_hidden()
-            .rounded_md()
-            .border_1()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background)
             .child(
                 div()
                     .w_full()
                     .min_w_0()
-                    .px_3()
-                    .py_2()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .bg(colors.element_background.opacity(0.72))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_start()
-                            .gap_2()
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
-                            .line_height(relative(1.45))
-                            .whitespace_normal()
-                            .child(div().flex_none().text_color(colors.text_accent).child("$"))
-                            .child(div().min_w_0().flex_1().child(highlighted_command)),
-                    )
-                    .when_some(command.cwd.filter(|cwd| !cwd.is_empty()), |this, cwd| {
-                        this.child(
-                            div()
-                                .pl_5()
-                                .font_buffer(cx)
-                                .text_ui_xs(cx)
-                                .text_color(colors.text_muted)
-                                .child(cwd),
-                        )
-                    }),
+                    .items_start()
+                    .gap_2()
+                    .font_buffer(cx)
+                    .text_ui_sm(cx)
+                    .line_height(relative(1.45))
+                    .whitespace_normal()
+                    .child(div().flex_none().text_color(colors.text_accent).child("$"))
+                    .child(div().min_w_0().flex_1().child(highlighted_command)),
             )
-            .when(!command.output.is_empty(), |this| {
+            .when(!output.is_empty(), |this| {
                 this.child(
                     div()
+                        .id(("command-output-scroll", index))
                         .w_full()
                         .min_w_0()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .px_3()
-                        .py_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            Label::new("Output")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .font_buffer(cx)
-                                .text_ui_sm(cx)
-                                .line_height(relative(1.45))
-                                .text_color(colors.text)
-                                .whitespace_normal()
-                                .child(command.output),
-                        ),
+                        .mt_2()
+                        .pt_2()
+                        .when(bounded_output, |this| {
+                            this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .pr_1()
+                        })
+                        .font_buffer(cx)
+                        .text_ui_sm(cx)
+                        .line_height(relative(1.45))
+                        .text_color(colors.text)
+                        .whitespace_normal()
+                        .child(output),
                 )
             })
             .into_any_element()
@@ -3452,7 +3455,10 @@ impl HarnessApp {
         .then(|| compact_reasoning_preview(&item.content));
         let visible_status = item.display_status().map(ToOwned::to_owned);
         let has_collapsible_content = !item.content.trim().is_empty();
-        let show_header = item.kind != model::TranscriptKind::Agent || item.title != "Codex";
+        let show_header = !matches!(
+            (item.kind, item.title.as_str()),
+            (model::TranscriptKind::Agent, "Codex") | (model::TranscriptKind::User, "You")
+        );
         let disclosure_weak = cx.weak_entity();
 
         let header = div()
@@ -3557,11 +3563,12 @@ impl HarnessApp {
                 .flex_col()
                 .gap_2()
                 .when(item.kind == model::TranscriptKind::User, |this| {
-                    this.rounded_lg()
+                    this.rounded_sm()
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.element_background)
-                        .p_4()
+                        .px_3()
+                        .py_2()
                 })
                 .when(
                     matches!(
@@ -3593,17 +3600,14 @@ impl HarnessApp {
                 .w_full()
                 .flex()
                 .flex_col()
-                .gap_2()
+                .gap_1()
                 .when(!compact_trace, |this| {
-                    let this = this
-                        .border_1()
+                    this.border_l_1()
                         .border_color(colors.border_variant)
-                        .bg(colors.element_background.opacity(0.72));
-                    if narrow {
-                        this.rounded_md().px_3().py_2()
-                    } else {
-                        this.rounded_lg().p_3()
-                    }
+                        .bg(colors.element_background.opacity(0.28))
+                        .pl_3()
+                        .pr_2()
+                        .py_1()
                 })
                 .when(compact_trace, |this| this.px_1().py_1())
                 .child(header)
@@ -3632,13 +3636,13 @@ impl HarnessApp {
         div()
             .id(("transcript-item", index))
             .w_full()
-            .px(if narrow { px(12.) } else { px(24.) })
+            .px(if narrow { px(10.) } else { px(18.) })
             .py(if compact_trace {
                 px(3.)
             } else if narrow && !narrative {
-                px(8.)
+                px(6.)
             } else {
-                px(12.)
+                px(8.)
             })
             .border_l_2()
             .border_color(if cursor {
@@ -5157,6 +5161,33 @@ mod tests {
         assert_eq!(reconnect_delay(u8::MAX), None);
     }
 
+    #[test]
+    fn only_large_structured_output_gets_a_nested_viewport() {
+        assert!(!structured_output_needs_viewport("one\ntwo\nthree"));
+        assert!(!structured_output_needs_viewport(
+            &std::iter::repeat_n("line", STRUCTURED_OUTPUT_MAX_LINES)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        assert!(structured_output_needs_viewport(
+            &std::iter::repeat_n("line", STRUCTURED_OUTPUT_MAX_LINES + 1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+        assert!(structured_output_needs_viewport(
+            &"x".repeat(STRUCTURED_OUTPUT_MAX_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn command_output_only_trims_trailing_line_breaks() {
+        assert_eq!(
+            command_output_for_display("first\n\nsecond  \r\n\n"),
+            "first\n\nsecond  "
+        );
+        assert_eq!(command_output_for_display("\n\r\n"), "");
+    }
+
     fn assert_interactive(method: &str, params: Value) {
         assert_eq!(
             route_server_request(method, &params, Some("thread-1")),
@@ -5614,6 +5645,9 @@ mod tests {
         assert!(captured("string", "'%s'"));
         assert!(captured("operator", "&&"));
         assert!(captured("function", "cargo"));
+        assert!(shell_capture_priority("function") > shell_capture_priority("string"));
+        assert!(shell_capture_priority("operator") > shell_capture_priority("string"));
+        assert!(shell_capture_priority("constant") > shell_capture_priority("string"));
     }
 
     #[test]
