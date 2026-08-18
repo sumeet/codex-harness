@@ -18,17 +18,18 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    FontWeight, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render, SharedString,
-    Window, div, point, prelude::*,
+    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
+    FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render,
+    SharedString, TextStyle, TextStyleRefinement, Window, div, point, prelude::*,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
     minimal_text_edit,
 };
-use language::{Buffer, Point};
+use language::{Buffer, Language, LanguageRegistry, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
-use settings::{KeybindSource, KeymapFile};
+use settings::{KeybindSource, KeymapFile, Settings as _};
+use theme_settings::ThemeSettings;
 use ui::{
     Color, Icon, IconName, IconSize, Label, LabelSize,
     prelude::{ActiveTheme, LabelCommon as _},
@@ -44,6 +45,8 @@ pub use vim::{
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     editor::init(cx);
     vim::init(cx);
+    let language_set = HarnessLanguageSet::new(cx)?;
+    cx.set_global(language_set);
 
     let mut defaults =
         KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;
@@ -84,6 +87,42 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The deliberately small language surface embedded by the standalone Harness.
+///
+/// This is enough to style Markdown prose and its common fenced snippets without
+/// pulling Zed's project-aware `languages` application crate into the editor seam.
+struct HarnessLanguageSet {
+    registry: Arc<LanguageRegistry>,
+    markdown: Arc<Language>,
+}
+
+impl Global for HarnessLanguageSet {}
+
+impl HarnessLanguageSet {
+    fn new(cx: &mut App) -> anyhow::Result<Self> {
+        let registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
+        let markdown = embedded_language("markdown", tree_sitter_md::LANGUAGE.into())?;
+        for language in [
+            markdown.clone(),
+            embedded_language("markdown-inline", tree_sitter_md::INLINE_LANGUAGE.into())?,
+            embedded_language("bash", tree_sitter_bash::LANGUAGE.into())?,
+            embedded_language("rust", tree_sitter_rust::LANGUAGE.into())?,
+            embedded_language("json", tree_sitter_json::LANGUAGE.into())?,
+        ] {
+            registry.add(language);
+        }
+        registry.set_theme(cx.theme().clone());
+        Ok(Self { registry, markdown })
+    }
+}
+
+fn embedded_language(name: &str, grammar: tree_sitter::Language) -> anyhow::Result<Arc<Language>> {
+    Ok(Arc::new(
+        Language::new(grammars::load_config(name), Some(grammar))
+            .with_queries(grammars::load_queries(name))?,
+    ))
+}
+
 pub struct LocalEditor {
     editor: Entity<Editor>,
 }
@@ -95,10 +134,20 @@ impl EventEmitter<LocalEditorChanged> for LocalEditor {}
 
 impl LocalEditor {
     pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let editor = cx.new(|cx| {
+        let (language_registry, markdown) = {
+            let languages = cx.global::<HarnessLanguageSet>();
+            (languages.registry.clone(), languages.markdown.clone())
+        };
+        let editor = cx.new(move |cx| {
             let mut editor = Editor::auto_height(3, 12, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             editor.set_use_modal_editing(true);
+            if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language_registry(language_registry);
+                    buffer.set_language(Some(markdown), cx);
+                });
+            }
             editor
         });
         cx.subscribe(&editor, |_, _, event, cx| {
@@ -178,6 +227,7 @@ impl Render for LocalEditor {
 pub struct TranscriptEditor {
     buffer: Entity<Buffer>,
     editor: Entity<Editor>,
+    typography_profile: TranscriptTypographyProfile,
     segments: Vec<TranscriptDocumentSegment>,
     segment_header_texts: Vec<String>,
     model_item_count: usize,
@@ -197,6 +247,52 @@ pub struct TranscriptEditor {
     follow_tail: bool,
     last_selection_head: Option<Anchor>,
     pending_tail_intent: Option<PendingTailIntent>,
+}
+
+/// The font geometry used by the selectable transcript Editor.
+///
+/// Both profiles retain Zed's native Buffer, display map, selections, and Vim
+/// implementation. `Reading` changes only the whole-surface font identity;
+/// size and line height remain those of the user's buffer settings.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TranscriptTypographyProfile {
+    #[default]
+    Buffer,
+    Reading,
+}
+
+fn typography_profile_changed(
+    current: TranscriptTypographyProfile,
+    requested: TranscriptTypographyProfile,
+) -> bool {
+    current != requested
+}
+
+fn font_for_typography_profile(profile: TranscriptTypographyProfile, cx: &App) -> Font {
+    let settings = ThemeSettings::get_global(cx);
+    match profile {
+        TranscriptTypographyProfile::Buffer => settings.buffer_font.clone(),
+        TranscriptTypographyProfile::Reading => settings.ui_font.clone(),
+    }
+}
+
+fn typography_refinement(font: &Font) -> TextStyleRefinement {
+    TextStyleRefinement {
+        font_family: Some(font.family.clone()),
+        font_features: Some(font.features.clone()),
+        font_fallbacks: font.fallbacks.clone(),
+        font_weight: Some(font.weight),
+        font_style: Some(font.style),
+        ..TextStyleRefinement::default()
+    }
+}
+
+fn apply_typography_font(style: &mut TextStyle, font: &Font) {
+    style.font_family = font.family.clone();
+    style.font_features = font.features.clone();
+    style.font_fallbacks.clone_from(&font.fallbacks);
+    style.font_weight = font.weight;
+    style.font_style = font.style;
 }
 
 /// Marks only the transcript's Zed Editor in its intrinsic key context.
@@ -1051,6 +1147,7 @@ impl TranscriptEditor {
         Self {
             buffer,
             editor,
+            typography_profile: TranscriptTypographyProfile::Buffer,
             segments: Vec::new(),
             segment_header_texts: Vec::new(),
             model_item_count: 0,
@@ -1069,6 +1166,39 @@ impl TranscriptEditor {
 
     pub fn text(&self, cx: &App) -> String {
         self.buffer.read(cx).text()
+    }
+
+    pub fn typography_profile(&self) -> TranscriptTypographyProfile {
+        self.typography_profile
+    }
+
+    /// Change the whole transcript between the user's buffer font and Zed's UI
+    /// reading font without rebuilding or replacing the selectable document.
+    ///
+    /// `Editor::set_style` immediately propagates the new font metrics into the
+    /// display map, forcing a correct soft-wrap pass. The persistent refinement
+    /// ensures subsequent Editor renders keep the selected family while leaving
+    /// buffer font size and line height untouched.
+    pub fn set_typography_profile(
+        &mut self,
+        profile: TranscriptTypographyProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !typography_profile_changed(self.typography_profile, profile) {
+            return false;
+        }
+
+        let font = font_for_typography_profile(profile, cx);
+        self.editor.update(cx, |editor, cx| {
+            editor.set_text_style_refinement(typography_refinement(&font));
+            let mut style = editor.style(cx).clone();
+            apply_typography_font(&mut style.text, &font);
+            editor.set_style(style, window, cx);
+        });
+        self.typography_profile = profile;
+        cx.notify();
+        true
     }
 
     pub fn cursor_offset(&self, cx: &mut App) -> usize {
@@ -2346,6 +2476,71 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typography_profile_transition_is_stable_and_idempotent() {
+        assert!(!typography_profile_changed(
+            TranscriptTypographyProfile::Buffer,
+            TranscriptTypographyProfile::Buffer,
+        ));
+        assert!(!typography_profile_changed(
+            TranscriptTypographyProfile::Reading,
+            TranscriptTypographyProfile::Reading,
+        ));
+        assert!(typography_profile_changed(
+            TranscriptTypographyProfile::Buffer,
+            TranscriptTypographyProfile::Reading,
+        ));
+        assert!(typography_profile_changed(
+            TranscriptTypographyProfile::Reading,
+            TranscriptTypographyProfile::Buffer,
+        ));
+    }
+
+    #[test]
+    fn typography_font_swap_preserves_editor_geometry_and_non_font_paint() {
+        let mut style = TextStyle {
+            color: gpui::red(),
+            font_size: gpui::px(17.).into(),
+            line_height: gpui::relative(1.6),
+            background_color: Some(gpui::blue()),
+            ..TextStyle::default()
+        };
+        let geometry = (style.font_size, style.line_height);
+        let paint = (style.color, style.background_color, style.underline);
+        let reading_font = Font {
+            family: "Harness Variable Reading".into(),
+            features: gpui::FontFeatures::disable_ligatures(),
+            fallbacks: Some(gpui::FontFallbacks::from_fonts(vec![
+                "Harness Fallback".into(),
+            ])),
+            weight: FontWeight::BOLD,
+            style: gpui::FontStyle::Italic,
+        };
+
+        apply_typography_font(&mut style, &reading_font);
+
+        assert_eq!((style.font_size, style.line_height), geometry);
+        assert_eq!(
+            (style.color, style.background_color, style.underline),
+            paint
+        );
+        assert_eq!(style.font_family, reading_font.family);
+        assert_eq!(style.font_features, reading_font.features);
+        assert_eq!(style.font_fallbacks, reading_font.fallbacks);
+        assert_eq!(style.font_weight, reading_font.weight);
+        assert_eq!(style.font_style, reading_font.style);
+    }
+
+    #[test]
+    fn typography_refinement_never_changes_size_or_line_height() {
+        let font = gpui::font("Harness Reading");
+        let refinement = typography_refinement(&font);
+
+        assert_eq!(refinement.font_family, Some(font.family));
+        assert_eq!(refinement.font_size, None);
+        assert_eq!(refinement.line_height, None);
+    }
 
     #[test]
     fn default_agent_header_keeps_a_boundary_without_a_redundant_label() {
