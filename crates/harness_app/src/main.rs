@@ -198,6 +198,21 @@ fn search_context_snippet(
     None
 }
 
+fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
+    item.title.to_lowercase().contains(folded_query)
+        || item.content.to_lowercase().contains(folded_query)
+}
+
+fn reconcile_sorted_search_match(matches: &mut Vec<usize>, index: usize, is_match: bool) {
+    match (matches.binary_search(&index), is_match) {
+        (Err(position), true) => matches.insert(position, index),
+        (Ok(position), false) => {
+            matches.remove(position);
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct ActivityTextSection {
     heading: Option<String>,
@@ -1195,7 +1210,7 @@ impl HarnessApp {
             self.refresh_threads(cx);
         }
         if !self.search_query.is_empty() {
-            self.rebuild_search_matches();
+            self.update_search_matches_for_changes(old_len, &dirty_items);
         }
         if document_changed && self.buffer_view {
             let incrementally_applied =
@@ -1857,7 +1872,11 @@ impl HarnessApp {
                 })
         };
         if !self.search_query.is_empty() {
-            self.rebuild_search_matches();
+            if outcome.reset {
+                self.rebuild_search_matches();
+            } else {
+                self.update_search_matches_for_changes(outcome.old_len, &dirty_items);
+            }
         }
 
         if self.buffer_view {
@@ -3195,15 +3214,49 @@ impl HarnessApp {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
-                    (item.title.to_lowercase().contains(&query)
-                        || item.content.to_lowercase().contains(&query))
-                    .then_some(index)
+                    item_matches_folded_query(item, &query).then_some(index)
                 })
                 .collect()
         };
         self.active_search_match = self
             .active_search_match
             .min(self.search_matches.len().saturating_sub(1));
+    }
+
+    fn update_search_matches_for_changes(&mut self, old_len: usize, dirty_items: &[usize]) {
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            self.search_matches.clear();
+            self.active_search_match = 0;
+            return;
+        }
+
+        let active_item = self.search_matches.get(self.active_search_match).copied();
+        let item_count = self.model.items.len();
+        self.search_matches.retain(|index| *index < item_count);
+
+        let mut changed = dirty_items.to_vec();
+        changed.extend(old_len.min(item_count)..item_count);
+        changed.sort_unstable();
+        changed.dedup();
+        for index in changed {
+            let Some(item) = self.model.items.get(index) else {
+                continue;
+            };
+            reconcile_sorted_search_match(
+                &mut self.search_matches,
+                index,
+                item_matches_folded_query(item, &query),
+            );
+        }
+
+        self.active_search_match = active_item
+            .and_then(|active_item| self.search_matches.binary_search(&active_item).ok())
+            .unwrap_or_else(|| {
+                self.search_matches
+                    .partition_point(|index| *index < self.selected_item)
+                    .min(self.search_matches.len().saturating_sub(1))
+            });
     }
 
     fn jump_to_search_match(&mut self, cx: &mut Context<Self>) {
@@ -6665,6 +6718,16 @@ mod tests {
         let snippet = search_context_snippet(&content, "i\u{307}stanbul", 36).unwrap();
         assert_eq!(&snippet.text[snippet.match_range], "İSTANBUL");
         assert!(snippet.text.starts_with("… "));
+    }
+
+    #[test]
+    fn streaming_search_reconciliation_only_changes_affected_sorted_indices() {
+        let mut matches = vec![1, 4, 9];
+        reconcile_sorted_search_match(&mut matches, 3, true);
+        reconcile_sorted_search_match(&mut matches, 4, false);
+        reconcile_sorted_search_match(&mut matches, 9, true);
+        reconcile_sorted_search_match(&mut matches, 12, false);
+        assert_eq!(matches, vec![1, 3, 9]);
     }
 
     #[test]
