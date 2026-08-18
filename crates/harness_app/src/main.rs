@@ -932,6 +932,7 @@ impl HarnessApp {
         } else {
             composer.focus_handle(cx).focus(window, cx);
         }
+        let palette_state = palette::load_state();
 
         let mut this = Self {
             cwd,
@@ -979,8 +980,8 @@ impl HarnessApp {
             dirty_request_surfaces: HashSet::default(),
             request_surfaces: HashMap::default(),
             command_palette: None,
-            command_palette_history: Vec::new(),
-            command_palette_usage: HashMap::default(),
+            command_palette_history: palette_state.history,
+            command_palette_usage: palette_state.usage,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             sidebar_open: true,
@@ -2858,6 +2859,12 @@ impl HarnessApp {
                         .unwrap_or(0)
                         .saturating_add(1);
                     this.command_palette_usage.insert(command.name, next_usage);
+                    if let Err(error) = palette::save_state(
+                        &this.command_palette_history,
+                        &this.command_palette_usage,
+                    ) {
+                        log::warn!("could not persist command palette state: {error}");
+                    }
                     window.dispatch_action(command.action, cx);
                 }
                 cx.notify();

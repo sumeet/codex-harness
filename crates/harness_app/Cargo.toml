@@ -14,6 +14,7 @@ assets.workspace = true
 codex_app_server_client.workspace = true
 command_palette_core.workspace = true
 command_palette_hooks.workspace = true
+dirs.workspace = true
 env_logger.workspace = true
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
