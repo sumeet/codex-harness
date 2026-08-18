@@ -108,6 +108,48 @@ struct StructuredOutputPreview {
     footer: Option<String>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ActivityTextSection {
+    heading: Option<String>,
+    body: String,
+}
+
+fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
+    const HEADINGS: &[&str] = &[
+        "Arguments",
+        "Result",
+        "Structured result",
+        "Error",
+        "Prompt",
+        "Agents",
+        "Query",
+        "Page",
+        "Find",
+    ];
+
+    let mut sections: Vec<ActivityTextSection> = Vec::new();
+    for block in content.split("\n\n").filter(|block| !block.is_empty()) {
+        let (first_line, remainder) = block.split_once('\n').unwrap_or((block, ""));
+        if HEADINGS.contains(&first_line) {
+            sections.push(ActivityTextSection {
+                heading: Some(first_line.into()),
+                body: remainder.into(),
+            });
+        } else if let Some(section) = sections.last_mut() {
+            if !section.body.is_empty() {
+                section.body.push_str("\n\n");
+            }
+            section.body.push_str(block);
+        } else {
+            sections.push(ActivityTextSection {
+                heading: None,
+                body: block.into(),
+            });
+        }
+    }
+    sections
+}
+
 fn structured_output_preview(content: &str, noun: &str) -> StructuredOutputPreview {
     let total_lines = content.lines().count();
     let mut preview = if total_lines > STRUCTURED_OUTPUT_PREVIEW_LINES {
@@ -228,6 +270,32 @@ fn file_change_line_count(item: &TranscriptItem) -> usize {
         .sum()
 }
 
+fn file_change_counts(presentation: &FileChangePresentation) -> (usize, usize) {
+    let unified = presentation
+        .content
+        .lines()
+        .any(|line| line.starts_with("@@"));
+    if !unified {
+        let line_count = presentation.content.lines().count();
+        return match presentation.operation.as_str() {
+            "Added" => (line_count, 0),
+            "Deleted" => (0, line_count),
+            _ => (0, 0),
+        };
+    }
+
+    let mut in_hunk = false;
+    presentation
+        .content
+        .lines()
+        .map(|line| diff_line_tone(line, &mut in_hunk))
+        .fold((0, 0), |(additions, deletions), tone| match tone {
+            DiffLineTone::Addition => (additions + 1, deletions),
+            DiffLineTone::Deletion => (additions, deletions + 1),
+            _ => (additions, deletions),
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DiffLineTone {
     Normal,
@@ -327,7 +395,7 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
                 .is_some()
         }),
         model::TranscriptKind::Web => {
-            web_search_presentation(&item.raw).results.len() > WEB_RESULT_PREVIEW_COUNT
+            web_search_has_hidden_content(&web_search_presentation(&item.raw))
         }
         model::TranscriptKind::Diff => {
             item.content.lines().count() > STRUCTURED_OUTPUT_PREVIEW_LINES
@@ -356,17 +424,23 @@ struct WebSearchPresentation {
     results: Vec<WebResultPresentation>,
 }
 
-fn compact_web_text(text: &str, max_chars: usize) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        return compact;
-    }
-    let mut truncated = compact
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .collect::<String>();
-    truncated.push('…');
-    truncated
+fn compact_web_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn web_search_has_hidden_content(presentation: &WebSearchPresentation) -> bool {
+    presentation.results.len() > WEB_RESULT_PREVIEW_COUNT
+        || presentation.results.iter().any(|result| {
+            result.title.chars().count() > 100
+                || result
+                    .url
+                    .as_ref()
+                    .is_some_and(|url| url.chars().count() > 140)
+                || result
+                    .snippet
+                    .as_ref()
+                    .is_some_and(|snippet| snippet.chars().count() > 120)
+        })
 }
 
 fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
@@ -389,7 +463,7 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
         .filter_map(|result| {
             if let Some(text) = result.as_str() {
                 return Some(WebResultPresentation {
-                    title: compact_web_text(text, 160),
+                    title: compact_web_text(text),
                     url: None,
                     snippet: None,
                 });
@@ -409,9 +483,9 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
                 .or_else(|| result.get("content"))
                 .and_then(Value::as_str);
             (title.is_some() || url.is_some() || snippet.is_some()).then(|| WebResultPresentation {
-                title: compact_web_text(title.unwrap_or("Result"), 160),
-                url: url.map(|url| compact_web_text(url, 180)),
-                snippet: snippet.map(|snippet| compact_web_text(snippet, 240)),
+                title: compact_web_text(title.unwrap_or("Result")),
+                url: url.map(compact_web_text),
+                snippet: snippet.map(compact_web_text),
             })
         })
         .collect();
@@ -3112,6 +3186,7 @@ impl HarnessApp {
             }
             let visible_lines = remaining_lines.min(presentation.content.lines().count());
             remaining_lines = remaining_lines.saturating_sub(visible_lines);
+            let (additions, deletions) = file_change_counts(&presentation);
             let operation_color = match presentation.operation.as_str() {
                 "Added" => Color::Success,
                 "Deleted" => Color::Error,
@@ -3159,9 +3234,32 @@ impl HarnessApp {
                                     .child(presentation.path),
                             )
                             .child(
-                                Label::new(presentation.operation)
-                                    .size(LabelSize::XSmall)
-                                    .color(operation_color),
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(additions > 0, |this| {
+                                        this.child(
+                                            Label::new(format!("+{additions}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Success),
+                                        )
+                                    })
+                                    .when(deletions > 0, |this| {
+                                        this.child(
+                                            Label::new(format!("−{deletions}"))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Error),
+                                        )
+                                    })
+                                    .when(additions == 0 && deletions == 0, |this| {
+                                        this.child(
+                                            Label::new(presentation.operation)
+                                                .size(LabelSize::XSmall)
+                                                .color(operation_color),
+                                        )
+                                    }),
                             ),
                     )
                     .when(!presentation.content.is_empty(), |this| {
@@ -3292,6 +3390,86 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_activity_sections(
+        &mut self,
+        content: String,
+        item_key: &str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let preview = structured_output_presentation(
+            &content,
+            "output",
+            self.expanded_output.contains(item_key),
+        );
+        let sections = activity_text_sections(&preview.content);
+        if !sections.iter().any(|section| section.heading.is_some()) {
+            return self.render_terminal(content, item_key, index, cx);
+        }
+
+        let colors = cx.theme().colors().clone();
+        let error_color = cx.theme().status().error;
+        div()
+            .id(("activity-sections", index))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .children(
+                sections
+                    .into_iter()
+                    .enumerate()
+                    .map(|(section_index, section)| {
+                        let error = section.heading.as_deref() == Some("Error");
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .when(section_index > 0, |this| {
+                                this.mt_1()
+                                    .pt_2()
+                                    .border_t_1()
+                                    .border_color(colors.border_variant)
+                            })
+                            .when_some(section.heading, |this, heading| {
+                                this.child(
+                                    Label::new(heading).size(LabelSize::XSmall).color(if error {
+                                        Color::Error
+                                    } else {
+                                        Color::Muted
+                                    }),
+                                )
+                            })
+                            .when(!section.body.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .font_buffer(cx)
+                                        .text_ui_sm(cx)
+                                        .line_height(relative(1.45))
+                                        .text_color(if error { error_color } else { colors.text })
+                                        .whitespace_normal()
+                                        .child(section.body),
+                                )
+                            })
+                    }),
+            )
+            .when_some(preview.footer, |this, footer| {
+                this.child(
+                    div()
+                        .mt_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(item_key, index, footer, cx)),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_command(
         &mut self,
         item: &TranscriptItem,
@@ -3361,7 +3539,9 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let presentation = web_search_presentation(&item.raw);
         let total_results = presentation.results.len();
+        let has_hidden_content = web_search_has_hidden_content(&presentation);
         let expanded = self.expanded_output.contains(&item.key);
+        let item_key = item.key.clone();
         let visible_result_count = if expanded {
             total_results
         } else {
@@ -3372,7 +3552,7 @@ impl HarnessApp {
             .into_iter()
             .take(visible_result_count)
             .enumerate()
-            .map(|(index, result)| {
+            .map(|(result_index, result)| {
                 div()
                     .w_full()
                     .min_w_0()
@@ -3380,7 +3560,7 @@ impl HarnessApp {
                     .items_start()
                     .gap_2()
                     .py_1()
-                    .when(index > 0, |this| {
+                    .when(result_index > 0, |this| {
                         this.border_t_1().border_color(colors.border_variant)
                     })
                     .child(
@@ -3389,7 +3569,7 @@ impl HarnessApp {
                             .flex_none()
                             .text_ui_xs(cx)
                             .text_color(colors.text_muted)
-                            .child(format!("{}.", index + 1)),
+                            .child(format!("{}.", result_index + 1)),
                     )
                     .child(
                         div()
@@ -3399,24 +3579,35 @@ impl HarnessApp {
                             .flex_col()
                             .gap_0p5()
                             .child(
-                                Label::new(result.title)
-                                    .size(LabelSize::Small)
-                                    .line_clamp(1),
+                                div()
+                                    .min_w_0()
+                                    .text_ui_sm(cx)
+                                    .when(!expanded, |this| this.truncate())
+                                    .child(result.title),
                             )
                             .when_some(result.url, |this, url| {
+                                let open_url = url.clone();
                                 this.child(
-                                    Label::new(url)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Accent)
-                                        .line_clamp(1),
+                                    div()
+                                        .id(format!("web-result-url:{item_key}:{result_index}"))
+                                        .min_w_0()
+                                        .cursor_pointer()
+                                        .text_ui_xs(cx)
+                                        .text_color(colors.text_accent)
+                                        .when(!expanded, |this| this.truncate())
+                                        .hover(|this| this.underline())
+                                        .on_click(move |_, _, cx| cx.open_url(&open_url))
+                                        .child(url),
                                 )
                             })
                             .when_some(result.snippet, |this, snippet| {
                                 this.child(
-                                    Label::new(snippet)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted)
-                                        .line_clamp(1),
+                                    div()
+                                        .min_w_0()
+                                        .text_ui_xs(cx)
+                                        .text_color(colors.text_muted)
+                                        .when(!expanded, |this| this.truncate())
+                                        .child(snippet),
                                 )
                             }),
                     )
@@ -3445,7 +3636,7 @@ impl HarnessApp {
                 )
             })
             .children(visible_results)
-            .when(total_results > WEB_RESULT_PREVIEW_COUNT, |this| {
+            .when(has_hidden_content, |this| {
                 this.child(
                     div()
                         .pt_1()
@@ -3456,6 +3647,8 @@ impl HarnessApp {
                             index,
                             if expanded {
                                 "Show fewer results".into()
+                            } else if total_results <= WEB_RESULT_PREVIEW_COUNT {
+                                "Show full results".into()
                             } else {
                                 format!(
                                     "Show {} more results",
@@ -4212,6 +4405,11 @@ impl HarnessApp {
                 model::TranscriptKind::FileChange => self.render_file_change(&item, index, cx),
                 model::TranscriptKind::Image => {
                     Self::render_image(&item, self.image_surfaces.get(&item.key).cloned(), cx)
+                }
+                model::TranscriptKind::Tool
+                | model::TranscriptKind::Subagent
+                | model::TranscriptKind::Review => {
+                    self.render_activity_sections(item.content.clone(), &item.key, index, cx)
                 }
                 _ => self.render_terminal(item.content.clone(), &item.key, index, cx),
             })
@@ -5870,6 +6068,25 @@ mod tests {
     }
 
     #[test]
+    fn tool_activity_sections_preserve_result_paragraphs() {
+        assert_eq!(
+            activity_text_sections(
+                "Arguments\n{\"path\":\"README.md\"}\n\nResult\nFirst paragraph\n\nSecond paragraph"
+            ),
+            vec![
+                ActivityTextSection {
+                    heading: Some("Arguments".into()),
+                    body: "{\"path\":\"README.md\"}".into(),
+                },
+                ActivityTextSection {
+                    heading: Some("Result".into()),
+                    body: "First paragraph\n\nSecond paragraph".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn command_output_only_trims_trailing_line_breaks() {
         assert_eq!(
             command_output_for_display("first\n\nsecond  \r\n\n"),
@@ -5890,6 +6107,16 @@ mod tests {
                 path: "/tmp/helium-browser-flags.conf".into(),
                 content: "# Native Wayland\n--ozone-platform=wayland".into(),
             }]
+        );
+        assert_eq!(file_change_counts(&presentations[0]), (2, 0));
+
+        assert_eq!(
+            file_change_counts(&FileChangePresentation {
+                operation: "Modified".into(),
+                path: "/tmp/example".into(),
+                content: "@@ -3,2 +3,3 @@\n context\n-removed\n+added\n+another".into(),
+            }),
+            (2, 1)
         );
 
         let mut in_hunk = false;
@@ -5985,6 +6212,19 @@ mod tests {
             Some("A native UI framework")
         );
         assert_eq!(presentation.results[1].title, "A plain result");
+        assert!(!web_search_has_hidden_content(&presentation));
+
+        let presentation = web_search_presentation(&json!({
+            "results": [{
+                "title": "Long result",
+                "snippet": "x".repeat(121),
+            }],
+        }));
+        assert!(web_search_has_hidden_content(&presentation));
+        assert_eq!(
+            presentation.results[0].snippet.as_ref().map(String::len),
+            Some(121)
+        );
     }
 
     fn assert_interactive(method: &str, params: Value) {
