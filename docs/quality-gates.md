@@ -173,7 +173,26 @@ multi-window use.
 - Focused protocol tests passed 57/57 and app tests passed 38/38; the standalone
   app binary rebuilt successfully. Only the known warnings from the reduced
   upstream Editor feature slice remain.
+- A long real Helium history was paused around a file-diff section before
+  switching Rich → Text → Rich; both reading surfaces returned to the same
+  semantic area. After Text moved to the exact tail with `G`, Rich also opened
+  at the latest response instead of restoring an unrelated viewport.
+- Three live `item/commandExecution/requestApproval` requests were exercised
+  against harmless HTTPS `curl` commands. The first exposed that an idle
+  composer retained focus; the request could be operated only after an
+  explicit pane transfer. Harness now auto-focuses only a newly mounted,
+  unresolved request belonging to the live thread when the composer is empty
+  and still focused. It never steals a draft, a history-reading position, the
+  task rail, or an existing request update.
+- Two rebuilt-window repetitions proved immediate `h/l` choice movement,
+  Enter submission, successful App Server response, command exit 0, compact
+  completed-state collapse, and focus return to the transcript. The final
+  visual pass removed the duplicated command from the request header, kept one
+  syntax-highlighted command line, flattened the nested inner panel, preserved
+  the complete outer border, and reduced fixed Text-mode request height.
+- Focused app tests passed 40/40 after the request-focus and compact-surface
+  changes; the standalone binary rebuilt successfully.
 
-Still open: a live approval/form response including failure recovery;
-Rich/Text selection and tail-position transfer under longer real histories;
-and longer exploratory multi-window use.
+Still open: live response-failure recovery and an editable form response;
+measured high-refresh-rate scrolling/input latency; and longer exploratory
+multi-window use.

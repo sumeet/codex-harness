@@ -893,6 +893,27 @@ fn composer_send_blocked(
     composer_empty || loading_thread || read_only || !transport_available
 }
 
+fn request_should_take_focus(
+    newly_mounted: bool,
+    is_live: bool,
+    unresolved: bool,
+    composer_empty: bool,
+    focus_mode: FocusMode,
+) -> bool {
+    newly_mounted && is_live && unresolved && composer_empty && focus_mode == FocusMode::Composer
+}
+
+fn request_header_title(method: &str) -> Option<&'static str> {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => Some("Command approval"),
+        "item/fileChange/requestApproval" | "applyPatchApproval" => Some("File change approval"),
+        "item/permissions/requestApproval" => Some("Permission request"),
+        "item/tool/requestUserInput" => Some("Input requested"),
+        "mcpServer/elicitation/request" => Some("MCP request"),
+        _ => None,
+    }
+}
+
 fn mark_unbacked_requests_inactive(
     model: &mut TranscriptModel,
     live_request_keys: &HashSet<String>,
@@ -1478,6 +1499,9 @@ impl HarnessApp {
 
     fn sync_request_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dirty = std::mem::take(&mut self.dirty_request_surfaces);
+        let composer_empty = self.composer.read(cx).text(cx).trim().is_empty();
+        let focus_mode = self.focus_mode;
+        let mut auto_focus_request: Option<(usize, String)> = None;
         for item_key in dirty {
             let item = self
                 .model
@@ -1514,6 +1538,7 @@ impl HarnessApp {
                         self.remove_request_surface(&item_key, false, window, cx);
                     }
 
+                    let newly_mounted = !self.request_surfaces.contains_key(&item_key);
                     let surface = if let Some(entry) = self.request_surfaces.get(&item_key) {
                         entry.entity.clone()
                     } else {
@@ -1568,6 +1593,23 @@ impl HarnessApp {
                         );
                         surface
                     };
+                    if request_should_take_focus(
+                        newly_mounted,
+                        is_live,
+                        unresolved,
+                        composer_empty,
+                        focus_mode,
+                    ) && let Some(index) = self
+                        .model
+                        .items
+                        .iter()
+                        .position(|item| item.key == item_key)
+                        && auto_focus_request
+                            .as_ref()
+                            .is_none_or(|(current_index, _)| index > *current_index)
+                    {
+                        auto_focus_request = Some((index, item_key.clone()));
+                    }
                     surface.update(cx, |surface, cx| {
                         surface.update_request(request.method.clone(), item.raw.clone(), window, cx)
                     });
@@ -1585,6 +1627,34 @@ impl HarnessApp {
                     });
                 }
             }
+        }
+        if let Some((_, item_key)) = auto_focus_request {
+            cx.defer_in(window, move |this, window, cx| {
+                let composer_empty = this.composer.read(cx).text(cx).trim().is_empty();
+                let Some(index) = this
+                    .model
+                    .items
+                    .iter()
+                    .position(|item| item.key == item_key)
+                else {
+                    return;
+                };
+                let unresolved = this.model.items[index]
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| !request.resolved);
+                if !request_should_take_focus(
+                    true,
+                    this.live_request_keys.contains(&item_key),
+                    unresolved,
+                    composer_empty,
+                    this.focus_mode,
+                ) {
+                    return;
+                }
+                this.selected_item = index;
+                this.focus_selected_request_surface(window, cx);
+            });
         }
     }
 
@@ -4889,6 +4959,10 @@ impl HarnessApp {
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
         let visible_status = item.display_status().map(ToOwned::to_owned);
+        let header_title = request_method
+            .and_then(request_header_title)
+            .unwrap_or(&item.title)
+            .to_owned();
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = !matches!(
             (item.kind, item.title.as_str()),
@@ -4950,7 +5024,7 @@ impl HarnessApp {
             )
             .child(
                 div().flex_1().min_w_0().truncate().child(
-                    Label::new(item.title.clone())
+                    Label::new(header_title)
                         .size(LabelSize::Small)
                         .color(if cursor { Color::Default } else { Color::Muted }),
                 ),
@@ -7510,6 +7584,70 @@ mod tests {
         assert!(composer_send_blocked(false, false, true, true));
         assert!(composer_send_blocked(false, false, false, false));
         assert!(!composer_send_blocked(false, false, false, true));
+    }
+
+    #[test]
+    fn a_new_blocking_request_takes_an_idle_composer_but_never_steals_a_draft() {
+        assert!(request_should_take_focus(
+            true,
+            true,
+            true,
+            true,
+            FocusMode::Composer,
+        ));
+        assert!(!request_should_take_focus(
+            true,
+            true,
+            true,
+            false,
+            FocusMode::Composer,
+        ));
+        assert!(!request_should_take_focus(
+            true,
+            true,
+            true,
+            true,
+            FocusMode::Buffer,
+        ));
+        assert!(!request_should_take_focus(
+            false,
+            true,
+            true,
+            true,
+            FocusMode::Composer,
+        ));
+        assert!(!request_should_take_focus(
+            true,
+            false,
+            true,
+            true,
+            FocusMode::Composer,
+        ));
+    }
+
+    #[test]
+    fn request_headers_name_the_interaction_without_repeating_its_payload() {
+        assert_eq!(
+            request_header_title("item/commandExecution/requestApproval"),
+            Some("Command approval")
+        );
+        assert_eq!(
+            request_header_title("item/fileChange/requestApproval"),
+            Some("File change approval")
+        );
+        assert_eq!(
+            request_header_title("item/permissions/requestApproval"),
+            Some("Permission request")
+        );
+        assert_eq!(
+            request_header_title("item/tool/requestUserInput"),
+            Some("Input requested")
+        );
+        assert_eq!(
+            request_header_title("mcpServer/elicitation/request"),
+            Some("MCP request")
+        );
+        assert_eq!(request_header_title("future/request"), None);
     }
 
     #[test]

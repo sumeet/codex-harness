@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, Render, SharedString, Window, div, prelude::*, px,
+    IntoElement, Render, SharedString, StyledText, Window, div, prelude::*, px, relative,
 };
 use harness_editor::LocalEditor;
 use serde_json::Value;
@@ -14,7 +14,7 @@ use ui::{
 
 use super::{
     RequestChoice, action_button, build_mcp_form_response, build_user_input_response,
-    decision_button, mcp_form_field_hint, request_choice_visual, request_choices,
+    decision_button, mcp_form_field_hint, request_choice_visual, request_choices, shell_highlights,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -412,13 +412,15 @@ impl RequestSurface {
             .and_then(Value::as_str)
             .filter(|reason| !reason.trim().is_empty())
             .map(ToOwned::to_owned);
-        let primary = match self.method.as_str() {
-            "item/commandExecution/requestApproval" => self
-                .raw
-                .get("command")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            "execCommandApproval" => {
+        let (primary, primary_is_command) = match self.method.as_str() {
+            "item/commandExecution/requestApproval" => (
+                self.raw
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                true,
+            ),
+            "execCommandApproval" => (
                 self.raw
                     .get("command")
                     .and_then(Value::as_array)
@@ -428,14 +430,17 @@ impl RequestSurface {
                             .filter_map(Value::as_str)
                             .collect::<Vec<_>>()
                             .join(" ")
-                    })
-            }
-            "item/fileChange/requestApproval" => self
-                .raw
-                .get("grantRoot")
-                .and_then(Value::as_str)
-                .map(|root| format!("Write access under {root}")),
-            "applyPatchApproval" => {
+                    }),
+                true,
+            ),
+            "item/fileChange/requestApproval" => (
+                self.raw
+                    .get("grantRoot")
+                    .and_then(Value::as_str)
+                    .map(|root| format!("Write access under {root}")),
+                false,
+            ),
+            "applyPatchApproval" => (
                 self.raw
                     .get("fileChanges")
                     .and_then(Value::as_object)
@@ -443,10 +448,13 @@ impl RequestSurface {
                         Some(file) if changes.len() == 1 => format!("Change {file}"),
                         None => "Apply requested patch".into(),
                         Some(_) => format!("Change {} files", changes.len()),
-                    })
+                    }),
+                false,
+            ),
+            "item/permissions/requestApproval" => {
+                (Some("Additional permissions requested".into()), false)
             }
-            "item/permissions/requestApproval" => Some("Additional permissions requested".into()),
-            _ => None,
+            _ => (None, false),
         };
         let cwd = self
             .raw
@@ -466,16 +474,19 @@ impl RequestSurface {
             .flex_col()
             .gap_1()
             .when_some(primary, |this, primary| {
+                let highlights = primary_is_command
+                    .then(|| shell_highlights(&primary, cx))
+                    .unwrap_or_default();
                 this.child(
                     div()
-                        .rounded_md()
-                        .bg(colors.editor_background)
-                        .px_3()
-                        .py_2()
+                        .w_full()
+                        .min_w_0()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
+                        .line_height(relative(1.4))
                         .text_color(colors.text)
-                        .child(primary),
+                        .whitespace_normal()
+                        .child(StyledText::new(primary).with_highlights(highlights)),
                 )
             })
             .when_some(cwd, |this, cwd| {
@@ -491,12 +502,9 @@ impl RequestSurface {
             .when(!permissions.is_empty(), |this| {
                 this.child(
                     div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_background)
-                        .px_3()
-                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
                         .font_buffer(cx)
                         .text_ui_xs(cx)
                         .text_color(colors.text_muted)
@@ -850,18 +858,18 @@ impl Render for RequestSurface {
             .track_focus(&self.focus_handle)
             .w_full()
             .min_w_0()
-            .px_3()
-            .py_2()
+            .pl_2()
+            .pr_1()
+            .py_1()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .border_l_2()
             .border_color(if self.focus_handle.contains_focused(window, cx) {
                 colors.text_accent
             } else {
                 colors.border_variant
             })
-            .bg(colors.editor_background.opacity(0.35))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -1027,7 +1035,7 @@ fn estimated_text_rows(text: &str) -> u32 {
 pub(crate) fn request_surface_rows(method: &str, raw: &Value) -> u32 {
     match surface_kind(method, raw) {
         SurfaceKind::Approval => {
-            let mut rows = 6;
+            let mut rows = 4;
             for key in ["command", "cwd", "reason", "grantRoot"] {
                 if let Some(text) = raw.get(key).and_then(Value::as_str) {
                     rows += estimated_text_rows(text);
@@ -1035,7 +1043,7 @@ pub(crate) fn request_surface_rows(method: &str, raw: &Value) -> u32 {
             }
             rows += semantic_permission_rows(raw).len() as u32;
             rows += (request_choices(method, raw).len() > 3) as u32;
-            rows.clamp(8, 32)
+            rows.clamp(6, 24)
         }
         SurfaceKind::UserInput => {
             let content_rows = raw
@@ -1193,7 +1201,7 @@ mod tests {
             "item/commandExecution/requestApproval",
             &json!({"command": "x".repeat(600), "reason": "needed"}),
         );
-        assert!((8..=12).contains(&compact_approval));
+        assert!((6..=10).contains(&compact_approval));
         assert!(long_approval > compact_approval);
         assert!(long_approval <= 32);
 
