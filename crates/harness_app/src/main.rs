@@ -100,11 +100,11 @@ const STREAM_FRAME: Duration = Duration::from_millis(32);
 const READ_ONLY_ACTIVE_REFRESH: Duration = Duration::from_millis(900);
 const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
-const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 14;
-const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_800;
-const COMMAND_PREVIEW_LINES: usize = 6;
-const COMMAND_PREVIEW_BYTES: usize = 1_200;
-const WEB_RESULT_PREVIEW_COUNT: usize = 5;
+const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
+const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
+const COMMAND_PREVIEW_LINES: usize = 4;
+const COMMAND_PREVIEW_BYTES: usize = 800;
+const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 
 #[derive(Debug, Eq, PartialEq)]
 struct StructuredOutputPreview {
@@ -2576,6 +2576,14 @@ impl HarnessApp {
     fn show_rich_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let was_following_tail =
             self.buffer_view && self.transcript_editor.read(cx).is_following_tail();
+        let top_visible_item = self
+            .buffer_view
+            .then(|| {
+                self.transcript_editor
+                    .update(cx, |editor, cx| editor.top_visible_item(cx))
+            })
+            .flatten();
+        let preserved_viewport = top_visible_item.is_some();
         if self.buffer_view {
             let item_index = self
                 .transcript_editor
@@ -2592,14 +2600,25 @@ impl HarnessApp {
             self.list_state.set_follow_mode(FollowMode::Tail);
         } else {
             self.list_state.pause_following_tail();
-            self.list_state.scroll_to_reveal_item(self.selected_item);
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: top_visible_item.unwrap_or(self.selected_item),
+                offset_in_item: px(0.),
+            });
         }
-        cx.defer_in(window, |this, _, cx| {
+        cx.defer_in(window, move |this, _, cx| {
             if !this.buffer_view && this.focus_mode == FocusMode::Transcript {
                 if this.list_state.is_following_tail() {
                     this.list_state.scroll_to_end();
-                } else {
-                    this.list_state.scroll_to_reveal_item(this.selected_item);
+                } else if !preserved_viewport {
+                    let selected_visible = this
+                        .list_state
+                        .bounds_for_item(this.selected_item)
+                        .is_some_and(|bounds| {
+                            bounds.intersects(&this.list_state.viewport_bounds())
+                        });
+                    if !selected_visible {
+                        this.list_state.scroll_to_reveal_item(this.selected_item);
+                    }
                 }
                 cx.notify();
             }
@@ -2621,6 +2640,12 @@ impl HarnessApp {
         self.buffer_search_backwards = false;
         let should_follow_tail = self.list_state.is_following_tail()
             && (self.model.items.is_empty() || self.selected_item + 1 >= self.model.items.len());
+        let top_visible_item = (!should_follow_tail).then(|| {
+            self.list_state
+                .logical_scroll_top()
+                .item_ix
+                .min(self.model.items.len().saturating_sub(1))
+        });
         self.buffer_view = true;
         let Some(document) = self.sync_transcript_document(cx) else {
             return;
@@ -2636,13 +2661,29 @@ impl HarnessApp {
                     .find_map(|row| *row)
             })
             .unwrap_or(0);
+        let top_row = top_visible_item.and_then(|item_index| {
+            document
+                .item_rows
+                .get(item_index)
+                .and_then(|row| *row)
+                .or_else(|| {
+                    document.item_rows[..item_index.min(document.item_rows.len())]
+                        .iter()
+                        .rev()
+                        .find_map(|row| *row)
+                })
+        });
         self.focus_mode = FocusMode::Buffer;
         self.transcript_editor.update(cx, |editor, cx| {
             editor.set_cursor_row(row, window, cx);
             if should_follow_tail {
                 editor.reveal_tail(cx);
             } else {
-                editor.pause_tail_follow();
+                if let Some(top_row) = top_row {
+                    editor.reveal_row_at_top(top_row, cx);
+                } else {
+                    editor.pause_tail_follow();
+                }
             }
         });
         self.transcript_editor.focus_handle(cx).focus(window, cx);
@@ -2770,7 +2811,11 @@ impl HarnessApp {
             self.sidebar_open = false;
             self.sidebar_user_override = false;
             if self.focus_mode == FocusMode::Tasks {
-                self.focus_mode = FocusMode::Transcript;
+                self.focus_mode = if self.buffer_view {
+                    FocusMode::Buffer
+                } else {
+                    FocusMode::Transcript
+                };
             }
         } else {
             self.sidebar_open = true;
@@ -2816,7 +2861,12 @@ impl HarnessApp {
             .selected_item
             .saturating_add_signed(delta)
             .min(self.model.items.len() - 1);
-        self.list_state.scroll_to_reveal_item(self.selected_item);
+        if self.selected_item + 1 >= self.model.items.len() && delta > 0 {
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.list_state.pause_following_tail();
+            self.list_state.scroll_to_reveal_item(self.selected_item);
+        }
         cx.notify();
     }
 
@@ -4590,8 +4640,11 @@ impl HarnessApp {
             (model::TranscriptKind::Agent, "Codex") | (model::TranscriptKind::User, "You")
         );
         let disclosure_weak = cx.weak_entity();
+        let is_disclosure = has_collapsible_content
+            && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
 
         let header = div()
+            .id(("item-header", index))
             .w_full()
             .min_w_0()
             .flex()
@@ -4618,27 +4671,21 @@ impl HarnessApp {
                     ),
                 )
             })
-            .when(
-                has_collapsible_content
-                    && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning),
-                |this| {
-                    this.child(
-                        Disclosure::new(("item-disclosure", index), item.expanded).on_click(
-                            move |_, _, cx| {
-                                disclosure_weak
-                                    .update(cx, |this, cx| {
-                                        if let Some(item) = this.model.items.get_mut(index) {
-                                            item.expanded = !item.expanded;
-                                            this.list_state.splice(index..index + 1, 1);
-                                            cx.notify();
-                                        }
-                                    })
-                                    .ok();
-                            },
-                        ),
-                    )
-                },
-            );
+            .when(is_disclosure, |this| {
+                this.cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        disclosure_weak
+                            .update(cx, |this, cx| {
+                                if let Some(item) = this.model.items.get_mut(index) {
+                                    item.expanded = !item.expanded;
+                                    this.list_state.splice(index..index + 1, 1);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    })
+                    .child(Disclosure::new(("item-disclosure", index), item.expanded))
+            });
 
         let body = if request_method.is_some() || !item.expanded || item.content.is_empty() {
             None
@@ -4792,6 +4839,9 @@ impl HarnessApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.selected_item = index;
                 this.visual_anchor = None;
+                if index + 1 < this.model.items.len() {
+                    this.list_state.pause_following_tail();
+                }
                 this.focus_transcript(window, cx);
             }))
             .child(content)
@@ -4985,7 +5035,7 @@ impl Render for HarnessApp {
                     this.task_list_state.scroll_to_end();
                 } else {
                     this.selected_item = this.model.items.len().saturating_sub(1);
-                    this.list_state.scroll_to_end();
+                    this.list_state.set_follow_mode(FollowMode::Tail);
                 }
                 cx.notify();
             }))

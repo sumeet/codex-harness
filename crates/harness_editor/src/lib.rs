@@ -965,9 +965,28 @@ impl TranscriptEditor {
 
     pub fn selected_item(&self, cx: &mut App) -> Option<usize> {
         let cursor_offset = self.cursor_offset(cx);
+        self.item_at_offset(cursor_offset)
+    }
+
+    /// Return the semantic item intersecting the top of the visible Editor
+    /// viewport. Hosts use this as a scroll anchor when switching between a
+    /// rich list projection and the selectable text projection.
+    pub fn top_visible_item(&mut self, cx: &mut App) -> Option<usize> {
+        let visible_offset = self.editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let visible_range = editor.multi_buffer_visible_range(&display_snapshot, cx);
+            visible_range
+                .start
+                .to_offset(display_snapshot.buffer_snapshot())
+                .0
+        });
+        self.item_at_offset(visible_offset)
+    }
+
+    fn item_at_offset(&self, offset: usize) -> Option<usize> {
         let segment_index = self
             .segments
-            .partition_point(|segment| segment.whole_range.end <= cursor_offset)
+            .partition_point(|segment| segment.whole_range.end <= offset)
             .min(self.segments.len().saturating_sub(1));
         self.segments
             .get(segment_index)
@@ -975,7 +994,7 @@ impl TranscriptEditor {
                 self.segments
                     .iter()
                     .rev()
-                    .find(|segment| segment.whole_range.start <= cursor_offset)
+                    .find(|segment| segment.whole_range.start <= offset)
             })
             .map(|segment| segment.item_index)
     }
@@ -1237,6 +1256,20 @@ impl TranscriptEditor {
     pub fn pause_tail_follow(&mut self) {
         self.follow_tail = false;
         self.pending_tail_intent = None;
+    }
+
+    /// Align a Buffer row to the top of the viewport without changing the Vim
+    /// cursor or selection. The request is anchor-based so soft wrapping and
+    /// supplemental display-map blocks are accounted for during layout.
+    pub fn reveal_row_at_top(&mut self, row: u32, cx: &mut Context<Self>) {
+        self.pause_tail_follow();
+        let text = self.buffer.read(cx).text();
+        let offset = point_to_offset(&text, Point::new(row, 0));
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchor = snapshot.anchor_before(MultiBufferOffset(offset));
+            editor.request_autoscroll(Autoscroll::top().for_anchor(anchor), cx);
+        });
     }
 
     fn request_tail_autoscroll(&mut self, cx: &mut Context<Self>) {
