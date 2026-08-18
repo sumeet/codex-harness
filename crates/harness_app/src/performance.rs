@@ -8,14 +8,34 @@ const FRAME_BUDGET_60_HZ_NS: u64 = 16_666_667;
 #[derive(Default)]
 pub(crate) struct PerformanceReporter {
     previous: Option<PerformanceSnapshot>,
+    previous_label: Option<&'static str>,
 }
 
 impl PerformanceReporter {
+    pub(crate) fn mark_baseline(&mut self, window: &mut Window) {
+        window.begin_performance_measurement();
+        self.previous = Some(PerformanceSnapshot::capture(window));
+        self.previous_label = Some(":perf-j baseline");
+    }
+
     pub(crate) fn snapshot_report(&mut self, window: &Window) -> Result<String> {
+        self.snapshot_report_as(window, ":perf")
+    }
+
+    pub(crate) fn snapshot_benchmark_report(&mut self, window: &Window) -> Result<String> {
+        self.snapshot_report_as(window, ":perf-j")
+    }
+
+    fn snapshot_report_as(
+        &mut self,
+        window: &Window,
+        current_label: &'static str,
+    ) -> Result<String> {
         let current = PerformanceSnapshot::capture(window);
         let result = PerformanceSample::between(&current, self.previous.as_ref())
-            .map(|sample| sample.format(self.previous.is_some()));
+            .map(|sample| sample.format(self.previous_label));
         self.previous = Some(current);
+        self.previous_label = Some(current_label);
         result
     }
 }
@@ -37,6 +57,8 @@ impl PerformanceSnapshot {
 struct PerformanceSample {
     draw_duration: Histogram<u64>,
     input_to_present: Histogram<u64>,
+    input_arrival_interval: Histogram<u64>,
+    input_dispatch_duration: Histogram<u64>,
     input_present_interval: Histogram<u64>,
     animation_interval: Histogram<u64>,
     events_per_frame: Histogram<u64>,
@@ -70,6 +92,16 @@ impl PerformanceSample {
                 previous_input.map(|snapshot| &snapshot.latency_histogram),
                 "input-to-present latency",
             )?,
+            input_arrival_interval: histogram_delta(
+                &current.input.input_arrival_interval_histogram,
+                previous_input.map(|snapshot| &snapshot.input_arrival_interval_histogram),
+                "input arrival interval",
+            )?,
+            input_dispatch_duration: histogram_delta(
+                &current.input.input_dispatch_duration_histogram,
+                previous_input.map(|snapshot| &snapshot.input_dispatch_duration_histogram),
+                "input dispatch duration",
+            )?,
             input_present_interval: histogram_delta(
                 &current.frames.input_driven_present_interval_histogram,
                 previous_frames.map(|snapshot| &snapshot.input_driven_present_interval_histogram),
@@ -89,17 +121,17 @@ impl PerformanceSample {
         })
     }
 
-    fn format(&self, delta: bool) -> String {
-        let period = if delta {
-            "since previous :perf"
-        } else {
-            "cumulative"
-        };
+    fn format(&self, previous_label: Option<&str>) -> String {
+        let period = previous_label
+            .map(|label| format!("since {label}"))
+            .unwrap_or_else(|| "cumulative".into());
         [
             format!("Harness performance ({period})"),
             format_duration_histogram("draw", &self.draw_duration),
+            format_duration_histogram("input arrival", &self.input_arrival_interval),
+            format_duration_histogram("input dispatch", &self.input_dispatch_duration),
             format_duration_histogram("input→present", &self.input_to_present),
-            format_duration_histogram("input cadence", &self.input_present_interval),
+            format_duration_histogram("input present cadence", &self.input_present_interval),
             format_duration_histogram("animation", &self.animation_interval),
             format_count_histogram("events/frame", &self.events_per_frame),
             format!("mid-draw drops n={}", self.mid_draw_events_dropped),
@@ -175,6 +207,8 @@ mod tests {
         let previous = snapshot(
             &[1_000_000],
             &[2_000_000],
+            &[3_000_000],
+            &[500_000],
             &[8_000_000],
             &[9_000_000],
             &[1],
@@ -183,6 +217,8 @@ mod tests {
         let current = snapshot(
             &[1_000_000, 20_000_000],
             &[2_000_000, 3_000_000],
+            &[3_000_000, 4_000_000],
+            &[500_000, 1_500_000],
             &[8_000_000, 17_000_000],
             &[9_000_000, 10_000_000],
             &[1, 3],
@@ -193,15 +229,21 @@ mod tests {
             .expect("monotonic snapshots should subtract");
         assert_eq!(sample.draw_duration.len(), 1);
         assert_eq!(sample.draw_duration.count_at(20_000_000), 1);
+        assert_eq!(sample.input_arrival_interval.len(), 1);
+        assert_eq!(sample.input_arrival_interval.count_at(4_000_000), 1);
+        assert_eq!(sample.input_dispatch_duration.len(), 1);
+        assert_eq!(sample.input_dispatch_duration.count_at(1_500_000), 1);
         assert_eq!(sample.input_present_interval.len(), 1);
         assert_eq!(sample.input_present_interval.count_at(17_000_000), 1);
         assert_eq!(sample.events_per_frame.len(), 1);
         assert_eq!(sample.events_per_frame.count_at(3), 1);
-        let report = sample.format(true);
+        let report = sample.format(Some("previous :perf"));
 
         assert!(report.contains("since previous :perf"));
         assert!(report.contains("draw n=1"));
-        assert!(report.contains("input cadence n=1"));
+        assert!(report.contains("input arrival n=1"));
+        assert!(report.contains("input dispatch n=1"));
+        assert!(report.contains("input present cadence n=1"));
         assert!(report.contains(">16.67ms=1"));
         assert!(report.contains("events/frame n=1 p50=3"));
         assert!(report.contains("mid-draw drops n=3"));
@@ -220,6 +262,8 @@ mod tests {
     fn snapshot(
         draws: &[u64],
         input_latency: &[u64],
+        input_arrival_intervals: &[u64],
+        input_dispatch_durations: &[u64],
         input_intervals: &[u64],
         animation_intervals: &[u64],
         events_per_frame: &[u64],
@@ -233,6 +277,8 @@ mod tests {
             },
             input: InputLatencySnapshot {
                 latency_histogram: histogram(input_latency),
+                input_arrival_interval_histogram: histogram(input_arrival_intervals),
+                input_dispatch_duration_histogram: histogram(input_dispatch_durations),
                 events_per_frame_histogram: histogram(events_per_frame),
                 mid_draw_events_dropped,
             },

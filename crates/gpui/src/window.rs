@@ -2978,6 +2978,14 @@ impl Window {
         self.window_profiler.frame_duration_snapshot()
     }
 
+    /// Starts a new profiler measurement interval while preserving cumulative
+    /// histograms. Samples recorded afterward will not span input or
+    /// presentation anchors from preparation work before this boundary.
+    #[cfg(feature = "profiler")]
+    pub fn begin_performance_measurement(&mut self) {
+        self.window_profiler.begin_measurement();
+    }
+
     fn draw_roots(&mut self, cx: &mut App) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();

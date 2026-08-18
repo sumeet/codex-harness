@@ -11,7 +11,7 @@ use assets::Assets;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render, SharedString,
+    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListState, Render, SharedString,
     StyledText, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div,
     list, prelude::*, px, relative, size,
 };
@@ -92,6 +92,7 @@ actions!(
         UseBufferTypography,
         UseReadingTypography,
         CopyPerformanceReport,
+        RunPerformanceBenchmark,
         NormalEscape,
         ChooseApproval,
         OpenRequestSurface,
@@ -117,6 +118,96 @@ const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
 const PROGRESSIVE_WEB_MEDIUM_RESULTS: usize = 10;
 const PROGRESSIVE_WEB_LARGE_RESULTS: usize = 50;
+const PERFORMANCE_J_STEPS: u16 = 240;
+const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceJPhase {
+    Prepare,
+    Baseline,
+    Dispatch { remaining: u16 },
+    Report,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PerformanceJStep {
+    Prepare,
+    Baseline,
+    Dispatch,
+    Report,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PerformanceJRunState {
+    generation: u64,
+    phase: PerformanceJPhase,
+}
+
+impl PerformanceJRunState {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            phase: PerformanceJPhase::Prepare,
+        }
+    }
+
+    fn next_step(&mut self, generation: u64) -> Option<PerformanceJStep> {
+        if self.generation != generation {
+            return None;
+        }
+        match self.phase {
+            PerformanceJPhase::Prepare => {
+                self.phase = PerformanceJPhase::Baseline;
+                Some(PerformanceJStep::Prepare)
+            }
+            PerformanceJPhase::Baseline => {
+                self.phase = PerformanceJPhase::Dispatch {
+                    remaining: PERFORMANCE_J_STEPS,
+                };
+                Some(PerformanceJStep::Baseline)
+            }
+            PerformanceJPhase::Dispatch {
+                remaining: remaining @ 2..=u16::MAX,
+            } => {
+                self.phase = PerformanceJPhase::Dispatch {
+                    remaining: remaining - 1,
+                };
+                Some(PerformanceJStep::Dispatch)
+            }
+            PerformanceJPhase::Dispatch { remaining: 1 } => {
+                self.phase = PerformanceJPhase::Report;
+                Some(PerformanceJStep::Dispatch)
+            }
+            PerformanceJPhase::Dispatch { remaining: 0 } | PerformanceJPhase::Report => {
+                self.phase = PerformanceJPhase::Complete;
+                Some(PerformanceJStep::Report)
+            }
+            PerformanceJPhase::Complete => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PerformanceJDriver {
+    state: PerformanceJRunState,
+    g: Keystroke,
+    j: Keystroke,
+}
+
+impl PerformanceJDriver {
+    fn new(generation: u64, g: Keystroke, j: Keystroke) -> Self {
+        Self {
+            state: PerformanceJRunState::new(generation),
+            g,
+            j,
+        }
+    }
+}
+
+fn performance_j_has_room(logical_lines: usize) -> bool {
+    logical_lines > usize::from(PERFORMANCE_J_STEPS)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct StructuredOutputPreview {
@@ -1640,6 +1731,10 @@ struct HarnessApp {
     command_palette_history: Vec<String>,
     command_palette_usage: HashMap<String, u16>,
     performance_reporter: PerformanceReporter,
+    performance_j_generation: u64,
+    performance_j_run: Option<PerformanceJDriver>,
+    performance_status: Option<SharedString>,
+    performance_status_generation: u64,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
     list_state: ListState,
@@ -1771,6 +1866,10 @@ impl HarnessApp {
             command_palette_history: palette_state.history,
             command_palette_usage: palette_state.usage,
             performance_reporter: PerformanceReporter::default(),
+            performance_j_generation: 0,
+            performance_j_run: None,
+            performance_status: None,
+            performance_status_generation: 0,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             sidebar_open: true,
@@ -3750,6 +3849,196 @@ impl HarnessApp {
                 log::error!("failed to build Harness performance report: {error:#}");
             }
         }
+    }
+
+    fn set_performance_status(
+        &mut self,
+        message: impl Into<SharedString>,
+        clear_after: Option<Duration>,
+        cx: &mut Context<Self>,
+    ) {
+        self.performance_status_generation = self.performance_status_generation.wrapping_add(1);
+        let generation = self.performance_status_generation;
+        self.performance_status = Some(message.into());
+        cx.notify();
+
+        let Some(delay) = clear_after else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            _ = this.update(cx, |this, cx| {
+                if this.performance_status_generation == generation {
+                    this.performance_status = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn performance_j_ready(&self, window: &Window, cx: &App) -> bool {
+        self.buffer_view
+            && self.focus_mode == FocusMode::Buffer
+            && self.transcript_editor.focus_handle(cx).is_focused(window)
+    }
+
+    fn schedule_performance_j_step(generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.performance_j_step(generation, window, cx);
+        });
+    }
+
+    fn cancel_performance_j(&mut self, generation: u64, reason: &str, cx: &mut Context<Self>) {
+        if self
+            .performance_j_run
+            .as_ref()
+            .is_some_and(|driver| driver.state.generation == generation)
+        {
+            self.performance_j_run = None;
+            self.set_performance_status(
+                format!("Performance run cancelled: {reason}"),
+                Some(PERFORMANCE_STATUS_DURATION),
+                cx,
+            );
+            log::warn!("cancelled Harness :perf-j run: {reason}");
+        }
+    }
+
+    fn performance_j_step(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let (step, key) = {
+            let Some(driver) = self.performance_j_run.as_mut() else {
+                return;
+            };
+            let Some(step) = driver.state.next_step(generation) else {
+                return;
+            };
+            let key = match step {
+                PerformanceJStep::Prepare => Some(driver.g.clone()),
+                PerformanceJStep::Dispatch => Some(driver.j.clone()),
+                PerformanceJStep::Baseline | PerformanceJStep::Report => None,
+            };
+            (step, key)
+        };
+
+        if step != PerformanceJStep::Report && !self.performance_j_ready(window, cx) {
+            self.cancel_performance_j(generation, "Text view lost focus", cx);
+            return;
+        }
+
+        match step {
+            PerformanceJStep::Prepare => {
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.enter_normal_mode(window, cx);
+                });
+                let Some(g) = key else {
+                    self.cancel_performance_j(generation, "Vim gg key was unavailable", cx);
+                    return;
+                };
+                if !window.dispatch_keystroke(g.clone(), cx) || !window.dispatch_keystroke(g, cx) {
+                    self.cancel_performance_j(generation, "Vim gg was not handled", cx);
+                    return;
+                }
+                self.set_performance_status(
+                    format!("Running {PERFORMANCE_J_STEPS}-frame Vim j performance sample…"),
+                    None,
+                    cx,
+                );
+                Self::schedule_performance_j_step(generation, window, cx);
+            }
+            PerformanceJStep::Baseline => {
+                self.performance_reporter.mark_baseline(window);
+                Self::schedule_performance_j_step(generation, window, cx);
+            }
+            PerformanceJStep::Dispatch => {
+                let Some(j) = key else {
+                    self.cancel_performance_j(generation, "Vim j key was unavailable", cx);
+                    return;
+                };
+                if !window.dispatch_keystroke(j, cx) {
+                    self.cancel_performance_j(generation, "Vim j was not handled", cx);
+                    return;
+                }
+                Self::schedule_performance_j_step(generation, window, cx);
+            }
+            PerformanceJStep::Report => {
+                self.performance_j_run = None;
+                match self.performance_reporter.snapshot_benchmark_report(window) {
+                    Ok(report) => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
+                        self.set_performance_status(
+                            format!(
+                                "{PERFORMANCE_J_STEPS}-frame performance report copied to clipboard"
+                            ),
+                            Some(PERFORMANCE_STATUS_DURATION),
+                            cx,
+                        );
+                        log::info!(
+                            "completed Harness :perf-j run and copied the performance report"
+                        );
+                    }
+                    Err(error) => {
+                        self.set_performance_status(
+                            "Performance run completed, but its report failed",
+                            Some(PERFORMANCE_STATUS_DURATION),
+                            cx,
+                        );
+                        log::error!("failed to build Harness :perf-j report: {error:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn run_performance_j(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.performance_j_generation = self.performance_j_generation.wrapping_add(1);
+        let generation = self.performance_j_generation;
+        self.performance_j_run = None;
+        let g = match Keystroke::parse("g") {
+            Ok(keystroke) => keystroke,
+            Err(error) => {
+                self.set_performance_status(
+                    "Performance run could not prepare its Vim key",
+                    Some(PERFORMANCE_STATUS_DURATION),
+                    cx,
+                );
+                log::error!("failed to parse Harness :perf-j preparation key: {error}");
+                return;
+            }
+        };
+        let j = match Keystroke::parse("j") {
+            Ok(keystroke) => keystroke,
+            Err(error) => {
+                self.set_performance_status(
+                    "Performance run could not prepare its Vim key",
+                    Some(PERFORMANCE_STATUS_DURATION),
+                    cx,
+                );
+                log::error!("failed to parse Harness :perf-j measurement key: {error}");
+                return;
+            }
+        };
+        self.show_text_transcript(window, cx);
+
+        let logical_lines = self.transcript_editor.read(cx).text(cx).lines().count();
+        if !performance_j_has_room(logical_lines) {
+            self.set_performance_status(
+                format!(
+                    ":perf-j needs more than {PERFORMANCE_J_STEPS} transcript lines ({logical_lines} available)"
+                ),
+                Some(PERFORMANCE_STATUS_DURATION),
+                cx,
+            );
+            log::warn!(
+                "Harness :perf-j needs more than {PERFORMANCE_J_STEPS} transcript lines; found {logical_lines}"
+            );
+            return;
+        }
+
+        self.performance_j_run = Some(PerformanceJDriver::new(generation, g, j));
+        self.set_performance_status("Preparing Vim j performance sample…", None, cx);
+        log::info!("starting Harness :perf-j run ({PERFORMANCE_J_STEPS} frames)");
+        Self::schedule_performance_j_step(generation, window, cx);
     }
 
     fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5991,17 +6280,20 @@ impl Render for HarnessApp {
                 self.search_matches.len()
             )
         };
-        let composer_status = if self.loading_thread {
-            Some(("Loading task history…", Color::Muted))
-        } else if self.thread_read_only_reason.is_some() {
-            Some(("Read-only · Ctrl-N for a new thread", Color::Warning))
-        } else if self.connecting {
-            Some(("Connecting…", Color::Muted))
-        } else if self.client.is_none() && self.replay_count.is_none() {
-            Some(("Offline · refresh to reconnect", Color::Warning))
-        } else {
-            None
-        };
+        let composer_status: Option<(SharedString, Color)> =
+            if let Some(status) = self.performance_status.clone() {
+                Some((status, Color::Muted))
+            } else if self.loading_thread {
+                Some(("Loading task history…".into(), Color::Muted))
+            } else if self.thread_read_only_reason.is_some() {
+                Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
+            } else if self.connecting {
+                Some(("Connecting…".into(), Color::Muted))
+            } else if self.client.is_none() && self.replay_count.is_none() {
+                Some(("Offline · refresh to reconnect".into(), Color::Warning))
+            } else {
+                None
+            };
 
         div()
             .key_context(self.key_context())
@@ -6083,6 +6375,11 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &CopyPerformanceReport, window, cx| {
                 this.copy_performance_report(window, cx)
             }))
+            .on_action(
+                cx.listener(|this, _: &RunPerformanceBenchmark, window, cx| {
+                    this.run_performance_j(window, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.open_command_palette("", window, cx)
             }))
@@ -7450,6 +7747,42 @@ fn load_harness_keymaps(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn performance_j_run_has_one_preparation_one_baseline_and_exact_move_count() {
+        let mut run = PerformanceJRunState::new(7);
+        let mut steps = Vec::new();
+        while let Some(step) = run.next_step(7) {
+            steps.push(step);
+        }
+
+        assert_eq!(steps.first(), Some(&PerformanceJStep::Prepare));
+        assert_eq!(steps.get(1), Some(&PerformanceJStep::Baseline));
+        assert_eq!(steps.last(), Some(&PerformanceJStep::Report));
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| **step == PerformanceJStep::Dispatch)
+                .count(),
+            usize::from(PERFORMANCE_J_STEPS)
+        );
+        assert_eq!(run.phase, PerformanceJPhase::Complete);
+    }
+
+    #[test]
+    fn stale_performance_j_generation_does_not_advance_the_active_run() {
+        let mut run = PerformanceJRunState::new(9);
+
+        assert_eq!(run.next_step(8), None);
+        assert_eq!(run.phase, PerformanceJPhase::Prepare);
+        assert_eq!(run.next_step(9), Some(PerformanceJStep::Prepare));
+    }
+
+    #[test]
+    fn performance_j_requires_room_for_every_downward_motion() {
+        assert!(!performance_j_has_room(usize::from(PERFORMANCE_J_STEPS)));
+        assert!(performance_j_has_room(usize::from(PERFORMANCE_J_STEPS) + 1));
+    }
 
     #[test]
     fn reconnect_backoff_is_bounded() {

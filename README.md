@@ -75,10 +75,13 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 - Text is Zed's modal Editor. Its normal/visual motions, registers, yank,
   `/ ? n N`, jumplist, and `:` palette operate on real Buffer text. `:rich`,
   `:text`, `:reading`, `:mono`, `:compose`, `:tasks`, `:new`, `:stop`, and
-  `:perf` are Harness aliases. `:perf` copies a delta performance report rather
-  than adding permanent profiler chrome. `--text` starts directly in Text for
-  repeatable QA; the code icon in the thread-rail toolbar switches modes with
-  the mouse. Standalone `* # g* g# gn gN` search semantics are still active
+  `:perf` are Harness aliases. `:perf` copies a delta performance report that
+  distinguishes input arrival, input dispatch, input-to-present latency, and
+  input-present cadence rather than adding permanent profiler chrome. The
+  developer alias `:perf-j` runs 240 real Vim `j` inputs paced one per presented
+  frame in Text, then copies that run's report. `--text` starts directly in Text
+  for repeatable QA; the code icon in the thread-rail toolbar switches modes
+  with the mouse. Standalone `* # g* g# gn gN` search semantics are still active
   work rather than being silently claimed here.
 - `Enter` on an interactive request in Text focuses its shared form/approval
   surface; `Escape` returns to the transcript.
