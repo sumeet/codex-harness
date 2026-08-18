@@ -20,7 +20,7 @@ use gpui::{
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
-    find_wrapped_match, minimal_text_edit,
+    minimal_text_edit,
 };
 use language::{Buffer, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
@@ -33,7 +33,8 @@ use ui::{
 pub use editor::actions::{LocalNavigationBack, LocalNavigationForward};
 pub use vim::Search as VimSearch;
 pub use vim::{
-    ModeIndicator, MoveToNextMatch as VimNextMatch, MoveToPreviousMatch as VimPreviousMatch,
+    ModeIndicator, MoveToNext as VimWordNext, MoveToNextMatch as VimNextMatch,
+    MoveToPrevious as VimWordPrevious, MoveToPreviousMatch as VimPreviousMatch,
 };
 
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
@@ -237,6 +238,8 @@ struct DiffDeletionHighlight;
 struct TranscriptSearchState {
     query: String,
     backwards: bool,
+    case_sensitive: bool,
+    whole_word: bool,
     // MultiBuffer anchors follow streaming edits while byte offsets do not.
     // The highlights remain decorations; Vim's actual selection stays owned
     // by the Editor and is changed only by explicit match navigation.
@@ -404,15 +407,42 @@ fn visible_diff_body_ranges(
         .collect()
 }
 
-/// Return overlapping ASCII-case-insensitive literal matches in one already
-/// bounded text window. ASCII folding preserves the source's UTF-8 offsets;
-/// non-ASCII characters continue to match exactly.
+/// Return overlapping default search matches in one already bounded window.
+/// The production helper below also carries the case and keyword-boundary
+/// policy used by Vim word search.
+#[cfg(test)]
 fn literal_match_ranges(text: &str, query: &str, base_offset: usize) -> Vec<Range<usize>> {
+    literal_match_ranges_with_options(
+        text,
+        query,
+        base_offset,
+        text.len() + base_offset,
+        false,
+        false,
+    )
+}
+
+fn literal_match_ranges_with_options(
+    text: &str,
+    query: &str,
+    base_offset: usize,
+    document_len: usize,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<Range<usize>> {
     if query.is_empty() {
         return Vec::new();
     }
-    let haystack = text.to_ascii_lowercase();
-    let needle = query.to_ascii_lowercase();
+    let haystack = if case_sensitive {
+        text.to_string()
+    } else {
+        text.to_ascii_lowercase()
+    };
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_ascii_lowercase()
+    };
     let mut matches = Vec::new();
     let mut search_start = 0;
     while search_start <= haystack.len() {
@@ -421,10 +451,93 @@ fn literal_match_ranges(text: &str, query: &str, base_offset: usize) -> Vec<Rang
         };
         let start = search_start + relative_start;
         let end = start + needle.len();
-        matches.push(base_offset + start..base_offset + end);
+        if !whole_word || is_whole_keyword_match(text, start, end, base_offset, document_len) {
+            matches.push(base_offset + start..base_offset + end);
+        }
         search_start = next_char_boundary(text, start);
     }
     matches
+}
+
+fn is_keyword_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn is_whole_keyword_match(
+    text: &str,
+    start: usize,
+    end: usize,
+    base_offset: usize,
+    document_len: usize,
+) -> bool {
+    let starts_at_boundary = if start == 0 {
+        base_offset == 0
+    } else {
+        text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_keyword_character(character))
+    };
+    let ends_at_boundary = if end == text.len() {
+        base_offset + end == document_len
+    } else {
+        text[end..]
+            .chars()
+            .next()
+            .is_none_or(|character| !is_keyword_character(character))
+    };
+    starts_at_boundary && ends_at_boundary
+}
+
+fn keyword_range_at_offset(text: &str, offset: usize) -> Option<Range<usize>> {
+    let offset = previous_char_boundary(text, offset.min(text.len()));
+    let character = text[offset..].chars().next()?;
+    if !is_keyword_character(character) {
+        return None;
+    }
+
+    let mut start = offset;
+    while let Some((previous, character)) = text[..start].char_indices().next_back() {
+        if !is_keyword_character(character) {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = offset + character.len_utf8();
+    while let Some(character) = text[end..].chars().next() {
+        if !is_keyword_character(character) {
+            break;
+        }
+        end += character.len_utf8();
+    }
+    Some(start..end)
+}
+
+fn find_wrapped_literal_match(
+    text: &str,
+    query: &str,
+    cursor_offset: usize,
+    backwards: bool,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Option<usize> {
+    let matches =
+        literal_match_ranges_with_options(text, query, 0, text.len(), case_sensitive, whole_word);
+    let cursor_offset = previous_char_boundary(text, cursor_offset.min(text.len()));
+    if backwards {
+        matches
+            .iter()
+            .rev()
+            .find(|range| range.start < cursor_offset)
+            .or_else(|| matches.last())
+            .map(|range| range.start)
+    } else {
+        matches
+            .iter()
+            .find(|range| range.start > cursor_offset)
+            .or_else(|| matches.first())
+            .map(|range| range.start)
+    }
 }
 
 fn next_char_boundary(text: &str, offset: usize) -> usize {
@@ -1267,18 +1380,24 @@ impl TranscriptEditor {
             }
             highlights
         });
+        let search_case_sensitive = self.search.case_sensitive;
+        let search_whole_word = self.search.whole_word;
         let search_highlights = rebuild_search_highlights.then(|| {
             if self.search.query.is_empty() {
                 None
             } else {
                 let buffer = self.buffer.read(cx);
+                let document_len = buffer.len();
                 let text = buffer
                     .text_for_range(desired.byte_range.clone())
                     .collect::<String>();
-                Some(literal_match_ranges(
+                Some(literal_match_ranges_with_options(
                     &text,
                     &self.search.query,
                     desired.byte_range.start,
+                    document_len,
+                    search_case_sensitive,
+                    search_whole_word,
                 ))
             }
         });
@@ -1781,8 +1900,11 @@ impl TranscriptEditor {
             self.clear_search(cx);
             return;
         }
-        let query_changed = self.search.query != query;
+        let query_changed =
+            self.search.query != query || self.search.case_sensitive || self.search.whole_word;
         self.search.backwards = backwards;
+        self.search.case_sensitive = false;
+        self.search.whole_word = false;
         if query_changed {
             self.search.query.clear();
             self.search.query.push_str(query);
@@ -1830,8 +1952,11 @@ impl TranscriptEditor {
             self.clear_search(cx);
             return false;
         }
-        let query_changed = self.search.query != query;
+        let query_changed =
+            self.search.query != query || self.search.case_sensitive || self.search.whole_word;
         self.search.backwards = backwards;
+        self.search.case_sensitive = false;
+        self.search.whole_word = false;
         if query_changed {
             self.search.query.clear();
             self.search.query.push_str(query);
@@ -1839,6 +1964,36 @@ impl TranscriptEditor {
             self.search.highlights_dirty = true;
         }
         self.move_search_in_direction(backwards, window, cx)
+    }
+
+    /// Search from the keyword under the Vim cursor. Whole-word `*`/`#` and
+    /// partial-word `g*`/`g#` share the same persistent state as `/`, so n/N
+    /// continue in the expected original direction.
+    pub fn search_word_under_cursor(
+        &mut self,
+        backwards: bool,
+        partial_word: bool,
+        case_sensitive: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = self.buffer.read(cx).text();
+        let cursor = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor.selections.newest::<Point>(&snapshot).head()
+        });
+        let cursor_offset = point_to_offset(&text, cursor);
+        let Some(word_range) = keyword_range_at_offset(&text, cursor_offset) else {
+            return false;
+        };
+        let query = text[word_range.clone()].to_string();
+        self.search.query = query;
+        self.search.backwards = backwards;
+        self.search.case_sensitive = case_sensitive;
+        self.search.whole_word = !partial_word;
+        self.search.active_match = None;
+        self.search.highlights_dirty = true;
+        self.move_search_from_offset(word_range.start, backwards, window, cx)
     }
 
     fn move_search_in_direction(
@@ -1856,7 +2011,25 @@ impl TranscriptEditor {
             editor.selections.newest::<Point>(&snapshot).head()
         });
         let cursor_offset = point_to_offset(&text, cursor);
-        let match_offset = find_wrapped_match(&text, &self.search.query, cursor_offset, backwards);
+        self.move_search_from_offset(cursor_offset, backwards, window, cx)
+    }
+
+    fn move_search_from_offset(
+        &mut self,
+        cursor_offset: usize,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = self.buffer.read(cx).text();
+        let match_offset = find_wrapped_literal_match(
+            &text,
+            &self.search.query,
+            cursor_offset,
+            backwards,
+            self.search.case_sensitive,
+            self.search.whole_word,
+        );
         let Some(match_offset) = match_offset else {
             self.search.active_match = None;
             self.search.highlights_dirty = true;
@@ -2021,6 +2194,44 @@ mod tests {
         assert_eq!(
             literal_match_ranges("aaaa", "aa", 20),
             vec![20..22, 21..23, 22..24]
+        );
+    }
+
+    #[test]
+    fn keyword_search_distinguishes_whole_partial_case_and_utf8_ranges() {
+        let text = "cat scatter cat Cat naïve_naïve";
+        let document_len = text.len();
+        let whole = literal_match_ranges_with_options(text, "cat", 0, document_len, true, true);
+        assert_eq!(highlighted_text(text, &whole), vec!["cat", "cat"]);
+
+        let partial = literal_match_ranges_with_options(text, "cat", 0, document_len, true, false);
+        assert_eq!(highlighted_text(text, &partial), vec!["cat", "cat", "cat"]);
+
+        let folded = literal_match_ranges_with_options(text, "cat", 0, document_len, false, true);
+        assert_eq!(highlighted_text(text, &folded), vec!["cat", "cat", "Cat"]);
+        let unicode_offset = text.find("naïve_naïve").unwrap() + "na".len();
+        assert_eq!(
+            keyword_range_at_offset(text, unicode_offset).map(|range| &text[range]),
+            Some("naïve_naïve")
+        );
+    }
+
+    #[test]
+    fn word_search_skips_the_current_occurrence_and_wraps() {
+        let text = "cat scatter cat";
+        let second_cat = text.rfind("cat").unwrap();
+        assert_eq!(
+            find_wrapped_literal_match(text, "cat", 0, false, true, true),
+            Some(second_cat)
+        );
+        assert_eq!(
+            find_wrapped_literal_match(text, "cat", second_cat, true, true, true),
+            Some(0)
+        );
+        assert_eq!(
+            find_wrapped_literal_match(text, "cat", second_cat, false, true, true),
+            Some(0),
+            "forward search wraps after the last whole-word occurrence"
         );
     }
 
