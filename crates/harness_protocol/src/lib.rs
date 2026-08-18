@@ -621,7 +621,10 @@ pub struct TranscriptModel {
 impl TranscriptModel {
     pub fn replay(item_count: usize) -> Self {
         let mut this = Self::default();
-        let templates = replay_templates();
+        let templates = replay_templates()
+            .into_iter()
+            .filter(|item| item.kind != TranscriptKind::Trace)
+            .collect::<Vec<_>>();
         for index in 0..item_count {
             let mut item = templates[index % templates.len()].clone();
             item.key = format!("replay:{index}");
@@ -720,7 +723,7 @@ impl TranscriptModel {
                 let mut raw = protocol_item.body.clone();
                 raw.insert("id".into(), Value::String(protocol_item.id.clone()));
                 raw.insert("type".into(), Value::String(protocol_item.kind.clone()));
-                self.upsert_protocol_item(Value::Object(raw), true, Some(&turn.id));
+                let _ = self.upsert_protocol_item(Value::Object(raw), true, Some(&turn.id));
             }
         }
     }
@@ -831,12 +834,11 @@ impl TranscriptModel {
                     "item/started" | "item/completed" => {
                         if let Some(item) = params.get("item").cloned() {
                             let turn_id = string_at(&params, "/turnId");
-                            let index = self.upsert_protocol_item(
-                                item,
-                                method == "item/completed",
-                                turn_id,
-                            );
-                            outcome.dirty.insert(index);
+                            if let Some(index) =
+                                self.upsert_protocol_item(item, method == "item/completed", turn_id)
+                            {
+                                outcome.dirty.insert(index);
+                            }
                         }
                     }
                     "item/agentMessage/delta"
@@ -1010,12 +1012,11 @@ impl TranscriptModel {
                         } else {
                             if let Some(items) = turn.get("items").and_then(Value::as_array) {
                                 for item in items {
-                                    let index = self.upsert_protocol_item(
-                                        item.clone(),
-                                        true,
-                                        Some(turn_id),
-                                    );
-                                    outcome.dirty.insert(index);
+                                    if let Some(index) =
+                                        self.upsert_protocol_item(item.clone(), true, Some(turn_id))
+                                    {
+                                        outcome.dirty.insert(index);
+                                    }
                                 }
                             }
 
@@ -1183,8 +1184,9 @@ impl TranscriptModel {
                     }
                     "thread/realtime/itemAdded" => {
                         if let Some(item) = params.get("item").cloned() {
-                            let index = self.upsert_protocol_item(item, true, None);
-                            outcome.dirty.insert(index);
+                            if let Some(index) = self.upsert_protocol_item(item, true, None) {
+                                outcome.dirty.insert(index);
+                            }
                         }
                     }
                     "thread/realtime/transcript/done" => {
@@ -1375,7 +1377,10 @@ impl TranscriptModel {
         value: Value,
         completed: bool,
         turn_id: Option<&str>,
-    ) -> usize {
+    ) -> Option<usize> {
+        if string_at(&value, "/type") == Some("contextCompaction") {
+            return None;
+        }
         let protocol_id = string_at(&value, "/id")
             .unwrap_or("unknown-item")
             .to_string();
@@ -1391,7 +1396,7 @@ impl TranscriptModel {
                 item.event_count += 1;
                 item.expanded = false;
                 self.item_indices.insert(protocol_id, index);
-                return index;
+                return Some(index);
             }
 
             let mut item = item_from_protocol(value, completed);
@@ -1399,7 +1404,7 @@ impl TranscriptModel {
             item.expanded = false;
             let index = self.push_without_splice(item);
             self.item_indices.insert(protocol_id, index);
-            return index;
+            return Some(index);
         }
         if let Some(index) = self.item_indices.get(&protocol_id).copied() {
             let old_events = self.items[index].event_count;
@@ -1414,7 +1419,7 @@ impl TranscriptModel {
             };
             item.pending_request = pending_request;
             self.items[index] = item;
-            return index;
+            return Some(index);
         }
 
         let item = item_from_protocol(value, completed);
@@ -1426,9 +1431,9 @@ impl TranscriptModel {
             self.item_indices.remove(&self.items[index].key);
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
-            return index;
+            return Some(index);
         }
-        self.push_without_splice(item)
+        Some(self.push_without_splice(item))
     }
 
     fn upsert_generated(
@@ -3705,6 +3710,37 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_stays_in_the_raw_journal_not_the_transcript() {
+        let mut model = TranscriptModel::default();
+        let outcome = model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "compaction-1",
+                        "type": "contextCompaction",
+                        "status": "completed"
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert!(model.items.is_empty());
+        assert!(outcome.dirty.is_empty());
+        assert_eq!(model.raw_events.len(), 1);
+        assert_eq!(model.raw_events[0].method, "item/completed");
+        assert!(
+            TranscriptModel::replay(120)
+                .items
+                .iter()
+                .all(|item| item.kind != TranscriptKind::Trace)
+        );
+    }
+
+    #[test]
     fn file_changes_render_semantics_instead_of_protocol_metadata() {
         let changes = json!([
             {
@@ -4062,7 +4098,14 @@ mod tests {
                 &document.text[segment.body_range.clone()]
             );
         }
-        assert!(model.item_projection(8).is_none());
+        assert_eq!(document.segments.len(), model.items.len());
+        assert!(
+            model
+                .items
+                .iter()
+                .enumerate()
+                .all(|(index, _)| model.item_projection(index).is_some())
+        );
     }
 
     #[test]

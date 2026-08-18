@@ -6,7 +6,7 @@
 use std::{collections::BTreeMap, ops::Range, sync::Arc};
 
 use editor::{
-    Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
+    Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
         NavigationOverlayKey, RenderBlock,
@@ -23,7 +23,7 @@ use harness_protocol::{
     find_wrapped_match, minimal_text_edit,
 };
 use language::{Buffer, Point};
-use multi_buffer::{Anchor, MultiBufferOffset, ToOffset as _};
+use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
 use settings::{KeybindSource, KeymapFile};
 use ui::{
     Color, Icon, IconName, IconSize, Label, LabelSize,
@@ -541,8 +541,12 @@ fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -
     segment.whole_range == (0..projection.text.len())
         && segment.header_range.start <= segment.header_range.end
         && segment.header_range.end <= projection.text.len()
+        && projection.text.is_char_boundary(segment.header_range.start)
+        && projection.text.is_char_boundary(segment.header_range.end)
         && segment.body_range.start <= segment.body_range.end
         && segment.body_range.end <= projection.text.len()
+        && projection.text.is_char_boundary(segment.body_range.start)
+        && projection.text.is_char_boundary(segment.body_range.end)
         && segment.header_range.end <= segment.body_range.start
 }
 
@@ -560,6 +564,26 @@ fn shift_range(range: &mut Range<usize>, delta: isize) -> bool {
 
 fn range_at_offset(range: &Range<usize>, offset: usize) -> Range<usize> {
     range.start + offset..range.end + offset
+}
+
+/// Convert protocol/document byte offsets into Zed anchors without allowing a
+/// stale streaming range to panic the UI process. Protocol projections are
+/// expected to contain UTF-8 boundaries, but clipping here is the final trust
+/// boundary before entering the Editor display map.
+fn clipped_anchor_pair(snapshot: &MultiBufferSnapshot, range: Range<usize>) -> (Anchor, Anchor) {
+    let start = snapshot.clip_offset(MultiBufferOffset(range.start), Bias::Left);
+    let end = snapshot.clip_offset(MultiBufferOffset(range.end), Bias::Right);
+    (snapshot.anchor_before(start), snapshot.anchor_after(end))
+}
+
+fn clipped_anchor_range(snapshot: &MultiBufferSnapshot, range: Range<usize>) -> Range<Anchor> {
+    let (start, end) = clipped_anchor_pair(snapshot, range);
+    start..end
+}
+
+fn clipped_anchor_after(snapshot: &MultiBufferSnapshot, offset: usize) -> Anchor {
+    let offset = snapshot.clip_offset(MultiBufferOffset(offset), Bias::Right);
+    snapshot.anchor_after(offset)
 }
 
 /// Apply the length/offset effects of one already-validated item projection.
@@ -1035,7 +1059,7 @@ impl TranscriptEditor {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let blocks = pending.iter().map(|(_, offset, rows, view)| {
                 supplemental_block(
-                    snapshot.anchor_after(MultiBufferOffset(*offset)),
+                    clipped_anchor_after(&snapshot, *offset),
                     *rows,
                     view.clone(),
                 )
@@ -1244,9 +1268,9 @@ impl TranscriptEditor {
                 .iter()
                 .zip(header_texts)
                 .map(|(segment, header_text)| {
+                    let (start, end) = clipped_anchor_pair(&snapshot, segment.header_range.clone());
                     native_header_block(
-                        snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
-                            ..=snapshot.anchor_after(MultiBufferOffset(segment.header_range.end)),
+                        start..=end,
                         segment.kind,
                         native_header_text(&header_text).into(),
                     )
@@ -1272,8 +1296,7 @@ impl TranscriptEditor {
                     else {
                         continue;
                     };
-                    let anchors = snapshot.anchor_before(MultiBufferOffset(range.start))
-                        ..snapshot.anchor_after(MultiBufferOffset(range.end));
+                    let anchors = clipped_anchor_range(&snapshot, range);
                     match segment.kind {
                         TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
                             anchors,
@@ -1316,10 +1339,7 @@ impl TranscriptEditor {
                 let anchors = |ranges: Vec<Range<usize>>| {
                     ranges
                         .into_iter()
-                        .map(|range| {
-                            snapshot.anchor_before(MultiBufferOffset(range.start))
-                                ..snapshot.anchor_after(MultiBufferOffset(range.end))
-                        })
+                        .map(|range| clipped_anchor_range(&snapshot, range))
                         .collect::<Vec<_>>()
                 };
 
@@ -1398,10 +1418,7 @@ impl TranscriptEditor {
                     });
                     let anchors = search_highlights
                         .into_iter()
-                        .map(|range| {
-                            snapshot.anchor_before(MultiBufferOffset(range.start))
-                                ..snapshot.anchor_after(MultiBufferOffset(range.end))
-                        })
+                        .map(|range| clipped_anchor_range(&snapshot, range))
                         .collect::<Vec<_>>();
                     editor.highlight_background(
                         HighlightKey::BufferSearchHighlights,
@@ -1474,10 +1491,7 @@ impl TranscriptEditor {
             let headers = document
                 .segments
                 .iter()
-                .map(|segment| {
-                    snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
-                        ..snapshot.anchor_after(MultiBufferOffset(segment.header_range.end))
-                })
+                .map(|segment| clipped_anchor_range(&snapshot, segment.header_range.clone()))
                 .collect();
             let header_key = HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
                 TranscriptHeaderHighlight,
@@ -1681,10 +1695,10 @@ impl TranscriptEditor {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let mut headers = Vec::with_capacity(segments.len());
             for segment in &segments {
-                headers.push(
-                    snapshot.anchor_before(MultiBufferOffset(segment.header_range.start))
-                        ..snapshot.anchor_after(MultiBufferOffset(segment.header_range.end)),
-                );
+                headers.push(clipped_anchor_range(
+                    &snapshot,
+                    segment.header_range.clone(),
+                ));
             }
 
             let header_key = HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
@@ -1823,8 +1837,7 @@ impl TranscriptEditor {
         let point = offset_to_point(&text, match_offset);
         self.search.active_match = Some(self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let anchored_match = snapshot.anchor_before(MultiBufferOffset(match_range.start))
-                ..snapshot.anchor_after(MultiBufferOffset(match_range.end));
+            let anchored_match = clipped_anchor_range(&snapshot, match_range);
             editor.change_selections(
                 SelectionEffects::default().from_search(true),
                 window,
@@ -1886,6 +1899,32 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_rejects_offsets_inside_multibyte_status_separator() {
+        let text = "x·y".to_string();
+        let valid = TranscriptItemProjection {
+            text: text.clone(),
+            segment: TranscriptDocumentSegment {
+                item_index: 0,
+                item_key: "valid".into(),
+                kind: TranscriptKind::Agent,
+                whole_range: 0..text.len(),
+                header_range: 0..3,
+                body_range: 3..text.len(),
+            },
+        };
+        assert!(projection_has_valid_relative_ranges(&valid));
+
+        let invalid = TranscriptItemProjection {
+            segment: TranscriptDocumentSegment {
+                header_range: 0..2,
+                ..valid.segment.clone()
+            },
+            ..valid
+        };
+        assert!(!projection_has_valid_relative_ranges(&invalid));
+    }
 
     #[test]
     fn transcript_render_does_not_create_idle_frame_demand() {

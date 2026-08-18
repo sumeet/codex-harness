@@ -11,7 +11,7 @@ use serde_json::Value;
 use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize, prelude::ActiveTheme};
 
 const IMAGE_PREVIEW_ROWS: u32 = 15;
-const IMAGE_PLACEHOLDER_ROWS: u32 = 5;
+const IMAGE_PLACEHOLDER_ROWS: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ImageAvailability {
