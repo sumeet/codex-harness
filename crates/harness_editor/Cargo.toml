@@ -14,7 +14,8 @@ editor = { path = "../editor", default-features = false }
 gpui.workspace = true
 grammars.workspace = true
 harness_protocol.workspace = true
-language.workspace = true
+# Harness registers only the native grammars embedded below.
+language = { path = "../language", default-features = false }
 multi_buffer.workspace = true
 settings.workspace = true
 theme_settings.workspace = true

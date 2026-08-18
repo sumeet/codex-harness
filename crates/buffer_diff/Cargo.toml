@@ -18,7 +18,7 @@ test-support = ["settings"]
 clock.workspace = true
 imara-diff.workspace = true
 gpui.workspace = true
-language.workspace = true
+language = { path = "../language", default-features = false }
 log.workspace = true
 pretty_assertions.workspace = true
 rope.workspace = true
