@@ -235,19 +235,7 @@ enum DeleteMarks {
     AllLocal,
 }
 
-actions!(
-    vim,
-    [
-        /// Executes a command in visual mode.
-        VisualCommand,
-        /// Executes a command with a count prefix.
-        CountCommand,
-        /// Executes a shell command.
-        ShellCommand,
-        /// Indicates that an argument is required for the command.
-        ArgumentRequired
-    ]
-);
+actions!(vim, [ArgumentRequired]);
 
 /// Opens the specified file for editing.
 #[derive(Clone, PartialEq, Action)]
@@ -335,14 +323,6 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             });
         }
     });
-    Vim::action(editor, cx, |_, _: &VisualCommand, window, cx| {
-        open_command_palette_with_query("'<,'>".to_string(), window, cx);
-    });
-
-    Vim::action(editor, cx, |_, _: &ShellCommand, window, cx| {
-        open_command_palette_with_query("'<,'>!".to_string(), window, cx);
-    });
-
     Vim::action(editor, cx, |_, _: &ArgumentRequired, window, cx| {
         let _ = window.prompt(
             gpui::PromptLevel::Critical,
@@ -852,17 +832,6 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
             .log_err();
         })
         .detach();
-    });
-
-    Vim::action(editor, cx, |_, _: &CountCommand, window, cx| {
-        let count = Vim::take_count(cx).unwrap_or(1);
-        Vim::take_forced_motion(cx);
-        let n = if count > 1 {
-            format!(".,.+{}", count.saturating_sub(1))
-        } else {
-            ".".to_string()
-        };
-        open_command_palette_with_query(n, window, cx);
     });
 
     Vim::action(editor, cx, |vim, action: &GoToLine, window, cx| {

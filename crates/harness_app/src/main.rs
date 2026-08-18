@@ -15,8 +15,8 @@ use gpui::{
 };
 use gpui_platform::application;
 use harness_editor::{
-    LocalEditor, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged, TranscriptSupplement,
-    VimNextMatch, VimPreviousMatch, VimSearch,
+    LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged,
+    TranscriptSupplement, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -142,6 +142,43 @@ struct LiveRequestSurface {
     entity: Entity<RequestSurface>,
 }
 
+fn legacy_request_controls_active(
+    request_is_live: bool,
+    uses_shared_surface: bool,
+    request_is_pending: bool,
+) -> bool {
+    request_is_live && !uses_shared_surface && request_is_pending
+}
+
+fn composer_height(text: &str, available_width: f32) -> f32 {
+    let columns = (((available_width - 48.).max(0.) / 8.).floor() as usize).max(24);
+    let visual_rows = if text.is_empty() {
+        1
+    } else {
+        text.split('\n')
+            .map(|line| line.chars().count().max(1).div_ceil(columns))
+            .sum::<usize>()
+            .clamp(1, 8)
+    };
+    78. + 20. * visual_rows.saturating_sub(1) as f32
+}
+
+fn mark_unbacked_requests_inactive(
+    model: &mut TranscriptModel,
+    live_request_keys: &HashSet<String>,
+) {
+    for item in &mut model.items {
+        if item
+            .pending_request
+            .as_ref()
+            .is_some_and(|request| !request.resolved)
+            && !live_request_keys.contains(&item.key)
+        {
+            item.status = Some("inactive".into());
+        }
+    }
+}
+
 struct HarnessApp {
     cwd: String,
     replay_count: Option<usize>,
@@ -222,6 +259,8 @@ impl HarnessApp {
             }
         })
         .detach();
+        cx.subscribe(&composer, |_, _, _: &LocalEditorChanged, cx| cx.notify())
+            .detach();
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
@@ -236,9 +275,10 @@ impl HarnessApp {
             },
         )
         .detach();
-        let model = replay_count
+        let mut model = replay_count
             .map(TranscriptModel::replay)
             .unwrap_or_default();
+        mark_unbacked_requests_inactive(&mut model, &HashSet::default());
         let dirty_image_surfaces = model
             .items
             .iter()
@@ -998,6 +1038,7 @@ impl HarnessApp {
             Ok(_) => {}
             Err(error) => log::warn!("could not restore transcript history: {error}"),
         }
+        mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         self.markdown_cache.clear();
         self.raw_visible.clear();
         self.request_answers.clear();
@@ -1171,7 +1212,7 @@ impl HarnessApp {
         }) else {
             return;
         };
-        if request.resolved {
+        if request.resolved || !self.live_request_keys.contains(&request_key) {
             return;
         }
         if let Some(entry) = self.request_surfaces.get(&request_key) {
@@ -1242,11 +1283,15 @@ impl HarnessApp {
     }
 
     fn reject_pending_requests(&mut self, cx: &mut Context<Self>) {
+        let live_request_keys = self.live_request_keys.clone();
         let pending = self
             .model
             .items
             .iter_mut()
             .filter_map(|item| {
+                if !live_request_keys.contains(&item.key) {
+                    return None;
+                }
                 let (id, method) = {
                     let request = item
                         .pending_request
@@ -1945,10 +1990,20 @@ impl HarnessApp {
     }
 
     fn toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .model
+            .items
+            .get(self.selected_item)
+            .is_some_and(|item| self.request_surfaces.contains_key(&item.key))
+        {
+            self.focus_selected_request_surface(window, cx);
+            return;
+        }
         if let Some(method) = self
             .model
             .items
             .get(self.selected_item)
+            .filter(|item| self.live_request_keys.contains(&item.key))
             .and_then(|item| item.pending_request.as_ref())
             .filter(|request| !request.resolved)
             .map(|request| request.method.clone())
@@ -2488,7 +2543,11 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_pending_request_summary(item: &TranscriptItem, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pending_request_summary(
+        item: &TranscriptItem,
+        request_is_live: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let method = item
             .pending_request
@@ -2546,13 +2605,26 @@ impl HarnessApp {
             .and_then(Value::as_str)
             .filter(|cwd| !cwd.is_empty())
             .map(ToOwned::to_owned);
-        let permissions = (method == "item/permissions/requestApproval")
-            .then(|| item.raw.get("permissions"))
-            .flatten()
-            .map(|permissions| {
-                serde_json::to_string_pretty(permissions)
-                    .unwrap_or_else(|_| permissions.to_string())
-            });
+        let semantic_content = matches!(
+            method,
+            "item/permissions/requestApproval"
+                | "item/tool/requestUserInput"
+                | "mcpServer/elicitation/request"
+        )
+        .then(|| item.content.trim())
+        .filter(|content| !content.is_empty())
+        .map(ToOwned::to_owned);
+        let inactive_label = (!request_is_live).then(|| {
+            if item
+                .pending_request
+                .as_ref()
+                .is_some_and(|request| request.resolved)
+            {
+                "Request completed"
+            } else {
+                "Request is no longer active"
+            }
+        });
 
         div()
             .w_full()
@@ -2582,19 +2654,22 @@ impl HarnessApp {
                         .color(Color::Muted),
                 )
             })
-            .when_some(permissions, |this, permissions| {
+            .when_some(semantic_content, |this, content| {
                 this.child(
                     div()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_background)
-                        .px_3()
-                        .py_2()
-                        .font_buffer(cx)
-                        .text_ui_xs(cx)
+                        .text_ui(cx)
+                        .line_height(relative(1.45))
                         .text_color(colors.text_muted)
-                        .child(permissions),
+                        .child(content),
+                )
+            })
+            .when_some(inactive_label, |this, label| {
+                this.child(
+                    div()
+                        .mt_1()
+                        .text_ui_xs(cx)
+                        .text_color(colors.text_disabled)
+                        .child(label),
                 )
             })
             .into_any_element()
@@ -2999,7 +3074,13 @@ impl HarnessApp {
             .get(&item.key)
             .map(|entry| entry.entity.clone());
         let uses_shared_request_surface = request_surface.is_some();
-        let has_approval = !uses_shared_request_surface && !response_choices.is_empty();
+        let request_is_live = self.live_request_keys.contains(&item.key);
+        let legacy_request_controls = legacy_request_controls_active(
+            request_is_live,
+            uses_shared_request_surface,
+            pending_method.is_some(),
+        );
+        let has_approval = legacy_request_controls && !response_choices.is_empty();
         let approval_focused =
             self.focus_mode == FocusMode::Approval && index == self.selected_item;
         let approval_cursor = self.approval_cursor;
@@ -3019,22 +3100,23 @@ impl HarnessApp {
             && !item.content.is_empty())
         .then(|| self.markdown_for(&item.key, &item.content, cx));
         let icon = icon_for_kind(item.kind);
-        let user_input = (!uses_shared_request_surface && has_user_input)
+        let user_input = (legacy_request_controls && has_user_input)
             .then(|| self.render_user_input_request(index, &item, window, cx));
-        let mcp_elicitation = (!uses_shared_request_surface && has_elicitation)
+        let mcp_elicitation = (legacy_request_controls && has_elicitation)
             .then(|| self.render_mcp_elicitation(index, &item, window, cx));
         let pending_summary = request_method
             .filter(|_| !uses_shared_request_surface)
             .filter(|method| {
-                !matches!(
-                    *method,
-                    "item/tool/requestUserInput" | "mcpServer/elicitation/request"
-                )
+                !legacy_request_controls
+                    || !matches!(
+                        *method,
+                        "item/tool/requestUserInput" | "mcpServer/elicitation/request"
+                    )
             })
-            .map(|_| Self::render_pending_request_summary(&item, cx));
+            .map(|_| Self::render_pending_request_summary(&item, request_is_live, cx));
         let choice_buttons = response_choices
             .into_iter()
-            .filter(|_| !uses_shared_request_surface)
+            .filter(|_| legacy_request_controls)
             .enumerate()
             .map(|(choice_index, choice)| {
                 let (icon, color) = request_choice_visual(choice.tone);
@@ -3055,7 +3137,11 @@ impl HarnessApp {
             && !item.expanded
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
-        let visible_status = item.display_status().map(ToOwned::to_owned);
+        let visible_status = if pending_method.is_some() && !request_is_live {
+            Some("inactive".to_string())
+        } else {
+            item.display_status().map(ToOwned::to_owned)
+        };
         let disclosure_weak = cx.weak_entity();
 
         let header = div()
@@ -3272,7 +3358,11 @@ impl Render for HarnessApp {
         let colors = cx.theme().colors().clone();
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
-        let composer_empty = self.composer.read(cx).text(cx).trim().is_empty();
+        let composer_text = self.composer.read(cx).text(cx);
+        let composer_empty = composer_text.trim().is_empty();
+        let available_composer_width = f32::from(window.viewport_size().width)
+            - if sidebar_visible { SIDEBAR_WIDTH } else { 0. };
+        let composer_height = composer_height(&composer_text, available_composer_width);
         let turn_active = self.model.current_turn_id.is_some();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
@@ -3533,6 +3623,38 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &VimPreviousMatch, window, cx| {
                 this.move_search_match(-1, window, cx)
             }))
+            .on_action(cx.listener(|this, action: &VimWordNext, window, cx| {
+                if !this.buffer_view {
+                    cx.propagate();
+                    return;
+                }
+                this.transcript_editor.update(cx, |editor, cx| {
+                    editor.search_word_under_cursor(
+                        false,
+                        action.partial_word(),
+                        action.case_sensitive(),
+                        window,
+                        cx,
+                    );
+                });
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &VimWordPrevious, window, cx| {
+                if !this.buffer_view {
+                    cx.propagate();
+                    return;
+                }
+                this.transcript_editor.update(cx, |editor, cx| {
+                    editor.search_word_under_cursor(
+                        true,
+                        action.partial_word(),
+                        action.case_sensitive(),
+                        window,
+                        cx,
+                    );
+                });
+                cx.notify();
+            }))
             .on_action(
                 cx.listener(|this, _: &CommitSearch, window, cx| this.commit_search(window, cx)),
             )
@@ -3744,8 +3866,7 @@ impl Render for HarnessApp {
                     .child(
                         div()
                             .flex_none()
-                            .min_h(px(72.))
-                            .max_h(px(280.))
+                            .h(px(composer_height))
                             .border_t_1()
                             .border_color(if self.focus_mode == FocusMode::Composer {
                                 colors.border_focused
@@ -5168,6 +5289,67 @@ mod tests {
             surface_sync_decision(false, false, false, true),
             SurfaceSyncDecision::Remove
         );
+    }
+
+    #[test]
+    fn legacy_request_controls_require_an_exact_live_request() {
+        assert!(legacy_request_controls_active(true, false, true));
+        assert!(
+            !legacy_request_controls_active(false, false, true),
+            "replay and persisted requests must stay inert"
+        );
+        assert!(
+            !legacy_request_controls_active(true, true, true),
+            "the shared surface is the sole live control owner"
+        );
+        assert!(
+            !legacy_request_controls_active(true, false, false),
+            "resolved requests cannot regain controls"
+        );
+    }
+
+    #[test]
+    fn loaded_request_status_matches_the_live_request_registry() {
+        let mut model = TranscriptModel::replay(24);
+        let pending_keys = model
+            .items
+            .iter()
+            .filter(|item| {
+                item.pending_request
+                    .as_ref()
+                    .is_some_and(|request| !request.resolved)
+            })
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
+        assert!(pending_keys.len() >= 2);
+        let live = HashSet::from([pending_keys[0].clone()]);
+
+        mark_unbacked_requests_inactive(&mut model, &live);
+
+        for item in model.items.iter().filter(|item| {
+            item.pending_request
+                .as_ref()
+                .is_some_and(|request| !request.resolved)
+        }) {
+            if item.key == pending_keys[0] {
+                assert_ne!(item.status.as_deref(), Some("inactive"));
+            } else {
+                assert_eq!(item.status.as_deref(), Some("inactive"));
+            }
+        }
+    }
+
+    #[test]
+    fn composer_height_is_compact_grows_with_content_and_stays_bounded() {
+        assert_eq!(composer_height("", 900.), 78.);
+        assert_eq!(composer_height("one line", 900.), 78.);
+        assert!(composer_height("first\nsecond\nthird", 900.) > 78.);
+        assert!(
+            composer_height(&"wrapped ".repeat(200), 320.)
+                > composer_height(&"wrapped ".repeat(20), 900.),
+            "narrow, wrapped prompts should receive more editing room"
+        );
+        assert_eq!(composer_height(&"line\n".repeat(100), 320.), 218.);
     }
 
     #[test]

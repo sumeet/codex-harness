@@ -29,7 +29,7 @@ use crate::{
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MoveToNext {
+pub struct MoveToNext {
     #[serde(default = "default_true")]
     case_sensitive: bool,
     #[serde(default)]
@@ -38,17 +38,37 @@ pub(crate) struct MoveToNext {
     regex: bool,
 }
 
+impl MoveToNext {
+    pub fn case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    pub fn partial_word(&self) -> bool {
+        self.partial_word
+    }
+}
+
 /// Moves to the previous search match.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Action)]
 #[action(namespace = vim)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MoveToPrevious {
+pub struct MoveToPrevious {
     #[serde(default = "default_true")]
     case_sensitive: bool,
     #[serde(default)]
     partial_word: bool,
     #[serde(default = "default_true")]
     regex: bool,
+}
+
+impl MoveToPrevious {
+    pub fn case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    pub fn partial_word(&self) -> bool {
+        self.partial_word
+    }
 }
 
 /// Searches for the word under the cursor without moving.

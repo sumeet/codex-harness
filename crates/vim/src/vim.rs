@@ -6,6 +6,7 @@ mod test;
 mod change_list;
 #[cfg(any(feature = "workspace-integration", test))]
 mod command;
+mod command_entry;
 mod digraph;
 mod helix;
 mod indent;
@@ -46,12 +47,14 @@ use motion::Motion;
 use multi_buffer::ToPoint as _;
 #[cfg(feature = "workspace-integration")]
 use normal::search::SearchSubmit;
-pub use normal::search::{MoveToNextMatch, MoveToPreviousMatch, Search};
-// TODO(vim-host-surface): standalone embedders currently own `/`, `?`, `n`, and `N`
-// through the public actions above. Extract a host-neutral command/search surface
-// before claiming full Vim parity: `:` still needs palette history/completion and
-// `*`, `#`, `g*`, `g#`, `gn`, and `gN` still need query/match actions that do not
-// depend on Zed's Workspace toolbar.
+pub use normal::search::{
+    MoveToNext, MoveToNextMatch, MoveToPrevious, MoveToPreviousMatch, Search,
+};
+// TODO(vim-host-surface): standalone embedders own `/`, `?`, `n`, and `N` through
+// the public actions above, word-search intent (`*`, `#`, `g*`, `g#`) is also
+// public, and command_entry preserves normal/visual/count `:` palette entry.
+// Full Ex parsing/execution remains a host concern; `gn` and `gN` still need
+// operator-aware match selection independent of Zed's Workspace toolbar.
 use object::Object;
 use schemars::JsonSchema;
 #[cfg(any(feature = "workspace-integration", test))]
@@ -1061,6 +1064,7 @@ impl Vim {
             );
 
             normal::register(editor, cx);
+            command_entry::register(editor, cx);
             insert::register(editor, cx);
             helix::register(editor, cx);
             motion::register(editor, cx);
