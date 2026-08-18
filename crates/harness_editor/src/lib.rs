@@ -1089,6 +1089,19 @@ impl TranscriptEditor {
         }));
     }
 
+    /// Whether streaming/appended content is currently pinned to the bottom.
+    /// Hosts use this when switching between two projections of the same
+    /// transcript so the hidden projection cannot dictate scroll behavior.
+    pub fn is_following_tail(&self) -> bool {
+        self.follow_tail
+    }
+
+    /// Preserve the current viewport while disabling streaming tail-follow.
+    pub fn pause_tail_follow(&mut self) {
+        self.follow_tail = false;
+        self.pending_tail_intent = None;
+    }
+
     fn request_tail_autoscroll(&mut self, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
