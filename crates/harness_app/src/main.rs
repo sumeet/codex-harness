@@ -253,6 +253,72 @@ fn diff_line_tone(line: &str, in_hunk: &mut bool) -> DiffLineTone {
     }
 }
 
+fn diff_hunk_starts(line: &str) -> Option<(usize, usize)> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "@@" {
+        return None;
+    }
+    let old_line = fields
+        .next()?
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    let new_line = fields
+        .next()?
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((old_line, new_line))
+}
+
+fn diff_line_numbers(
+    line: &str,
+    tone: DiffLineTone,
+    unified: bool,
+    in_hunk: bool,
+    old_line: &mut Option<usize>,
+    new_line: &mut Option<usize>,
+    fallback_line: usize,
+) -> (Option<usize>, Option<usize>) {
+    if tone == DiffLineTone::Hunk {
+        if let Some((old_start, new_start)) = diff_hunk_starts(line) {
+            *old_line = Some(old_start);
+            *new_line = Some(new_start);
+        }
+        return (None, None);
+    }
+    if !unified {
+        return (None, Some(fallback_line));
+    }
+    if !in_hunk || line.starts_with("\\ No newline") {
+        return (None, None);
+    }
+
+    match tone {
+        DiffLineTone::Addition => {
+            let displayed = *new_line;
+            *new_line = new_line.map(|line| line + 1);
+            (None, displayed)
+        }
+        DiffLineTone::Deletion => {
+            let displayed = *old_line;
+            *old_line = old_line.map(|line| line + 1);
+            (displayed, None)
+        }
+        DiffLineTone::Normal => {
+            let displayed = (*old_line, *new_line);
+            *old_line = old_line.map(|line| line + 1);
+            *new_line = new_line.map(|line| line + 1);
+            displayed
+        }
+        DiffLineTone::Hunk => unreachable!(),
+    }
+}
+
 fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
     match item.kind {
         model::TranscriptKind::Command => item.command_transcript().is_some_and(|command| {
@@ -2907,13 +2973,25 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
+        let unified = content.lines().any(|line| line.starts_with("@@"));
         let mut in_hunk = false;
+        let mut old_line = None;
+        let mut new_line = None;
         content
             .lines()
             .take(visible_line_count)
             .enumerate()
             .map(|(index, line)| {
                 let tone = diff_line_tone(line, &mut in_hunk);
+                let (displayed_old_line, displayed_new_line) = diff_line_numbers(
+                    line,
+                    tone,
+                    unified,
+                    in_hunk,
+                    &mut old_line,
+                    &mut new_line,
+                    index + 1,
+                );
                 div()
                     .w_full()
                     .min_h(px(22.))
@@ -2941,10 +3019,27 @@ impl HarnessApp {
                     })
                     .child(
                         div()
-                            .w(px(28.))
+                            .w(if unified { px(54.) } else { px(28.) })
                             .flex_none()
+                            .flex()
+                            .gap_1()
                             .text_color(colors.text_muted)
-                            .child((index + 1).to_string()),
+                            .when(unified, |this| {
+                                this.child(
+                                    div().w(px(24.)).flex().justify_end().child(
+                                        displayed_old_line
+                                            .map(|line| line.to_string())
+                                            .unwrap_or_default(),
+                                    ),
+                                )
+                            })
+                            .child(
+                                div().w(px(24.)).flex().justify_end().child(
+                                    displayed_new_line
+                                        .map(|line| line.to_string())
+                                        .unwrap_or_default(),
+                                ),
+                            ),
                     )
                     .child(div().min_w_0().whitespace_nowrap().child(line.to_string()))
                     .into_any_element()
@@ -3043,18 +3138,30 @@ impl HarnessApp {
                             .flex()
                             .items_center()
                             .gap_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_xs()
+                            .border_b_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_subheader_background.opacity(0.72))
                             .child(
-                                Label::new(presentation.operation)
-                                    .size(LabelSize::XSmall)
-                                    .color(operation_color),
+                                Icon::new(IconName::File)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
                             )
                             .child(
                                 div()
                                     .min_w_0()
+                                    .flex_1()
                                     .font_buffer(cx)
                                     .text_ui_sm(cx)
                                     .truncate()
                                     .child(presentation.path),
+                            )
+                            .child(
+                                Label::new(presentation.operation)
+                                    .size(LabelSize::XSmall)
+                                    .color(operation_color),
                             ),
                     )
                     .when(!presentation.content.is_empty(), |this| {
@@ -5662,7 +5769,6 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new("v", ToggleVisual, Some("HarnessTranscript")),
         KeyBinding::new("y", YankItem, Some("HarnessTranscript")),
         KeyBinding::new("/", OpenSearch, Some("HarnessTranscript")),
-        KeyBinding::new("shift-v", ToggleBufferView, Some("HarnessTranscript")),
         KeyBinding::new("n", NextMatch, Some("HarnessTranscript")),
         KeyBinding::new("shift-n", PreviousMatch, Some("HarnessTranscript")),
         KeyBinding::new("i", FocusComposer, Some("HarnessTranscript")),
@@ -5802,6 +5908,58 @@ mod tests {
         assert_eq!(
             diff_line_tone("+new value", &mut in_hunk),
             DiffLineTone::Addition
+        );
+
+        let mut old_line = None;
+        let mut new_line = None;
+        assert_eq!(
+            diff_line_numbers(
+                "@@ -29,2 +29,4 @@",
+                DiffLineTone::Hunk,
+                true,
+                true,
+                &mut old_line,
+                &mut new_line,
+                1,
+            ),
+            (None, None)
+        );
+        assert_eq!((old_line, new_line), (Some(29), Some(29)));
+        assert_eq!(
+            diff_line_numbers(
+                " context",
+                DiffLineTone::Normal,
+                true,
+                true,
+                &mut old_line,
+                &mut new_line,
+                2,
+            ),
+            (Some(29), Some(29))
+        );
+        assert_eq!(
+            diff_line_numbers(
+                "+added",
+                DiffLineTone::Addition,
+                true,
+                true,
+                &mut old_line,
+                &mut new_line,
+                3,
+            ),
+            (None, Some(30))
+        );
+        assert_eq!(
+            diff_line_numbers(
+                "-removed",
+                DiffLineTone::Deletion,
+                true,
+                true,
+                &mut old_line,
+                &mut new_line,
+                4,
+            ),
+            (Some(30), None)
         );
     }
 
