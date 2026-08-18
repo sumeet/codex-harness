@@ -293,10 +293,28 @@ enum PendingTailIntent {
 const VIEWPORT_OVERSCAN_ROWS: u32 = 64;
 const FOLLOW_TAIL_SLOP_ROWS: f64 = 1.;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct ViewportDecorationWindow {
     byte_range: Range<usize>,
     header_segment_range: Range<usize>,
+    anchor_range: Range<Anchor>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewportWindowChoice {
+    ReuseCached,
+    Recenter,
+}
+
+fn viewport_window_choice(
+    visible: &Range<usize>,
+    cached: Option<&Range<usize>>,
+) -> ViewportWindowChoice {
+    if cached.is_some_and(|cached| cached.start <= visible.start && visible.end <= cached.end) {
+        ViewportWindowChoice::ReuseCached
+    } else {
+        ViewportWindowChoice::Recenter
+    }
 }
 
 fn overscanned_point_range(
@@ -1471,22 +1489,46 @@ impl TranscriptEditor {
         &mut self,
         cx: &mut Context<Self>,
     ) -> ViewportDecorationWindow {
-        let byte_range = self.editor.update(cx, |editor, cx| {
+        let cached_anchor_range = self
+            .viewport_decorations
+            .as_ref()
+            .map(|window| window.anchor_range.clone());
+        let (byte_range, anchor_range) = self.editor.update(cx, |editor, cx| {
             let display_snapshot = editor.display_snapshot(cx);
             let visible_range = editor.multi_buffer_visible_range(&display_snapshot, cx);
             let buffer_snapshot = display_snapshot.buffer_snapshot();
+            let visible_byte_range = visible_range.start.to_offset(buffer_snapshot).0
+                ..visible_range.end.to_offset(buffer_snapshot).0;
+            let cached_byte_range = cached_anchor_range.as_ref().map(|range| {
+                range.start.to_offset(buffer_snapshot).0..range.end.to_offset(buffer_snapshot).0
+            });
+
+            if viewport_window_choice(&visible_byte_range, cached_byte_range.as_ref())
+                == ViewportWindowChoice::ReuseCached
+            {
+                return (
+                    cached_byte_range.expect("a reused viewport window has cached offsets"),
+                    cached_anchor_range
+                        .clone()
+                        .expect("a reused viewport window has cached anchors"),
+                );
+            }
+
             let point_range = overscanned_point_range(
                 visible_range,
                 buffer_snapshot.max_point(),
                 VIEWPORT_OVERSCAN_ROWS,
             );
-            point_range.start.to_offset(buffer_snapshot).0
-                ..point_range.end.to_offset(buffer_snapshot).0
+            let byte_range = point_range.start.to_offset(buffer_snapshot).0
+                ..point_range.end.to_offset(buffer_snapshot).0;
+            let anchor_range = clipped_anchor_range(buffer_snapshot, byte_range.clone());
+            (byte_range, anchor_range)
         });
         let header_segment_range = header_segments_intersecting(&self.segments, &byte_range);
         ViewportDecorationWindow {
             byte_range,
             header_segment_range,
+            anchor_range,
         }
     }
 
@@ -2911,6 +2953,63 @@ mod tests {
         assert_eq!(
             overscanned_point_range(Point::new(0, 0)..Point::new(0, 0), Point::new(0, 100), 64,),
             Point::new(0, 0)..Point::new(0, 100)
+        );
+    }
+
+    #[test]
+    fn one_row_viewport_movements_reuse_cached_decoration_coverage() {
+        let cached = 136..285;
+
+        assert_eq!(
+            viewport_window_choice(&(200..220), Some(&cached)),
+            ViewportWindowChoice::ReuseCached
+        );
+        assert_eq!(
+            viewport_window_choice(&(201..221), Some(&cached)),
+            ViewportWindowChoice::ReuseCached
+        );
+        assert_eq!(
+            viewport_window_choice(&(199..219), Some(&cached)),
+            ViewportWindowChoice::ReuseCached
+        );
+    }
+
+    #[test]
+    fn decoration_coverage_reuses_exact_edges_and_recenters_after_crossing_them() {
+        let cached = 136..285;
+
+        assert_eq!(
+            viewport_window_choice(&(136..285), Some(&cached)),
+            ViewportWindowChoice::ReuseCached
+        );
+        assert_eq!(
+            viewport_window_choice(&(135..155), Some(&cached)),
+            ViewportWindowChoice::Recenter
+        );
+        assert_eq!(
+            viewport_window_choice(&(265..286), Some(&cached)),
+            ViewportWindowChoice::Recenter
+        );
+        assert_eq!(
+            viewport_window_choice(&(200..220), None),
+            ViewportWindowChoice::Recenter
+        );
+
+        assert_eq!(
+            overscanned_point_range(
+                Point::new(135, 0)..Point::new(155, 0),
+                Point::new(1_000, 0),
+                64,
+            ),
+            Point::new(71, 0)..Point::new(220, 0)
+        );
+        assert_eq!(
+            overscanned_point_range(
+                Point::new(265, 0)..Point::new(286, 0),
+                Point::new(1_000, 0),
+                64,
+            ),
+            Point::new(201, 0)..Point::new(351, 0)
         );
     }
 
