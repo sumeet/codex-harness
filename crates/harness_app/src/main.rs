@@ -29,9 +29,9 @@ use tree_sitter::{Query, StreamingIterator as _};
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
-    ContextMenu, ContextMenuEntry, Disableable, Disclosure, Icon, IconButton, IconButtonShape,
-    IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing, SelectableButton,
-    ThreadItem, TintColor, Toggleable, right_click_menu,
+    ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, Icon, IconButton,
+    IconButtonShape, IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing,
+    SelectableButton, ThreadItem, TintColor, Toggleable, right_click_menu,
 };
 
 mod image_surface;
@@ -540,6 +540,101 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
 
 fn rich_search_match_needs_context(item: &TranscriptItem, output_expanded: bool) -> bool {
     !item.expanded || (transcript_output_is_expandable(item) && !output_expanded)
+}
+
+fn folded_contains(text: &str, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    !query.is_empty() && folded_text_with_source_chars(text).0.contains(&query)
+}
+
+/// Whether the active Rich card already paints the matching text. Search
+/// context is a fallback for collapsed/truncated content, not a second copy of
+/// metadata that the card always exposes (notably file paths and commands).
+fn rich_search_query_is_visible(item: &TranscriptItem, output_expanded: bool, query: &str) -> bool {
+    if folded_contains(&item.title, query)
+        || item
+            .display_status()
+            .is_some_and(|status| folded_contains(status, query))
+    {
+        return true;
+    }
+    if !item.expanded {
+        return false;
+    }
+
+    match item.kind {
+        model::TranscriptKind::Command => item.command_transcript().is_some_and(|transcript| {
+            let command_text = transcript.command.trim_end_matches(['\r', '\n']);
+            let command_preview = structured_output_preview_with_limits(
+                command_text,
+                "command",
+                COMMAND_PREVIEW_LINES,
+                COMMAND_PREVIEW_BYTES,
+            );
+            let command = if output_expanded && command_preview.footer.is_some() {
+                command_text
+            } else {
+                command_preview.content.as_str()
+            };
+            let output_text = command_output_for_display(&transcript.output);
+            let output_preview = structured_output_preview(output_text, "output");
+            let output = if output_expanded && output_preview.footer.is_some() {
+                output_text
+            } else {
+                output_preview.content.as_str()
+            };
+            folded_contains(command, query) || folded_contains(output, query)
+        }),
+        model::TranscriptKind::FileChange => {
+            let mut remaining_lines = if output_expanded {
+                usize::MAX
+            } else {
+                STRUCTURED_OUTPUT_PREVIEW_LINES
+            };
+            for presentation in file_change_presentations(&item.content) {
+                if remaining_lines == 0 && !presentation.content.is_empty() {
+                    break;
+                }
+                if folded_contains(&presentation.operation, query)
+                    || folded_contains(&presentation.path, query)
+                {
+                    return true;
+                }
+                let visible_lines = remaining_lines.min(presentation.content.lines().count());
+                if folded_contains(
+                    &presentation
+                        .content
+                        .lines()
+                        .take(visible_lines)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    query,
+                ) {
+                    return true;
+                }
+                remaining_lines = remaining_lines.saturating_sub(visible_lines);
+            }
+            false
+        }
+        model::TranscriptKind::Diff => folded_contains(
+            &item
+                .content
+                .lines()
+                .take(if output_expanded {
+                    usize::MAX
+                } else {
+                    STRUCTURED_OUTPUT_PREVIEW_LINES
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            query,
+        ),
+        kind if kind.is_structured() => {
+            let visible = structured_output_presentation(&item.content, "output", output_expanded);
+            folded_contains(&visible.content, query)
+        }
+        _ => folded_contains(&item.content, query),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3669,18 +3764,19 @@ impl HarnessApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .when(additions > 0, |this| {
+                                    .when(additions > 0 || deletions > 0, |this| {
                                         this.child(
-                                            Label::new(format!("+{additions}"))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Success),
-                                        )
-                                    })
-                                    .when(deletions > 0, |this| {
-                                        this.child(
-                                            Label::new(format!("−{deletions}"))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Error),
+                                            DiffStat::new(
+                                                format!(
+                                                    "file-change-stat:{index}:{section_index}"
+                                                ),
+                                                additions,
+                                                deletions,
+                                            )
+                                            .label_size(LabelSize::XSmall)
+                                            .tooltip(format!(
+                                                "{additions} lines added, {deletions} lines removed"
+                                            )),
                                         )
                                     })
                                     .when(additions == 0 && deletions == 0, |this| {
@@ -4803,10 +4899,11 @@ impl HarnessApp {
             && active_search_item
             && is_disclosure
             && rich_search_match_needs_context(&item, self.expanded_output.contains(&item.key))
-            && !item
-                .title
-                .to_lowercase()
-                .contains(&self.search_query.to_lowercase()))
+            && !rich_search_query_is_visible(
+                &item,
+                self.expanded_output.contains(&item.key),
+                &self.search_query,
+            ))
         .then(|| search_context_snippet(&item.content, &self.search_query, 180))
         .flatten()
         .map(|snippet| {
@@ -6683,6 +6780,36 @@ mod tests {
         assert!(!rich_search_match_needs_context(&item, true));
         item.expanded = false;
         assert!(rich_search_match_needs_context(&item, true));
+    }
+
+    #[test]
+    fn rich_search_does_not_duplicate_visible_file_metadata() {
+        let mut lines = vec!["@@ -1 +1 @@".to_string()];
+        lines.extend((0..STRUCTURED_OUTPUT_PREVIEW_LINES).map(|index| format!(" context {index}")));
+        lines.push("+hidden needle".into());
+        let item = TranscriptItem {
+            key: "file-1".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::FileChange,
+            title: "File change · 1 file".into(),
+            status: None,
+            content: format!(
+                "Modified · /tmp/REVERSE_ENGINEERING.md\n{}",
+                lines.join("\n")
+            ),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(rich_search_query_is_visible(
+            &item,
+            false,
+            "reverse_engineering.md"
+        ));
+        assert!(!rich_search_query_is_visible(&item, false, "hidden needle"));
+        assert!(rich_search_query_is_visible(&item, true, "hidden needle"));
     }
 
     #[test]
