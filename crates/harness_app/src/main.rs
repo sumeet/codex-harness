@@ -63,6 +63,7 @@ actions!(
         GoTop,
         GoBottom,
         ToggleItem,
+        ToggleOutput,
         ToggleRaw,
         ToggleVisual,
         YankItem,
@@ -97,17 +98,261 @@ const COMPACT_SIDEBAR_THRESHOLD: f32 = 1100.;
 const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
-const STRUCTURED_OUTPUT_MAX_HEIGHT: f32 = 240.;
-const STRUCTURED_OUTPUT_MAX_LINES: usize = 18;
-const STRUCTURED_OUTPUT_MAX_BYTES: usize = 2_400;
+const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 14;
+const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_800;
+const WEB_RESULT_PREVIEW_COUNT: usize = 5;
 
-fn structured_output_needs_viewport(content: &str) -> bool {
-    content.lines().count() > STRUCTURED_OUTPUT_MAX_LINES
-        || content.len() > STRUCTURED_OUTPUT_MAX_BYTES
+#[derive(Debug, Eq, PartialEq)]
+struct StructuredOutputPreview {
+    content: String,
+    footer: Option<String>,
+}
+
+fn structured_output_preview(content: &str, noun: &str) -> StructuredOutputPreview {
+    let total_lines = content.lines().count();
+    let mut preview = if total_lines > STRUCTURED_OUTPUT_PREVIEW_LINES {
+        content
+            .lines()
+            .take(STRUCTURED_OUTPUT_PREVIEW_LINES)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        content.to_string()
+    };
+    let hidden_lines = total_lines.saturating_sub(STRUCTURED_OUTPUT_PREVIEW_LINES);
+    let truncated_bytes = if preview.len() > STRUCTURED_OUTPUT_PREVIEW_BYTES {
+        let end = preview
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .take_while(|offset| *offset <= STRUCTURED_OUTPUT_PREVIEW_BYTES)
+            .last()
+            .unwrap_or(0);
+        preview.truncate(end);
+        true
+    } else {
+        false
+    };
+    let footer = if hidden_lines > 0 {
+        Some(format!("Show {hidden_lines} more {noun} lines"))
+    } else if truncated_bytes {
+        Some(format!("Show more {noun}"))
+    } else {
+        None
+    };
+    StructuredOutputPreview {
+        content: preview,
+        footer,
+    }
+}
+
+fn structured_output_presentation(
+    content: &str,
+    noun: &str,
+    expanded: bool,
+) -> StructuredOutputPreview {
+    let collapsed = structured_output_preview(content, noun);
+    if expanded && collapsed.footer.is_some() {
+        StructuredOutputPreview {
+            content: content.to_string(),
+            footer: Some("Show less".into()),
+        }
+    } else {
+        collapsed
+    }
 }
 
 fn command_output_for_display(output: &str) -> &str {
     output.trim_end_matches(['\r', '\n'])
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FileChangePresentation {
+    operation: String,
+    path: String,
+    content: String,
+}
+
+fn file_change_summary(line: &str) -> Option<(&str, &str)> {
+    ["Added", "Modified", "Deleted", "Moved"]
+        .into_iter()
+        .find_map(|operation| {
+            line.strip_prefix(operation)
+                .and_then(|rest| rest.strip_prefix(" · "))
+                .map(|path| (operation, path))
+        })
+}
+
+fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
+    let mut presentations = Vec::new();
+    let mut current: Option<FileChangePresentation> = None;
+
+    for line in content.lines() {
+        if let Some((operation, path)) = file_change_summary(line) {
+            if let Some(mut presentation) = current.take() {
+                presentation.content = presentation.content.trim_end().to_string();
+                presentations.push(presentation);
+            }
+            current = Some(FileChangePresentation {
+                operation: operation.into(),
+                path: path.into(),
+                content: String::new(),
+            });
+        } else if let Some(presentation) = current.as_mut() {
+            if !presentation.content.is_empty() {
+                presentation.content.push('\n');
+            }
+            presentation.content.push_str(line);
+        }
+    }
+
+    if let Some(mut presentation) = current {
+        presentation.content = presentation.content.trim_end().to_string();
+        presentations.push(presentation);
+    }
+
+    if presentations.is_empty() && !content.trim().is_empty() {
+        presentations.push(FileChangePresentation {
+            operation: "Changed".into(),
+            path: "File details unavailable".into(),
+            content: content.trim_end().into(),
+        });
+    }
+
+    presentations
+}
+
+fn file_change_line_count(item: &TranscriptItem) -> usize {
+    file_change_presentations(&item.content)
+        .iter()
+        .map(|presentation| presentation.content.lines().count())
+        .sum()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiffLineTone {
+    Normal,
+    Hunk,
+    Addition,
+    Deletion,
+}
+
+fn diff_line_tone(line: &str, in_hunk: &mut bool) -> DiffLineTone {
+    if line.starts_with("--- ") || line.starts_with("diff --git ") {
+        *in_hunk = false;
+    }
+    if line.starts_with("@@") {
+        *in_hunk = true;
+        return DiffLineTone::Hunk;
+    }
+    if *in_hunk && line.starts_with('+') && !line.starts_with("+++") {
+        DiffLineTone::Addition
+    } else if *in_hunk && line.starts_with('-') && !line.starts_with("---") {
+        DiffLineTone::Deletion
+    } else {
+        DiffLineTone::Normal
+    }
+}
+
+fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
+    match item.kind {
+        model::TranscriptKind::Command => item.command_transcript().is_some_and(|command| {
+            structured_output_preview(command_output_for_display(&command.output), "command")
+                .footer
+                .is_some()
+        }),
+        model::TranscriptKind::Web => {
+            web_search_presentation(&item.raw).results.len() > WEB_RESULT_PREVIEW_COUNT
+        }
+        model::TranscriptKind::Diff => {
+            item.content.lines().count() > STRUCTURED_OUTPUT_PREVIEW_LINES
+        }
+        model::TranscriptKind::FileChange => {
+            file_change_line_count(item) > STRUCTURED_OUTPUT_PREVIEW_LINES
+        }
+        model::TranscriptKind::Image | model::TranscriptKind::Approval => false,
+        kind if kind.is_structured() => structured_output_preview(&item.content, "output")
+            .footer
+            .is_some(),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WebResultPresentation {
+    title: String,
+    url: Option<String>,
+    snippet: Option<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WebSearchPresentation {
+    related_queries: usize,
+    results: Vec<WebResultPresentation>,
+}
+
+fn compact_web_text(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    let mut truncated = compact
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
+    let action = raw.get("action").unwrap_or(&Value::Null);
+    let query_count = action
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|queries| queries.iter().filter(|query| query.is_string()).count())
+        .unwrap_or_else(|| {
+            usize::from(
+                action.get("query").and_then(Value::as_str).is_some()
+                    || raw.get("query").and_then(Value::as_str).is_some(),
+            )
+        });
+    let results = raw
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            if let Some(text) = result.as_str() {
+                return Some(WebResultPresentation {
+                    title: compact_web_text(text, 160),
+                    url: None,
+                    snippet: None,
+                });
+            }
+            let title = result
+                .get("title")
+                .or_else(|| result.get("name"))
+                .or_else(|| result.get("text"))
+                .and_then(Value::as_str);
+            let url = result
+                .get("url")
+                .or_else(|| result.get("link"))
+                .and_then(Value::as_str);
+            let snippet = result
+                .get("snippet")
+                .or_else(|| result.get("description"))
+                .or_else(|| result.get("content"))
+                .and_then(Value::as_str);
+            (title.is_some() || url.is_some() || snippet.is_some()).then(|| WebResultPresentation {
+                title: compact_web_text(title.unwrap_or("Result"), 160),
+                url: url.map(|url| compact_web_text(url, 180)),
+                snippet: snippet.map(|snippet| compact_web_text(snippet, 240)),
+            })
+        })
+        .collect();
+    WebSearchPresentation {
+        related_queries: query_count.saturating_sub(1),
+        results,
+    }
 }
 
 fn shell_capture_priority(capture_name: &str) -> u8 {
@@ -320,6 +565,7 @@ struct HarnessApp {
     selected_task: usize,
     visual_anchor: Option<usize>,
     raw_visible: HashSet<String>,
+    expanded_output: HashSet<String>,
     markdown_cache: HashMap<String, CachedMarkdown>,
     search_visible: bool,
     search_query: String,
@@ -446,6 +692,7 @@ impl HarnessApp {
             selected_task: 0,
             visual_anchor: None,
             raw_visible: HashSet::default(),
+            expanded_output: HashSet::default(),
             markdown_cache: HashMap::default(),
             search_visible: false,
             search_query: String::new(),
@@ -1201,6 +1448,7 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
         self.raw_visible.clear();
+        self.expanded_output.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -1272,6 +1520,7 @@ impl HarnessApp {
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         self.markdown_cache.clear();
         self.raw_visible.clear();
+        self.expanded_output.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -1296,6 +1545,7 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
         self.raw_visible.clear();
+        self.expanded_output.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -2295,6 +2545,24 @@ impl HarnessApp {
         }
     }
 
+    fn toggle_selected_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.model.items.get(self.selected_item) else {
+            return;
+        };
+        if !item.expanded || !transcript_output_is_expandable(item) {
+            self.toggle_selected(window, cx);
+            return;
+        }
+
+        let item_key = item.key.clone();
+        if !self.expanded_output.remove(&item_key) {
+            self.expanded_output.insert(item_key);
+        }
+        self.list_state
+            .splice(self.selected_item..self.selected_item + 1, 1);
+        cx.notify();
+    }
+
     fn toggle_raw(&mut self, cx: &mut Context<Self>) {
         let Some(item) = self.model.items.get(self.selected_item) else {
             return;
@@ -2605,45 +2873,75 @@ impl HarnessApp {
         entity
     }
 
-    fn render_diff(content: &str, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_output_toggle(
+        item_key: &str,
+        index: usize,
+        label: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let line_count = content.lines().count();
-        let lines = content
+        let item_key = item_key.to_string();
+        let toggle_key = item_key.clone();
+        div()
+            .id(format!("output-toggle:{item_key}"))
+            .w_full()
+            .py_1()
+            .cursor_pointer()
+            .text_ui_xs(cx)
+            .text_color(colors.text_muted)
+            .hover(|this| this.text_color(colors.text))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.expanded_output.remove(&toggle_key) {
+                    this.expanded_output.insert(toggle_key.clone());
+                }
+                this.list_state.splice(index..index + 1, 1);
+                cx.notify();
+            }))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_diff_lines(
+        content: &str,
+        visible_line_count: usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let colors = cx.theme().colors().clone();
+        let mut in_hunk = false;
+        content
             .lines()
-            .take(1_200)
+            .take(visible_line_count)
             .enumerate()
             .map(|(index, line)| {
-                let addition = line.starts_with('+') && !line.starts_with("+++");
-                let deletion = line.starts_with('-') && !line.starts_with("---");
-                let hunk = line.starts_with("@@");
+                let tone = diff_line_tone(line, &mut in_hunk);
                 div()
                     .w_full()
                     .min_h(px(22.))
-                    .px_3()
+                    .px_2()
                     .py_0p5()
                     .flex()
-                    .gap_3()
+                    .gap_2()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
-                    .bg(if addition {
+                    .bg(if tone == DiffLineTone::Addition {
                         colors.version_control_added.opacity(0.12)
-                    } else if deletion {
+                    } else if tone == DiffLineTone::Deletion {
                         colors.version_control_deleted.opacity(0.12)
                     } else {
-                        colors.editor_background
+                        gpui::transparent_black()
                     })
-                    .text_color(if addition {
+                    .text_color(if tone == DiffLineTone::Addition {
                         colors.version_control_added
-                    } else if deletion {
+                    } else if tone == DiffLineTone::Deletion {
                         colors.version_control_deleted
-                    } else if hunk {
+                    } else if tone == DiffLineTone::Hunk {
                         colors.text_accent
                     } else {
                         colors.text
                     })
                     .child(
                         div()
-                            .w(px(34.))
+                            .w(px(28.))
                             .flex_none()
                             .text_color(colors.text_muted)
                             .child((index + 1).to_string()),
@@ -2651,27 +2949,157 @@ impl HarnessApp {
                     .child(div().min_w_0().whitespace_nowrap().child(line.to_string()))
                     .into_any_element()
             })
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    fn render_diff(
+        &mut self,
+        item: &TranscriptItem,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let line_count = item.content.lines().count();
+        let expanded = self.expanded_output.contains(&item.key);
+        let visible_line_count = if expanded {
+            line_count
+        } else {
+            STRUCTURED_OUTPUT_PREVIEW_LINES
+        };
+        let lines = Self::render_diff_lines(&item.content, visible_line_count, cx);
 
         div()
             .id(("diff-scroll", index))
             .w_full()
             .min_w_0()
-            .overflow_scroll()
-            .when(line_count > STRUCTURED_OUTPUT_MAX_LINES, |this| {
-                this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
-            })
+            .overflow_x_scroll()
             .children(lines)
-            .when(line_count > 1_200, |this| {
+            .when(line_count > STRUCTURED_OUTPUT_PREVIEW_LINES, |this| {
+                this.child(Self::render_output_toggle(
+                    &item.key,
+                    index,
+                    if expanded {
+                        "Show fewer diff lines".into()
+                    } else {
+                        format!(
+                            "Show {} more diff lines",
+                            line_count - STRUCTURED_OUTPUT_PREVIEW_LINES
+                        )
+                    },
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn render_file_change(
+        &mut self,
+        item: &TranscriptItem,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let presentations = file_change_presentations(&item.content);
+        let line_count = presentations
+            .iter()
+            .map(|presentation| presentation.content.lines().count())
+            .sum::<usize>();
+        let expanded = self.expanded_output.contains(&item.key);
+        let mut remaining_lines = if expanded {
+            line_count
+        } else {
+            STRUCTURED_OUTPUT_PREVIEW_LINES
+        };
+        let mut sections = Vec::new();
+
+        for (section_index, presentation) in presentations.into_iter().enumerate() {
+            if remaining_lines == 0 && !presentation.content.is_empty() {
+                break;
+            }
+            let visible_lines = remaining_lines.min(presentation.content.lines().count());
+            remaining_lines = remaining_lines.saturating_sub(visible_lines);
+            let operation_color = match presentation.operation.as_str() {
+                "Added" => Color::Success,
+                "Deleted" => Color::Error,
+                "Modified" | "Moved" => Color::Accent,
+                _ => Color::Muted,
+            };
+            sections.push(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(section_index > 0, |this| {
+                        this.mt_1()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(colors.border_variant)
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Label::new(presentation.operation)
+                                    .size(LabelSize::XSmall)
+                                    .color(operation_color),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .font_buffer(cx)
+                                    .text_ui_sm(cx)
+                                    .truncate()
+                                    .child(presentation.path),
+                            ),
+                    )
+                    .when(!presentation.content.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .id(format!("file-change-scroll:{index}:{section_index}"))
+                                .w_full()
+                                .min_w_0()
+                                .overflow_x_scroll()
+                                .children(Self::render_diff_lines(
+                                    &presentation.content,
+                                    visible_lines,
+                                    cx,
+                                )),
+                        )
+                    }),
+            );
+        }
+
+        div()
+            .id(("file-change-output", index))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(sections)
+            .when(line_count > STRUCTURED_OUTPUT_PREVIEW_LINES, |this| {
                 this.child(
                     div()
-                        .px_3()
-                        .py_2()
-                        .text_ui_sm(cx)
-                        .text_color(colors.text_muted)
-                        .child(format!(
-                            "{} more lines · switch to TEXT for the complete selectable diff",
-                            line_count - 1_200
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(
+                            &item.key,
+                            index,
+                            if expanded {
+                                "Show fewer changed lines".into()
+                            } else {
+                                format!(
+                                    "Show {} more changed lines",
+                                    line_count - STRUCTURED_OUTPUT_PREVIEW_LINES
+                                )
+                            },
+                            cx,
                         )),
                 )
             })
@@ -2719,36 +3147,62 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_terminal(content: String, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_terminal(
+        &mut self,
+        content: String,
+        item_key: &str,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let bounded = structured_output_needs_viewport(&content);
+        let preview = structured_output_presentation(
+            &content,
+            "output",
+            self.expanded_output.contains(item_key),
+        );
         div()
             .id(("terminal-scroll", index))
             .w_full()
             .min_w_0()
-            .when(bounded, |this| {
-                this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
-                    .overflow_y_scroll()
-                    .pr_1()
-            })
+            .flex()
+            .flex_col()
+            .gap_1()
             .font_buffer(cx)
             .text_ui_sm(cx)
             .line_height(relative(1.45))
             .text_color(colors.text)
             .whitespace_normal()
-            .child(content)
+            .child(preview.content)
+            .when_some(preview.footer, |this, footer| {
+                this.child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(item_key, index, footer, cx)),
+                )
+            })
             .into_any_element()
     }
 
-    fn render_command(item: &TranscriptItem, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    fn render_command(
+        &mut self,
+        item: &TranscriptItem,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(command) = item.command_transcript() else {
-            return Self::render_terminal(item.content.clone(), index, cx);
+            return self.render_terminal(item.content.clone(), &item.key, index, cx);
         };
         let colors = cx.theme().colors().clone();
         let highlighted_command = StyledText::new(command.command.clone())
             .with_highlights(shell_highlights(&command.command, cx));
         let output = command_output_for_display(&command.output).to_string();
-        let bounded_output = structured_output_needs_viewport(&output);
+        let output_preview = structured_output_presentation(
+            &output,
+            "command",
+            self.expanded_output.contains(&item.key),
+        );
 
         div()
             .id(("command-output", index))
@@ -2758,15 +3212,11 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .min_w_0()
-                    .flex()
-                    .items_start()
-                    .gap_2()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
                     .line_height(relative(1.45))
                     .whitespace_normal()
-                    .child(div().flex_none().text_color(colors.text_accent).child("$"))
-                    .child(div().min_w_0().flex_1().child(highlighted_command)),
+                    .child(highlighted_command),
             )
             .when(!output.is_empty(), |this| {
                 this.child(
@@ -2778,18 +3228,139 @@ impl HarnessApp {
                         .border_color(colors.border_variant)
                         .mt_2()
                         .pt_2()
-                        .when(bounded_output, |this| {
-                            this.max_h(px(STRUCTURED_OUTPUT_MAX_HEIGHT))
-                                .overflow_y_scroll()
-                                .pr_1()
-                        })
+                        .flex()
+                        .flex_col()
+                        .gap_1()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
                         .line_height(relative(1.45))
                         .text_color(colors.text)
                         .whitespace_normal()
-                        .child(output),
+                        .child(output_preview.content)
+                        .when_some(output_preview.footer, |this, footer| {
+                            this.child(Self::render_output_toggle(&item.key, index, footer, cx))
+                        }),
                 )
+            })
+            .into_any_element()
+    }
+
+    fn render_web_search(
+        &mut self,
+        item: &TranscriptItem,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let presentation = web_search_presentation(&item.raw);
+        let total_results = presentation.results.len();
+        let expanded = self.expanded_output.contains(&item.key);
+        let visible_result_count = if expanded {
+            total_results
+        } else {
+            WEB_RESULT_PREVIEW_COUNT
+        };
+        let visible_results = presentation
+            .results
+            .into_iter()
+            .take(visible_result_count)
+            .enumerate()
+            .map(|(index, result)| {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .py_1()
+                    .when(index > 0, |this| {
+                        this.border_t_1().border_color(colors.border_variant)
+                    })
+                    .child(
+                        div()
+                            .w(px(18.))
+                            .flex_none()
+                            .text_ui_xs(cx)
+                            .text_color(colors.text_muted)
+                            .child(format!("{}.", index + 1)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                Label::new(result.title)
+                                    .size(LabelSize::Small)
+                                    .line_clamp(1),
+                            )
+                            .when_some(result.url, |this, url| {
+                                this.child(
+                                    Label::new(url)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Accent)
+                                        .line_clamp(1),
+                                )
+                            })
+                            .when_some(result.snippet, |this, snippet| {
+                                this.child(
+                                    Label::new(snippet)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted)
+                                        .line_clamp(1),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .when(presentation.related_queries > 0, |this| {
+                this.child(
+                    Label::new(format!(
+                        "+{} related {}",
+                        presentation.related_queries,
+                        if presentation.related_queries == 1 {
+                            "query"
+                        } else {
+                            "queries"
+                        }
+                    ))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+                )
+            })
+            .children(visible_results)
+            .when(total_results > WEB_RESULT_PREVIEW_COUNT, |this| {
+                this.child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(
+                            &item.key,
+                            index,
+                            if expanded {
+                                "Show fewer results".into()
+                            } else {
+                                format!(
+                                    "Show {} more results",
+                                    total_results - WEB_RESULT_PREVIEW_COUNT
+                                )
+                            },
+                            cx,
+                        )),
+                )
+            })
+            .when(total_results == 0, |this| {
+                this.child(self.render_terminal(item.content.clone(), &item.key, index, cx))
             })
             .into_any_element()
     }
@@ -3528,14 +4099,14 @@ impl HarnessApp {
                 | model::TranscriptKind::Agent
                 | model::TranscriptKind::Plan => Self::render_plain_prose(&item.content, cx),
                 model::TranscriptKind::Reasoning => Self::render_reasoning(&item.content, cx),
-                model::TranscriptKind::Command => Self::render_command(&item, index, cx),
-                model::TranscriptKind::Diff | model::TranscriptKind::FileChange => {
-                    Self::render_diff(&item.content, index, cx)
-                }
+                model::TranscriptKind::Command => self.render_command(&item, index, cx),
+                model::TranscriptKind::Web => self.render_web_search(&item, index, cx),
+                model::TranscriptKind::Diff => self.render_diff(&item, index, cx),
+                model::TranscriptKind::FileChange => self.render_file_change(&item, index, cx),
                 model::TranscriptKind::Image => {
                     Self::render_image(&item, self.image_surfaces.get(&item.key).cloned(), cx)
                 }
-                _ => Self::render_terminal(item.content.clone(), index, cx),
+                _ => self.render_terminal(item.content.clone(), &item.key, index, cx),
             })
         };
 
@@ -3602,11 +4173,10 @@ impl HarnessApp {
                 .flex_col()
                 .gap_1()
                 .when(!compact_trace, |this| {
-                    this.border_l_1()
+                    this.rounded_sm()
+                        .border_1()
                         .border_color(colors.border_variant)
-                        .bg(colors.element_background.opacity(0.28))
-                        .pl_3()
-                        .pr_2()
+                        .px_2()
                         .py_1()
                 })
                 .when(compact_trace, |this| this.px_1().py_1())
@@ -3858,6 +4428,9 @@ impl Render for HarnessApp {
             .on_action(
                 cx.listener(|this, _: &ToggleItem, window, cx| this.toggle_selected(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ToggleOutput, window, cx| {
+                this.toggle_selected_output(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &ToggleRaw, _, cx| this.toggle_raw(cx)))
             .on_action(cx.listener(|this, _: &ToggleVisual, _, cx| this.toggle_visual(cx)))
             .on_action(cx.listener(|this, _: &YankItem, _, cx| this.yank_selected(cx)))
@@ -5082,7 +5655,7 @@ fn load_harness_keymaps(cx: &mut App) {
         ),
         KeyBinding::new("ctrl-u", PageUp, Some("HarnessTranscript")),
         KeyBinding::new("ctrl-d", PageDown, Some("HarnessTranscript")),
-        KeyBinding::new("enter", ToggleItem, Some("HarnessTranscript")),
+        KeyBinding::new("enter", ToggleOutput, Some("HarnessTranscript")),
         KeyBinding::new("space", ToggleItem, Some("HarnessTranscript")),
         KeyBinding::new("z a", ToggleItem, Some("HarnessTranscript")),
         KeyBinding::new("r", ToggleRaw, Some("HarnessTranscript")),
@@ -5162,21 +5735,32 @@ mod tests {
     }
 
     #[test]
-    fn only_large_structured_output_gets_a_nested_viewport() {
-        assert!(!structured_output_needs_viewport("one\ntwo\nthree"));
-        assert!(!structured_output_needs_viewport(
-            &std::iter::repeat_n("line", STRUCTURED_OUTPUT_MAX_LINES)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-        assert!(structured_output_needs_viewport(
-            &std::iter::repeat_n("line", STRUCTURED_OUTPUT_MAX_LINES + 1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-        assert!(structured_output_needs_viewport(
-            &"x".repeat(STRUCTURED_OUTPUT_MAX_BYTES + 1)
-        ));
+    fn large_structured_output_gets_a_stable_non_scrolling_preview() {
+        assert_eq!(
+            structured_output_preview("one\ntwo\nthree", "output"),
+            StructuredOutputPreview {
+                content: "one\ntwo\nthree".into(),
+                footer: None,
+            }
+        );
+        let content = std::iter::repeat_n("line", STRUCTURED_OUTPUT_PREVIEW_LINES + 2)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = structured_output_preview(&content, "output");
+        assert_eq!(
+            preview.content.lines().count(),
+            STRUCTURED_OUTPUT_PREVIEW_LINES
+        );
+        assert_eq!(preview.footer.as_deref(), Some("Show 2 more output lines"));
+
+        let preview =
+            structured_output_preview(&"é".repeat(STRUCTURED_OUTPUT_PREVIEW_BYTES), "output");
+        assert!(preview.content.is_char_boundary(preview.content.len()));
+        assert_eq!(preview.footer.as_deref(), Some("Show more output"));
+
+        let expanded = structured_output_presentation(&content, "output", true);
+        assert_eq!(expanded.content, content);
+        assert_eq!(expanded.footer.as_deref(), Some("Show less"));
     }
 
     #[test]
@@ -5186,6 +5770,63 @@ mod tests {
             "first\n\nsecond  "
         );
         assert_eq!(command_output_for_display("\n\r\n"), "");
+    }
+
+    #[test]
+    fn file_change_metadata_is_not_numbered_or_misread_as_diff_content() {
+        let presentations = file_change_presentations(
+            "Added · /tmp/helium-browser-flags.conf\n# Native Wayland\n--ozone-platform=wayland",
+        );
+        assert_eq!(
+            presentations,
+            vec![FileChangePresentation {
+                operation: "Added".into(),
+                path: "/tmp/helium-browser-flags.conf".into(),
+                content: "# Native Wayland\n--ozone-platform=wayland".into(),
+            }]
+        );
+
+        let mut in_hunk = false;
+        assert_eq!(
+            diff_line_tone("--ozone-platform=wayland", &mut in_hunk),
+            DiffLineTone::Normal
+        );
+        assert_eq!(
+            diff_line_tone("@@ -1 +1 @@", &mut in_hunk),
+            DiffLineTone::Hunk
+        );
+        assert_eq!(
+            diff_line_tone("-old value", &mut in_hunk),
+            DiffLineTone::Deletion
+        );
+        assert_eq!(
+            diff_line_tone("+new value", &mut in_hunk),
+            DiffLineTone::Addition
+        );
+    }
+
+    #[test]
+    fn web_search_projection_uses_semantic_results_instead_of_raw_terminal_text() {
+        let presentation = web_search_presentation(&json!({
+            "query": "GPUI",
+            "action": {"type": "search", "queries": ["GPUI", "Zed GPUI"]},
+            "results": [
+                {
+                    "title": " GPUI   framework ",
+                    "url": "https://example.test/gpui",
+                    "snippet": "A   native UI framework",
+                },
+                "A plain result",
+            ],
+        }));
+        assert_eq!(presentation.related_queries, 1);
+        assert_eq!(presentation.results.len(), 2);
+        assert_eq!(presentation.results[0].title, "GPUI framework");
+        assert_eq!(
+            presentation.results[0].snippet.as_deref(),
+            Some("A native UI framework")
+        );
+        assert_eq!(presentation.results[1].title, "A plain result");
     }
 
     fn assert_interactive(method: &str, params: Value) {
