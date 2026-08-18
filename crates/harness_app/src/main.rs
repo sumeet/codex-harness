@@ -37,6 +37,7 @@ use ui::{
 
 mod image_surface;
 mod palette;
+mod performance;
 mod request_surface;
 
 use image_surface::{
@@ -45,6 +46,7 @@ use image_surface::{
     surface_sync_decision as image_surface_sync_decision,
 };
 use palette::{PaletteEvent, PaletteOverlay};
+use performance::PerformanceReporter;
 use request_surface::{
     RequestSurface, Respond as RequestSurfaceRespond, ReturnToTranscript, SurfaceSyncDecision,
     surface_sync_decision,
@@ -89,6 +91,7 @@ actions!(
         ShowTextTranscript,
         UseBufferTypography,
         UseReadingTypography,
+        CopyPerformanceReport,
         NormalEscape,
         ChooseApproval,
         OpenRequestSurface,
@@ -1352,6 +1355,7 @@ struct HarnessApp {
     command_palette: Option<Entity<PaletteOverlay>>,
     command_palette_history: Vec<String>,
     command_palette_usage: HashMap<String, u16>,
+    performance_reporter: PerformanceReporter,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
     list_state: ListState,
@@ -1482,6 +1486,7 @@ impl HarnessApp {
             command_palette: None,
             command_palette_history: palette_state.history,
             command_palette_usage: palette_state.usage,
+            performance_reporter: PerformanceReporter::default(),
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             sidebar_open: true,
@@ -3449,6 +3454,18 @@ impl HarnessApp {
             window.focus(&previous_focus, cx);
         }
         cx.notify();
+    }
+
+    fn copy_performance_report(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.performance_reporter.snapshot_report(window) {
+            Ok(report) => {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
+                log::info!("copied Harness performance report to the clipboard");
+            }
+            Err(error) => {
+                log::error!("failed to build Harness performance report: {error:#}");
+            }
+        }
     }
 
     fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5769,6 +5786,9 @@ impl Render for HarnessApp {
             }))
             .on_action(cx.listener(|this, _: &UseReadingTypography, window, cx| {
                 this.use_transcript_typography(TranscriptTypographyProfile::Reading, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &CopyPerformanceReport, window, cx| {
+                this.copy_performance_report(window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
                 this.open_command_palette("", window, cx)
