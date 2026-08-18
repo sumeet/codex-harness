@@ -46,15 +46,15 @@ impl Focusable for PaletteOverlay {
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
-        GpuiKeyBinding::new("up", MoveUp, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("ctrl-p", MoveUp, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("shift-tab", MoveUp, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("down", MoveDown, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("ctrl-n", MoveDown, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("tab", MoveDown, Some("HarnessPalette && Editor")),
-        GpuiKeyBinding::new("enter", Confirm, Some("HarnessPalette && Editor")),
+        GpuiKeyBinding::new("up", MoveUp, Some("HarnessPalette")),
+        GpuiKeyBinding::new("ctrl-p", MoveUp, Some("HarnessPalette")),
+        GpuiKeyBinding::new("shift-tab", MoveUp, Some("HarnessPalette")),
+        GpuiKeyBinding::new("down", MoveDown, Some("HarnessPalette")),
+        GpuiKeyBinding::new("ctrl-n", MoveDown, Some("HarnessPalette")),
+        GpuiKeyBinding::new("tab", MoveDown, Some("HarnessPalette")),
+        GpuiKeyBinding::new("enter", Confirm, Some("HarnessPalette")),
         GpuiKeyBinding::new("escape", Dismiss, Some("HarnessPalette")),
-        GpuiKeyBinding::new("ctrl-c", Dismiss, Some("HarnessPalette && Editor")),
+        GpuiKeyBinding::new("ctrl-c", Dismiss, Some("HarnessPalette")),
     ]);
 }
 
