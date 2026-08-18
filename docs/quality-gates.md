@@ -159,11 +159,21 @@ multi-window use.
   from version-1 local snapshots, and a rebuilt real-window replay showed one
   syntax-highlighted Command card with its output and no `Tool · Exec` or
   `write_stdin` implementation cards.
+- From the paused history, Text mode returned to the exact tail with `G` and
+  sent a third turn that streamed 20 numbered lines. The viewport followed the
+  appended command output and final `repin test complete.` response through
+  completion without moving the transcript selection, proving the automatic
+  re-pin half of the follow contract against a real turn.
+- Text mode's transcript-specific Editor context was verified in the rebuilt
+  real window: one `i` moved focus from the read-only transcript to the
+  composer, entered Insert mode after the focus handoff, and the next literal
+  character appeared in the composer. The test draft was then removed without
+  sending it. The same literal-entry proof passed through `Ctrl-W J`. This uses
+  Zed's Editor addon/keymap/Vim stack rather than a host key-event shim.
 - Focused protocol tests passed 57/57 and app tests passed 38/38; the standalone
   app binary rebuilt successfully. Only the known warnings from the reduced
   upstream Editor feature slice remain.
 
-Still open: verify automatic re-pin after returning to exact tail; a live
-approval/form response including failure recovery; Rich/Text selection and
-tail-position transfer under longer real histories; and longer exploratory
-multi-window use.
+Still open: a live approval/form response including failure recovery;
+Rich/Text selection and tail-position transfer under longer real histories;
+and longer exploratory multi-window use.
