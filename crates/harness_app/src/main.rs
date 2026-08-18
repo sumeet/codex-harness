@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
+    path::Path,
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -196,6 +196,24 @@ impl HarnessApp {
         let search_editor =
             cx.new(|cx| LocalEditor::plain_single_line("Search transcript…", window, cx));
         let transcript_editor = cx.new(|cx| TranscriptEditor::read_only(window, cx));
+        cx.on_focus_in(
+            &transcript_editor.focus_handle(cx),
+            window,
+            |this, _window, cx| {
+                if this.focus_mode != FocusMode::Buffer {
+                    this.focus_mode = FocusMode::Buffer;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.on_focus_in(&composer.focus_handle(cx), window, |this, _window, cx| {
+            if this.focus_mode != FocusMode::Composer {
+                this.focus_mode = FocusMode::Composer;
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
@@ -611,6 +629,27 @@ impl HarnessApp {
                                 cx,
                             )
                         });
+                        let surface_focus = surface.focus_handle(cx);
+                        let focus_item_key = item_key.clone();
+                        cx.on_focus_in(&surface_focus, window, move |this, _window, cx| {
+                            if let Some(index) = this
+                                .model
+                                .items
+                                .iter()
+                                .position(|item| item.key == focus_item_key)
+                            {
+                                this.selected_item = index;
+                            }
+                            if let Some(entry) = this.request_surfaces.get(&focus_item_key) {
+                                this.focus_mode = if entry.entity.read(cx).is_approval() {
+                                    FocusMode::Approval
+                                } else {
+                                    FocusMode::Request
+                                };
+                            }
+                            cx.notify();
+                        })
+                        .detach();
                         cx.subscribe(&surface, |this, _, event: &RequestSurfaceRespond, cx| {
                             this.handle_request_surface_response(event.clone(), cx);
                         })
@@ -1109,6 +1148,12 @@ impl HarnessApp {
             request.resolved = true;
         }
         self.list_state.splice(index..index + 1, 1);
+        if self.buffer_view {
+            let item_count = self.model.items.len();
+            if !self.sync_transcript_item_updates(item_count, &[index], cx) {
+                drop(self.sync_transcript_document(cx));
+            }
+        }
         cx.spawn(async move |this, cx| {
             let result = client.respond(request.id, response).await;
             if this
@@ -1143,8 +1188,13 @@ impl HarnessApp {
                         }
                         this.dirty_request_surfaces.insert(request_key.clone());
                         this.list_state.splice(index..index + 1, 1);
+                        if this.buffer_view {
+                            let item_count = this.model.items.len();
+                            if !this.sync_transcript_item_updates(item_count, &[index], cx) {
+                                drop(this.sync_transcript_document(cx));
+                            }
+                        }
                     }
-                    drop(this.sync_transcript_document(cx));
                     cx.notify();
                 })
                 .is_err()
@@ -1570,20 +1620,18 @@ impl HarnessApp {
             item.status = Some(message);
             self.list_state.splice(index..index + 1, 1);
         }
+        if self.buffer_view {
+            let item_count = self.model.items.len();
+            if !self.sync_transcript_item_updates(item_count, &[index], cx) {
+                drop(self.sync_transcript_document(cx));
+            }
+        }
         cx.notify();
     }
 
     fn focus_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer_view && self.focus_mode == FocusMode::Composer {
-            self.focus_mode = FocusMode::Buffer;
-            self.transcript_editor.focus_handle(cx).focus(window, cx);
-            cx.defer_in(window, |this, window, cx| {
-                if this.buffer_view && this.focus_mode == FocusMode::Buffer {
-                    this.transcript_editor
-                        .update(cx, |editor, cx| editor.enter_normal_mode(window, cx));
-                }
-            });
-            cx.notify();
+            self.focus_buffer_transcript(window, cx);
             return;
         }
         if self.buffer_view && self.focus_mode == FocusMode::Buffer {
@@ -1918,6 +1966,8 @@ impl HarnessApp {
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_visible = false;
         if self.search_returns_to_buffer {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.clear_search(cx));
             self.focus_mode = FocusMode::Buffer;
             self.transcript_editor.focus_handle(cx).focus(window, cx);
             cx.notify();
@@ -1959,9 +2009,9 @@ impl HarnessApp {
     }
 
     fn move_search_match(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.focus_mode == FocusMode::Buffer && self.search_returns_to_buffer {
+        if self.search_returns_to_buffer {
             self.transcript_editor.update(cx, |editor, cx| {
-                editor.search(&self.search_query, delta < 0, window, cx);
+                editor.repeat_search(delta < 0, window, cx);
             });
             cx.notify();
             return;
@@ -2264,63 +2314,35 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_image(item: &TranscriptItem, cx: &mut Context<Self>) -> AnyElement {
+    fn render_image(
+        item: &TranscriptItem,
+        surface: Option<Entity<ImageSurface>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let path = item
-            .raw
-            .pointer("/path")
-            .or_else(|| item.raw.pointer("/savedPath"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        let exists = path
-            .as_deref()
-            .is_some_and(|path| Path::new(path).is_file());
-        let image_path = exists.then(|| path.clone()).flatten();
+        let surface_height = surface
+            .as_ref()
+            .map(|surface| px(surface.read(cx).rows() as f32 * 20.));
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .when_some(image_path, |this, image_path| {
+            .when_some(surface.zip(surface_height), |this, (surface, height)| {
                 this.child(
                     div()
                         .w_full()
-                        .h(px(360.))
-                        .rounded_md()
+                        .h(height)
+                        .min_h(px(56.))
                         .overflow_hidden()
-                        .bg(colors.editor_background)
-                        .child(gpui::img(PathBuf::from(image_path)).size_full()),
-                )
-            })
-            .when(!exists, |this| {
-                this.child(
-                    div()
-                        .h(px(112.))
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_background)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(
-                            Icon::new(IconName::Image)
-                                .size(IconSize::Medium)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(path.clone().unwrap_or_else(|| "Image payload".into()))
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
+                        .child(surface),
                 )
             })
             .when(!item.content.is_empty(), |this| {
                 this.child(
                     div()
-                        .font_buffer(cx)
-                        .text_ui_sm(cx)
+                        .text_ui(cx)
+                        .line_height(relative(1.45))
                         .text_color(colors.text_muted)
                         .child(item.content.clone()),
                 )
@@ -2959,7 +2981,9 @@ impl HarnessApp {
                 model::TranscriptKind::Diff | model::TranscriptKind::FileChange => {
                     Self::render_diff(&item.content, index, cx)
                 }
-                model::TranscriptKind::Image => Self::render_image(&item, cx),
+                model::TranscriptKind::Image => {
+                    Self::render_image(&item, self.image_surfaces.get(&item.key).cloned(), cx)
+                }
                 _ => Self::render_terminal(item.content.clone(), index, cx),
             })
         };
@@ -3537,7 +3561,7 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
-                    .when(self.model.items.is_empty() && !self.buffer_view, |this| {
+                    .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
                                 .absolute()
@@ -3556,86 +3580,77 @@ impl Render for HarnessApp {
                                 }),
                         )
                     })
-                    .when(
-                        !self.buffer_view || self.focus_mode == FocusMode::Composer,
-                        |this| {
-                            this.child(
+                    .child(
+                        div()
+                            .flex_none()
+                            .min_h(px(72.))
+                            .max_h(px(280.))
+                            .border_t_1()
+                            .border_color(if self.focus_mode == FocusMode::Composer {
+                                colors.border_focused
+                            } else {
+                                colors.border
+                            })
+                            .bg(colors.editor_background)
+                            .flex()
+                            .flex_col()
+                            .child(
                                 div()
-                                    .flex_none()
-                                    .min_h(px(72.))
-                                    .max_h(px(280.))
-                                    .border_t_1()
-                                    .border_color(if self.focus_mode == FocusMode::Composer {
-                                        colors.border_focused
-                                    } else {
-                                        colors.border
-                                    })
-                                    .bg(colors.editor_background)
-                                    .flex()
-                                    .flex_col()
-                                    .child(
-                                        div()
-                                            .min_h(px(48.))
-                                            .px_3()
-                                            .pt_2()
-                                            .child(self.composer.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .h(px(30.))
-                                            .flex_none()
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                Label::new("Ctrl-Enter send")
-                                                    .size(LabelSize::XSmall)
-                                                    .color(Color::Muted),
-                                            )
-                                            .child(div().flex_1())
-                                            .when(turn_active, |this| {
-                                                this.child(
-                                                    IconButton::new("stop-turn", IconName::Stop)
-                                                        .shape(IconButtonShape::Square)
-                                                        .size(ButtonSize::Default)
-                                                        .icon_color(Color::Error)
-                                                        .style(ButtonStyle::Tinted(
-                                                            TintColor::Error,
-                                                        ))
-                                                        .aria_label("Stop turn")
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.stop(cx)
-                                                        })),
-                                                )
-                                            })
-                                            .when(!turn_active, |this| {
-                                                this.child(
-                                                    IconButton::new("send-turn", IconName::Send)
-                                                        .shape(IconButtonShape::Square)
-                                                        .size(ButtonSize::Default)
-                                                        .style(ButtonStyle::Filled)
-                                                        .disabled(composer_empty)
-                                                        .icon_color(if composer_empty {
-                                                            Color::Muted
-                                                        } else {
-                                                            Color::Accent
-                                                        })
-                                                        .aria_label(if composer_empty {
-                                                            "Type a prompt to send"
-                                                        } else {
-                                                            "Send prompt"
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            |this, _, window, cx| {
-                                                                this.send(window, cx)
-                                                            },
-                                                        )),
-                                                )
-                                            }),
-                                    ),
+                                    .min_h(px(48.))
+                                    .px_3()
+                                    .pt_2()
+                                    .child(self.composer.clone()),
                             )
-                        },
+                            .child(
+                                div()
+                                    .h(px(30.))
+                                    .flex_none()
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        Label::new("Ctrl-Enter send")
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(div().flex_1())
+                                    .when(turn_active, |this| {
+                                        this.child(
+                                            IconButton::new("stop-turn", IconName::Stop)
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Default)
+                                                .icon_color(Color::Error)
+                                                .style(ButtonStyle::Tinted(TintColor::Error))
+                                                .aria_label("Stop turn")
+                                                .on_click(
+                                                    cx.listener(|this, _, _, cx| this.stop(cx)),
+                                                ),
+                                        )
+                                    })
+                                    .when(!turn_active, |this| {
+                                        this.child(
+                                            IconButton::new("send-turn", IconName::Send)
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Default)
+                                                .style(ButtonStyle::Filled)
+                                                .disabled(composer_empty)
+                                                .icon_color(if composer_empty {
+                                                    Color::Muted
+                                                } else {
+                                                    Color::Accent
+                                                })
+                                                .aria_label(if composer_empty {
+                                                    "Type a prompt to send"
+                                                } else {
+                                                    "Send prompt"
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.send(window, cx)
+                                                })),
+                                        )
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -3678,16 +3693,11 @@ impl Render for HarnessApp {
                                 )
                             })
                             .child(
-                                IconButton::new(
+                                Button::new(
                                     "transcript-view",
-                                    if self.buffer_view {
-                                        IconName::Reader
-                                    } else {
-                                        IconName::FileTextOutlined
-                                    },
+                                    if self.buffer_view { "TEXT" } else { "RICH" },
                                 )
-                                .shape(IconButtonShape::Square)
-                                .size(ButtonSize::Default)
+                                .size(ButtonSize::Compact)
                                 .style(ButtonStyle::Subtle)
                                 .aria_label(if self.buffer_view {
                                     "Show rich transcript"
