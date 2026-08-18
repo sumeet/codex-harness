@@ -173,6 +173,7 @@ impl Client {
         let (event_tx, event_rx) = async_channel::unbounded::<Event>();
         let pending = PendingRequests::default();
 
+        let writer_pending = pending.clone();
         let writer_events = event_tx.clone();
         let writer_task = smol::spawn(async move {
             let mut stdin = stdin;
@@ -187,15 +188,12 @@ impl Client {
                 .await;
 
                 if let Err(error) = write_result {
-                    if writer_events
-                        .send(Event::Disconnected {
-                            reason: format!("failed to write to app-server: {error}"),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        log::debug!("app-server event receiver was dropped");
-                    }
+                    disconnect(
+                        &writer_pending,
+                        &writer_events,
+                        format!("failed to write to app-server: {error}"),
+                    )
+                    .await;
                     break;
                 }
             }
@@ -550,6 +548,11 @@ async fn disconnect(
     if events.send(Event::Disconnected { reason }).await.is_err() {
         log::debug!("app-server event receiver was dropped during disconnect");
     }
+    // Disconnection is terminal for this stdio session. Closing the channel is
+    // what lets hosts retire the Client after consuming the final semantic
+    // event; otherwise the writer task's Sender can keep `recv()` pending
+    // forever after stdout has already closed.
+    events.close();
 }
 
 fn decode_line(line: &str) -> Result<Incoming, Error> {
@@ -611,6 +614,27 @@ fn parse_rpc_error(value: &Value) -> Result<RpcError, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disconnect_event_is_terminal_for_the_event_stream() {
+        smol::block_on(async {
+            let pending = PendingRequests::default();
+            let (events, receiver) = async_channel::unbounded();
+
+            disconnect(&pending, &events, "stdout closed".into()).await;
+
+            assert_eq!(
+                receiver.recv().await,
+                Ok(Event::Disconnected {
+                    reason: "stdout closed".into(),
+                })
+            );
+            assert!(
+                receiver.recv().await.is_err(),
+                "the final disconnect event must be followed by channel closure"
+            );
+        });
+    }
 
     #[test]
     fn decodes_response() {

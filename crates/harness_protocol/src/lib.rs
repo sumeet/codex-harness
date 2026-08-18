@@ -1309,9 +1309,10 @@ impl TranscriptModel {
                     "app-server-disconnected".into(),
                     TranscriptKind::Error,
                     "App Server disconnected",
-                    pretty_json(&payload),
+                    reason,
                     payload,
                 );
+                self.items[index].status = Some("offline".into());
                 outcome.dirty.insert(index);
             }
         }
@@ -4935,6 +4936,31 @@ mod tests {
         assert!(model.items[1].title.contains("gpt-a → gpt-b"));
         assert_eq!(model.items[2].kind, TranscriptKind::Agent);
         assert_eq!(model.items[2].content, "Final realtime text");
+    }
+
+    #[test]
+    fn disconnect_is_semantic_prose_with_exact_raw_payload_retained() {
+        let mut model = TranscriptModel::default();
+        let outcome = model.apply_batch(
+            vec![Event::Disconnected {
+                reason: "app-server closed stdout".into(),
+            }],
+            None,
+        );
+
+        assert_eq!(
+            outcome.transport_error.as_deref(),
+            Some("app-server closed stdout")
+        );
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].title, "App Server disconnected");
+        assert_eq!(model.items[0].content, "app-server closed stdout");
+        assert_eq!(model.items[0].status.as_deref(), Some("offline"));
+        assert_eq!(
+            model.items[0].raw,
+            json!({"reason": "app-server closed stdout"})
+        );
+        assert!(!model.items[0].content.contains('{'));
     }
 
     #[test]

@@ -114,7 +114,12 @@ interaction review without obvious rough edges.
   previously suspected panic. Its active-writer conflict now degrades to an
   explicit read-only state with sending disabled instead of a red error and an
   apparently live composer.
+- The probe's private app-server child was forcibly terminated. Harness kept
+  the loaded history, retired the stale client, disabled sending, changed its
+  status to `OFFLINE`, and rendered one semantic disconnect item without raw
+  JSON. No orphaned app-server process or hanging event receiver remained.
 
 Still open: a separate fresh Text-mode visual pass; pinned and paused streaming
 against a real turn; a live approval/form response including failure recovery;
-thread disconnect/reconnect; and longer exploratory use across real histories.
+manual refresh reconnection after a forced disconnect; and longer exploratory
+use across real histories.
