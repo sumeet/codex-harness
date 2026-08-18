@@ -376,7 +376,11 @@ impl HarnessApp {
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
         let (events, live_request_ids) = self.dispatch_server_requests(events, cx);
-        let was_following_tail = self.list_state.is_following_tail();
+        let was_following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            self.list_state.is_following_tail()
+        };
         let old_len = self.model.items.len();
         let outcome = self
             .model
@@ -991,8 +995,12 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.list_state.splice(0..old_len, self.model.items.len());
         self.selected_item = self.model.items.len().saturating_sub(1);
-        self.list_state.scroll_to_end();
+        self.list_state.set_follow_mode(FollowMode::Tail);
         drop(self.sync_transcript_document(cx));
+        if self.buffer_view {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.reveal_tail(cx));
+        }
         cx.notify();
     }
 
@@ -1013,8 +1021,12 @@ impl HarnessApp {
         self.selected_title = "New task".into();
         self.selected_item = 0;
         self.error = None;
-        self.buffer_view = false;
+        self.list_state.set_follow_mode(FollowMode::Tail);
         drop(self.sync_transcript_document(cx));
+        if self.buffer_view {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.reveal_tail(cx));
+        }
         self.focus_composer(window, cx);
     }
 
@@ -1025,10 +1037,21 @@ impl HarnessApp {
             return;
         }
         let (index, key) = self.model.push_local_user(text.clone());
-        drop(self.sync_transcript_document(cx));
         self.list_state.splice(index..index, 1);
         self.selected_item = index;
-        self.list_state.scroll_to_end();
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        let document = self.sync_transcript_document(cx);
+        if self.buffer_view {
+            let row = document
+                .as_ref()
+                .and_then(|document| document.item_rows.get(index))
+                .and_then(|row| *row)
+                .unwrap_or(0);
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.set_cursor_row(row, window, cx);
+                editor.reveal_tail(cx);
+            });
+        }
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
 
@@ -1630,20 +1653,10 @@ impl HarnessApp {
     }
 
     fn focus_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.buffer_view && self.focus_mode == FocusMode::Composer {
+        if self.buffer_view {
             self.focus_buffer_transcript(window, cx);
             return;
         }
-        if self.buffer_view && self.focus_mode == FocusMode::Buffer {
-            let item_index = self
-                .transcript_editor
-                .update(cx, |editor, cx| editor.selected_item(cx));
-            if let Some(item_index) = item_index {
-                self.selected_item = item_index;
-            }
-        }
-        self.buffer_view = false;
-        self.search_returns_to_buffer = false;
         self.focus_mode = FocusMode::Transcript;
         self.transcript_focus.focus(window, cx);
         self.list_state.scroll_to_reveal_item(self.selected_item);
@@ -1656,9 +1669,43 @@ impl HarnessApp {
         cx.notify();
     }
 
+    fn show_rich_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_following_tail =
+            self.buffer_view && self.transcript_editor.read(cx).is_following_tail();
+        if self.buffer_view {
+            let item_index = self
+                .transcript_editor
+                .update(cx, |editor, cx| editor.selected_item(cx));
+            if let Some(item_index) = item_index {
+                self.selected_item = item_index;
+            }
+        }
+        self.buffer_view = false;
+        self.search_returns_to_buffer = false;
+        self.focus_mode = FocusMode::Transcript;
+        self.transcript_focus.focus(window, cx);
+        if was_following_tail {
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.list_state.pause_following_tail();
+            self.list_state.scroll_to_reveal_item(self.selected_item);
+        }
+        cx.defer_in(window, |this, _, cx| {
+            if !this.buffer_view && this.focus_mode == FocusMode::Transcript {
+                if this.list_state.is_following_tail() {
+                    this.list_state.scroll_to_end();
+                } else {
+                    this.list_state.scroll_to_reveal_item(this.selected_item);
+                }
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+
     fn toggle_buffer_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer_view {
-            self.focus_transcript(window, cx);
+            self.show_rich_transcript(window, cx);
             return;
         }
 
@@ -1668,6 +1715,8 @@ impl HarnessApp {
         self.active_search_match = 0;
         self.search_returns_to_buffer = false;
         self.buffer_search_backwards = false;
+        let should_follow_tail = self.list_state.is_following_tail()
+            && (self.model.items.is_empty() || self.selected_item + 1 >= self.model.items.len());
         self.buffer_view = true;
         let Some(document) = self.sync_transcript_document(cx) else {
             return;
@@ -1684,8 +1733,14 @@ impl HarnessApp {
             })
             .unwrap_or(0);
         self.focus_mode = FocusMode::Buffer;
-        self.transcript_editor
-            .update(cx, |editor, cx| editor.set_cursor_row(row, window, cx));
+        self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_cursor_row(row, window, cx);
+            if should_follow_tail {
+                editor.reveal_tail(cx);
+            } else {
+                editor.pause_tail_follow();
+            }
+        });
         self.transcript_editor.focus_handle(cx).focus(window, cx);
         cx.defer_in(window, |this, window, cx| {
             if this.buffer_view {
@@ -2192,8 +2247,7 @@ impl HarnessApp {
         div()
             .id(("diff-scroll", index))
             .w_full()
-            .max_h(px(520.))
-            .overflow_scroll()
+            .overflow_x_scroll()
             .rounded_md()
             .border_1()
             .border_color(colors.border_variant)
@@ -2207,7 +2261,7 @@ impl HarnessApp {
                         .text_ui_sm(cx)
                         .text_color(colors.text_muted)
                         .child(format!(
-                            "{} more lines · press r for the complete raw payload",
+                            "{} more lines · switch to TEXT for the complete selectable diff",
                             line_count - 1_200
                         )),
                 )
@@ -2273,8 +2327,6 @@ impl HarnessApp {
         div()
             .id(("terminal-scroll", index))
             .w_full()
-            .max_h(px(460.))
-            .overflow_scroll()
             .rounded_md()
             .border_1()
             .border_color(colors.border_variant)
@@ -3287,10 +3339,8 @@ impl Render for HarnessApp {
             .on_action(
                 cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
             )
-            .on_action(cx.listener(|this, _: &NormalEscape, window, cx| {
-                if this.buffer_view && this.focus_mode == FocusMode::Buffer {
-                    this.focus_transcript(window, cx);
-                } else if let Ok(action) = cx.build_action("vim::ClearOperators", None) {
+            .on_action(cx.listener(|_this, _: &NormalEscape, window, cx| {
+                if let Ok(action) = cx.build_action("vim::ClearOperators", None) {
                     window.dispatch_action(action, cx);
                 }
             }))
