@@ -102,6 +102,8 @@ const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 14;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_800;
+const COMMAND_PREVIEW_LINES: usize = 6;
+const COMMAND_PREVIEW_BYTES: usize = 1_200;
 const WEB_RESULT_PREVIEW_COUNT: usize = 5;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -153,22 +155,36 @@ fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
 }
 
 fn structured_output_preview(content: &str, noun: &str) -> StructuredOutputPreview {
+    structured_output_preview_with_limits(
+        content,
+        noun,
+        STRUCTURED_OUTPUT_PREVIEW_LINES,
+        STRUCTURED_OUTPUT_PREVIEW_BYTES,
+    )
+}
+
+fn structured_output_preview_with_limits(
+    content: &str,
+    noun: &str,
+    line_limit: usize,
+    byte_limit: usize,
+) -> StructuredOutputPreview {
     let total_lines = content.lines().count();
-    let mut preview = if total_lines > STRUCTURED_OUTPUT_PREVIEW_LINES {
+    let mut preview = if total_lines > line_limit {
         content
             .lines()
-            .take(STRUCTURED_OUTPUT_PREVIEW_LINES)
+            .take(line_limit)
             .collect::<Vec<_>>()
             .join("\n")
     } else {
         content.to_string()
     };
-    let hidden_lines = total_lines.saturating_sub(STRUCTURED_OUTPUT_PREVIEW_LINES);
-    let truncated_bytes = if preview.len() > STRUCTURED_OUTPUT_PREVIEW_BYTES {
+    let hidden_lines = total_lines.saturating_sub(line_limit);
+    let truncated_bytes = if preview.len() > byte_limit {
         let end = preview
             .char_indices()
             .map(|(offset, _)| offset)
-            .take_while(|offset| *offset <= STRUCTURED_OUTPUT_PREVIEW_BYTES)
+            .take_while(|offset| *offset <= byte_limit)
             .last()
             .unwrap_or(0);
         preview.truncate(end);
@@ -392,9 +408,17 @@ fn diff_line_numbers(
 fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
     match item.kind {
         model::TranscriptKind::Command => item.command_transcript().is_some_and(|command| {
-            structured_output_preview(command_output_for_display(&command.output), "command")
-                .footer
-                .is_some()
+            structured_output_preview_with_limits(
+                command.command.trim_end_matches(['\r', '\n']),
+                "command",
+                COMMAND_PREVIEW_LINES,
+                COMMAND_PREVIEW_BYTES,
+            )
+            .footer
+            .is_some()
+                || structured_output_preview(command_output_for_display(&command.output), "output")
+                    .footer
+                    .is_some()
         }),
         model::TranscriptKind::Web => {
             web_search_has_hidden_content(&web_search_presentation(&item.raw))
@@ -3683,14 +3707,39 @@ impl HarnessApp {
             return self.render_terminal(item.content.clone(), &item.key, index, cx);
         };
         let colors = cx.theme().colors().clone();
-        let highlighted_command = StyledText::new(command.command.clone())
-            .with_highlights(shell_highlights(&command.command, cx));
+        let command_text = command.command.trim_end_matches(['\r', '\n']);
         let output = command_output_for_display(&command.output).to_string();
-        let output_preview = structured_output_presentation(
-            &output,
+        let command_preview = structured_output_preview_with_limits(
+            command_text,
             "command",
-            self.expanded_output.contains(&item.key),
+            COMMAND_PREVIEW_LINES,
+            COMMAND_PREVIEW_BYTES,
         );
+        let output_preview = structured_output_preview(&output, "output");
+        let command_hidden = command_preview.footer.is_some();
+        let output_hidden = output_preview.footer.is_some();
+        let expanded = self.expanded_output.contains(&item.key);
+        let displayed_command = if expanded && command_hidden {
+            command_text.to_string()
+        } else {
+            command_preview.content
+        };
+        let displayed_output = if expanded && output_hidden {
+            output.clone()
+        } else {
+            output_preview.content
+        };
+        let footer = if expanded && (command_hidden || output_hidden) {
+            Some("Show less".to_string())
+        } else if command_hidden && output_hidden {
+            Some("Show full command and output".to_string())
+        } else if command_hidden {
+            command_preview.footer
+        } else {
+            output_preview.footer
+        };
+        let highlighted_command = StyledText::new(displayed_command.clone())
+            .with_highlights(shell_highlights(&displayed_command, cx));
 
         div()
             .id(("command-output", index))
@@ -3706,7 +3755,7 @@ impl HarnessApp {
                     .whitespace_normal()
                     .child(highlighted_command),
             )
-            .when(!output.is_empty(), |this| {
+            .when(!displayed_output.is_empty(), |this| {
                 this.child(
                     div()
                         .id(("command-output-scroll", index))
@@ -3724,10 +3773,17 @@ impl HarnessApp {
                         .line_height(relative(1.45))
                         .text_color(colors.text)
                         .whitespace_normal()
-                        .child(output_preview.content)
-                        .when_some(output_preview.footer, |this, footer| {
-                            this.child(Self::render_output_toggle(&item.key, index, footer, cx))
-                        }),
+                        .child(displayed_output),
+                )
+            })
+            .when_some(footer, |this, footer| {
+                this.child(
+                    div()
+                        .mt_1()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(&item.key, index, footer, cx)),
                 )
             })
             .into_any_element()
@@ -4541,11 +4597,11 @@ impl HarnessApp {
             .flex()
             .items_center()
             .gap_2()
-            .child(Icon::new(icon).size(IconSize::Small).color(if cursor {
-                Color::Accent
-            } else {
-                Color::Muted
-            }))
+            .child(
+                Icon::new(icon)
+                    .size(IconSize::Small)
+                    .color(transcript_icon_color(item.kind, cursor)),
+            )
             .child(
                 div().flex_1().min_w_0().truncate().child(
                     Label::new(item.title.clone())
@@ -4556,9 +4612,9 @@ impl HarnessApp {
             .when_some(visible_status, |this, status| {
                 this.child(
                     div().flex_none().child(
-                        Label::new(status)
+                        Label::new(status.clone())
                             .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                            .color(transcript_status_color(&status)),
                     ),
                 )
             })
@@ -4646,8 +4702,8 @@ impl HarnessApp {
                         .border_1()
                         .border_color(colors.border_variant)
                         .bg(colors.element_background)
-                        .px_3()
-                        .py_2()
+                        .px_2()
+                        .py_1()
                 })
                 .when(
                     matches!(
@@ -6067,6 +6123,41 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
     }
 }
 
+fn transcript_icon_color(kind: model::TranscriptKind, selected: bool) -> Color {
+    if selected {
+        return Color::Accent;
+    }
+    match kind {
+        model::TranscriptKind::Error => Color::Error,
+        model::TranscriptKind::Approval => Color::Warning,
+        model::TranscriptKind::FileChange | model::TranscriptKind::Diff => Color::Modified,
+        _ => Color::Muted,
+    }
+}
+
+fn transcript_status_color(status: &str) -> Color {
+    let normalized = status.to_ascii_lowercase();
+    if normalized.contains("error")
+        || normalized.contains("fail")
+        || normalized.contains("declin")
+        || normalized.contains("denied")
+    {
+        Color::Error
+    } else if normalized.contains("waiting")
+        || normalized.contains("approval")
+        || normalized.contains("interrupt")
+    {
+        Color::Warning
+    } else if normalized.contains("stream")
+        || normalized.contains("running")
+        || normalized.contains("progress")
+    {
+        Color::Accent
+    } else {
+        Color::Muted
+    }
+}
+
 fn thread_title(thread: &CodexThread) -> String {
     thread
         .name
@@ -6283,6 +6374,30 @@ mod tests {
     }
 
     #[test]
+    fn transcript_chrome_uses_semantic_tones_only_when_they_add_information() {
+        assert_eq!(
+            transcript_icon_color(model::TranscriptKind::FileChange, false),
+            Color::Modified
+        );
+        assert_eq!(
+            transcript_icon_color(model::TranscriptKind::Error, false),
+            Color::Error
+        );
+        assert_eq!(
+            transcript_icon_color(model::TranscriptKind::Command, false),
+            Color::Muted
+        );
+        assert_eq!(
+            transcript_icon_color(model::TranscriptKind::Error, true),
+            Color::Accent
+        );
+        assert_eq!(transcript_status_color("failed"), Color::Error);
+        assert_eq!(transcript_status_color("waiting"), Color::Warning);
+        assert_eq!(transcript_status_color("in progress"), Color::Accent);
+        assert_eq!(transcript_status_color("custom status"), Color::Muted);
+    }
+
+    #[test]
     fn large_structured_output_gets_a_stable_non_scrolling_preview() {
         assert_eq!(
             structured_output_preview("one\ntwo\nthree", "output"),
@@ -6309,6 +6424,24 @@ mod tests {
         let expanded = structured_output_presentation(&content, "output", true);
         assert_eq!(expanded.content, content);
         assert_eq!(expanded.footer.as_deref(), Some("Show less"));
+
+        let command = std::iter::repeat_n("echo 'hello'", COMMAND_PREVIEW_LINES + 3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let command_preview = structured_output_preview_with_limits(
+            &command,
+            "command",
+            COMMAND_PREVIEW_LINES,
+            COMMAND_PREVIEW_BYTES,
+        );
+        assert_eq!(
+            command_preview.content.lines().count(),
+            COMMAND_PREVIEW_LINES
+        );
+        assert_eq!(
+            command_preview.footer.as_deref(),
+            Some("Show 3 more command lines")
+        );
     }
 
     #[test]
