@@ -112,6 +112,103 @@ const MIN_KEYCODE: u32 = 8;
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerAxes(u8);
+
+impl PointerAxes {
+    const VERTICAL: u8 = 1 << 0;
+    const HORIZONTAL: u8 = 1 << 1;
+
+    fn insert(&mut self, axis: wl_pointer::Axis) {
+        self.0 |= match axis {
+            wl_pointer::Axis::VerticalScroll => Self::VERTICAL,
+            wl_pointer::Axis::HorizontalScroll => Self::HORIZONTAL,
+            _ => 0,
+        };
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+#[derive(Debug, Default)]
+struct PointerAxisFrame {
+    source: Option<AxisSource>,
+    continuous_delta: Option<Point<Pixels>>,
+    discrete_delta: Option<Point<f32>>,
+    moved_axes: PointerAxes,
+    stopped_axes: PointerAxes,
+}
+
+#[derive(Debug, Default)]
+struct PointerAxisSequence {
+    active_finger_axes: PointerAxes,
+}
+
+#[derive(Debug)]
+struct PointerAxisDispatch {
+    movement: Option<(ScrollDelta, TouchPhase)>,
+    ended: bool,
+}
+
+fn finish_pointer_axis_frame(
+    frame: PointerAxisFrame,
+    sequence: &mut PointerAxisSequence,
+) -> PointerAxisDispatch {
+    // `axis_source` belongs to one pointer frame. A source-less continuous
+    // frame can safely continue a known finger sequence, but must not start
+    // one: wheel sources are explicitly unterminated by the protocol.
+    let continuing_finger = !sequence.active_finger_axes.is_empty()
+        && frame.source.is_none()
+        && frame.continuous_delta.is_some()
+        && frame.discrete_delta.is_none();
+    let source = frame.source.unwrap_or(if continuing_finger {
+        AxisSource::Finger
+    } else {
+        AxisSource::Wheel
+    });
+    let movement = if source == AxisSource::Wheel {
+        frame.discrete_delta.map(ScrollDelta::Lines)
+    } else {
+        frame
+            .continuous_delta
+            .map(ScrollDelta::Pixels)
+            .or_else(|| frame.discrete_delta.map(ScrollDelta::Lines))
+    };
+
+    let movement = movement.map(|delta| {
+        let phase = if source == AxisSource::Finger {
+            let phase = if sequence.active_finger_axes.is_empty() {
+                TouchPhase::Started
+            } else {
+                TouchPhase::Moved
+            };
+            sequence.active_finger_axes.extend(frame.moved_axes);
+            phase
+        } else {
+            TouchPhase::Moved
+        };
+        (delta, phase)
+    });
+
+    let had_finger_sequence = !sequence.active_finger_axes.is_empty();
+    sequence.active_finger_axes.remove(frame.stopped_axes);
+    let ended = had_finger_sequence
+        && !frame.stopped_axes.is_empty()
+        && sequence.active_finger_axes.is_empty();
+
+    PointerAxisDispatch { movement, ended }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImeCursorRectangle {
     x: i32,
@@ -334,13 +431,11 @@ pub(crate) struct WaylandClientState {
     repeat: KeyRepeat,
     pub modifiers: Modifiers,
     pub capslock: Capslock,
-    axis_source: AxisSource,
     pub mouse_location: Option<Point<Pixels>>,
-    continuous_scroll_delta: Option<Point<Pixels>>,
-    discrete_scroll_delta: Option<Point<f32>>,
+    pointer_axis_frame: PointerAxisFrame,
+    pointer_axis_sequence: PointerAxisSequence,
     vertical_modifier: f32,
     horizontal_modifier: f32,
-    scroll_event_received: bool,
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -888,11 +983,9 @@ impl WaylandClient {
                 platform: false,
             },
             capslock: Capslock { on: false },
-            scroll_event_received: false,
-            axis_source: AxisSource::Wheel,
             mouse_location: None,
-            continuous_scroll_delta: None,
-            discrete_scroll_delta: None,
+            pointer_axis_frame: PointerAxisFrame::default(),
+            pointer_axis_sequence: PointerAxisSequence::default(),
             vertical_modifier: -1.0,
             horizontal_modifier: -1.0,
             button_pressed: None,
@@ -2232,16 +2325,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             wl_pointer::Event::AxisSource {
                 axis_source: WEnum::Value(axis_source),
             } => {
-                state.axis_source = axis_source;
+                state.pointer_axis_frame.source = Some(axis_source);
             }
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
                 value,
                 ..
             } => {
-                if state.axis_source == AxisSource::Wheel {
-                    return;
-                }
+                let protocol_axis = axis;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2252,9 +2343,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     wl_pointer::Axis::HorizontalScroll => state.horizontal_modifier,
                     _ => 1.0,
                 };
-                state.scroll_event_received = true;
                 let scroll_delta = state
-                    .continuous_scroll_delta
+                    .pointer_axis_frame
+                    .continuous_delta
                     .get_or_insert(point(px(0.0), px(0.0)));
                 let modifier = 3.0;
                 match axis {
@@ -2266,12 +2357,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     _ => unreachable!(),
                 }
+                state.pointer_axis_frame.moved_axes.insert(protocol_axis);
             }
             wl_pointer::Event::AxisDiscrete {
                 axis: WEnum::Value(axis),
                 discrete,
             } => {
-                state.scroll_event_received = true;
+                let protocol_axis = axis;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2283,7 +2375,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => 1.0,
                 };
 
-                let scroll_delta = state.discrete_scroll_delta.get_or_insert(point(0.0, 0.0));
+                let scroll_delta = state
+                    .pointer_axis_frame
+                    .discrete_delta
+                    .get_or_insert(point(0.0, 0.0));
                 match axis {
                     wl_pointer::Axis::VerticalScroll => {
                         scroll_delta.y += discrete as f32 * axis_modifier * SCROLL_LINES;
@@ -2293,12 +2388,13 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     _ => unreachable!(),
                 }
+                state.pointer_axis_frame.moved_axes.insert(protocol_axis);
             }
             wl_pointer::Event::AxisValue120 {
                 axis: WEnum::Value(axis),
                 value120,
             } => {
-                state.scroll_event_received = true;
+                let protocol_axis = axis;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
                 } else {
@@ -2310,7 +2406,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => unreachable!(),
                 };
 
-                let scroll_delta = state.discrete_scroll_delta.get_or_insert(point(0.0, 0.0));
+                let scroll_delta = state
+                    .pointer_axis_frame
+                    .discrete_delta
+                    .get_or_insert(point(0.0, 0.0));
                 let wheel_percent = value120 as f32 / 120.0;
                 match axis {
                     wl_pointer::Axis::VerticalScroll => {
@@ -2321,35 +2420,42 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     _ => unreachable!(),
                 }
+                state.pointer_axis_frame.moved_axes.insert(protocol_axis);
+            }
+            wl_pointer::Event::AxisStop {
+                axis: WEnum::Value(axis),
+                ..
+            } => {
+                state.pointer_axis_frame.stopped_axes.insert(axis);
             }
             wl_pointer::Event::Frame => {
-                if state.scroll_event_received {
-                    state.scroll_event_received = false;
-                    let continuous = state.continuous_scroll_delta.take();
-                    let discrete = state.discrete_scroll_delta.take();
-                    if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                            position: state.mouse_location.unwrap(),
-                            delta: ScrollDelta::Lines(discrete),
-                            modifiers: state.modifiers,
-                            touch_phase: TouchPhase::Moved,
-                        });
-                        drop(state);
-                        window.handle_input(input);
-                    }
+                let frame = std::mem::take(&mut state.pointer_axis_frame);
+                let dispatch = finish_pointer_axis_frame(frame, &mut state.pointer_axis_sequence);
+                if dispatch.movement.is_none() && !dispatch.ended {
+                    return;
+                }
+                let Some(window) = state.mouse_focused_window.clone() else {
+                    return;
+                };
+                let position = state.mouse_location.unwrap();
+                let modifiers = state.modifiers;
+                drop(state);
+
+                if let Some((delta, touch_phase)) = dispatch.movement {
+                    window.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta,
+                        modifiers,
+                        touch_phase,
+                    }));
+                }
+                if dispatch.ended {
+                    window.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Ended,
+                    }));
                 }
             }
             _ => {}
@@ -2840,6 +2946,159 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    fn pointer_axes(axes: impl IntoIterator<Item = wl_pointer::Axis>) -> PointerAxes {
+        let mut result = PointerAxes::default();
+        for axis in axes {
+            result.insert(axis);
+        }
+        result
+    }
+
+    fn pixel_delta(dispatch: &PointerAxisDispatch) -> (Point<Pixels>, TouchPhase) {
+        let Some((ScrollDelta::Pixels(delta), phase)) = dispatch.movement else {
+            panic!("expected a precise pointer-axis movement, got {dispatch:?}");
+        };
+        (delta, phase)
+    }
+
+    #[test]
+    fn finger_axis_frames_emit_started_moved_and_a_separate_end() {
+        let mut sequence = PointerAxisSequence::default();
+        let vertical = pointer_axes([wl_pointer::Axis::VerticalScroll]);
+
+        let started = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                source: Some(AxisSource::Finger),
+                continuous_delta: Some(point(px(0.), px(12.))),
+                moved_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert_eq!(
+            pixel_delta(&started),
+            (point(px(0.), px(12.)), TouchPhase::Started)
+        );
+        assert!(!started.ended);
+
+        // A compositor may omit the optional source on a continuation frame;
+        // an already active finger sequence still supplies the safe context.
+        let moved = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                continuous_delta: Some(point(px(0.), px(4.))),
+                moved_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert_eq!(
+            pixel_delta(&moved),
+            (point(px(0.), px(4.)), TouchPhase::Moved)
+        );
+        assert!(!moved.ended);
+
+        let ended = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                stopped_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert!(ended.movement.is_none());
+        assert!(ended.ended);
+        assert!(sequence.active_finger_axes.is_empty());
+
+        let source_less_after_end = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                continuous_delta: Some(point(px(0.), px(2.))),
+                moved_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert!(source_less_after_end.movement.is_none());
+        assert!(!source_less_after_end.ended);
+
+        let restarted = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                source: Some(AxisSource::Finger),
+                continuous_delta: Some(point(px(0.), px(-3.))),
+                moved_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert_eq!(pixel_delta(&restarted).1, TouchPhase::Started);
+    }
+
+    #[test]
+    fn diagonal_finger_sequence_ends_only_after_both_protocol_axes_stop() {
+        let mut sequence = PointerAxisSequence::default();
+        let vertical = pointer_axes([wl_pointer::Axis::VerticalScroll]);
+        let horizontal = pointer_axes([wl_pointer::Axis::HorizontalScroll]);
+        let both = pointer_axes([
+            wl_pointer::Axis::VerticalScroll,
+            wl_pointer::Axis::HorizontalScroll,
+        ]);
+
+        let started = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                source: Some(AxisSource::Finger),
+                continuous_delta: Some(point(px(5.), px(8.))),
+                moved_axes: both,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert_eq!(pixel_delta(&started).1, TouchPhase::Started);
+
+        let one_axis_stopped = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                stopped_axes: horizontal,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert!(!one_axis_stopped.ended);
+        assert_eq!(sequence.active_finger_axes, vertical);
+
+        let ended = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                stopped_axes: vertical,
+                ..Default::default()
+            },
+            &mut sequence,
+        );
+        assert!(ended.ended);
+        assert!(sequence.active_finger_axes.is_empty());
+    }
+
+    #[test]
+    fn wheel_frames_keep_line_deltas_and_never_open_a_finger_sequence() {
+        let mut sequence = PointerAxisSequence::default();
+        let vertical = pointer_axes([wl_pointer::Axis::VerticalScroll]);
+        let dispatch = finish_pointer_axis_frame(
+            PointerAxisFrame {
+                // `axis` and `axis_value120` share a protocol frame. Source
+                // ordering is irrelevant because selection happens at Frame.
+                source: Some(AxisSource::Wheel),
+                continuous_delta: Some(point(px(0.), px(30.))),
+                discrete_delta: Some(point(0., 3.)),
+                moved_axes: vertical,
+                stopped_axes: vertical,
+            },
+            &mut sequence,
+        );
+
+        let Some((ScrollDelta::Lines(delta), phase)) = dispatch.movement else {
+            panic!("expected a line-wheel movement, got {dispatch:?}");
+        };
+        assert_eq!(delta, point(0., 3.));
+        assert_eq!(phase, TouchPhase::Moved);
+        assert!(!dispatch.ended);
+        assert!(sequence.active_finger_axes.is_empty());
+    }
 
     #[derive(Default)]
     struct FakeImeCursorRectangleSink {

@@ -540,6 +540,21 @@ impl Deref for ScrollWheelEvent {
     }
 }
 
+impl ScrollWheelEvent {
+    /// Whether this event only communicates the end of a precise scrolling
+    /// gesture and carries no content movement.
+    ///
+    /// Some platforms deliver the terminal phase separately from the final
+    /// non-zero delta. Scroll consumers with geometry captured from the last
+    /// painted frame must use this to unwind gesture state without applying a
+    /// second scroll calculation against that stale geometry.
+    pub fn is_lifecycle_only(&self) -> bool {
+        matches!(self.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled)
+            && self.delta.precise()
+            && self.delta.is_zero()
+    }
+}
+
 /// The scroll delta for a scroll wheel event.
 #[derive(Clone, Copy, Debug)]
 pub enum ScrollDelta {
@@ -593,6 +608,14 @@ impl Deref for PinchEvent {
 }
 
 impl ScrollDelta {
+    /// Returns true when this delta carries no movement on either axis.
+    pub fn is_zero(&self) -> bool {
+        match self {
+            ScrollDelta::Pixels(delta) => delta.x.0 == 0. && delta.y.0 == 0.,
+            ScrollDelta::Lines(delta) => delta.x == 0. && delta.y == 0.,
+        }
+    }
+
     /// Returns true if this is a precise scroll delta in pixels.
     pub fn precise(&self) -> bool {
         match self {
@@ -835,7 +858,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext as _, Context, FocusHandle, InteractiveElement, IntoElement,
-        KeyBinding, Keystroke, Modifiers, ParentElement, Render, TestAppContext, Window, div,
+        KeyBinding, Keystroke, Modifiers, ParentElement, Render, ScrollDelta, ScrollWheelEvent,
+        TestAppContext, TouchPhase, Window, div, point, px,
     };
 
     struct TestView {
@@ -845,6 +869,45 @@ mod test {
     }
 
     actions!(test_only, [TestAction]);
+
+    #[test]
+    fn only_zero_precise_terminal_scroll_events_are_lifecycle_only() {
+        let event = |delta, touch_phase| ScrollWheelEvent {
+            delta,
+            touch_phase,
+            ..Default::default()
+        };
+
+        assert!(
+            event(
+                ScrollDelta::Pixels(point(px(0.), px(0.))),
+                TouchPhase::Ended,
+            )
+            .is_lifecycle_only()
+        );
+        assert!(
+            event(
+                ScrollDelta::Pixels(point(px(0.), px(0.))),
+                TouchPhase::Cancelled,
+            )
+            .is_lifecycle_only()
+        );
+        assert!(
+            !event(
+                ScrollDelta::Pixels(point(px(0.), px(0.))),
+                TouchPhase::Moved
+            )
+            .is_lifecycle_only()
+        );
+        assert!(
+            !event(
+                ScrollDelta::Pixels(point(px(0.), px(1.))),
+                TouchPhase::Ended
+            )
+            .is_lifecycle_only()
+        );
+        assert!(!event(ScrollDelta::Lines(point(0., 0.)), TouchPhase::Ended).is_lifecycle_only());
+    }
 
     impl Render for TestView {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

@@ -1600,6 +1600,9 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
+                if event.is_lifecycle_only() {
+                    return;
+                }
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
                 list_state.0.borrow_mut().scroll(
@@ -1719,7 +1722,7 @@ impl sum_tree::SeekTarget<'_, ListItemSummary, ListItemSummary> for Height {
 #[cfg(test)]
 mod test {
 
-    use gpui::{ScrollDelta, ScrollWheelEvent};
+    use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1823,6 +1826,51 @@ mod test {
         // Scroll position should stay at the top of the list
         assert_eq!(state.logical_scroll_top().item_ix, 0);
         assert_eq!(state.logical_scroll_top().offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn terminal_touchpad_phase_does_not_revert_unpainted_scroll_input(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(20.)), |_, cx| {
+            cx.new(|_| TestView(state.clone())).into_any_element()
+        });
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(1.), px(1.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-15.))),
+            touch_phase: TouchPhase::Started,
+            ..Default::default()
+        });
+        let after_movement = state.logical_scroll_top();
+        assert_eq!(after_movement.item_ix, 0);
+        assert_eq!(after_movement.offset_in_item, px(15.));
+
+        // Wayland may deliver axis_stop before the next surface paint. This
+        // phase-only event must not recalculate from the last painted anchor.
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(1.), px(1.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+            touch_phase: TouchPhase::Ended,
+            ..Default::default()
+        });
+        let after_terminal_phase = state.logical_scroll_top();
+        assert_eq!(after_terminal_phase.item_ix, after_movement.item_ix);
+        assert_eq!(
+            after_terminal_phase.offset_in_item,
+            after_movement.offset_in_item
+        );
     }
 
     #[gpui::test]
