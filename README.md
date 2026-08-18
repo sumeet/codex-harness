@@ -61,12 +61,13 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 
 ```sh
 ./script/run-standalone.sh --replay 12
+./script/run-standalone.sh --replay 120 --text
 ./script/run-standalone.sh --replay 10000
 ```
 
 ## Controls worth knowing
 
-- `Ctrl-W H/J/K/L` moves between the task rail, composer, and transcript where
+- `Ctrl-W H/J/K/L` moves between the thread rail, composer, and transcript where
   the current focus makes that direction meaningful; `Ctrl-B` toggles the rail.
 - `Ctrl-N` starts a fresh task. `Ctrl-Enter` sends from the composer.
 - Rich uses `j`/`k`, `gg`/`G`, `/`, disclosures, and blockwise selection/yank.
@@ -74,7 +75,8 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 - Text is Zed's modal Editor. Its normal/visual motions, registers, yank,
   `/ ? n N`, `* # g* g#`, jumplist, and `:` palette operate on real Buffer
   text. `:rich`, `:text`, `:compose`, `:tasks`, `:new`, and `:stop` are Harness
-  aliases. The status-bar `RICH`/`TEXT` control switches modes with the mouse.
+  aliases. `--text` starts directly in Text for repeatable QA; the code icon in
+  the thread-rail toolbar switches modes with the mouse.
 - `Enter` on an interactive request in Text focuses its shared form/approval
   surface; `Escape` returns to the transcript.
 
@@ -106,9 +108,9 @@ Rich and Text are intentional product modes, not old/new implementations.
 Current work is validating mode-to-mode semantic position and tail-follow
 transfer, consolidating every interactive surface across both projections,
 and polishing long diffs, tools, reasoning, images, and the always-visible
-composer in real windows. Full Ex command semantics, settings controls, a fresh
-Text-mode visual pass, and live-turn/request/reconnect endurance testing remain
-active work.
+composer in real windows. Full Ex command semantics, settings controls,
+live-turn/request endurance testing, and longer exploratory use across real
+histories remain active work.
 
 The stripped standalone graph no longer pulls Zed Workspace, Search, Picker,
 or command-palette UI through Vim. The fork still contains upstream Zed source

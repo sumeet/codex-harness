@@ -7,8 +7,9 @@ agent client.
 
 ## Visual language
 
-- Use Zed theme tokens, iconography, spacing rhythm, compact controls, and
-  status-bar language. Do not invent a second generic desktop-app aesthetic.
+- Use Zed theme tokens, iconography, spacing rhythm, and compact control
+  language. Do not invent a second generic desktop-app aesthetic or permanent
+  chrome that merely explains healthy state.
 - The transcript uses the available width. It must not become a narrow centered
   reading column.
 - Rich prose uses proportional UI typography; monospace is reserved for code,
@@ -26,8 +27,8 @@ agent client.
 ## Interaction
 
 - The composer is always directly below the transcript and remains a real Zed
-  modal Editor. Focus changes by mouse and keyboard update the visible mode and
-  hints correctly.
+  modal Editor. Its mode and exceptional state belong inside the composer;
+  permanent navigation guides and duplicated transport/view labels do not.
 - There is one vertical history scrollbar. A diff, terminal, image, form, or
   tool card may scroll horizontally when its content requires it, but never
   creates a nested vertical reading surface.
@@ -119,7 +120,26 @@ interaction review without obvious rough edges.
   status to `OFFLINE`, and rendered one semantic disconnect item without raw
   JSON. No orphaned app-server process or hanging event receiver remained.
 
-Still open: a separate fresh Text-mode visual pass; pinned and paused streaming
-against a real turn; a live approval/form response including failure recovery;
-manual refresh reconnection after a forced disconnect; and longer exploratory
-use across real histories.
+### 2026-08-17 — quiet chrome and bounded automatic reconnect
+
+- Focused Editor tests passed 32/32 and app tests passed 23/23. Rich and Text
+  were separately launched and inspected full-height at 1920×1080/1.5× scale.
+- The transcript title row and separate global status row were removed, giving
+  62 logical pixels back to history. The unlabeled thread rail owns its compact
+  collapse/view/refresh/new controls, while a collapsed rail leaves one reveal
+  affordance. The composer now owns the real Vim mode, exceptional connection
+  state, and send/stop control without a duplicated send guide.
+- Ordinary `Codex` attribution was removed from Rich messages and from Text's
+  native header label. Text retains a small semantic boundary and keeps labels
+  for genuinely distinct agents and subagents.
+- After forcibly terminating a real Helium probe's direct app-server child,
+  Harness spawned a different child through capped 1/2/4-second backoff,
+  reinitialized, and reopened exact thread
+  `01a00e18-ffe7-7982-be69-640ad4b2668e` without a panic. Manual refresh remains
+  available after the retry cap rather than being required for ordinary
+  recovery.
+
+Still open: pinned and paused streaming against a real turn; a live
+approval/form response including failure recovery; Rich/Text selection and
+tail-position transfer under longer real histories; and longer exploratory
+multi-window use.

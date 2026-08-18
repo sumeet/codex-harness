@@ -631,6 +631,10 @@ fn native_header_text(text: &str) -> &str {
         .unwrap_or(text)
 }
 
+fn native_header_shows_label(kind: TranscriptKind, label: &str) -> bool {
+    kind != TranscriptKind::Agent || label != "Codex"
+}
+
 /// Whether an edit can retain the native header blocks' existing anchors.
 ///
 /// Edits wholly contained by one semantic body are the common streaming case:
@@ -759,6 +763,7 @@ fn native_header_block(
     kind: TranscriptKind,
     label: SharedString,
 ) -> BlockProperties<Anchor> {
+    let show_label = native_header_shows_label(kind, &label);
     BlockProperties {
         placement: BlockPlacement::Replace(placement),
         height: Some(1),
@@ -800,16 +805,18 @@ fn native_header_block(
                         .size(IconSize::XSmall)
                         .color(icon_color),
                 )
-                .child(
-                    Label::new(label.clone())
-                        .size(LabelSize::XSmall)
-                        .color(if cx.selected {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        })
-                        .truncate(),
-                )
+                .when(show_label, |this| {
+                    this.child(
+                        Label::new(label.clone())
+                            .size(LabelSize::XSmall)
+                            .color(if cx.selected {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
+                            .truncate(),
+                    )
+                })
                 .into_any_element()
         }),
         priority: 0,
@@ -2102,6 +2109,19 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_agent_header_keeps_a_boundary_without_a_redundant_label() {
+        assert!(!native_header_shows_label(TranscriptKind::Agent, "Codex"));
+        assert!(native_header_shows_label(
+            TranscriptKind::Agent,
+            "Delegated reviewer"
+        ));
+        assert!(native_header_shows_label(
+            TranscriptKind::Subagent,
+            "protocol audit"
+        ));
+    }
 
     #[test]
     fn projection_rejects_offsets_inside_multibyte_status_separator() {
