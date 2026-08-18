@@ -8344,6 +8344,8 @@ dependencies = [
  "settings",
  "theme",
  "theme_settings",
+ "tree-sitter",
+ "tree-sitter-bash",
  "ui",
  "zed_actions",
 ]

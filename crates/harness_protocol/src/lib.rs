@@ -152,6 +152,13 @@ pub struct TranscriptItem {
     pub pending_request: Option<PendingRequest>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandTranscript {
+    pub command: String,
+    pub cwd: Option<String>,
+    pub output: String,
+}
+
 #[derive(Deserialize, Serialize)]
 struct PersistedTranscript {
     version: u32,
@@ -174,6 +181,65 @@ impl TranscriptItem {
             || !self.content.trim().is_empty()
             || self.pending_request.is_some()
             || self.display_status().is_some()
+    }
+
+    /// Extract the stable invocation and the changing output from a command
+    /// item. Typed app-server fields win; the text fallback keeps older raw
+    /// tool-call snapshots presentable without changing their selectable
+    /// transcript representation.
+    pub fn command_transcript(&self) -> Option<CommandTranscript> {
+        if self.kind != TranscriptKind::Command {
+            return None;
+        }
+
+        let raw_command = string_at(&self.raw, "/command");
+        let raw_cwd = string_at(&self.raw, "/cwd");
+        let mut remainder = self.content.as_str();
+        let command = if let Some(command) = raw_command {
+            if let Some(rest) = remainder.strip_prefix("$ ")
+                && let Some(rest) = rest.strip_prefix(command)
+            {
+                remainder = rest;
+            }
+            command.to_string()
+        } else {
+            let rest = remainder.strip_prefix("$ ")?;
+            let separator = ["\n\nWorking directory\n", "\n\nResult\n", "\n\n"]
+                .into_iter()
+                .filter_map(|marker| rest.find(marker))
+                .min()
+                .unwrap_or(rest.len());
+            let command = rest[..separator].to_string();
+            remainder = &rest[separator..];
+            command
+        };
+
+        remainder = remainder.trim_start_matches('\n');
+        let mut cwd = raw_cwd.map(ToOwned::to_owned);
+        if let Some(rest) = remainder.strip_prefix("Working directory\n") {
+            if let Some((working_directory, output)) = rest.split_once("\n\nResult\n") {
+                cwd.get_or_insert_with(|| working_directory.trim().to_string());
+                remainder = output;
+            } else {
+                cwd.get_or_insert_with(|| rest.trim().to_string());
+                remainder = "";
+            }
+        } else if let Some(rest) = remainder.strip_prefix("Result\n") {
+            remainder = rest;
+        }
+
+        let output = if remainder.is_empty() {
+            string_at(&self.raw, "/aggregatedOutput")
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            remainder.to_string()
+        };
+        Some(CommandTranscript {
+            command,
+            cwd,
+            output,
+        })
     }
 }
 
@@ -656,9 +722,12 @@ impl TranscriptModel {
             item.key = format!("replay:{index}");
             item.protocol_id = Some(format!("fixture-{index}"));
             if item.kind == TranscriptKind::Command {
-                item.content = format!(
-                    "$ cargo check -p harness_app\nFinished replay frame {index} without blocking paint"
-                );
+                let command = "cargo check -p harness_app";
+                item.content =
+                    format!("$ {command}\n\nFinished replay frame {index} without blocking paint");
+                if let Some(raw) = item.raw.as_object_mut() {
+                    raw.insert("command".into(), command.into());
+                }
             }
             this.push_without_splice(item);
         }
@@ -1363,8 +1432,19 @@ impl TranscriptModel {
             })
         };
         let delta = string_at(params, "/delta").unwrap_or_default();
+        let needs_command_separator = kind == TranscriptKind::Command
+            && !delta.is_empty()
+            && self.items[index]
+                .command_transcript()
+                .is_some_and(|command| command.output.is_empty())
+            && !self.items[index].content.is_empty();
+        if needs_command_separator {
+            self.items[index].content.push_str("\n\n");
+        }
         self.items[index].content.push_str(delta);
-        self.items[index].raw = bounded_raw_payload(params.clone());
+        if self.items[index].raw.get("type").is_none() {
+            self.items[index].raw = bounded_raw_payload(params.clone());
+        }
         self.items[index].event_count += 1;
         index
     }
@@ -2385,9 +2465,9 @@ fn replay_templates() -> Vec<TranscriptItem> {
         replay_item(
             5,
             TranscriptKind::Command,
-            "cargo test -p harness_app",
+            "Command",
             "$ cargo test -p harness_app\n\nrunning 12 tests\ntest replay::ten_thousand_blocks ... ok\ntest navigation::visual_yank ... ok\ntest protocol::unknown_events_are_visible ... ok\n\ntest result: ok. 12 passed; 0 failed",
-            json!({"id":"fixture-command","type":"commandExecution","command":"cargo test -p harness_app","status":"completed","exitCode":0}),
+            json!({"id":"fixture-command","type":"commandExecution","command":"cargo test -p harness_app","cwd":"/home/smt/harness/app","status":"completed","exitCode":0}),
         ),
         replay_item(
             6,
@@ -2681,9 +2761,7 @@ fn command_title(raw: &Value) -> String {
             return title;
         }
     }
-    string_at(raw, "/command")
-        .map(|command| format!("Command · {}", one_line(command, 96)))
-        .unwrap_or_else(|| "Command".into())
+    "Command".into()
 }
 
 fn mcp_tool_title(raw: &Value) -> String {
@@ -2842,7 +2920,7 @@ fn present_nested_tool(tool: &str, arguments: &Value) -> RawToolPresentation {
             }
             RawToolPresentation {
                 kind: TranscriptKind::Command,
-                title: format!("Command · {}", one_line(command, 96)),
+                title: "Command".into(),
                 content,
             }
         }
@@ -3086,6 +3164,7 @@ fn render_content_blocks(content: Option<&Value>) -> String {
             },
             _ => pretty_json(block),
         })
+        .map(|section| section.trim_end_matches('\n').to_string())
         .filter(|section| !section.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -3900,12 +3979,65 @@ mod tests {
 
         assert_eq!(model.items.len(), 1);
         assert_eq!(model.items[0].kind, TranscriptKind::Command);
-        assert_eq!(model.items[0].title, "Command · cargo test");
+        assert_eq!(model.items[0].title, "Command");
         assert_eq!(model.items[0].status.as_deref(), Some("completed"));
         assert!(model.items[0].content.contains("$ cargo test"));
         assert!(model.items[0].content.contains("2 tests passed"));
         assert!(!model.items[0].content.contains("const r ="));
+        assert_eq!(
+            model.items[0].command_transcript(),
+            Some(CommandTranscript {
+                command: "cargo test".into(),
+                cwd: Some("/workspace".into()),
+                output: "Script completed\n\n2 tests passed".into(),
+            })
+        );
         assert_eq!(model.raw_events.len(), 2);
+    }
+
+    #[test]
+    fn command_stream_keeps_invocation_structured_and_output_separate() {
+        let mut model = TranscriptModel::default();
+        model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "printf '%s' \"hello\"",
+                            "cwd": "/workspace",
+                            "status": "inProgress"
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/commandExecution/outputDelta".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "itemId": "command-1",
+                        "delta": "hello"
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items[0].content, "$ printf '%s' \"hello\"\n\nhello");
+        assert_eq!(
+            model.items[0].raw.get("command").and_then(Value::as_str),
+            Some("printf '%s' \"hello\"")
+        );
+        assert_eq!(
+            model.items[0].command_transcript(),
+            Some(CommandTranscript {
+                command: "printf '%s' \"hello\"".into(),
+                cwd: Some("/workspace".into()),
+                output: "hello".into(),
+            })
+        );
     }
 
     #[test]

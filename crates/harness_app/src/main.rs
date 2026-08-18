@@ -1,7 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::Range,
     path::Path,
     rc::Rc,
+    sync::LazyLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,9 +11,9 @@ use assets::Assets;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render, SharedString, Task,
-    UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div, list, prelude::*,
-    px, relative, size,
+    IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render, SharedString,
+    StyledText, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div,
+    list, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -23,6 +25,7 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
 use serde_json::{Value, json};
 use settings::SettingsStore;
+use tree_sitter::{Query, StreamingIterator as _};
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
@@ -94,6 +97,76 @@ const COMPACT_SIDEBAR_THRESHOLD: f32 = 1100.;
 const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
+
+fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
+    static QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
+        Query::new(
+            &tree_sitter_bash::LANGUAGE.into(),
+            include_str!("../../grammars/src/bash/highlights.scm"),
+        )
+        .ok()
+    });
+    let Some(query) = QUERY.as_ref() else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(command, None) else {
+        return Vec::new();
+    };
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), command.as_bytes());
+    let mut captures = Vec::new();
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            let range = capture.node.byte_range();
+            if !range.is_empty()
+                && range.end <= command.len()
+                && let Some(name) = capture_names.get(capture.index as usize)
+            {
+                captures.push((range, (*name).to_string()));
+            }
+        }
+    }
+    captures
+}
+
+fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    let mut byte_styles = vec![None; command.len()];
+    for (range, capture_name) in shell_capture_ranges(command) {
+        let Some(style) = cx.theme().syntax().style_for_name(&capture_name) else {
+            continue;
+        };
+        for byte_style in &mut byte_styles[range] {
+            *byte_style = Some(style);
+        }
+    }
+
+    let mut highlights = Vec::new();
+    let mut active_style = None;
+    let mut active_start = 0;
+    for offset in command
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(command.len()))
+    {
+        let style = byte_styles.get(offset).copied().flatten();
+        if style != active_style {
+            if let Some(style) = active_style {
+                highlights.push((active_start..offset, style));
+            }
+            active_style = style;
+            active_start = offset;
+        }
+    }
+    highlights
+}
 
 fn reconnect_delay(attempt: u8) -> Option<Duration> {
     (attempt < MAX_RECONNECT_ATTEMPTS).then(|| Duration::from_secs(1 << attempt))
@@ -2633,6 +2706,91 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_command(item: &TranscriptItem, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(command) = item.command_transcript() else {
+            return Self::render_terminal(item.content.clone(), index, cx);
+        };
+        let colors = cx.theme().colors().clone();
+        let highlighted_command = StyledText::new(command.command.clone())
+            .with_highlights(shell_highlights(&command.command, cx));
+
+        div()
+            .id(("command-output", index))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border_variant)
+            .bg(colors.editor_background)
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .bg(colors.element_background.opacity(0.72))
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .line_height(relative(1.45))
+                            .whitespace_normal()
+                            .child(div().flex_none().text_color(colors.text_accent).child("$"))
+                            .child(div().min_w_0().flex_1().child(highlighted_command)),
+                    )
+                    .when_some(command.cwd.filter(|cwd| !cwd.is_empty()), |this, cwd| {
+                        this.child(
+                            div()
+                                .pl_5()
+                                .font_buffer(cx)
+                                .text_ui_xs(cx)
+                                .text_color(colors.text_muted)
+                                .child(cwd),
+                        )
+                    }),
+            )
+            .when(!command.output.is_empty(), |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .px_3()
+                        .py_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            Label::new("Output")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .font_buffer(cx)
+                                .text_ui_sm(cx)
+                                .line_height(relative(1.45))
+                                .text_color(colors.text)
+                                .whitespace_normal()
+                                .child(command.output),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_plain_prose(content: &str, cx: &mut Context<Self>) -> AnyElement {
         div()
             .w_full()
@@ -3364,9 +3522,7 @@ impl HarnessApp {
                 | model::TranscriptKind::Agent
                 | model::TranscriptKind::Plan => Self::render_plain_prose(&item.content, cx),
                 model::TranscriptKind::Reasoning => Self::render_reasoning(&item.content, cx),
-                model::TranscriptKind::Command => {
-                    Self::render_terminal(item.content.clone(), index, cx)
-                }
+                model::TranscriptKind::Command => Self::render_command(&item, index, cx),
                 model::TranscriptKind::Diff | model::TranscriptKind::FileChange => {
                     Self::render_diff(&item.content, index, cx)
                 }
@@ -5442,6 +5598,22 @@ mod tests {
             "narrow, wrapped prompts should receive more editing room"
         );
         assert_eq!(composer_height(&"line\n".repeat(100), 320.), 218.);
+    }
+
+    #[test]
+    fn shell_command_highlighting_identifies_commands_strings_and_operators() {
+        let command = "printf '%s' \"$USER\" && cargo test --offline";
+        let captures = shell_capture_ranges(command);
+        let captured = |name: &str, text: &str| {
+            captures
+                .iter()
+                .any(|(range, capture)| capture == name && command.get(range.clone()) == Some(text))
+        };
+
+        assert!(captured("function", "printf"));
+        assert!(captured("string", "'%s'"));
+        assert!(captured("operator", "&&"));
+        assert!(captured("function", "cargo"));
     }
 
     #[test]
