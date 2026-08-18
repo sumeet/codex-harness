@@ -163,6 +163,10 @@ fn composer_height(text: &str, available_width: f32) -> f32 {
     78. + 20. * visual_rows.saturating_sub(1) as f32
 }
 
+fn composer_send_blocked(composer_empty: bool, loading_thread: bool, read_only: bool) -> bool {
+    composer_empty || loading_thread || read_only
+}
+
 fn mark_unbacked_requests_inactive(
     model: &mut TranscriptModel,
     live_request_keys: &HashSet<String>,
@@ -188,6 +192,7 @@ struct HarnessApp {
     selected_title: SharedString,
     connecting: bool,
     loading_thread: bool,
+    thread_read_only_reason: Option<SharedString>,
     error: Option<SharedString>,
     model: TranscriptModel,
     composer: Entity<LocalEditor>,
@@ -304,6 +309,7 @@ impl HarnessApp {
             },
             connecting: false,
             loading_thread: false,
+            thread_read_only_reason: None,
             error: None,
             selected_item: model.items.len().saturating_sub(1),
             model,
@@ -972,6 +978,7 @@ impl HarnessApp {
         self.selected_thread_id = Some(thread_id.clone());
         self.selected_title = title.into();
         self.loading_thread = true;
+        self.thread_read_only_reason = None;
         self.error = None;
         let old_len = self.model.items.len();
         self.model.clear();
@@ -993,12 +1000,16 @@ impl HarnessApp {
             let result = match read {
                 Ok(read_thread) => match client.resume_thread(&thread_id).await {
                     Ok(resumed) => Ok((resumed, None)),
-                    Err(error) => Ok((
-                        read_thread,
-                        Some(format!(
-                            "Read-only while another Codex window owns this task: {error}"
-                        )),
-                    )),
+                    Err(error) => {
+                        log::warn!("could not resume task {thread_id}; opening read-only: {error}");
+                        Ok((
+                            read_thread,
+                            Some(
+                                "Another Codex client owns this task. History is available read-only."
+                                    .to_string(),
+                            ),
+                        ))
+                    }
                 },
                 Err(error) => Err(error),
             };
@@ -1008,9 +1019,14 @@ impl HarnessApp {
                     match result {
                         Ok((thread, warning)) => {
                             this.load_thread(thread, cx);
-                            this.error = warning.map(Into::into);
+                            this.thread_read_only_reason = warning.map(Into::into);
+                            this.error = None;
                         }
                         Err(error) => {
+                            this.thread_read_only_reason = Some(
+                                "This task could not be loaded. Choose another task or start a new one."
+                                    .into(),
+                            );
                             this.error = Some(format!("Could not open task: {error}").into());
                         }
                     }
@@ -1074,6 +1090,7 @@ impl HarnessApp {
         self.selected_thread_id = None;
         self.selected_title = "New task".into();
         self.selected_item = 0;
+        self.thread_read_only_reason = None;
         self.error = None;
         self.list_state.set_follow_mode(FollowMode::Tail);
         drop(self.sync_transcript_document(cx));
@@ -1087,7 +1104,11 @@ impl HarnessApp {
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text(cx);
         let text = text.trim().to_string();
-        if text.is_empty() {
+        if composer_send_blocked(
+            text.is_empty(),
+            self.loading_thread,
+            self.thread_read_only_reason.is_some(),
+        ) {
             return;
         }
         let (index, key) = self.model.push_local_user(text.clone());
@@ -3316,7 +3337,6 @@ impl HarnessApp {
             .w_full()
             .px_6()
             .py(if compact_trace { px(3.) } else { px(12.) })
-            .cursor_pointer()
             .border_l_2()
             .border_color(if cursor {
                 colors.text_accent
@@ -3360,6 +3380,11 @@ impl Render for HarnessApp {
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
         let composer_empty = composer_text.trim().is_empty();
+        let send_blocked = composer_send_blocked(
+            composer_empty,
+            self.loading_thread,
+            self.thread_read_only_reason.is_some(),
+        );
         let available_composer_width = f32::from(window.viewport_size().width)
             - if sidebar_visible { SIDEBAR_WIDTH } else { 0. };
         let composer_height = composer_height(&composer_text, available_composer_width);
@@ -3843,6 +3868,30 @@ impl Render for HarnessApp {
                                 .child(error),
                         )
                     })
+                    .when_some(self.thread_read_only_reason.clone(), |this, reason| {
+                        this.child(
+                            div()
+                                .flex_none()
+                                .px_4()
+                                .py_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .border_b_1()
+                                .border_color(cx.theme().status().warning_border)
+                                .bg(cx.theme().status().warning_background.opacity(0.18))
+                                .child(
+                                    Icon::new(IconName::Lock)
+                                        .size(IconSize::Small)
+                                        .color(Color::Warning),
+                                )
+                                .child(
+                                    Label::new(reason)
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Warning),
+                                ),
+                        )
+                    })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
@@ -3892,9 +3941,21 @@ impl Render for HarnessApp {
                                     .items_center()
                                     .gap_2()
                                     .child(
-                                        Label::new("Ctrl-Enter send")
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Muted),
+                                        Label::new(if self.loading_thread {
+                                            "Loading task history…"
+                                        } else if self.thread_read_only_reason.is_some() {
+                                            "Read-only task · Ctrl-N starts a new task"
+                                        } else {
+                                            "Ctrl-Enter send"
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(
+                                            if self.thread_read_only_reason.is_some() {
+                                                Color::Warning
+                                            } else {
+                                                Color::Muted
+                                            },
+                                        ),
                                     )
                                     .child(div().flex_1())
                                     .when(turn_active, |this| {
@@ -3916,13 +3977,17 @@ impl Render for HarnessApp {
                                                 .shape(IconButtonShape::Square)
                                                 .size(ButtonSize::Default)
                                                 .style(ButtonStyle::Filled)
-                                                .disabled(composer_empty)
-                                                .icon_color(if composer_empty {
+                                                .disabled(send_blocked)
+                                                .icon_color(if send_blocked {
                                                     Color::Muted
                                                 } else {
                                                     Color::Accent
                                                 })
-                                                .aria_label(if composer_empty {
+                                                .aria_label(if self.loading_thread {
+                                                    "Wait for task history to finish loading"
+                                                } else if self.thread_read_only_reason.is_some() {
+                                                    "This task is open read-only"
+                                                } else if composer_empty {
                                                     "Type a prompt to send"
                                                 } else {
                                                     "Send prompt"
@@ -5350,6 +5415,14 @@ mod tests {
             "narrow, wrapped prompts should receive more editing room"
         );
         assert_eq!(composer_height(&"line\n".repeat(100), 320.), 218.);
+    }
+
+    #[test]
+    fn composer_send_is_blocked_while_loading_or_read_only() {
+        assert!(composer_send_blocked(true, false, false));
+        assert!(composer_send_blocked(false, true, false));
+        assert!(composer_send_blocked(false, false, true));
+        assert!(!composer_send_blocked(false, false, false));
     }
 
     #[test]
