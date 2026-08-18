@@ -269,6 +269,34 @@ struct ActivityTextSection {
     body: String,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct ActivitySectionPresentation {
+    heading: Option<String>,
+    body: String,
+    is_json: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ActivityOutputPresentation {
+    sections: Vec<ActivitySectionPresentation>,
+    toggle: Option<ProgressiveOutputToggle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonTokenKind {
+    Key,
+    String,
+    Number,
+    Literal,
+    Punctuation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct JsonToken {
+    range: Range<usize>,
+    kind: JsonTokenKind,
+}
+
 fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
     const HEADINGS: &[&str] = &[
         "Arguments",
@@ -303,6 +331,171 @@ fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
         }
     }
     sections
+}
+
+fn activity_sections_fit_output_expansion(
+    sections: &[ActivityTextSection],
+    expansion: OutputExpansion,
+) -> bool {
+    sections.iter().all(|section| {
+        content_fits_output_expansion(
+            &section.body,
+            expansion,
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+            STRUCTURED_OUTPUT_PREVIEW_BYTES,
+        )
+    })
+}
+
+fn activity_output_toggle(
+    sections: &[ActivityTextSection],
+    current: OutputExpansion,
+) -> Option<ProgressiveOutputToggle> {
+    if activity_sections_fit_output_expansion(sections, OutputExpansion::Preview) {
+        return None;
+    }
+
+    let next = next_useful_output_expansion(current, |candidate| {
+        activity_sections_fit_output_expansion(sections, candidate)
+    });
+    let label = match next {
+        OutputExpansion::Preview => "Collapse to preview".into(),
+        OutputExpansion::Medium | OutputExpansion::Large => {
+            let limits = output_limits(
+                next,
+                STRUCTURED_OUTPUT_PREVIEW_LINES,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+            );
+            if sections
+                .iter()
+                .any(|section| section.body.lines().count() > limits.lines)
+            {
+                format!("Show up to {} lines per section", limits.lines)
+            } else {
+                format!("Show up to {} KiB per section", limits.bytes / 1_024)
+            }
+        }
+        OutputExpansion::All => "Show all activity".into(),
+    };
+    Some(ProgressiveOutputToggle { label, next })
+}
+
+fn activity_output_presentation(
+    content: &str,
+    expansion: OutputExpansion,
+) -> Option<ActivityOutputPresentation> {
+    let sections = activity_text_sections(content);
+    if !sections.iter().any(|section| section.heading.is_some()) {
+        return None;
+    }
+
+    let limits = output_limits(
+        expansion,
+        STRUCTURED_OUTPUT_PREVIEW_LINES,
+        STRUCTURED_OUTPUT_PREVIEW_BYTES,
+    );
+    let toggle = activity_output_toggle(&sections, expansion);
+    let sections = sections
+        .into_iter()
+        .map(|section| {
+            let is_json = is_valid_json(&section.body);
+            let body = structured_output_preview_with_limits(
+                &section.body,
+                "section",
+                limits.lines,
+                limits.bytes,
+            )
+            .content;
+            ActivitySectionPresentation {
+                heading: section.heading,
+                body,
+                is_json,
+            }
+        })
+        .collect();
+
+    Some(ActivityOutputPresentation { sections, toggle })
+}
+
+fn is_valid_json(content: &str) -> bool {
+    serde_json::from_str::<Box<serde_json::value::RawValue>>(content).is_ok()
+}
+
+fn json_tokens(content: &str) -> Option<Vec<JsonToken>> {
+    is_valid_json(content).then_some(())?;
+    Some(json_tokens_unchecked(content))
+}
+
+fn json_tokens_unchecked(content: &str) -> Vec<JsonToken> {
+    let bytes = content.as_bytes();
+    let mut tokens = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'"' => {
+                let start = offset;
+                offset += 1;
+                while offset < bytes.len() {
+                    match bytes[offset] {
+                        b'\\' => offset = (offset + 2).min(bytes.len()),
+                        b'"' => {
+                            offset += 1;
+                            break;
+                        }
+                        _ => offset += 1,
+                    }
+                }
+                let mut next = offset;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                tokens.push(JsonToken {
+                    range: start..offset,
+                    kind: if bytes.get(next) == Some(&b':') {
+                        JsonTokenKind::Key
+                    } else {
+                        JsonTokenKind::String
+                    },
+                });
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = offset;
+                offset += 1;
+                while offset < bytes.len()
+                    && matches!(
+                        bytes[offset],
+                        b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'
+                    )
+                {
+                    offset += 1;
+                }
+                tokens.push(JsonToken {
+                    range: start..offset,
+                    kind: JsonTokenKind::Number,
+                });
+            }
+            b't' | b'f' | b'n' => {
+                let start = offset;
+                offset += 1;
+                while offset < bytes.len() && bytes[offset].is_ascii_alphabetic() {
+                    offset += 1;
+                }
+                tokens.push(JsonToken {
+                    range: start..offset,
+                    kind: JsonTokenKind::Literal,
+                });
+            }
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                tokens.push(JsonToken {
+                    range: offset..offset + 1,
+                    kind: JsonTokenKind::Punctuation,
+                });
+                offset += 1;
+            }
+            _ => offset += 1,
+        }
+    }
+    tokens
 }
 
 fn structured_output_preview(content: &str, noun: &str) -> StructuredOutputPreview {
@@ -802,6 +995,17 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
             !file_change_fits_output_expansion(item, OutputExpansion::Preview)
         }
         model::TranscriptKind::Image | model::TranscriptKind::Approval => false,
+        model::TranscriptKind::Tool
+        | model::TranscriptKind::Subagent
+        | model::TranscriptKind::Review => {
+            activity_output_presentation(&item.content, OutputExpansion::Preview)
+                .map(|presentation| presentation.toggle.is_some())
+                .unwrap_or_else(|| {
+                    structured_output_preview(&item.content, "output")
+                        .footer
+                        .is_some()
+                })
+        }
         kind if kind.is_structured() => structured_output_preview(&item.content, "output")
             .footer
             .is_some(),
@@ -870,6 +1074,21 @@ fn output_expansion_reveals_all(item: &TranscriptItem, expansion: OutputExpansio
         }
         model::TranscriptKind::FileChange => file_change_fits_output_expansion(item, expansion),
         model::TranscriptKind::Image | model::TranscriptKind::Approval => true,
+        model::TranscriptKind::Tool
+        | model::TranscriptKind::Subagent
+        | model::TranscriptKind::Review => {
+            let sections = activity_text_sections(&item.content);
+            if sections.iter().any(|section| section.heading.is_some()) {
+                activity_sections_fit_output_expansion(&sections, expansion)
+            } else {
+                content_fits_output_expansion(
+                    &item.content,
+                    expansion,
+                    STRUCTURED_OUTPUT_PREVIEW_LINES,
+                    STRUCTURED_OUTPUT_PREVIEW_BYTES,
+                )
+            }
+        }
         kind if kind.is_structured() => content_fits_output_expansion(
             &item.content,
             expansion,
@@ -897,6 +1116,25 @@ fn next_item_output_expansion(item: &TranscriptItem, current: OutputExpansion) -
         ),
         model::TranscriptKind::FileChange => next_file_change_expansion(item, current),
         model::TranscriptKind::Image | model::TranscriptKind::Approval => OutputExpansion::Preview,
+        model::TranscriptKind::Tool
+        | model::TranscriptKind::Subagent
+        | model::TranscriptKind::Review => {
+            let sections = activity_text_sections(&item.content);
+            if sections.iter().any(|section| section.heading.is_some()) {
+                activity_output_toggle(&sections, current)
+                    .map(|toggle| toggle.next)
+                    .unwrap_or(OutputExpansion::Preview)
+            } else {
+                next_useful_output_expansion(current, |candidate| {
+                    content_fits_output_expansion(
+                        &item.content,
+                        candidate,
+                        STRUCTURED_OUTPUT_PREVIEW_LINES,
+                        STRUCTURED_OUTPUT_PREVIEW_BYTES,
+                    )
+                })
+            }
+        }
         kind if kind.is_structured() => next_useful_output_expansion(current, |candidate| {
             content_fits_output_expansion(
                 &item.content,
@@ -1012,6 +1250,22 @@ fn rich_search_query_is_visible(
                 .join("\n"),
             query,
         ),
+        model::TranscriptKind::Tool
+        | model::TranscriptKind::Subagent
+        | model::TranscriptKind::Review => activity_output_presentation(&item.content, expansion)
+            .map(|presentation| {
+                presentation.sections.iter().any(|section| {
+                    section
+                        .heading
+                        .as_deref()
+                        .is_some_and(|heading| folded_contains(heading, query))
+                        || folded_contains(&section.body, query)
+                })
+            })
+            .unwrap_or_else(|| {
+                let visible = structured_output_presentation(&item.content, "output", expansion);
+                folded_contains(&visible.content, query)
+            }),
         kind if kind.is_structured() => {
             let visible = structured_output_presentation(&item.content, "output", expansion);
             folded_contains(&visible.content, query)
@@ -1192,6 +1446,36 @@ fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::Highlig
         }
     }
     highlights
+}
+
+fn json_highlights(content: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    let syntax = cx.theme().syntax();
+    let colors = cx.theme().colors();
+    json_tokens_unchecked(content)
+        .into_iter()
+        .map(|token| {
+            let style = match token.kind {
+                JsonTokenKind::Key => syntax
+                    .style_for_name("property")
+                    .or_else(|| syntax.style_for_name("variable"))
+                    .unwrap_or(gpui::HighlightStyle {
+                        color: Some(colors.text_accent),
+                        ..Default::default()
+                    }),
+                JsonTokenKind::String => syntax.style_for_name("string").unwrap_or_default(),
+                JsonTokenKind::Number => syntax.style_for_name("number").unwrap_or_default(),
+                JsonTokenKind::Literal => syntax
+                    .style_for_name("boolean")
+                    .or_else(|| syntax.style_for_name("constant"))
+                    .unwrap_or_default(),
+                JsonTokenKind::Punctuation => gpui::HighlightStyle {
+                    color: Some(colors.text_muted),
+                    ..Default::default()
+                },
+            };
+            (token.range, style)
+        })
+        .collect()
 }
 
 fn reconnect_delay(attempt: u8) -> Option<Duration> {
@@ -4412,11 +4696,9 @@ impl HarnessApp {
             .get(item_key)
             .copied()
             .unwrap_or_default();
-        let preview = structured_output_presentation(&content, "output lines", expansion);
-        let sections = activity_text_sections(&preview.content);
-        if !sections.iter().any(|section| section.heading.is_some()) {
+        let Some(presentation) = activity_output_presentation(&content, expansion) else {
             return self.render_terminal(content, item_key, index, cx);
-        }
+        };
 
         let colors = cx.theme().colors().clone();
         let error_color = cx.theme().status().error;
@@ -4426,49 +4708,60 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .children(
-                sections
-                    .into_iter()
-                    .enumerate()
-                    .map(|(section_index, section)| {
-                        let error = section.heading.as_deref() == Some("Error");
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .when(section_index > 0, |this| {
-                                this.mt_1()
-                                    .pt_2()
-                                    .border_t_1()
-                                    .border_color(colors.border_variant)
-                            })
-                            .when_some(section.heading, |this, heading| {
-                                this.child(
-                                    Label::new(heading).size(LabelSize::XSmall).color(if error {
-                                        Color::Error
-                                    } else {
-                                        Color::Muted
-                                    }),
-                                )
-                            })
-                            .when(!section.body.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .min_w_0()
-                                        .font_buffer(cx)
-                                        .text_ui_sm(cx)
-                                        .line_height(relative(1.45))
-                                        .text_color(if error { error_color } else { colors.text })
-                                        .whitespace_normal()
-                                        .child(section.body),
-                                )
-                            })
-                    }),
-            )
-            .when_some(preview.toggle, |this, toggle| {
+            .children(presentation.sections.into_iter().enumerate().map(
+                |(section_index, section)| {
+                    let error = section.heading.as_deref() == Some("Error");
+                    let primary = matches!(
+                        section.heading.as_deref(),
+                        Some("Result" | "Structured result" | "Error")
+                    );
+                    let body = section.is_json.then(|| {
+                        StyledText::new(section.body.clone())
+                            .with_highlights(json_highlights(&section.body, cx))
+                    });
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .when(section_index > 0, |this| {
+                            this.mt_1()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                        })
+                        .when_some(section.heading, |this, heading| {
+                            this.child(Label::new(heading).size(LabelSize::XSmall).color(
+                                if error {
+                                    Color::Error
+                                } else if primary {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                },
+                            ))
+                        })
+                        .when(!section.body.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .font_buffer(cx)
+                                    .text_ui_sm(cx)
+                                    .line_height(relative(1.45))
+                                    .text_color(if error { error_color } else { colors.text })
+                                    .whitespace_normal()
+                                    .child(
+                                        body.unwrap_or_else(|| {
+                                            StyledText::new(section.body.clone())
+                                        }),
+                                    ),
+                            )
+                        })
+                },
+            ))
+            .when_some(presentation.toggle, |this, toggle| {
                 this.child(
                     div()
                         .mt_1()
@@ -7565,6 +7858,124 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn huge_activity_arguments_do_not_hide_result_or_error_sections() {
+        let arguments = serde_json::to_string_pretty(&json!({
+            "paths": (0..2_000)
+                .map(|index| format!("src/module-{index}.rs"))
+                .collect::<Vec<_>>()
+        }))
+        .unwrap();
+        let content = format!(
+            "Arguments\n{arguments}\n\nResult\ncreated the index\n\nError\nsecondary operation failed"
+        );
+        let presentation =
+            activity_output_presentation(&content, OutputExpansion::Preview).unwrap();
+
+        assert_eq!(presentation.sections.len(), 3);
+        let arguments = &presentation.sections[0];
+        assert_eq!(arguments.heading.as_deref(), Some("Arguments"));
+        assert!(arguments.is_json);
+        assert!(arguments.body.lines().count() <= STRUCTURED_OUTPUT_PREVIEW_LINES);
+        assert!(arguments.body.len() <= STRUCTURED_OUTPUT_PREVIEW_BYTES);
+        assert_eq!(presentation.sections[1].heading.as_deref(), Some("Result"));
+        assert_eq!(presentation.sections[1].body, "created the index");
+        assert_eq!(presentation.sections[2].heading.as_deref(), Some("Error"));
+        assert_eq!(presentation.sections[2].body, "secondary operation failed");
+        assert_eq!(
+            presentation.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Show up to 100 lines per section".into(),
+                next: OutputExpansion::Medium,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_activity_json_falls_back_to_plain_section_text() {
+        let presentation = activity_output_presentation(
+            "Arguments\n{\"path\": \"README.md\"\n\nResult\nstill available",
+            OutputExpansion::Preview,
+        )
+        .unwrap();
+
+        assert!(!presentation.sections[0].is_json);
+        assert_eq!(presentation.sections[0].body, "{\"path\": \"README.md\"");
+        assert_eq!(presentation.sections[1].body, "still available");
+        assert!(json_tokens(&presentation.sections[0].body).is_none());
+    }
+
+    #[test]
+    fn activity_sections_expand_independently_through_bounded_stages() {
+        let arguments = serde_json::to_string_pretty(
+            &(0..10_000)
+                .map(|index| json!({ "id": index }))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let result = (0..10_000)
+            .map(|line| format!("result {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!("Arguments\n{arguments}\n\nResult\n{result}");
+
+        for (expansion, line_limit, byte_limit, next) in [
+            (
+                OutputExpansion::Preview,
+                STRUCTURED_OUTPUT_PREVIEW_LINES,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+                OutputExpansion::Medium,
+            ),
+            (
+                OutputExpansion::Medium,
+                PROGRESSIVE_OUTPUT_MEDIUM_LINES,
+                PROGRESSIVE_OUTPUT_MEDIUM_BYTES,
+                OutputExpansion::Large,
+            ),
+            (
+                OutputExpansion::Large,
+                PROGRESSIVE_OUTPUT_LARGE_LINES,
+                PROGRESSIVE_OUTPUT_LARGE_BYTES,
+                OutputExpansion::All,
+            ),
+        ] {
+            let presentation = activity_output_presentation(&content, expansion).unwrap();
+            assert!(presentation.sections.iter().all(|section| {
+                section.body.lines().count() <= line_limit && section.body.len() <= byte_limit
+            }));
+            assert_eq!(presentation.toggle.unwrap().next, next);
+        }
+
+        let all = activity_output_presentation(&content, OutputExpansion::All).unwrap();
+        assert_eq!(all.sections[0].body, arguments);
+        assert_eq!(all.sections[1].body, result);
+        assert_eq!(
+            all.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Collapse to preview".into(),
+                next: OutputExpansion::Preview,
+            })
+        );
+    }
+
+    #[test]
+    fn json_activity_tokens_distinguish_keys_and_value_kinds() {
+        let content = r#"{"path":"README.md","count":2,"ok":true,"none":null}"#;
+        let tokens = json_tokens(content).unwrap();
+        let token = |text: &str| {
+            tokens
+                .iter()
+                .find(|token| &content[token.range.clone()] == text)
+                .map(|token| token.kind)
+        };
+
+        assert_eq!(token("\"path\""), Some(JsonTokenKind::Key));
+        assert_eq!(token("\"README.md\""), Some(JsonTokenKind::String));
+        assert_eq!(token("2"), Some(JsonTokenKind::Number));
+        assert_eq!(token("true"), Some(JsonTokenKind::Literal));
+        assert_eq!(token("{"), Some(JsonTokenKind::Punctuation));
     }
 
     #[test]
