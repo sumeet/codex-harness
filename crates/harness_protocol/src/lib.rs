@@ -1111,13 +1111,14 @@ impl TranscriptModel {
                             outcome.dirty.insert(index);
                         }
                     }
-                    "rawResponseItem/completed" => {
-                        if let Some(item) = params.get("item").cloned()
-                            && let Some(index) = self.upsert_raw_response_item(item)
-                        {
-                            outcome.dirty.insert(index);
-                        }
-                    }
+                    // `rawResponseItem/completed` is the provider-facing record that backs the
+                    // semantic `item/*` stream. In code mode it contains implementation wrappers
+                    // such as `const r = await tools.exec_command(...)`; rendering it creates a
+                    // second, noisier card next to the real `commandExecution`, `fileChange`, or
+                    // tool item. `record_raw` above deliberately retains the exact payload for
+                    // diagnostics, while the transcript treats the typed item stream as the sole
+                    // presentation authority.
+                    "rawResponseItem/completed" => {}
                     "thread/realtime/transcript/delta" => {
                         let thread_id = string_at(&params, "/threadId").unwrap_or("realtime");
                         let role = string_at(&params, "/role").unwrap_or("assistant");
@@ -1648,59 +1649,6 @@ impl TranscriptModel {
             expanded: kind != TranscriptKind::Trace,
             pending_request: None,
         })
-    }
-
-    fn upsert_raw_response_item(&mut self, raw: Value) -> Option<usize> {
-        let kind = string_at(&raw, "/type")?;
-        match kind {
-            "custom_tool_call" | "function_call" | "tool_search_call" => {
-                let call_id = string_at(&raw, "/call_id")?.to_string();
-                let call = raw_tool_call(&raw);
-                let index = self.upsert_generated(
-                    call_id.clone(),
-                    call.kind,
-                    call.title,
-                    call.content,
-                    raw,
-                );
-                self.items[index].protocol_id = Some(call_id);
-                self.items[index].status = Some("running".into());
-                Some(index)
-            }
-            "custom_tool_call_output" | "function_call_output" | "tool_search_output" => {
-                let call_id = string_at(&raw, "/call_id")?;
-                let output = render_function_output(raw.get("output"));
-                let index = if let Some(index) = self.item_indices.get(call_id).copied() {
-                    let item = &mut self.items[index];
-                    if !output.is_empty() {
-                        if !item.content.is_empty() {
-                            item.content.push_str("\n\n");
-                        }
-                        item.content.push_str("Result\n");
-                        item.content.push_str(&output);
-                    }
-                    item.raw = bounded_raw_payload(json!({
-                        "call": item.raw.clone(),
-                        "output": raw
-                    }));
-                    item.event_count += 1;
-                    item.status = Some("completed".into());
-                    index
-                } else {
-                    let index = self.upsert_generated(
-                        call_id.to_string(),
-                        TranscriptKind::Tool,
-                        "Tool result",
-                        output,
-                        raw,
-                    );
-                    self.items[index].status = Some("completed".into());
-                    index
-                };
-                Some(index)
-            }
-            _ => None,
-        }
     }
 
     fn push_without_splice(&mut self, item: TranscriptItem) -> usize {
@@ -2464,6 +2412,14 @@ fn merge_snapshot_items(
     fresh: Vec<TranscriptItem>,
     persisted: Vec<TranscriptItem>,
 ) -> (Vec<TranscriptItem>, usize) {
+    // Version-1 snapshots may contain provider-level tool wrappers that older
+    // Harness builds promoted into transcript cards. They have no semantic
+    // identity in `thread/read` and must not be resurrected beside their typed
+    // command/file/tool counterparts.
+    let persisted = persisted
+        .into_iter()
+        .filter(|item| !originates_from_raw_response(item))
+        .collect::<Vec<_>>();
     let mut next_fresh = 0;
     let mut matches = vec![None; persisted.len()];
     for (persisted_index, persisted_item) in persisted.iter().enumerate() {
@@ -2501,6 +2457,23 @@ fn merge_snapshot_items(
     }
     merged.extend(fresh[next_unmerged_fresh..].iter().cloned());
     (merged, restored)
+}
+
+fn originates_from_raw_response(item: &TranscriptItem) -> bool {
+    let response_type = string_at(&item.raw, "/type")
+        .or_else(|| string_at(&item.raw, "/call/type"))
+        .or_else(|| string_at(&item.raw, "/output/type"));
+    matches!(
+        response_type,
+        Some(
+            "custom_tool_call"
+                | "custom_tool_call_output"
+                | "function_call"
+                | "function_call_output"
+                | "tool_search_call"
+                | "tool_search_output"
+        )
+    )
 }
 
 fn items_are_semantically_equal(left: &TranscriptItem, right: &TranscriptItem) -> bool {
@@ -2959,106 +2932,6 @@ fn render_mcp_tool_call(raw: &Value) -> String {
         "Waiting for tool output…".into()
     } else {
         sections.join("\n\n")
-    }
-}
-
-struct RawToolPresentation {
-    kind: TranscriptKind,
-    title: String,
-    content: String,
-}
-
-fn raw_tool_call(raw: &Value) -> RawToolPresentation {
-    let response_kind = string_at(raw, "/type").unwrap_or("tool");
-    let outer_name = string_at(raw, "/name").unwrap_or(response_kind);
-    let raw_arguments = raw
-        .get("input")
-        .or_else(|| raw.get("arguments"))
-        .unwrap_or(&Value::Null);
-
-    if outer_name == "exec"
-        && let Some(input) = raw_arguments.as_str()
-        && let Some((tool, arguments)) = parse_code_mode_tool(input)
-    {
-        return present_nested_tool(&tool, &arguments);
-    }
-
-    let arguments = raw_arguments
-        .as_str()
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
-        .unwrap_or_else(|| raw_arguments.clone());
-    RawToolPresentation {
-        kind: TranscriptKind::Tool,
-        title: format!("Tool · {}", humanize_identifier(outer_name)),
-        content: if arguments.is_null() {
-            "Waiting for tool output…".into()
-        } else {
-            format!("Arguments\n{}", pretty_json(&arguments))
-        },
-    }
-}
-
-fn parse_code_mode_tool(input: &str) -> Option<(String, Value)> {
-    let marker = input.find("tools.")? + "tools.".len();
-    let name_end = input[marker..]
-        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))?
-        + marker;
-    let name = input[marker..name_end].to_string();
-    let arguments_start = input[name_end..].find('(')? + name_end + 1;
-    let mut values =
-        serde_json::Deserializer::from_str(&input[arguments_start..]).into_iter::<Value>();
-    let arguments = values.next()?.ok()?;
-    Some((name, arguments))
-}
-
-fn present_nested_tool(tool: &str, arguments: &Value) -> RawToolPresentation {
-    match tool {
-        "exec_command" => {
-            let command = string_at(arguments, "/cmd").unwrap_or("command");
-            let mut content = format!("$ {command}");
-            if let Some(workdir) = string_at(arguments, "/workdir") {
-                content.push_str(&format!("\n\nWorking directory\n{workdir}"));
-            }
-            RawToolPresentation {
-                kind: TranscriptKind::Command,
-                title: "Command".into(),
-                content,
-            }
-        }
-        "apply_patch" => RawToolPresentation {
-            kind: TranscriptKind::Diff,
-            title: "Apply patch".into(),
-            content: arguments.as_str().unwrap_or_default().to_string(),
-        },
-        "view_image" => {
-            let path = string_at(arguments, "/path").unwrap_or("image");
-            RawToolPresentation {
-                kind: TranscriptKind::Tool,
-                title: media_title("Viewed image", Some(path)),
-                content: path.into(),
-            }
-        }
-        _ => RawToolPresentation {
-            kind: TranscriptKind::Tool,
-            title: format!("Tool · {}", humanize_identifier(tool)),
-            content: format!("Arguments\n{}", pretty_json(arguments)),
-        },
-    }
-}
-
-fn render_function_output(output: Option<&Value>) -> String {
-    let Some(output) = output.filter(|output| !output.is_null()) else {
-        return String::new();
-    };
-    match output {
-        Value::Array(_) => render_content_blocks(Some(output)),
-        Value::String(text) => serde_json::from_str::<Value>(text)
-            .ok()
-            .filter(Value::is_array)
-            .map(|content| render_content_blocks(Some(&content)))
-            .filter(|content| !content.is_empty())
-            .unwrap_or_else(|| text.clone()),
-        _ => pretty_json(output),
     }
 }
 
@@ -4096,7 +3969,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_code_mode_calls_become_semantic_live_tool_cards() {
+    fn raw_code_mode_wrappers_stay_in_the_journal_beside_one_typed_command() {
         let mut model = TranscriptModel::default();
         model.apply_batch(
             vec![
@@ -4109,7 +3982,7 @@ mod tests {
                             "type": "custom_tool_call",
                             "call_id": "call-1",
                             "name": "exec",
-                            "input": "const r = await tools.exec_command({\"cmd\":\"cargo test\",\"workdir\":\"/workspace\"}); text(r.output);"
+                            "input": "const r = await tools.exec_command({\n  cmd: \"cargo test\",\n  workdir: \"/workspace\",\n  yield_time_ms: 1000\n});\ntext(JSON.stringify(r));"
                         }
                     }),
                 },
@@ -4128,6 +4001,35 @@ mod tests {
                         }
                     }),
                 },
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "cargo test",
+                            "cwd": "/workspace",
+                            "status": "inProgress"
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/completed".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "cargo test",
+                            "cwd": "/workspace",
+                            "aggregatedOutput": "2 tests passed\n",
+                            "status": "completed"
+                        }
+                    }),
+                },
             ],
             Some("thread-1"),
         );
@@ -4137,17 +4039,31 @@ mod tests {
         assert_eq!(model.items[0].title, "Command");
         assert_eq!(model.items[0].status.as_deref(), Some("completed"));
         assert!(model.items[0].content.contains("$ cargo test"));
-        assert!(model.items[0].content.contains("2 tests passed"));
+        assert_eq!(model.items[0].content, "$ cargo test\n\n2 tests passed\n");
         assert!(!model.items[0].content.contains("const r ="));
         assert_eq!(
             model.items[0].command_transcript(),
             Some(CommandTranscript {
                 command: "cargo test".into(),
                 cwd: Some("/workspace".into()),
-                output: "Script completed\n\n2 tests passed".into(),
+                output: "2 tests passed\n".into(),
             })
         );
-        assert_eq!(model.raw_events.len(), 2);
+        assert_eq!(model.raw_events.len(), 4);
+        assert_eq!(
+            model
+                .raw_events
+                .iter()
+                .filter(|event| event.method == "rawResponseItem/completed")
+                .count(),
+            2
+        );
+        assert!(
+            model.raw_events[0]
+                .payload
+                .to_string()
+                .contains("const r =")
+        );
     }
 
     #[test]
@@ -4275,6 +4191,52 @@ mod tests {
         );
         assert_eq!(merged[3].content, "fresh final");
         assert_eq!(merged[3].status.as_deref(), Some("fresh status"));
+    }
+
+    #[test]
+    fn local_snapshot_discards_legacy_provider_wrapper_cards() {
+        let user = replay_item(0, TranscriptKind::User, "You", "prompt", json!(null));
+        let command = replay_item(
+            2,
+            TranscriptKind::Command,
+            "Command",
+            "$ cargo test\n\n2 tests passed",
+            json!({"type": "commandExecution"}),
+        );
+        let agent = replay_item(3, TranscriptKind::Agent, "Codex", "done", json!(null));
+        let wrapper = replay_item(
+            1,
+            TranscriptKind::Tool,
+            "Tool · Exec",
+            "Arguments\nconst r = await tools.exec_command(...)",
+            json!({
+                "call": {
+                    "type": "custom_tool_call",
+                    "call_id": "call-1",
+                    "name": "exec"
+                },
+                "output": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-1"
+                }
+            }),
+        );
+        let persisted = vec![user.clone(), wrapper, command.clone(), agent.clone()];
+        let mut fresh = vec![user, command, agent];
+        for (index, item) in fresh.iter_mut().enumerate() {
+            item.key = format!("server-item-{index}");
+        }
+
+        let (merged, restored) = merge_snapshot_items(fresh, persisted);
+
+        assert_eq!(restored, 0);
+        assert_eq!(merged.len(), 3);
+        assert!(merged.iter().all(|item| item.title != "Tool · Exec"));
+        assert!(
+            merged
+                .iter()
+                .all(|item| !item.content.contains("const r ="))
+        );
     }
 
     #[test]
