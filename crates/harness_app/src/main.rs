@@ -113,6 +113,107 @@ struct StructuredOutputPreview {
 }
 
 #[derive(Debug, Eq, PartialEq)]
+struct SearchContextSnippet {
+    text: String,
+    match_range: Range<usize>,
+}
+
+fn folded_text_with_source_chars(text: &str) -> (String, Vec<usize>) {
+    let mut folded = String::new();
+    let mut source_chars = Vec::new();
+    for (source_char, character) in text.chars().enumerate() {
+        for lowercase in character.to_lowercase() {
+            folded.push(lowercase);
+            source_chars.push(source_char);
+        }
+    }
+    (folded, source_chars)
+}
+
+fn search_context_snippet(
+    content: &str,
+    query: &str,
+    max_chars: usize,
+) -> Option<SearchContextSnippet> {
+    let folded_query = query.trim().to_lowercase();
+    if folded_query.is_empty() || max_chars == 0 {
+        return None;
+    }
+
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let (folded_line, source_chars) = folded_text_with_source_chars(line);
+        let Some(folded_byte_start) = folded_line.find(&folded_query) else {
+            continue;
+        };
+        let folded_char_start = folded_line[..folded_byte_start].chars().count();
+        let folded_char_len = folded_query.chars().count();
+        let Some(source_start) = source_chars.get(folded_char_start).copied() else {
+            continue;
+        };
+        let Some(source_end) = source_chars
+            .get(folded_char_start + folded_char_len - 1)
+            .map(|source_char| source_char.saturating_add(1))
+        else {
+            continue;
+        };
+        let characters = line.chars().collect::<Vec<_>>();
+
+        let mut context_start = source_start.saturating_sub(max_chars / 3);
+        if source_end > context_start + max_chars {
+            context_start = source_end.saturating_sub(max_chars);
+        }
+        let mut context_end = (context_start + max_chars).min(characters.len());
+        context_start = context_start.min(context_end.saturating_sub(max_chars));
+        context_end = (context_start + max_chars).min(characters.len());
+
+        let mut text = String::new();
+        if context_start > 0 {
+            text.push_str("… ");
+        }
+        let prefix_bytes = text.len();
+        let visible = characters[context_start..context_end]
+            .iter()
+            .collect::<String>();
+        let match_start_bytes = characters[context_start..source_start]
+            .iter()
+            .collect::<String>()
+            .len();
+        let match_bytes = characters[source_start..source_end]
+            .iter()
+            .collect::<String>()
+            .len();
+        text.push_str(&visible);
+        let match_range =
+            prefix_bytes + match_start_bytes..prefix_bytes + match_start_bytes + match_bytes;
+        if context_end < characters.len() {
+            text.push_str(" …");
+        }
+        return Some(SearchContextSnippet { text, match_range });
+    }
+
+    None
+}
+
+fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
+    item.title.to_lowercase().contains(folded_query)
+        || item.content.to_lowercase().contains(folded_query)
+}
+
+fn reconcile_sorted_search_match(matches: &mut Vec<usize>, index: usize, is_match: bool) {
+    match (matches.binary_search(&index), is_match) {
+        (Err(position), true) => matches.insert(position, index),
+        (Ok(position), false) => {
+            matches.remove(position);
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
 struct ActivityTextSection {
     heading: Option<String>,
     body: String,
@@ -1109,7 +1210,7 @@ impl HarnessApp {
             self.refresh_threads(cx);
         }
         if !self.search_query.is_empty() {
-            self.rebuild_search_matches();
+            self.update_search_matches_for_changes(old_len, &dirty_items);
         }
         if document_changed && self.buffer_view {
             let incrementally_applied =
@@ -1771,7 +1872,11 @@ impl HarnessApp {
                 })
         };
         if !self.search_query.is_empty() {
-            self.rebuild_search_matches();
+            if outcome.reset {
+                self.rebuild_search_matches();
+            } else {
+                self.update_search_matches_for_changes(outcome.old_len, &dirty_items);
+            }
         }
 
         if self.buffer_view {
@@ -3109,15 +3214,49 @@ impl HarnessApp {
                 .iter()
                 .enumerate()
                 .filter_map(|(index, item)| {
-                    (item.title.to_lowercase().contains(&query)
-                        || item.content.to_lowercase().contains(&query))
-                    .then_some(index)
+                    item_matches_folded_query(item, &query).then_some(index)
                 })
                 .collect()
         };
         self.active_search_match = self
             .active_search_match
             .min(self.search_matches.len().saturating_sub(1));
+    }
+
+    fn update_search_matches_for_changes(&mut self, old_len: usize, dirty_items: &[usize]) {
+        let query = self.search_query.to_lowercase();
+        if query.is_empty() {
+            self.search_matches.clear();
+            self.active_search_match = 0;
+            return;
+        }
+
+        let active_item = self.search_matches.get(self.active_search_match).copied();
+        let item_count = self.model.items.len();
+        self.search_matches.retain(|index| *index < item_count);
+
+        let mut changed = dirty_items.to_vec();
+        changed.extend(old_len.min(item_count)..item_count);
+        changed.sort_unstable();
+        changed.dedup();
+        for index in changed {
+            let Some(item) = self.model.items.get(index) else {
+                continue;
+            };
+            reconcile_sorted_search_match(
+                &mut self.search_matches,
+                index,
+                item_matches_folded_query(item, &query),
+            );
+        }
+
+        self.active_search_match = active_item
+            .and_then(|active_item| self.search_matches.binary_search(&active_item).ok())
+            .unwrap_or_else(|| {
+                self.search_matches
+                    .partition_point(|index| *index < self.selected_item)
+                    .min(self.search_matches.len().saturating_sub(1))
+            });
     }
 
     fn jump_to_search_match(&mut self, cx: &mut Context<Self>) {
@@ -4642,6 +4781,43 @@ impl HarnessApp {
         let disclosure_weak = cx.weak_entity();
         let is_disclosure = has_collapsible_content
             && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
+        let active_search_item = self
+            .search_matches
+            .get(self.active_search_match)
+            .is_some_and(|active| *active == index);
+        let search_context = (self.search_visible
+            && active_search_item
+            && is_disclosure
+            && !item.expanded
+            && !item
+                .title
+                .to_lowercase()
+                .contains(&self.search_query.to_lowercase()))
+        .then(|| search_context_snippet(&item.content, &self.search_query, 180))
+        .flatten()
+        .map(|snippet| {
+            let styled = StyledText::new(snippet.text).with_highlights(vec![(
+                snippet.match_range,
+                gpui::HighlightStyle {
+                    color: Some(colors.text),
+                    background_color: Some(colors.search_active_match_background),
+                    ..Default::default()
+                },
+            )]);
+            div()
+                .w_full()
+                .min_w_0()
+                .overflow_hidden()
+                .border_l_2()
+                .border_color(colors.search_active_match_background)
+                .pl_2()
+                .py_0p5()
+                .font_buffer(cx)
+                .text_ui_xs(cx)
+                .text_color(colors.text_muted)
+                .child(styled)
+                .into_any_element()
+        });
 
         let header = div()
             .id(("item-header", index))
@@ -4774,6 +4950,7 @@ impl HarnessApp {
                             .child(preview),
                     )
                 })
+                .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
                 .when_some(raw, |this, raw| this.child(raw))
                 .into_any_element()
@@ -4792,6 +4969,7 @@ impl HarnessApp {
                 })
                 .when(compact_trace, |this| this.px_1().py_1())
                 .child(header)
+                .when_some(search_context, |this, context| this.child(context))
                 .when_some(request_surface, |this, surface| this.child(surface))
                 .when_some(body, |this, body| this.child(body))
                 .when_some(raw, |this, raw| this.child(raw))
@@ -6520,6 +6698,36 @@ mod tests {
             "first\n\nsecond  "
         );
         assert_eq!(command_output_for_display("\n\r\n"), "");
+    }
+
+    #[test]
+    fn collapsed_search_context_centers_and_exposes_the_actual_match() {
+        let content = format!(
+            "unrelated first line\n{} ReVeRsE_EnGiNeErInG.md trailing details",
+            "prefix ".repeat(30)
+        );
+        let snippet = search_context_snippet(&content, "reverse_engineering.md", 72).unwrap();
+        assert_eq!(&snippet.text[snippet.match_range], "ReVeRsE_EnGiNeErInG.md");
+        assert!(snippet.text.starts_with("… "));
+        assert!(snippet.text.chars().count() <= 76);
+    }
+
+    #[test]
+    fn collapsed_search_context_maps_expanding_unicode_case_folds_safely() {
+        let content = format!("{} İSTANBUL suffix", "界".repeat(60));
+        let snippet = search_context_snippet(&content, "i\u{307}stanbul", 36).unwrap();
+        assert_eq!(&snippet.text[snippet.match_range], "İSTANBUL");
+        assert!(snippet.text.starts_with("… "));
+    }
+
+    #[test]
+    fn streaming_search_reconciliation_only_changes_affected_sorted_indices() {
+        let mut matches = vec![1, 4, 9];
+        reconcile_sorted_search_match(&mut matches, 3, true);
+        reconcile_sorted_search_match(&mut matches, 4, false);
+        reconcile_sorted_search_match(&mut matches, 9, true);
+        reconcile_sorted_search_match(&mut matches, 12, false);
+        assert_eq!(matches, vec![1, 3, 9]);
     }
 
     #[test]
