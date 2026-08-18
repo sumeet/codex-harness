@@ -9,9 +9,9 @@ use assets::Assets;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    FontWeight, IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render,
-    SharedString, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div,
-    list, prelude::*, px, relative, size,
+    IntoElement, KeyBinding, KeyContext, ListAlignment, ListState, Render, SharedString, Task,
+    UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div, list, prelude::*,
+    px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -93,6 +93,11 @@ const SIDEBAR_WIDTH: f32 = 252.;
 const COMPACT_SIDEBAR_THRESHOLD: f32 = 1100.;
 const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
+const MAX_RECONNECT_ATTEMPTS: u8 = 3;
+
+fn reconnect_delay(attempt: u8) -> Option<Duration> {
+    (attempt < MAX_RECONNECT_ATTEMPTS).then(|| Duration::from_secs(1 << attempt))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FocusMode {
@@ -194,7 +199,6 @@ struct HarnessApp {
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
     selected_thread_id: Option<String>,
-    selected_title: SharedString,
     connecting: bool,
     loading_thread: bool,
     thread_read_only_reason: Option<SharedString>,
@@ -237,12 +241,15 @@ struct HarnessApp {
     sidebar_user_override: bool,
     server_task: Task<()>,
     request_task: Task<()>,
+    reconnect_task: Task<()>,
+    reconnect_attempts: u8,
 }
 
 impl HarnessApp {
     fn new(
         cwd: String,
         replay_count: Option<usize>,
+        start_in_text_view: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -299,7 +306,11 @@ impl HarnessApp {
         list_state.set_follow_mode(FollowMode::Tail);
         let task_list_state = ListState::new(0, ListAlignment::Top, px(54.));
         let transcript_focus = cx.focus_handle();
-        composer.focus_handle(cx).focus(window, cx);
+        if start_in_text_view {
+            transcript_editor.focus_handle(cx).focus(window, cx);
+        } else {
+            composer.focus_handle(cx).focus(window, cx);
+        }
 
         let mut this = Self {
             cwd,
@@ -307,11 +318,6 @@ impl HarnessApp {
             client: None,
             threads: Vec::new(),
             selected_thread_id: None,
-            selected_title: if let Some(count) = replay_count {
-                format!("Replay · {count} items").into()
-            } else {
-                "New task".into()
-            },
             connecting: false,
             loading_thread: false,
             thread_read_only_reason: None,
@@ -322,9 +328,13 @@ impl HarnessApp {
             search_editor,
             transcript_editor,
             mode_indicator,
-            buffer_view: false,
+            buffer_view: start_in_text_view,
             transcript_focus,
-            focus_mode: FocusMode::Composer,
+            focus_mode: if start_in_text_view {
+                FocusMode::Buffer
+            } else {
+                FocusMode::Composer
+            },
             list_state,
             task_list_state,
             selected_task: 0,
@@ -354,7 +364,16 @@ impl HarnessApp {
             sidebar_user_override: false,
             server_task: Task::ready(()),
             request_task: Task::ready(()),
+            reconnect_task: Task::ready(()),
+            reconnect_attempts: 0,
         };
+        if start_in_text_view {
+            drop(this.sync_transcript_document(cx));
+            this.transcript_editor.update(cx, |editor, cx| {
+                editor.reveal_tail(cx);
+                editor.enter_normal_mode(window, cx);
+            });
+        }
         if replay_count.is_none() {
             this.connect(cx);
         }
@@ -362,9 +381,15 @@ impl HarnessApp {
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.connecting || self.client.is_some() || self.replay_count.is_some() {
+            return;
+        }
         self.connecting = true;
         self.error = None;
-        let initial_thread_query = std::env::var("HARNESS_OPEN_THREAD").ok();
+        let initial_thread_query = self
+            .selected_thread_id
+            .clone()
+            .or_else(|| std::env::var("HARNESS_OPEN_THREAD").ok());
         self.server_task = cx.spawn(async move |this, cx| {
             let result = async {
                 let client = Rc::new(Client::launch("codex")?);
@@ -385,6 +410,7 @@ impl HarnessApp {
                             this.threads = threads;
                             this.task_list_state.splice(0..old_len, this.threads.len());
                             this.connecting = false;
+                            this.reconnect_attempts = 0;
                             this.error = None;
                             if let Some(query) = initial_thread_query.as_deref() {
                                 let query = query.to_lowercase();
@@ -407,8 +433,17 @@ impl HarnessApp {
                     if this
                         .update(cx, |this, cx| {
                             this.connecting = false;
-                            this.error =
-                                Some(format!("Could not connect to Codex: {error}").into());
+                            this.error = Some(
+                                if this.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                                    format!(
+                                        "Could not reconnect to Codex: {error}. Refresh the task list to try again."
+                                    )
+                                } else {
+                                    format!("Could not connect to Codex: {error}")
+                                }
+                                .into(),
+                            );
+                            this.schedule_reconnect(cx);
                             cx.notify();
                         })
                         .is_err()
@@ -434,6 +469,32 @@ impl HarnessApp {
                 }
             }
             _ = this.update(cx, |this, cx| this.handle_server_disconnect(&client, cx));
+        });
+    }
+
+    fn schedule_reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.client.is_some() || self.connecting || self.replay_count.is_some() {
+            return;
+        }
+        let Some(delay) = reconnect_delay(self.reconnect_attempts) else {
+            return;
+        };
+        self.reconnect_attempts += 1;
+        let attempt = self.reconnect_attempts;
+        self.error = Some(
+            format!(
+                "Codex app server disconnected. Reconnecting in {}s ({attempt}/{MAX_RECONNECT_ATTEMPTS})…",
+                delay.as_secs()
+            )
+            .into(),
+        );
+        self.reconnect_task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            _ = this.update(cx, |this, cx| {
+                if this.client.is_none() && !this.connecting {
+                    this.connect(cx);
+                }
+            });
         });
     }
 
@@ -468,11 +529,7 @@ impl HarnessApp {
         self.connecting = false;
         self.model.current_turn_id = None;
         self.thread_read_only_reason = None;
-        self.error = Some(
-            "Codex app server disconnected. Refresh the task list to reconnect."
-                .to_string()
-                .into(),
-        );
+        self.error = Some("Codex app server disconnected.".into());
         self.retire_all_request_surfaces();
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         for index in &dirty_requests {
@@ -484,6 +541,7 @@ impl HarnessApp {
                 drop(self.sync_transcript_document(cx));
             }
         }
+        self.schedule_reconnect(cx);
         cx.notify();
     }
 
@@ -512,9 +570,6 @@ impl HarnessApp {
             if *index < old_len {
                 self.list_state.splice(*index..*index + 1, 1);
             }
-        }
-        if let Some(name) = outcome.renamed_thread {
-            self.selected_title = name.into();
         }
         if let Some(error) = outcome.transport_error {
             self.error = Some(error.into());
@@ -990,6 +1045,7 @@ impl HarnessApp {
     fn refresh_threads(&mut self, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             if self.replay_count.is_none() {
+                self.reconnect_attempts = 0;
                 self.connect(cx);
             }
             return;
@@ -1025,14 +1081,12 @@ impl HarnessApp {
             return;
         };
         let thread_id = thread.id.clone();
-        let title = thread_title(thread);
         let Some(client) = self.client.clone() else {
             return;
         };
 
         self.reject_pending_requests(cx);
         self.selected_thread_id = Some(thread_id.clone());
-        self.selected_title = title.into();
         self.loading_thread = true;
         self.thread_read_only_reason = None;
         self.error = None;
@@ -1098,7 +1152,6 @@ impl HarnessApp {
     fn load_thread(&mut self, thread: CodexThread, cx: &mut Context<Self>) {
         let old_len = self.model.items.len();
         self.selected_thread_id = Some(thread.id.clone());
-        self.selected_title = thread_title(&thread).into();
         if !thread.cwd.is_empty() {
             self.cwd = thread.cwd.clone();
         }
@@ -1144,7 +1197,6 @@ impl HarnessApp {
         self.retire_all_request_surfaces();
         self.list_state.splice(0..old_len, 0);
         self.selected_thread_id = None;
-        self.selected_title = "New task".into();
         self.selected_item = 0;
         self.thread_read_only_reason = None;
         self.error = None;
@@ -3220,6 +3272,7 @@ impl HarnessApp {
         } else {
             item.display_status().map(ToOwned::to_owned)
         };
+        let show_header = item.kind != model::TranscriptKind::Agent || item.title != "Codex";
         let disclosure_weak = cx.weak_entity();
 
         let header = div()
@@ -3339,7 +3392,7 @@ impl HarnessApp {
                             .py_1()
                     },
                 )
-                .child(header)
+                .when(show_header, |this| this.child(header))
                 .when_some(reasoning_preview, |this, preview| {
                     this.child(
                         div()
@@ -3412,19 +3465,6 @@ impl HarnessApp {
             }))
             .child(content)
             .into_any_element()
-    }
-
-    fn connection_label(&self) -> SharedString {
-        if let Some(count) = self.replay_count {
-            return format!("REPLAY {count}").into();
-        }
-        if self.connecting {
-            "CONNECTING".into()
-        } else if self.client.is_some() {
-            "APP SERVER".into()
-        } else {
-            "OFFLINE".into()
-        }
     }
 }
 
@@ -3509,85 +3549,16 @@ impl Render for HarnessApp {
                 self.search_matches.len()
             )
         };
-        let pending_request = self
-            .model
-            .items
-            .get(self.selected_item)
-            .and_then(|item| item.pending_request.as_ref())
-            .filter(|request| !request.resolved);
-        let approval_count = pending_request
-            .map(|request| {
-                request_choices(&request.method, &self.model.items[self.selected_item].raw).len()
-            })
-            .unwrap_or_default()
-            .max(1);
-        let has_any_pending_request = !self.request_surfaces.is_empty();
-        let active_region: SharedString = match self.focus_mode {
-            FocusMode::Tasks => format!(
-                "Task {}/{}",
-                self.selected_task.saturating_add(1),
-                if self.replay_count.is_some() {
-                    1
-                } else {
-                    self.threads.len().max(1)
-                }
-            )
-            .into(),
-            FocusMode::Transcript => format!(
-                "Block {}/{}",
-                self.selected_item.saturating_add(1),
-                self.model.items.len().max(1)
-            )
-            .into(),
-            FocusMode::Composer => "Composer".into(),
-            FocusMode::Search => "Search".into(),
-            FocusMode::Request => "Request".into(),
-            FocusMode::Approval => format!(
-                "Approval {}/{}",
-                self.approval_cursor.min(approval_count - 1) + 1,
-                approval_count
-            )
-            .into(),
-            FocusMode::Buffer => {
-                let semantic_total = self
-                    .model
-                    .items
-                    .iter()
-                    .filter(|item| item.kind != model::TranscriptKind::Trace)
-                    .count()
-                    .max(1);
-                let semantic_position = self
-                    .model
-                    .items
-                    .iter()
-                    .take(self.selected_item.saturating_add(1))
-                    .filter(|item| item.kind != model::TranscriptKind::Trace)
-                    .count()
-                    .clamp(1, semantic_total);
-                format!("Text {semantic_position}/{semantic_total}").into()
-            }
-        };
-        let navigation_hint = match self.focus_mode {
-            FocusMode::Tasks => "j/k move · Enter open · l transcript",
-            FocusMode::Transcript if self.visual_anchor.is_some() => {
-                "j/k extend · y copy · v cancel"
-            }
-            FocusMode::Transcript => "j/k blocks · Shift-V text view · / find",
-            FocusMode::Composer => "Ctrl-W K transcript",
-            FocusMode::Search if self.search_returns_to_buffer => "Enter jump · Esc cancel",
-            FocusMode::Search => "Enter jump · Esc close",
-            FocusMode::Request
-                if pending_request
-                    .is_some_and(|request| request.method == "mcpServer/elicitation/request") =>
-            {
-                "Edit field · Ctrl-Enter submit · Esc return"
-            }
-            FocusMode::Request => "j/k question · h/l option · Enter choose · i type",
-            FocusMode::Approval => "h/l choose · Enter confirm · Esc cancel",
-            FocusMode::Buffer if has_any_pending_request => {
-                "Enter on a request to answer · Zed Vim motions"
-            }
-            FocusMode::Buffer => "Zed Vim motions · / find · Ctrl-W J composer",
+        let composer_status = if self.loading_thread {
+            Some(("Loading task history…", Color::Muted))
+        } else if self.thread_read_only_reason.is_some() {
+            Some(("Read-only · Ctrl-N for a new thread", Color::Warning))
+        } else if self.connecting {
+            Some(("Connecting…", Color::Muted))
+        } else if self.client.is_none() && self.replay_count.is_none() {
+            Some(("Offline · refresh to reconnect", Color::Warning))
+        } else {
+            None
         };
 
         div()
@@ -3771,42 +3742,63 @@ impl Render for HarnessApp {
                         .child(
                             div()
                                 .h(px(32.))
-                                .px_3()
+                                .px_1()
                                 .flex()
                                 .items_center()
-                                .justify_between()
+                                .gap_1()
                                 .border_b_1()
                                 .border_color(colors.border)
                                 .child(
-                                    Label::new("Tasks")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
+                                    IconButton::new(
+                                        "hide-sidebar",
+                                        IconName::ThreadsSidebarLeftOpen,
+                                    )
+                                    .shape(IconButtonShape::Square)
+                                    .size(ButtonSize::Default)
+                                    .style(ButtonStyle::Subtle)
+                                    .aria_label("Hide thread list")
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_sidebar(window, cx),
+                                    )),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    IconButton::new("transcript-view", IconName::Code)
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Default)
+                                        .style(if self.buffer_view {
+                                            ButtonStyle::Tinted(TintColor::Accent)
+                                        } else {
+                                            ButtonStyle::Subtle
+                                        })
+                                        .aria_label(if self.buffer_view {
+                                            "Show rich transcript"
+                                        } else {
+                                            "Show Vim text view"
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_buffer_view(window, cx)
+                                        })),
                                 )
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .child(
-                                            IconButton::new("refresh-tasks", IconName::RotateCw)
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Default)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("Refresh tasks")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.refresh_threads(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            IconButton::new("new-task", IconName::Plus)
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Default)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("New task")
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.new_task(window, cx)
-                                                })),
+                                    IconButton::new("refresh-tasks", IconName::RotateCw)
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Default)
+                                        .style(ButtonStyle::Subtle)
+                                        .aria_label("Refresh threads")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.refresh_threads(cx)),
                                         ),
+                                )
+                                .child(
+                                    IconButton::new("new-task", IconName::Plus)
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Default)
+                                        .style(ButtonStyle::Subtle)
+                                        .aria_label("New thread")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.new_task(window, cx)
+                                        })),
                                 ),
                         )
                         .child(task_body),
@@ -3819,42 +3811,7 @@ impl Render for HarnessApp {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .h(px(32.))
-                            .flex_none()
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .border_b_1()
-                            .border_color(colors.border)
-                            .child(
-                                IconButton::new(
-                                    "toggle-sidebar",
-                                    if sidebar_visible {
-                                        IconName::ThreadsSidebarLeftOpen
-                                    } else {
-                                        IconName::ThreadsSidebarLeftClosed
-                                    },
-                                )
-                                .shape(IconButtonShape::Square)
-                                .size(ButtonSize::Default)
-                                .style(ButtonStyle::Subtle)
-                                .aria_label("Toggle task rail")
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.toggle_sidebar(window, cx),
-                                )),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .truncate()
-                                    .child(self.selected_title.clone()),
-                            ),
-                    )
+                    .relative()
                     .when(self.search_visible, |this| {
                         this.child(
                             div()
@@ -3998,29 +3955,12 @@ impl Render for HarnessApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(
-                                        Label::new(if self.loading_thread {
-                                            "Loading task history…"
-                                        } else if self.thread_read_only_reason.is_some() {
-                                            "Read-only task · Ctrl-N starts a new task"
-                                        } else if self.connecting {
-                                            "Connecting to Codex…"
-                                        } else if self.client.is_none()
-                                            && self.replay_count.is_none()
-                                        {
-                                            "Offline · refresh tasks to reconnect"
-                                        } else {
-                                            "Ctrl-Enter send"
-                                        })
-                                        .size(LabelSize::XSmall)
-                                        .color(
-                                            if self.thread_read_only_reason.is_some() {
-                                                Color::Warning
-                                            } else {
-                                                Color::Muted
-                                            },
-                                        ),
-                                    )
+                                    .child(self.mode_indicator.clone())
+                                    .when_some(composer_status, |this, (status, color)| {
+                                        this.child(
+                                            Label::new(status).size(LabelSize::XSmall).color(color),
+                                        )
+                                    })
                                     .child(div().flex_1())
                                     .when(turn_active, |this| {
                                         this.child(
@@ -4067,63 +4007,31 @@ impl Render for HarnessApp {
                                     }),
                             ),
                     )
-                    .child(
-                        div()
-                            .h(px(30.))
-                            .flex_none()
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .border_t_1()
-                            .border_color(colors.border)
-                            .bg(colors.status_bar_background)
-                            .child(self.mode_indicator.clone())
-                            .child(
-                                Label::new(active_region)
-                                    .size(LabelSize::XSmall)
-                                    .weight(FontWeight::MEDIUM),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(colors.text_muted)
-                                    .child(navigation_hint),
-                            )
-                            .when(!compact, |this| {
-                                this.child(
-                                    Label::new(self.connection_label())
-                                        .size(LabelSize::XSmall)
-                                        .color(
-                                            if self.client.is_some() || self.replay_count.is_some()
-                                            {
-                                                Color::Success
-                                            } else {
-                                                Color::Muted
-                                            },
-                                        ),
-                                )
-                            })
-                            .child(
-                                Button::new(
-                                    "transcript-view",
-                                    if self.buffer_view { "TEXT" } else { "RICH" },
-                                )
-                                .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Subtle)
-                                .aria_label(if self.buffer_view {
-                                    "Show rich transcript"
-                                } else {
-                                    "Show Vim text view"
-                                })
-                                .on_click(cx.listener(
-                                    |this, _, window, cx| this.toggle_buffer_view(window, cx),
-                                )),
-                            ),
-                    ),
+                    .when(!sidebar_visible, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top(px(6.))
+                                .left(px(6.))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(colors.border)
+                                .bg(colors.panel_background.opacity(0.92))
+                                .child(
+                                    IconButton::new(
+                                        "show-sidebar",
+                                        IconName::ThreadsSidebarLeftClosed,
+                                    )
+                                    .shape(IconButtonShape::Square)
+                                    .size(ButtonSize::Default)
+                                    .style(ButtonStyle::Subtle)
+                                    .aria_label("Show thread list")
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| this.toggle_sidebar(window, cx),
+                                    )),
+                                ),
+                        )
+                    }),
             )
             .when_some(command_palette, |this, command_palette| {
                 this.child(deferred(
@@ -5042,6 +4950,15 @@ fn load_harness_keymaps(cx: &mut App) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reconnect_backoff_is_bounded() {
+        assert_eq!(reconnect_delay(0), Some(Duration::from_secs(1)));
+        assert_eq!(reconnect_delay(1), Some(Duration::from_secs(2)));
+        assert_eq!(reconnect_delay(2), Some(Duration::from_secs(4)));
+        assert_eq!(reconnect_delay(3), None);
+        assert_eq!(reconnect_delay(u8::MAX), None);
+    }
+
     fn assert_interactive(method: &str, params: Value) {
         assert_eq!(
             route_server_request(method, &params, Some("thread-1")),
@@ -5520,6 +5437,7 @@ fn main() {
         .filter_level(log::LevelFilter::Warn)
         .init();
     let replay_count = replay_count();
+    let start_in_text_view = std::env::args().any(|argument| argument == "--text");
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -5561,7 +5479,7 @@ fn main() {
             move |window, cx| {
                 window.set_window_title("Harness");
                 theme_settings::setup_ui_font(window, cx);
-                cx.new(|cx| HarnessApp::new(cwd, replay_count, window, cx))
+                cx.new(|cx| HarnessApp::new(cwd, replay_count, start_in_text_view, window, cx))
             },
         ) {
             log::error!("failed to open Harness window: {error}");
