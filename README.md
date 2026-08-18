@@ -22,7 +22,7 @@ itself considered finished.
 This is an active development checkpoint, not a finished release. The current
 tree includes the standalone app, direct App Server protocol client, segmented
 incremental transcript model, rich Editor decorations and supplemental views,
-and the ongoing extraction of Zed's command-palette behavior.
+and a lightweight standalone host for the extracted Zed command-palette core.
 
 ## Build
 
@@ -30,6 +30,16 @@ Install the normal Zed Linux build prerequisites, Rust through `rustup`, and a
 recent CMake. The repository pins its Rust toolchain. The `codex` executable
 must be installed and authenticated because Harness starts `codex app-server`
 locally.
+
+Then clone the compact private checkpoint with an authenticated GitHub CLI and
+build it from the repository root:
+
+```sh
+gh repo clone sumeet/codex-harness
+cd codex-harness
+./script/build-standalone.sh
+./script/run-standalone.sh
+```
 
 Builds and launches are deliberately separate; launching never invokes Cargo:
 
@@ -53,6 +63,20 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 ./script/run-standalone.sh --replay 12
 ./script/run-standalone.sh --replay 10000
 ```
+
+## Controls worth knowing
+
+- `Ctrl-W H/J/K/L` moves between the task rail, composer, and transcript where
+  the current focus makes that direction meaningful; `Ctrl-B` toggles the rail.
+- `Ctrl-N` starts a fresh task. `Ctrl-Enter` sends from the composer.
+- Rich uses `j`/`k`, `gg`/`G`, `/`, disclosures, and blockwise selection/yank.
+  `Shift-V` enters Text at the same semantic item.
+- Text is Zed's modal Editor. Its normal/visual motions, registers, yank,
+  `/ ? n N`, `* # g* g#`, jumplist, and `:` palette operate on real Buffer
+  text. `:rich`, `:text`, `:compose`, `:tasks`, `:new`, and `:stop` are Harness
+  aliases. The status-bar `RICH`/`TEXT` control switches modes with the mouse.
+- `Enter` on an interactive request in Text focuses its shared form/approval
+  surface; `Escape` returns to the transcript.
 
 ## Current architecture
 
@@ -82,9 +106,9 @@ Rich and Text are intentional product modes, not old/new implementations.
 Current work is validating mode-to-mode semantic position and tail-follow
 transfer, consolidating every interactive surface across both projections,
 and polishing long diffs, tools, reasoning, images, and the always-visible
-composer in real windows. The standalone `:` palette UI, additional media
-surfaces, settings controls, and live/reopen endurance testing remain active
-work.
+composer in real windows. Full Ex command semantics, settings controls, a fresh
+Text-mode visual pass, and live-turn/request/reconnect endurance testing remain
+active work.
 
 The stripped standalone graph no longer pulls Zed Workspace, Search, Picker,
 or command-palette UI through Vim. The fork still contains upstream Zed source
