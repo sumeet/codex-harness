@@ -699,6 +699,14 @@ pub struct BatchOutcome {
 }
 
 #[derive(Default)]
+pub struct ThreadRefreshOutcome {
+    pub dirty: HashSet<usize>,
+    pub old_len: usize,
+    pub new_len: usize,
+    pub reset: bool,
+}
+
+#[derive(Default)]
 pub struct TranscriptModel {
     pub items: Vec<TranscriptItem>,
     item_indices: HashMap<String, usize>,
@@ -820,6 +828,69 @@ impl TranscriptModel {
                 raw.insert("type".into(), Value::String(protocol_item.kind.clone()));
                 let _ = self.upsert_protocol_item(Value::Object(raw), true, Some(&turn.id));
             }
+        }
+    }
+
+    /// Refresh a thread/read snapshot without rebuilding stable transcript
+    /// items. This is used when another Codex client owns the thread: Harness
+    /// can observe it, but cannot subscribe to its live notifications.
+    pub fn refresh_thread(&mut self, thread: &CodexThread) -> ThreadRefreshOutcome {
+        let old_len = self.items.len();
+        let mut fresh = Self::default();
+        fresh.load_thread(thread);
+        let mut fresh_items = fresh.items;
+        let new_len = fresh_items.len();
+        let prefix_compatible = old_len <= new_len
+            && self
+                .items
+                .iter()
+                .zip(&fresh_items)
+                .all(|(old, new)| old.key == new.key);
+
+        if !prefix_compatible {
+            let expanded = self
+                .items
+                .iter()
+                .map(|item| (item.key.clone(), item.expanded))
+                .collect::<HashMap<_, _>>();
+            for item in &mut fresh_items {
+                if let Some(expanded) = expanded.get(&item.key) {
+                    item.expanded = *expanded;
+                }
+            }
+            self.items = fresh_items;
+            self.rebuild_item_indices();
+            return ThreadRefreshOutcome {
+                dirty: (0..new_len).collect(),
+                old_len,
+                new_len,
+                reset: true,
+            };
+        }
+
+        let mut dirty = HashSet::new();
+        let appended = fresh_items.split_off(old_len);
+        for (index, incoming) in fresh_items.into_iter().enumerate() {
+            let current = &self.items[index];
+            if thread_snapshot_items_equal(current, &incoming) {
+                continue;
+            }
+            let expanded = current.expanded;
+            let event_count = current.event_count.saturating_add(1);
+            let mut incoming = incoming;
+            incoming.expanded = expanded;
+            incoming.event_count = event_count;
+            self.items[index] = incoming;
+            dirty.insert(index);
+        }
+        self.items.extend(appended);
+        self.rebuild_item_indices();
+
+        ThreadRefreshOutcome {
+            dirty,
+            old_len,
+            new_len,
+            reset: false,
         }
     }
 
@@ -2425,6 +2496,25 @@ fn items_are_semantically_equal(left: &TranscriptItem, right: &TranscriptItem) -
     left.kind == right.kind && left.content.trim() == right.content.trim()
 }
 
+fn thread_snapshot_items_equal(left: &TranscriptItem, right: &TranscriptItem) -> bool {
+    left.key == right.key
+        && left.protocol_id == right.protocol_id
+        && left.kind == right.kind
+        && left.title == right.title
+        && left.status == right.status
+        && left.content == right.content
+        && left.raw == right.raw
+        && match (&left.pending_request, &right.pending_request) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.id == right.id
+                    && left.method == right.method
+                    && left.resolved == right.resolved
+            }
+            _ => false,
+        }
+}
+
 fn replay_templates() -> Vec<TranscriptItem> {
     let mut items = vec![
         replay_item(
@@ -3861,6 +3951,60 @@ mod tests {
         assert!(rendered.contains("Added · /tmp/created.rs"));
         assert!(!rendered.contains("move_path"));
         assert_eq!(file_changes_title(&changes), "File changes · 2 files");
+    }
+
+    #[test]
+    fn thread_snapshot_refresh_upgrades_incomplete_file_change_without_resetting_it() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let file_item = |diff: &str| CodexThreadItem {
+            id: "file-change-1".into(),
+            kind: "fileChange".into(),
+            body: json!({
+                "changes": [{
+                    "path": "/tmp/REVERSE_ENGINEERING.md",
+                    "kind": {"type": "update", "move_path": null},
+                    "diff": diff,
+                }],
+                "status": if diff.is_empty() { "inProgress" } else { "completed" },
+            })
+            .as_object()
+            .cloned()
+            .unwrap(),
+        };
+        let thread = |item| CodexThread {
+            id: "thread-1".into(),
+            name: None,
+            preview: String::new(),
+            cwd: "/tmp".into(),
+            updated_at: 1,
+            turns: vec![CodexTurn {
+                id: "turn-1".into(),
+                status: json!("inProgress"),
+                items: vec![item],
+            }],
+        };
+
+        let mut model = TranscriptModel::default();
+        model.load_thread(&thread(file_item("")));
+        model.items[0].expanded = false;
+        assert_eq!(
+            model.items[0].content,
+            "Modified · /tmp/REVERSE_ENGINEERING.md"
+        );
+
+        let completed = thread(file_item("@@ -1 +1,2 @@\n-old\n+new\n+another"));
+        let outcome = model.refresh_thread(&completed);
+        assert!(!outcome.reset);
+        assert_eq!(outcome.dirty, HashSet::from([0]));
+        assert_eq!(outcome.old_len, 1);
+        assert_eq!(outcome.new_len, 1);
+        assert!(!model.items[0].expanded);
+        assert!(model.items[0].content.contains("@@ -1 +1,2 @@"));
+
+        let unchanged = model.refresh_thread(&completed);
+        assert!(unchanged.dirty.is_empty());
+        assert!(!unchanged.reset);
     }
 
     #[test]
