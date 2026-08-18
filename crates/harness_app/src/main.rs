@@ -105,11 +105,55 @@ const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
 const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
+const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
+const PROGRESSIVE_OUTPUT_MEDIUM_BYTES: usize = 16 * 1_024;
+const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
+const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
+const PROGRESSIVE_WEB_MEDIUM_RESULTS: usize = 10;
+const PROGRESSIVE_WEB_LARGE_RESULTS: usize = 50;
 
 #[derive(Debug, Eq, PartialEq)]
 struct StructuredOutputPreview {
     content: String,
     footer: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum OutputExpansion {
+    #[default]
+    Preview,
+    Medium,
+    Large,
+    All,
+}
+
+impl OutputExpansion {
+    fn candidates_after(self) -> &'static [Self] {
+        match self {
+            Self::Preview => &[Self::Medium, Self::Large, Self::All],
+            Self::Medium => &[Self::Large, Self::All],
+            Self::Large => &[Self::All],
+            Self::All => &[Self::Preview],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputLimits {
+    lines: usize,
+    bytes: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProgressiveOutputPresentation {
+    content: String,
+    toggle: Option<ProgressiveOutputToggle>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ProgressiveOutputToggle {
+    label: String,
+    next: OutputExpansion,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -306,24 +350,208 @@ fn structured_output_preview_with_limits(
     }
 }
 
+fn output_limits(
+    expansion: OutputExpansion,
+    preview_lines: usize,
+    preview_bytes: usize,
+) -> OutputLimits {
+    match expansion {
+        OutputExpansion::Preview => OutputLimits {
+            lines: preview_lines,
+            bytes: preview_bytes,
+        },
+        OutputExpansion::Medium => OutputLimits {
+            lines: PROGRESSIVE_OUTPUT_MEDIUM_LINES,
+            bytes: PROGRESSIVE_OUTPUT_MEDIUM_BYTES,
+        },
+        OutputExpansion::Large => OutputLimits {
+            lines: PROGRESSIVE_OUTPUT_LARGE_LINES,
+            bytes: PROGRESSIVE_OUTPUT_LARGE_BYTES,
+        },
+        OutputExpansion::All => OutputLimits {
+            lines: usize::MAX,
+            bytes: usize::MAX,
+        },
+    }
+}
+
+fn content_fits_output_expansion(
+    content: &str,
+    expansion: OutputExpansion,
+    preview_lines: usize,
+    preview_bytes: usize,
+) -> bool {
+    let limits = output_limits(expansion, preview_lines, preview_bytes);
+    structured_output_preview_with_limits(content, "output", limits.lines, limits.bytes)
+        .footer
+        .is_none()
+}
+
+fn next_useful_output_expansion(
+    current: OutputExpansion,
+    fits: impl Fn(OutputExpansion) -> bool,
+) -> OutputExpansion {
+    if current == OutputExpansion::All {
+        return OutputExpansion::Preview;
+    }
+    current
+        .candidates_after()
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == OutputExpansion::All || !fits(*candidate))
+        .unwrap_or(OutputExpansion::All)
+}
+
+fn progressive_output_label(
+    noun: &str,
+    total_lines: usize,
+    total_bytes: usize,
+    preview_lines: usize,
+    preview_bytes: usize,
+    next: OutputExpansion,
+) -> String {
+    match next {
+        OutputExpansion::Preview => "Collapse to preview".into(),
+        OutputExpansion::Medium | OutputExpansion::Large => {
+            let limits = output_limits(next, preview_lines, preview_bytes);
+            if total_lines > limits.lines {
+                format!("Show first {} {noun}", limits.lines)
+            } else if total_bytes > limits.bytes {
+                format!("Show first {} KiB {noun}", limits.bytes / 1_024)
+            } else {
+                format!("Show more {noun}")
+            }
+        }
+        OutputExpansion::All if total_lines > preview_lines => {
+            format!("Show all {total_lines} {noun}")
+        }
+        OutputExpansion::All => format!("Show all {noun}"),
+    }
+}
+
+fn structured_output_presentation_with_limits(
+    content: &str,
+    noun: &str,
+    expansion: OutputExpansion,
+    preview_lines: usize,
+    preview_bytes: usize,
+) -> ProgressiveOutputPresentation {
+    let preview =
+        structured_output_preview_with_limits(content, noun, preview_lines, preview_bytes);
+    if preview.footer.is_none() {
+        return ProgressiveOutputPresentation {
+            content: content.to_string(),
+            toggle: None,
+        };
+    }
+
+    let limits = output_limits(expansion, preview_lines, preview_bytes);
+    let visible = structured_output_preview_with_limits(content, noun, limits.lines, limits.bytes);
+    let next = next_useful_output_expansion(expansion, |candidate| {
+        content_fits_output_expansion(content, candidate, preview_lines, preview_bytes)
+    });
+    ProgressiveOutputPresentation {
+        content: visible.content,
+        toggle: Some(ProgressiveOutputToggle {
+            label: progressive_output_label(
+                noun,
+                content.lines().count(),
+                content.len(),
+                preview_lines,
+                preview_bytes,
+                next,
+            ),
+            next,
+        }),
+    }
+}
+
 fn structured_output_presentation(
     content: &str,
     noun: &str,
-    expanded: bool,
-) -> StructuredOutputPreview {
-    let collapsed = structured_output_preview(content, noun);
-    if expanded && collapsed.footer.is_some() {
-        StructuredOutputPreview {
-            content: content.to_string(),
-            footer: Some("Show less".into()),
-        }
-    } else {
-        collapsed
-    }
+    expansion: OutputExpansion,
+) -> ProgressiveOutputPresentation {
+    structured_output_presentation_with_limits(
+        content,
+        noun,
+        expansion,
+        STRUCTURED_OUTPUT_PREVIEW_LINES,
+        STRUCTURED_OUTPUT_PREVIEW_BYTES,
+    )
 }
 
 fn command_output_for_display(output: &str) -> &str {
     output.trim_end_matches(['\r', '\n'])
+}
+
+fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> usize {
+    match expansion {
+        OutputExpansion::Preview => preview_limit,
+        OutputExpansion::Medium => PROGRESSIVE_OUTPUT_MEDIUM_LINES,
+        OutputExpansion::Large => PROGRESSIVE_OUTPUT_LARGE_LINES,
+        OutputExpansion::All => usize::MAX,
+    }
+}
+
+fn next_line_expansion(
+    current: OutputExpansion,
+    total_lines: usize,
+    preview_limit: usize,
+) -> OutputExpansion {
+    next_useful_output_expansion(current, |candidate| {
+        total_lines <= progressive_line_limit(candidate, preview_limit)
+    })
+}
+
+fn progressive_line_toggle(
+    current: OutputExpansion,
+    total_lines: usize,
+    preview_limit: usize,
+    noun: &str,
+) -> Option<ProgressiveOutputToggle> {
+    (total_lines > preview_limit).then(|| {
+        let next = next_line_expansion(current, total_lines, preview_limit);
+        ProgressiveOutputToggle {
+            label: progressive_output_label(noun, total_lines, 0, preview_limit, usize::MAX, next),
+            next,
+        }
+    })
+}
+
+fn progressive_web_limit(expansion: OutputExpansion) -> usize {
+    match expansion {
+        OutputExpansion::Preview => WEB_RESULT_PREVIEW_COUNT,
+        OutputExpansion::Medium => PROGRESSIVE_WEB_MEDIUM_RESULTS,
+        OutputExpansion::Large => PROGRESSIVE_WEB_LARGE_RESULTS,
+        OutputExpansion::All => usize::MAX,
+    }
+}
+
+fn next_web_expansion(current: OutputExpansion, result_count: usize) -> OutputExpansion {
+    next_useful_output_expansion(current, |candidate| {
+        candidate != OutputExpansion::Preview && result_count <= progressive_web_limit(candidate)
+    })
+}
+
+fn progressive_web_toggle(
+    current: OutputExpansion,
+    result_count: usize,
+    has_hidden_content: bool,
+) -> Option<ProgressiveOutputToggle> {
+    has_hidden_content.then(|| {
+        let next = next_web_expansion(current, result_count);
+        let label = match next {
+            OutputExpansion::Preview => "Collapse to preview".into(),
+            OutputExpansion::Medium | OutputExpansion::Large => {
+                format!("Show first {} results", progressive_web_limit(next))
+            }
+            OutputExpansion::All if result_count > WEB_RESULT_PREVIEW_COUNT => {
+                format!("Show all {result_count} results")
+            }
+            OutputExpansion::All => "Show all result details".into(),
+        };
+        ProgressiveOutputToggle { label, next }
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -382,11 +610,48 @@ fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
     presentations
 }
 
-fn file_change_line_count(item: &TranscriptItem) -> usize {
-    file_change_presentations(&item.content)
+fn file_change_counts_for_limits(item: &TranscriptItem) -> (usize, usize) {
+    let presentations = file_change_presentations(&item.content);
+    let changed_lines = presentations
         .iter()
         .map(|presentation| presentation.content.lines().count())
-        .sum()
+        .sum();
+    (presentations.len(), changed_lines)
+}
+
+fn file_change_fits_output_expansion(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
+    let (files, changed_lines) = file_change_counts_for_limits(item);
+    let limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
+    files <= limit && changed_lines <= limit
+}
+
+fn next_file_change_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
+    next_useful_output_expansion(current, |candidate| {
+        file_change_fits_output_expansion(item, candidate)
+    })
+}
+
+fn progressive_file_change_toggle(
+    item: &TranscriptItem,
+    current: OutputExpansion,
+) -> Option<ProgressiveOutputToggle> {
+    let (files, changed_lines) = file_change_counts_for_limits(item);
+    if files <= STRUCTURED_OUTPUT_PREVIEW_LINES && changed_lines <= STRUCTURED_OUTPUT_PREVIEW_LINES
+    {
+        return None;
+    }
+    let next = next_file_change_expansion(item, current);
+    let label = match next {
+        OutputExpansion::Preview => "Collapse to preview".into(),
+        OutputExpansion::Medium | OutputExpansion::Large => format!(
+            "Show up to {} files / changed lines",
+            progressive_line_limit(next, STRUCTURED_OUTPUT_PREVIEW_LINES)
+        ),
+        OutputExpansion::All => {
+            format!("Show all {files} files and {changed_lines} changed lines")
+        }
+    };
+    Some(ProgressiveOutputToggle { label, next })
 }
 
 fn file_change_counts(presentation: &FileChangePresentation) -> (usize, usize) {
@@ -528,7 +793,7 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
             item.content.lines().count() > STRUCTURED_OUTPUT_PREVIEW_LINES
         }
         model::TranscriptKind::FileChange => {
-            file_change_line_count(item) > STRUCTURED_OUTPUT_PREVIEW_LINES
+            !file_change_fits_output_expansion(item, OutputExpansion::Preview)
         }
         model::TranscriptKind::Image | model::TranscriptKind::Approval => false,
         kind if kind.is_structured() => structured_output_preview(&item.content, "output")
@@ -538,8 +803,109 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
     }
 }
 
-fn rich_search_match_needs_context(item: &TranscriptItem, output_expanded: bool) -> bool {
-    !item.expanded || (transcript_output_is_expandable(item) && !output_expanded)
+fn command_fits_output_expansion(
+    command: &model::CommandTranscript,
+    expansion: OutputExpansion,
+) -> bool {
+    content_fits_output_expansion(
+        command.command.trim_end_matches(['\r', '\n']),
+        expansion,
+        COMMAND_PREVIEW_LINES,
+        COMMAND_PREVIEW_BYTES,
+    ) && content_fits_output_expansion(
+        command_output_for_display(&command.output),
+        expansion,
+        STRUCTURED_OUTPUT_PREVIEW_LINES,
+        STRUCTURED_OUTPUT_PREVIEW_BYTES,
+    )
+}
+
+fn next_command_expansion(
+    command: &model::CommandTranscript,
+    current: OutputExpansion,
+) -> OutputExpansion {
+    next_useful_output_expansion(current, |candidate| {
+        command_fits_output_expansion(command, candidate)
+    })
+}
+
+fn command_output_toggle(
+    command: &model::CommandTranscript,
+    current: OutputExpansion,
+) -> Option<ProgressiveOutputToggle> {
+    if command_fits_output_expansion(command, OutputExpansion::Preview) {
+        return None;
+    }
+    let next = next_command_expansion(command, current);
+    let label = match next {
+        OutputExpansion::Preview => "Collapse to preview".into(),
+        OutputExpansion::Medium | OutputExpansion::Large => format!(
+            "Show up to {} lines per section",
+            output_limits(next, STRUCTURED_OUTPUT_PREVIEW_LINES, usize::MAX).lines
+        ),
+        OutputExpansion::All => "Show all command and output".into(),
+    };
+    Some(ProgressiveOutputToggle { label, next })
+}
+
+fn output_expansion_reveals_all(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
+    match item.kind {
+        model::TranscriptKind::Command => item
+            .command_transcript()
+            .is_some_and(|command| command_fits_output_expansion(&command, expansion)),
+        model::TranscriptKind::Web => {
+            let presentation = web_search_presentation(&item.raw);
+            expansion != OutputExpansion::Preview
+                && presentation.results.len() <= progressive_web_limit(expansion)
+        }
+        model::TranscriptKind::Diff => {
+            item.content.lines().count()
+                <= progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES)
+        }
+        model::TranscriptKind::FileChange => file_change_fits_output_expansion(item, expansion),
+        model::TranscriptKind::Image | model::TranscriptKind::Approval => true,
+        kind if kind.is_structured() => content_fits_output_expansion(
+            &item.content,
+            expansion,
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+            STRUCTURED_OUTPUT_PREVIEW_BYTES,
+        ),
+        _ => true,
+    }
+}
+
+fn next_item_output_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
+    match item.kind {
+        model::TranscriptKind::Command => item
+            .command_transcript()
+            .map(|command| next_command_expansion(&command, current))
+            .unwrap_or(OutputExpansion::Preview),
+        model::TranscriptKind::Web => {
+            let presentation = web_search_presentation(&item.raw);
+            next_web_expansion(current, presentation.results.len())
+        }
+        model::TranscriptKind::Diff => next_line_expansion(
+            current,
+            item.content.lines().count(),
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+        ),
+        model::TranscriptKind::FileChange => next_file_change_expansion(item, current),
+        model::TranscriptKind::Image | model::TranscriptKind::Approval => OutputExpansion::Preview,
+        kind if kind.is_structured() => next_useful_output_expansion(current, |candidate| {
+            content_fits_output_expansion(
+                &item.content,
+                candidate,
+                STRUCTURED_OUTPUT_PREVIEW_LINES,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+            )
+        }),
+        _ => OutputExpansion::Preview,
+    }
+}
+
+fn rich_search_match_needs_context(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
+    !item.expanded
+        || (transcript_output_is_expandable(item) && !output_expansion_reveals_all(item, expansion))
 }
 
 fn folded_contains(text: &str, query: &str) -> bool {
@@ -550,7 +916,11 @@ fn folded_contains(text: &str, query: &str) -> bool {
 /// Whether the active Rich card already paints the matching text. Search
 /// context is a fallback for collapsed/truncated content, not a second copy of
 /// metadata that the card always exposes (notably file paths and commands).
-fn rich_search_query_is_visible(item: &TranscriptItem, output_expanded: bool, query: &str) -> bool {
+fn rich_search_query_is_visible(
+    item: &TranscriptItem,
+    expansion: OutputExpansion,
+    query: &str,
+) -> bool {
     if folded_contains(&item.title, query)
         || item
             .display_status()
@@ -565,33 +935,41 @@ fn rich_search_query_is_visible(item: &TranscriptItem, output_expanded: bool, qu
     match item.kind {
         model::TranscriptKind::Command => item.command_transcript().is_some_and(|transcript| {
             let command_text = transcript.command.trim_end_matches(['\r', '\n']);
-            let command_preview = structured_output_preview_with_limits(
+            let command_limits =
+                output_limits(expansion, COMMAND_PREVIEW_LINES, COMMAND_PREVIEW_BYTES);
+            let visible_command = structured_output_preview_with_limits(
                 command_text,
                 "command",
-                COMMAND_PREVIEW_LINES,
-                COMMAND_PREVIEW_BYTES,
+                command_limits.lines,
+                command_limits.bytes,
             );
-            let command = if output_expanded && command_preview.footer.is_some() {
-                command_text
-            } else {
-                command_preview.content.as_str()
-            };
+            let command = visible_command.content.as_str();
             let output_text = command_output_for_display(&transcript.output);
-            let output_preview = structured_output_preview(output_text, "output");
-            let output = if output_expanded && output_preview.footer.is_some() {
-                output_text
-            } else {
-                output_preview.content.as_str()
-            };
+            let output_limits = output_limits(
+                expansion,
+                STRUCTURED_OUTPUT_PREVIEW_LINES,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+            );
+            let visible_output = structured_output_preview_with_limits(
+                output_text,
+                "output",
+                output_limits.lines,
+                output_limits.bytes,
+            );
+            let output = visible_output.content.as_str();
             folded_contains(command, query) || folded_contains(output, query)
         }),
         model::TranscriptKind::FileChange => {
-            let mut remaining_lines = if output_expanded {
-                usize::MAX
-            } else {
-                STRUCTURED_OUTPUT_PREVIEW_LINES
-            };
-            for presentation in file_change_presentations(&item.content) {
+            let mut remaining_lines =
+                progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
+            for presentation in
+                file_change_presentations(&item.content)
+                    .into_iter()
+                    .take(progressive_line_limit(
+                        expansion,
+                        STRUCTURED_OUTPUT_PREVIEW_LINES,
+                    ))
+            {
                 if remaining_lines == 0 && !presentation.content.is_empty() {
                     break;
                 }
@@ -620,17 +998,16 @@ fn rich_search_query_is_visible(item: &TranscriptItem, output_expanded: bool, qu
             &item
                 .content
                 .lines()
-                .take(if output_expanded {
-                    usize::MAX
-                } else {
-                    STRUCTURED_OUTPUT_PREVIEW_LINES
-                })
+                .take(progressive_line_limit(
+                    expansion,
+                    STRUCTURED_OUTPUT_PREVIEW_LINES,
+                ))
                 .collect::<Vec<_>>()
                 .join("\n"),
             query,
         ),
         kind if kind.is_structured() => {
-            let visible = structured_output_presentation(&item.content, "output", output_expanded);
+            let visible = structured_output_presentation(&item.content, "output", expansion);
             folded_contains(&visible.content, query)
         }
         _ => folded_contains(&item.content, query),
@@ -953,7 +1330,7 @@ struct HarnessApp {
     selected_task: usize,
     visual_anchor: Option<usize>,
     raw_visible: HashSet<String>,
-    expanded_output: HashSet<String>,
+    output_expansion: HashMap<String, OutputExpansion>,
     markdown_cache: HashMap<String, CachedMarkdown>,
     search_visible: bool,
     search_query: String,
@@ -1083,7 +1460,7 @@ impl HarnessApp {
             selected_task: 0,
             visual_anchor: None,
             raw_visible: HashSet::default(),
-            expanded_output: HashSet::default(),
+            output_expansion: HashMap::default(),
             markdown_cache: HashMap::default(),
             search_visible: false,
             search_query: String::new(),
@@ -2082,7 +2459,7 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
         self.raw_visible.clear();
-        self.expanded_output.clear();
+        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -2160,7 +2537,7 @@ impl HarnessApp {
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         self.markdown_cache.clear();
         self.raw_visible.clear();
-        self.expanded_output.clear();
+        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -2186,7 +2563,7 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
         self.raw_visible.clear();
-        self.expanded_output.clear();
+        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -3261,8 +3638,16 @@ impl HarnessApp {
         }
 
         let item_key = item.key.clone();
-        if !self.expanded_output.remove(&item_key) {
-            self.expanded_output.insert(item_key);
+        let current = self
+            .output_expansion
+            .get(&item_key)
+            .copied()
+            .unwrap_or_default();
+        let next = next_item_output_expansion(item, current);
+        if next == OutputExpansion::Preview {
+            self.output_expansion.remove(&item_key);
+        } else {
+            self.output_expansion.insert(item_key, next);
         }
         self.list_state
             .splice(self.selected_item..self.selected_item + 1, 1);
@@ -3617,12 +4002,13 @@ impl HarnessApp {
     fn render_output_toggle(
         item_key: &str,
         index: usize,
-        label: String,
+        toggle: ProgressiveOutputToggle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let item_key = item_key.to_string();
         let toggle_key = item_key.clone();
+        let next = toggle.next;
         div()
             .id(format!("output-toggle:{item_key}"))
             .w_full()
@@ -3632,13 +4018,15 @@ impl HarnessApp {
             .text_color(colors.text_muted)
             .hover(|this| this.text_color(colors.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.expanded_output.remove(&toggle_key) {
-                    this.expanded_output.insert(toggle_key.clone());
+                if next == OutputExpansion::Preview {
+                    this.output_expansion.remove(&toggle_key);
+                } else {
+                    this.output_expansion.insert(toggle_key.clone(), next);
                 }
                 this.list_state.splice(index..index + 1, 1);
                 cx.notify();
             }))
-            .child(label)
+            .child(toggle.label)
             .into_any_element()
     }
 
@@ -3729,12 +4117,21 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let line_count = item.content.lines().count();
-        let expanded = self.expanded_output.contains(&item.key);
-        let visible_line_count = if expanded {
-            line_count
-        } else {
-            STRUCTURED_OUTPUT_PREVIEW_LINES
-        };
+        let expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
+        let visible_line_count = line_count.min(progressive_line_limit(
+            expansion,
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+        ));
+        let toggle = progressive_line_toggle(
+            expansion,
+            line_count,
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+            "diff lines",
+        );
         let lines = Self::render_diff_lines(&item.content, visible_line_count, cx);
 
         div()
@@ -3743,20 +4140,8 @@ impl HarnessApp {
             .min_w_0()
             .overflow_x_scroll()
             .children(lines)
-            .when(line_count > STRUCTURED_OUTPUT_PREVIEW_LINES, |this| {
-                this.child(Self::render_output_toggle(
-                    &item.key,
-                    index,
-                    if expanded {
-                        "Show fewer diff lines".into()
-                    } else {
-                        format!(
-                            "Show {} more diff lines",
-                            line_count - STRUCTURED_OUTPUT_PREVIEW_LINES
-                        )
-                    },
-                    cx,
-                ))
+            .when_some(toggle, |this, toggle| {
+                this.child(Self::render_output_toggle(&item.key, index, toggle, cx))
             })
             .into_any_element()
     }
@@ -3769,19 +4154,21 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let presentations = file_change_presentations(&item.content);
-        let line_count = presentations
-            .iter()
-            .map(|presentation| presentation.content.lines().count())
-            .sum::<usize>();
-        let expanded = self.expanded_output.contains(&item.key);
-        let mut remaining_lines = if expanded {
-            line_count
-        } else {
-            STRUCTURED_OUTPUT_PREVIEW_LINES
-        };
+        let expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
+        let progressive_limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
+        let mut remaining_lines = progressive_limit;
+        let toggle = progressive_file_change_toggle(item, expansion);
         let mut sections = Vec::new();
 
-        for (section_index, presentation) in presentations.into_iter().enumerate() {
+        for (section_index, presentation) in presentations
+            .into_iter()
+            .take(progressive_limit)
+            .enumerate()
+        {
             if remaining_lines == 0 && !presentation.content.is_empty() {
                 break;
             }
@@ -3889,25 +4276,13 @@ impl HarnessApp {
             .flex_col()
             .gap_1()
             .children(sections)
-            .when(line_count > STRUCTURED_OUTPUT_PREVIEW_LINES, |this| {
+            .when_some(toggle, |this, toggle| {
                 this.child(
                     div()
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(
-                            &item.key,
-                            index,
-                            if expanded {
-                                "Show fewer changed lines".into()
-                            } else {
-                                format!(
-                                    "Show {} more changed lines",
-                                    line_count - STRUCTURED_OUTPUT_PREVIEW_LINES
-                                )
-                            },
-                            cx,
-                        )),
+                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
                 )
             })
             .into_any_element()
@@ -3962,11 +4337,12 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let preview = structured_output_presentation(
-            &content,
-            "output",
-            self.expanded_output.contains(item_key),
-        );
+        let expansion = self
+            .output_expansion
+            .get(item_key)
+            .copied()
+            .unwrap_or_default();
+        let preview = structured_output_presentation(&content, "output lines", expansion);
         div()
             .id(("terminal-scroll", index))
             .w_full()
@@ -3980,13 +4356,13 @@ impl HarnessApp {
             .text_color(colors.text)
             .whitespace_normal()
             .child(preview.content)
-            .when_some(preview.footer, |this, footer| {
+            .when_some(preview.toggle, |this, toggle| {
                 this.child(
                     div()
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(item_key, index, footer, cx)),
+                        .child(Self::render_output_toggle(item_key, index, toggle, cx)),
                 )
             })
             .into_any_element()
@@ -3999,11 +4375,12 @@ impl HarnessApp {
         index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let preview = structured_output_presentation(
-            &content,
-            "output",
-            self.expanded_output.contains(item_key),
-        );
+        let expansion = self
+            .output_expansion
+            .get(item_key)
+            .copied()
+            .unwrap_or_default();
+        let preview = structured_output_presentation(&content, "output lines", expansion);
         let sections = activity_text_sections(&preview.content);
         if !sections.iter().any(|section| section.heading.is_some()) {
             return self.render_terminal(content, item_key, index, cx);
@@ -4059,14 +4436,14 @@ impl HarnessApp {
                             })
                     }),
             )
-            .when_some(preview.footer, |this, footer| {
+            .when_some(preview.toggle, |this, toggle| {
                 this.child(
                     div()
                         .mt_1()
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(item_key, index, footer, cx)),
+                        .child(Self::render_output_toggle(item_key, index, toggle, cx)),
                 )
             })
             .into_any_element()
@@ -4084,35 +4461,36 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let command_text = command.command.trim_end_matches(['\r', '\n']);
         let output = command_output_for_display(&command.output).to_string();
+        let expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
+        let command_limits = output_limits(expansion, COMMAND_PREVIEW_LINES, COMMAND_PREVIEW_BYTES);
+        let output_limits = output_limits(
+            expansion,
+            STRUCTURED_OUTPUT_PREVIEW_LINES,
+            STRUCTURED_OUTPUT_PREVIEW_BYTES,
+        );
         let command_preview = structured_output_preview_with_limits(
             command_text,
             "command",
-            COMMAND_PREVIEW_LINES,
-            COMMAND_PREVIEW_BYTES,
+            command_limits.lines,
+            command_limits.bytes,
         );
-        let output_preview = structured_output_preview(&output, "output");
-        let command_hidden = command_preview.footer.is_some();
-        let output_hidden = output_preview.footer.is_some();
-        let expanded = self.expanded_output.contains(&item.key);
-        let displayed_command = if expanded && command_hidden {
-            command_text.to_string()
+        let displayed_command = if command_preview.footer.is_some() {
+            format!("{} …", command_preview.content.trim_end())
         } else {
             command_preview.content
         };
-        let displayed_output = if expanded && output_hidden {
-            output.clone()
-        } else {
-            output_preview.content
-        };
-        let footer = if expanded && (command_hidden || output_hidden) {
-            Some("Show less".to_string())
-        } else if command_hidden && output_hidden {
-            Some("Show full command and output".to_string())
-        } else if command_hidden {
-            command_preview.footer
-        } else {
-            output_preview.footer
-        };
+        let displayed_output = structured_output_preview_with_limits(
+            &output,
+            "output",
+            output_limits.lines,
+            output_limits.bytes,
+        )
+        .content;
+        let toggle = command_output_toggle(&command, expansion);
         let highlighted_command = StyledText::new(displayed_command.clone())
             .with_highlights(shell_highlights(&displayed_command, cx));
 
@@ -4151,14 +4529,14 @@ impl HarnessApp {
                         .child(displayed_output),
                 )
             })
-            .when_some(footer, |this, footer| {
+            .when_some(toggle, |this, toggle| {
                 this.child(
                     div()
                         .mt_1()
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(&item.key, index, footer, cx)),
+                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
                 )
             })
             .into_any_element()
@@ -4174,13 +4552,15 @@ impl HarnessApp {
         let presentation = web_search_presentation(&item.raw);
         let total_results = presentation.results.len();
         let has_hidden_content = web_search_has_hidden_content(&presentation);
-        let expanded = self.expanded_output.contains(&item.key);
+        let expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
+        let expanded = expansion != OutputExpansion::Preview;
         let item_key = item.key.clone();
-        let visible_result_count = if expanded {
-            total_results
-        } else {
-            WEB_RESULT_PREVIEW_COUNT
-        };
+        let visible_result_count = total_results.min(progressive_web_limit(expansion));
+        let toggle = progressive_web_toggle(expansion, total_results, has_hidden_content);
         let visible_results = presentation
             .results
             .into_iter()
@@ -4270,27 +4650,13 @@ impl HarnessApp {
                 )
             })
             .children(visible_results)
-            .when(has_hidden_content, |this| {
+            .when_some(toggle, |this, toggle| {
                 this.child(
                     div()
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(
-                            &item.key,
-                            index,
-                            if expanded {
-                                "Show fewer results".into()
-                            } else if total_results <= WEB_RESULT_PREVIEW_COUNT {
-                                "Show full results".into()
-                            } else {
-                                format!(
-                                    "Show {} more results",
-                                    total_results - WEB_RESULT_PREVIEW_COUNT
-                                )
-                            },
-                            cx,
-                        )),
+                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
                 )
             })
             .when(total_results == 0, |this| {
@@ -4959,6 +5325,11 @@ impl HarnessApp {
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
         let visible_status = item.display_status().map(ToOwned::to_owned);
+        let output_expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
         let header_title = request_method
             .and_then(request_header_title)
             .unwrap_or(&item.title)
@@ -4978,12 +5349,8 @@ impl HarnessApp {
         let search_context = (self.search_visible
             && active_search_item
             && is_disclosure
-            && rich_search_match_needs_context(&item, self.expanded_output.contains(&item.key))
-            && !rich_search_query_is_visible(
-                &item,
-                self.expanded_output.contains(&item.key),
-                &self.search_query,
-            ))
+            && rich_search_match_needs_context(&item, output_expansion)
+            && !rich_search_query_is_visible(&item, output_expansion, &self.search_query))
         .then(|| search_context_snippet(&item.content, &self.search_query, 180))
         .flatten()
         .map(|snippet| {
@@ -6831,9 +7198,16 @@ mod tests {
         assert!(preview.content.is_char_boundary(preview.content.len()));
         assert_eq!(preview.footer.as_deref(), Some("Show more output"));
 
-        let expanded = structured_output_presentation(&content, "output", true);
+        let expanded =
+            structured_output_presentation(&content, "output lines", OutputExpansion::All);
         assert_eq!(expanded.content, content);
-        assert_eq!(expanded.footer.as_deref(), Some("Show less"));
+        assert_eq!(
+            expanded.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Collapse to preview".into(),
+                next: OutputExpansion::Preview,
+            })
+        );
 
         let command = std::iter::repeat_n("echo 'hello'", COMMAND_PREVIEW_LINES + 3)
             .collect::<Vec<_>>()
@@ -6855,6 +7229,218 @@ mod tests {
     }
 
     #[test]
+    fn huge_output_expands_in_bounded_deterministic_steps_before_show_all() {
+        let content = (0..10_000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let preview =
+            structured_output_presentation(&content, "output lines", OutputExpansion::Preview);
+        assert_eq!(
+            preview.content.lines().count(),
+            STRUCTURED_OUTPUT_PREVIEW_LINES
+        );
+        assert_eq!(
+            preview.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Show first 100 output lines".into(),
+                next: OutputExpansion::Medium,
+            })
+        );
+
+        let medium =
+            structured_output_presentation(&content, "output lines", OutputExpansion::Medium);
+        assert_eq!(
+            medium.content.lines().count(),
+            PROGRESSIVE_OUTPUT_MEDIUM_LINES
+        );
+        assert_eq!(
+            medium.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Show first 500 output lines".into(),
+                next: OutputExpansion::Large,
+            })
+        );
+
+        let large =
+            structured_output_presentation(&content, "output lines", OutputExpansion::Large);
+        assert_eq!(
+            large.content.lines().count(),
+            PROGRESSIVE_OUTPUT_LARGE_LINES
+        );
+        assert_eq!(
+            large.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Show all 10000 output lines".into(),
+                next: OutputExpansion::All,
+            })
+        );
+
+        let all = structured_output_presentation(&content, "output lines", OutputExpansion::All);
+        assert_eq!(all.content.lines().count(), 10_000);
+        assert_eq!(
+            all.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Collapse to preview".into(),
+                next: OutputExpansion::Preview,
+            })
+        );
+    }
+
+    #[test]
+    fn short_overflow_skips_useless_steps_and_byte_limits_bound_single_lines() {
+        let twelve_lines = std::iter::repeat_n("line", 12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview =
+            structured_output_presentation(&twelve_lines, "output lines", OutputExpansion::Preview);
+        assert_eq!(
+            preview.toggle,
+            Some(ProgressiveOutputToggle {
+                label: "Show all 12 output lines".into(),
+                next: OutputExpansion::All,
+            })
+        );
+
+        let huge_line = "x".repeat(PROGRESSIVE_OUTPUT_LARGE_BYTES * 4);
+        for (expansion, bound, label) in [
+            (
+                OutputExpansion::Preview,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+                "Show first 16 KiB output",
+            ),
+            (
+                OutputExpansion::Medium,
+                PROGRESSIVE_OUTPUT_MEDIUM_BYTES,
+                "Show first 64 KiB output",
+            ),
+            (
+                OutputExpansion::Large,
+                PROGRESSIVE_OUTPUT_LARGE_BYTES,
+                "Show all output",
+            ),
+        ] {
+            let presentation = structured_output_presentation(&huge_line, "output", expansion);
+            assert!(presentation.content.len() <= bound);
+            assert_eq!(presentation.toggle.unwrap().label, label);
+        }
+    }
+
+    #[test]
+    fn command_progression_bounds_both_sections_and_keeps_explicit_collapse() {
+        let command = model::CommandTranscript {
+            command: std::iter::repeat_n("printf '%s\\n' value", 1_000)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            cwd: None,
+            output: std::iter::repeat_n("value", 1_000)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        assert_eq!(
+            command_output_toggle(&command, OutputExpansion::Preview),
+            Some(ProgressiveOutputToggle {
+                label: "Show up to 100 lines per section".into(),
+                next: OutputExpansion::Medium,
+            })
+        );
+        assert_eq!(
+            command_output_toggle(&command, OutputExpansion::Medium),
+            Some(ProgressiveOutputToggle {
+                label: "Show up to 500 lines per section".into(),
+                next: OutputExpansion::Large,
+            })
+        );
+        assert_eq!(
+            command_output_toggle(&command, OutputExpansion::Large),
+            Some(ProgressiveOutputToggle {
+                label: "Show all command and output".into(),
+                next: OutputExpansion::All,
+            })
+        );
+        assert_eq!(
+            command_output_toggle(&command, OutputExpansion::All),
+            Some(ProgressiveOutputToggle {
+                label: "Collapse to preview".into(),
+                next: OutputExpansion::Preview,
+            })
+        );
+    }
+
+    #[test]
+    fn web_results_use_smaller_semantic_steps_before_explicit_show_all() {
+        assert_eq!(
+            progressive_web_toggle(OutputExpansion::Preview, 200, true),
+            Some(ProgressiveOutputToggle {
+                label: "Show first 10 results".into(),
+                next: OutputExpansion::Medium,
+            })
+        );
+        assert_eq!(
+            progressive_web_toggle(OutputExpansion::Medium, 200, true),
+            Some(ProgressiveOutputToggle {
+                label: "Show first 50 results".into(),
+                next: OutputExpansion::Large,
+            })
+        );
+        assert_eq!(
+            progressive_web_toggle(OutputExpansion::Large, 200, true),
+            Some(ProgressiveOutputToggle {
+                label: "Show all 200 results".into(),
+                next: OutputExpansion::All,
+            })
+        );
+        assert_eq!(
+            progressive_web_toggle(OutputExpansion::All, 200, true),
+            Some(ProgressiveOutputToggle {
+                label: "Collapse to preview".into(),
+                next: OutputExpansion::Preview,
+            })
+        );
+    }
+
+    #[test]
+    fn file_change_limits_bound_metadata_only_histories_too() {
+        let content = (0..1_000)
+            .map(|index| format!("Modified · /tmp/file-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = TranscriptItem {
+            key: "many-files".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::FileChange,
+            title: "File changes · 1000 files".into(),
+            status: None,
+            content,
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert_eq!(file_change_counts_for_limits(&item), (1_000, 0));
+        assert!(!file_change_fits_output_expansion(
+            &item,
+            OutputExpansion::Preview
+        ));
+        assert_eq!(
+            progressive_file_change_toggle(&item, OutputExpansion::Preview),
+            Some(ProgressiveOutputToggle {
+                label: "Show up to 100 files / changed lines".into(),
+                next: OutputExpansion::Medium,
+            })
+        );
+        assert_eq!(
+            progressive_file_change_toggle(&item, OutputExpansion::Large),
+            Some(ProgressiveOutputToggle {
+                label: "Show all 1000 files and 0 changed lines".into(),
+                next: OutputExpansion::All,
+            })
+        );
+    }
+
+    #[test]
     fn rich_search_exposes_matches_hidden_by_output_previews() {
         let mut item = TranscriptItem {
             key: "tool-1".into(),
@@ -6871,10 +7457,16 @@ mod tests {
             pending_request: None,
         };
 
-        assert!(rich_search_match_needs_context(&item, false));
-        assert!(!rich_search_match_needs_context(&item, true));
+        assert!(rich_search_match_needs_context(
+            &item,
+            OutputExpansion::Preview
+        ));
+        assert!(!rich_search_match_needs_context(
+            &item,
+            OutputExpansion::All
+        ));
         item.expanded = false;
-        assert!(rich_search_match_needs_context(&item, true));
+        assert!(rich_search_match_needs_context(&item, OutputExpansion::All));
     }
 
     #[test]
@@ -6900,11 +7492,19 @@ mod tests {
 
         assert!(rich_search_query_is_visible(
             &item,
-            false,
+            OutputExpansion::Preview,
             "reverse_engineering.md"
         ));
-        assert!(!rich_search_query_is_visible(&item, false, "hidden needle"));
-        assert!(rich_search_query_is_visible(&item, true, "hidden needle"));
+        assert!(!rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "hidden needle"
+        ));
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::All,
+            "hidden needle"
+        ));
     }
 
     #[test]
