@@ -20,11 +20,11 @@ use editor::{
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
     FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render,
-    SharedString, TextStyle, TextStyleRefinement, Window, div, point, prelude::*,
+    SharedString, TextStyle, TextStyleRefinement, Window, div, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
-    minimal_text_edit,
+    TranscriptSemanticSpan, TranscriptSemanticStyle, minimal_text_edit,
 };
 use language::{Buffer, Language, LanguageRegistry, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
@@ -243,6 +243,7 @@ pub struct TranscriptEditor {
     // moving the viewport. Reparse only the visible Diff bodies on the next
     // refresh; never rescan the full transcript.
     diff_highlights_dirty: bool,
+    semantic_highlights_dirty: bool,
     search: TranscriptSearchState,
     follow_tail: bool,
     last_selection_head: Option<Anchor>,
@@ -361,6 +362,11 @@ struct StructuredTranscriptRows;
 struct ErrorTranscriptRows;
 struct ReasoningBodyHighlight;
 struct PlanBodyHighlight;
+struct MarkdownHeadingHighlight;
+struct MarkdownStrongHighlight;
+struct MarkdownEmphasisHighlight;
+struct MarkdownInlineCodeHighlight;
+struct MarkdownLinkHighlight;
 struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
@@ -390,6 +396,9 @@ enum PendingTailIntent {
 // viewport while leaving the full selectable semantic document in the Buffer.
 const VIEWPORT_OVERSCAN_ROWS: u32 = 64;
 const FOLLOW_TAIL_SLOP_ROWS: f64 = 1.;
+const MAX_SEMANTIC_SPANS_PER_SEGMENT: usize = 2_048;
+const MAX_SCANNED_SEMANTIC_SPANS_PER_VIEWPORT: usize = 4_096;
+const MAX_SEMANTIC_SPAN_LOOKBEHIND: usize = 128;
 
 #[derive(Clone, Debug)]
 struct ViewportDecorationWindow {
@@ -555,6 +564,53 @@ fn visible_diff_body_ranges(
         .filter(|segment| segment.kind == TranscriptKind::Diff)
         .filter_map(|segment| intersect_ranges(&segment.body_range, viewport))
         .collect()
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SemanticHighlightRanges {
+    headings: Vec<Range<usize>>,
+    strong: Vec<Range<usize>>,
+    emphasis: Vec<Range<usize>>,
+    inline_code: Vec<Range<usize>>,
+    links: Vec<Range<usize>>,
+    scanned_spans: usize,
+}
+
+fn visible_semantic_highlight_ranges(
+    segments: &[TranscriptDocumentSegment],
+    viewport: &Range<usize>,
+) -> SemanticHighlightRanges {
+    let mut highlights = SemanticHighlightRanges::default();
+    let visible_segments = segments_intersecting(segments, viewport);
+    'segments: for segment in &segments[visible_segments] {
+        // Spans are sorted by output start. Begin near the viewport instead of
+        // rescanning all semantics above it in one huge narrative item. A
+        // bounded lookbehind retains enclosing Heading/Strong/Link spans.
+        let first_starting_in_viewport = segment
+            .semantic_spans
+            .partition_point(|span| span.range.start < viewport.start);
+        let last_starting_in_viewport = segment
+            .semantic_spans
+            .partition_point(|span| span.range.start < viewport.end);
+        let scan_start = first_starting_in_viewport.saturating_sub(MAX_SEMANTIC_SPAN_LOOKBEHIND);
+        for span in &segment.semantic_spans[scan_start..last_starting_in_viewport] {
+            if highlights.scanned_spans >= MAX_SCANNED_SEMANTIC_SPANS_PER_VIEWPORT {
+                break 'segments;
+            }
+            highlights.scanned_spans += 1;
+            let Some(range) = intersect_ranges(&span.range, viewport) else {
+                continue;
+            };
+            match span.style {
+                TranscriptSemanticStyle::Heading => highlights.headings.push(range),
+                TranscriptSemanticStyle::Strong => highlights.strong.push(range),
+                TranscriptSemanticStyle::Emphasis => highlights.emphasis.push(range),
+                TranscriptSemanticStyle::InlineCode => highlights.inline_code.push(range),
+                TranscriptSemanticStyle::Link => highlights.links.push(range),
+            }
+        }
+    }
+    highlights
 }
 
 /// Return overlapping default search matches in one already bounded window.
@@ -832,6 +888,32 @@ fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -
         && projection.text.is_char_boundary(segment.body_range.start)
         && projection.text.is_char_boundary(segment.body_range.end)
         && segment.header_range.end <= segment.body_range.start
+        && semantic_spans_are_valid(
+            &segment.semantic_spans,
+            &segment.body_range,
+            &projection.text,
+        )
+}
+
+fn semantic_spans_are_valid(
+    spans: &[TranscriptSemanticSpan],
+    body_range: &Range<usize>,
+    text: &str,
+) -> bool {
+    spans.len() <= MAX_SEMANTIC_SPANS_PER_SEGMENT
+        && spans.iter().all(|span| {
+            body_range.start <= span.range.start
+                && span.range.start < span.range.end
+                && span.range.end <= body_range.end
+                && text.is_char_boundary(span.range.start)
+                && text.is_char_boundary(span.range.end)
+        })
+        && spans.windows(2).all(|pair| {
+            let left = &pair[0];
+            let right = &pair[1];
+            (left.range.start, left.range.end, left.style)
+                <= (right.range.start, right.range.end, right.style)
+        })
 }
 
 /// Validate the semantic byte index before any range is sliced or converted
@@ -889,6 +971,9 @@ fn document_has_valid_segment_ranges(document: &TranscriptDocument) -> bool {
         .into_iter()
         .all(|offset| document.text.is_char_boundary(offset));
         if !ranges_are_ordered || !boundaries_are_utf8 {
+            return false;
+        }
+        if !semantic_spans_are_valid(&segment.semantic_spans, &segment.body_range, &document.text) {
             return false;
         }
 
@@ -962,12 +1047,25 @@ fn apply_projected_segment_shape(
     let current = &mut segments[segment_position];
     current.body_range.end = new_body_end;
     current.whole_range.end = new_whole_end;
+    current.semantic_spans = projected
+        .semantic_spans
+        .iter()
+        .map(|span| TranscriptSemanticSpan {
+            range: range_at_offset(&span.range, whole_start),
+            style: span.style,
+        })
+        .collect();
     for later in &mut segments[segment_position + 1..] {
         if !shift_range(&mut later.whole_range, delta)
             || !shift_range(&mut later.header_range, delta)
             || !shift_range(&mut later.body_range, delta)
         {
             return false;
+        }
+        for span in &mut later.semantic_spans {
+            if !shift_range(&mut span.range, delta) {
+                return false;
+            }
         }
     }
     true
@@ -1169,6 +1267,7 @@ impl TranscriptEditor {
             viewport_refresh_pending: false,
             refresh_when_rendered: false,
             diff_highlights_dirty: true,
+            semantic_highlights_dirty: true,
             search: TranscriptSearchState::default(),
             follow_tail: false,
             last_selection_head: None,
@@ -1685,10 +1784,12 @@ impl TranscriptEditor {
             .as_ref()
             .is_none_or(|current| current.byte_range != desired.byte_range);
         let rebuild_diff_highlights = rebuild_rows || self.diff_highlights_dirty;
+        let rebuild_semantic_highlights = rebuild_rows || self.semantic_highlights_dirty;
         let rebuild_search_highlights = rebuild_rows || self.search.highlights_dirty;
         if !rebuild_headers
             && !rebuild_rows
             && !rebuild_diff_highlights
+            && !rebuild_semantic_highlights
             && !rebuild_search_highlights
         {
             return;
@@ -1742,6 +1843,8 @@ impl TranscriptEditor {
             }
             highlights
         });
+        let semantic_highlights = rebuild_semantic_highlights
+            .then(|| visible_semantic_highlight_ranges(&self.segments, &desired.byte_range));
         let search_case_sensitive = self.search.case_sensitive;
         let search_whole_word = self.search.whole_word;
         let search_highlights = rebuild_search_highlights.then(|| {
@@ -1950,6 +2053,91 @@ impl TranscriptEditor {
                 );
             }
 
+            if let Some(semantic_highlights) = semantic_highlights {
+                let SemanticHighlightRanges {
+                    headings,
+                    strong,
+                    emphasis,
+                    inline_code,
+                    links,
+                    scanned_spans: _,
+                } = semantic_highlights;
+                let anchors = |ranges: Vec<Range<usize>>| {
+                    ranges
+                        .into_iter()
+                        .map(|range| clipped_anchor_range(&snapshot, range))
+                        .collect::<Vec<_>>()
+                };
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownHeadingHighlight,
+                    >()),
+                    anchors(headings),
+                    HighlightStyle {
+                        color: Some(cx.theme().colors().text_accent),
+                        font_weight: Some(FontWeight::BOLD),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownStrongHighlight,
+                    >()),
+                    anchors(strong),
+                    HighlightStyle {
+                        font_weight: Some(FontWeight::BOLD),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownEmphasisHighlight,
+                    >()),
+                    anchors(emphasis),
+                    HighlightStyle {
+                        font_style: Some(gpui::FontStyle::Italic),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownInlineCodeHighlight,
+                    >()),
+                    anchors(inline_code),
+                    HighlightStyle {
+                        color: Some(cx.theme().colors().text_accent),
+                        background_color: Some(
+                            cx.theme()
+                                .colors()
+                                .editor_subheader_background
+                                .opacity(0.72),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                let link_color = cx.theme().colors().text_accent;
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownLinkHighlight,
+                    >()),
+                    anchors(links),
+                    HighlightStyle {
+                        color: Some(link_color),
+                        underline: Some(gpui::UnderlineStyle {
+                            thickness: px(1.),
+                            color: Some(link_color),
+                            wavy: false,
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+            }
+
             if let Some(search_highlights) = search_highlights {
                 if let Some(search_highlights) = search_highlights {
                     let active_search_match = active_search_match.map(|range| {
@@ -1994,6 +2182,7 @@ impl TranscriptEditor {
         }
         self.viewport_decorations = Some(desired);
         self.diff_highlights_dirty = false;
+        self.semantic_highlights_dirty = false;
         self.search.highlights_dirty = false;
     }
 
@@ -2019,6 +2208,7 @@ impl TranscriptEditor {
             let previous_header_blocks = std::mem::take(&mut self.header_blocks);
             self.viewport_decorations = None;
             self.diff_highlights_dirty = false;
+            self.semantic_highlights_dirty = false;
             self.search.highlights_dirty = true;
             self.editor.update(cx, |editor, cx| {
                 if !previous_header_blocks.is_empty() {
@@ -2032,6 +2222,11 @@ impl TranscriptEditor {
                     NavigationOverlayKey::unique::<TranscriptHeaderHighlight>(),
                     NavigationOverlayKey::unique::<ReasoningBodyHighlight>(),
                     NavigationOverlayKey::unique::<PlanBodyHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownHeadingHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownStrongHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownEmphasisHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownInlineCodeHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownLinkHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
                     NavigationOverlayKey::unique::<DiffHunkHighlight>(),
                     NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
@@ -2058,6 +2253,7 @@ impl TranscriptEditor {
         let previous_header_blocks = std::mem::take(&mut self.header_blocks);
         self.viewport_decorations = None;
         self.diff_highlights_dirty = true;
+        self.semantic_highlights_dirty = true;
         self.search.highlights_dirty = true;
         self.editor.update(cx, |editor, cx| {
             if !previous_header_blocks.is_empty() {
@@ -2179,6 +2375,10 @@ impl TranscriptEditor {
         }) || appended_projections
             .iter()
             .any(|projection| projection.segment.kind == TranscriptKind::Diff);
+        let semantic_bodies_changed = !updates.is_empty()
+            || appended_projections
+                .iter()
+                .any(|projection| !projection.segment.semantic_spans.is_empty());
 
         struct PendingEdit {
             old_range: Range<usize>,
@@ -2229,6 +2429,15 @@ impl TranscriptEditor {
                 whole_range: range_at_offset(&projection.segment.whole_range, next_offset),
                 header_range: range_at_offset(&projection.segment.header_range, next_offset),
                 body_range: range_at_offset(&projection.segment.body_range, next_offset),
+                semantic_spans: projection
+                    .segment
+                    .semantic_spans
+                    .iter()
+                    .map(|span| TranscriptSemanticSpan {
+                        range: range_at_offset(&span.range, next_offset),
+                        style: span.style,
+                    })
+                    .collect(),
             });
             appended_headers.push(projection.header_text().to_owned());
             next_offset += projection.text.len();
@@ -2255,6 +2464,7 @@ impl TranscriptEditor {
         self.segment_header_texts.extend(appended_headers);
         self.model_item_count = old_model_item_count + appended.len();
         self.diff_highlights_dirty |= diff_bodies_changed;
+        self.semantic_highlights_dirty |= semantic_bodies_changed;
         self.search.highlights_dirty |= search_text_changed;
         if self.segments.len() > appended_segment_start {
             self.decorate_appended_segments(appended_segment_start, cx);
@@ -2675,6 +2885,7 @@ mod tests {
                 whole_range: 0..text.len(),
                 header_range: 0..3,
                 body_range: 3..text.len(),
+                semantic_spans: Vec::new(),
             },
         };
         assert!(projection_has_valid_relative_ranges(&valid));
@@ -2684,9 +2895,22 @@ mod tests {
                 header_range: 0..2,
                 ..valid.segment.clone()
             },
-            ..valid
+            ..valid.clone()
         };
         assert!(!projection_has_valid_relative_ranges(&invalid));
+
+        let mut valid_semantics = valid.clone();
+        valid_semantics.segment.header_range = 0..0;
+        valid_semantics.segment.body_range = 0..text.len();
+        valid_semantics.segment.semantic_spans = vec![TranscriptSemanticSpan {
+            range: 1..3,
+            style: TranscriptSemanticStyle::Strong,
+        }];
+        assert!(projection_has_valid_relative_ranges(&valid_semantics));
+
+        let mut invalid_semantics = valid_semantics;
+        invalid_semantics.segment.semantic_spans[0].range = 1..2;
+        assert!(!projection_has_valid_relative_ranges(&invalid_semantics));
     }
 
     fn indexed_document(
@@ -2718,6 +2942,7 @@ mod tests {
                     whole_range: 0..first_end,
                     header_range: 0.."界 head".len(),
                     body_range: "界 head\n".len().."界 head\nbody".len(),
+                    semantic_spans: Vec::new(),
                 },
                 TranscriptDocumentSegment {
                     item_index: 1,
@@ -2726,6 +2951,7 @@ mod tests {
                     whole_range: first_end..text.len(),
                     header_range: first_end..first_end + "next".len(),
                     body_range: text.len()..text.len(),
+                    semantic_spans: Vec::new(),
                 },
             ],
         );
@@ -3001,6 +3227,7 @@ mod tests {
             whole_range,
             header_range,
             body_range,
+            semantic_spans: Vec::new(),
         }
     }
 
@@ -3236,6 +3463,44 @@ mod tests {
     }
 
     #[test]
+    fn incremental_body_updates_replace_and_shift_semantic_output_ranges() {
+        let mut first = segment(0, 0..20, 0..5, 7..18);
+        first.semantic_spans = vec![TranscriptSemanticSpan {
+            range: 8..12,
+            style: TranscriptSemanticStyle::Strong,
+        }];
+        let mut second = segment(1, 20..40, 20..25, 27..38);
+        second.semantic_spans = vec![TranscriptSemanticSpan {
+            range: 29..34,
+            style: TranscriptSemanticStyle::Link,
+        }];
+        let mut segments = vec![first, second];
+
+        let mut projected = segment(0, 0..24, 0..5, 7..22);
+        projected.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 8..20,
+                style: TranscriptSemanticStyle::Heading,
+            },
+            TranscriptSemanticSpan {
+                range: 12..18,
+                style: TranscriptSemanticStyle::Emphasis,
+            },
+        ];
+        assert!(apply_projected_segment_shape(&mut segments, 0, &projected));
+
+        assert_eq!(segments[0].semantic_spans, projected.semantic_spans);
+        assert_eq!(segments[1].whole_range, 24..44);
+        assert_eq!(
+            segments[1].semantic_spans,
+            [TranscriptSemanticSpan {
+                range: 33..38,
+                style: TranscriptSemanticStyle::Link,
+            }]
+        );
+    }
+
+    #[test]
     fn overscanned_window_tracks_viewport_size_and_document_edges() {
         assert_eq!(
             overscanned_point_range(
@@ -3380,6 +3645,113 @@ mod tests {
         let mut mixed = segments;
         mixed[8_025].kind = TranscriptKind::Agent;
         assert_eq!(visible_diff_body_ranges(&mixed, &viewport).len(), 49);
+    }
+
+    #[test]
+    fn ten_thousand_semantic_items_keep_paint_work_viewport_bounded() {
+        const ITEM_BYTES: usize = 64;
+        let segments = (0..10_000)
+            .map(|item_index| {
+                let start = item_index * ITEM_BYTES;
+                let mut segment = segment(
+                    item_index,
+                    start..start + ITEM_BYTES,
+                    start..start + 8,
+                    start + 10..start + 62,
+                );
+                segment.semantic_spans = vec![TranscriptSemanticSpan {
+                    range: start + 12..start + 24,
+                    style: TranscriptSemanticStyle::Strong,
+                }];
+                segment
+            })
+            .collect::<Vec<_>>();
+        let viewport = 8_000 * ITEM_BYTES..8_050 * ITEM_BYTES;
+
+        let highlights = visible_semantic_highlight_ranges(&segments, &viewport);
+        assert_eq!(highlights.strong.len(), 50);
+        assert_eq!(highlights.scanned_spans, 50);
+        assert!(
+            highlights
+                .strong
+                .iter()
+                .all(|range| { viewport.start <= range.start && range.end <= viewport.end })
+        );
+        assert!(highlights.headings.is_empty());
+        assert!(highlights.links.is_empty());
+    }
+
+    #[test]
+    fn overlapping_semantic_styles_are_clipped_without_flattening_channels() {
+        let mut segment = segment(0, 0..80, 0..8, 10..78);
+        segment.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 12..60,
+                style: TranscriptSemanticStyle::Heading,
+            },
+            TranscriptSemanticSpan {
+                range: 20..42,
+                style: TranscriptSemanticStyle::Strong,
+            },
+            TranscriptSemanticSpan {
+                range: 24..38,
+                style: TranscriptSemanticStyle::Emphasis,
+            },
+            TranscriptSemanticSpan {
+                range: 28..36,
+                style: TranscriptSemanticStyle::InlineCode,
+            },
+            TranscriptSemanticSpan {
+                range: 30..50,
+                style: TranscriptSemanticStyle::Link,
+            },
+        ];
+
+        let highlights = visible_semantic_highlight_ranges(&[segment], &(32..34));
+        assert_eq!(highlights.headings, [32..34]);
+        assert_eq!(highlights.strong, [32..34]);
+        assert_eq!(highlights.emphasis, [32..34]);
+        assert_eq!(highlights.inline_code, [32..34]);
+        assert_eq!(highlights.links, [32..34]);
+        assert_eq!(highlights.scanned_spans, 5);
+    }
+
+    #[test]
+    fn semantic_and_search_ranges_coexist_on_the_same_selectable_bytes() {
+        let text = "header\nrich code remains selectable\n";
+        let code_start = text.find("code").unwrap();
+        let code_range = code_start..code_start + "code".len();
+        let mut segment = segment(0, 0..text.len(), 0..6, 7..text.len());
+        segment.semantic_spans = vec![TranscriptSemanticSpan {
+            range: code_range.clone(),
+            style: TranscriptSemanticStyle::InlineCode,
+        }];
+
+        let semantic = visible_semantic_highlight_ranges(&[segment], &(0..text.len()));
+        let search = literal_match_ranges(text, "code", 0);
+        assert_eq!(semantic.inline_code, [code_range.clone()]);
+        assert_eq!(search, [code_range]);
+    }
+
+    #[test]
+    fn pathological_semantic_metadata_has_a_hard_viewport_scan_budget() {
+        let mut segment = segment(0, 0..20_000, 0..8, 10..19_998);
+        segment.semantic_spans = (0..10_000)
+            .map(|index| TranscriptSemanticSpan {
+                range: 10 + index..12 + index,
+                style: TranscriptSemanticStyle::Strong,
+            })
+            .collect();
+
+        let highlights = visible_semantic_highlight_ranges(&[segment], &(0..20_000));
+        assert_eq!(
+            highlights.scanned_spans,
+            MAX_SCANNED_SEMANTIC_SPANS_PER_VIEWPORT
+        );
+        assert_eq!(
+            highlights.strong.len(),
+            MAX_SCANNED_SEMANTIC_SPANS_PER_VIEWPORT
+        );
     }
 
     #[test]

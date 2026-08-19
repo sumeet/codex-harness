@@ -53,6 +53,13 @@ pub enum DiagnosticSeverity {
 }
 
 impl DiagnosticSeverity {
+    /// Compatibility aliases for callers that previously received LSP severities
+    /// through `language::DiagnosticSeverity`.
+    pub const ERROR: Self = Self::Error;
+    pub const WARNING: Self = Self::Warning;
+    pub const INFORMATION: Self = Self::Info;
+    pub const HINT: Self = Self::Hint;
+
     pub fn into_lsp(self) -> Option<lsp::DiagnosticSeverity> {
         match self {
             Self::Off => None,
