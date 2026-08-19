@@ -302,6 +302,112 @@ pub struct TranscriptDocumentSegment {
     pub whole_range: Range<usize>,
     pub header_range: Range<usize>,
     pub body_range: Range<usize>,
+    /// Theme-independent semantics in the exact selectable output coordinate
+    /// space. Ranges are absolute within the containing projection/document.
+    /// Structured and streaming bodies intentionally carry no spans.
+    pub semantic_spans: Vec<TranscriptSemanticSpan>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TranscriptSemanticStyle {
+    Heading,
+    Strong,
+    Emphasis,
+    InlineCode,
+    Link,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptSemanticSpan {
+    pub range: Range<usize>,
+    pub style: TranscriptSemanticStyle,
+}
+
+const MAX_SEMANTIC_SPANS_PER_ITEM: usize = 2_048;
+
+#[derive(Default)]
+struct SelectableBodyProjection {
+    text: String,
+    semantic_spans: Vec<TranscriptSemanticSpan>,
+}
+
+#[derive(Clone, Copy)]
+struct OpenSemanticSpan {
+    start: usize,
+    style: TranscriptSemanticStyle,
+}
+
+fn open_semantic_span(
+    open: &mut Vec<OpenSemanticSpan>,
+    style: TranscriptSemanticStyle,
+    output: &str,
+) {
+    open.push(OpenSemanticSpan {
+        start: output.len(),
+        style,
+    });
+}
+
+fn close_semantic_span(
+    open: &mut Vec<OpenSemanticSpan>,
+    spans: &mut Vec<TranscriptSemanticSpan>,
+    style: TranscriptSemanticStyle,
+    output: &str,
+) {
+    let Some(position) = open.iter().rposition(|candidate| candidate.style == style) else {
+        return;
+    };
+    let open = open.remove(position);
+    if open.start < output.len() && spans.len() < MAX_SEMANTIC_SPANS_PER_ITEM {
+        spans.push(TranscriptSemanticSpan {
+            range: open.start..output.len(),
+            style,
+        });
+    }
+}
+
+fn push_inline_semantic_text(
+    output: &mut String,
+    spans: &mut Vec<TranscriptSemanticSpan>,
+    text: &str,
+    style: TranscriptSemanticStyle,
+) {
+    let start = output.len();
+    output.push_str(text);
+    if start < output.len() && spans.len() < MAX_SEMANTIC_SPANS_PER_ITEM {
+        spans.push(TranscriptSemanticSpan {
+            range: start..output.len(),
+            style,
+        });
+    }
+}
+
+fn trim_body_projection(mut projection: SelectableBodyProjection) -> SelectableBodyProjection {
+    let trimmed_start = projection.text.len() - projection.text.trim_start().len();
+    let trimmed_end = projection.text.trim_end().len();
+    if trimmed_start >= trimmed_end {
+        projection.text.clear();
+        projection.semantic_spans.clear();
+        return projection;
+    }
+    if trimmed_start == 0 && trimmed_end == projection.text.len() {
+        projection
+    } else {
+        projection.text = projection.text[trimmed_start..trimmed_end].to_owned();
+        projection.semantic_spans = projection
+            .semantic_spans
+            .into_iter()
+            .filter_map(|span| {
+                let start = span.range.start.max(trimmed_start);
+                let end = span.range.end.min(trimmed_end);
+                (start < end).then_some(TranscriptSemanticSpan {
+                    range: start - trimmed_start..end - trimmed_start,
+                    style: span.style,
+                })
+            })
+            .collect();
+        projection
+    }
 }
 
 fn ensure_line_break(text: &mut String) {
@@ -310,18 +416,35 @@ fn ensure_line_break(text: &mut String) {
     }
 }
 
-fn selectable_markdown_text(source: &str) -> String {
+fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
     let options = MarkdownOptions::ENABLE_STRIKETHROUGH
         | MarkdownOptions::ENABLE_TABLES
         | MarkdownOptions::ENABLE_TASKLISTS
         | MarkdownOptions::ENABLE_FOOTNOTES
         | MarkdownOptions::ENABLE_MATH;
     let mut output = String::with_capacity(source.len());
+    let mut semantic_spans = Vec::new();
+    let mut open_semantic_spans = Vec::new();
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut destinations: Vec<(String, usize, bool)> = Vec::new();
 
     for event in MarkdownParser::new_ext(source, options) {
         match event {
+            MarkdownEvent::Start(Tag::Heading { .. }) => open_semantic_span(
+                &mut open_semantic_spans,
+                TranscriptSemanticStyle::Heading,
+                &output,
+            ),
+            MarkdownEvent::Start(Tag::Strong) => open_semantic_span(
+                &mut open_semantic_spans,
+                TranscriptSemanticStyle::Strong,
+                &output,
+            ),
+            MarkdownEvent::Start(Tag::Emphasis) => open_semantic_span(
+                &mut open_semantic_spans,
+                TranscriptSemanticStyle::Emphasis,
+                &output,
+            ),
             MarkdownEvent::Start(Tag::List(start)) => {
                 ensure_line_break(&mut output);
                 lists.push(start);
@@ -342,10 +465,20 @@ fn selectable_markdown_text(source: &str) -> String {
                 ensure_line_break(&mut output)
             }
             MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                open_semantic_span(
+                    &mut open_semantic_spans,
+                    TranscriptSemanticStyle::Link,
+                    &output,
+                );
                 destinations.push((dest_url.into_string(), output.len(), false));
             }
             MarkdownEvent::Start(Tag::Image { dest_url, .. }) => {
                 output.push_str("Image: ");
+                open_semantic_span(
+                    &mut open_semantic_spans,
+                    TranscriptSemanticStyle::Link,
+                    &output,
+                );
                 destinations.push((dest_url.into_string(), output.len(), true));
             }
             MarkdownEvent::End(TagEnd::List(_)) => {
@@ -365,18 +498,49 @@ fn selectable_markdown_text(source: &str) -> String {
                         output.push_str(&destination);
                     }
                 }
+                close_semantic_span(
+                    &mut open_semantic_spans,
+                    &mut semantic_spans,
+                    TranscriptSemanticStyle::Link,
+                    &output,
+                );
+            }
+            MarkdownEvent::End(TagEnd::Strong) => close_semantic_span(
+                &mut open_semantic_spans,
+                &mut semantic_spans,
+                TranscriptSemanticStyle::Strong,
+                &output,
+            ),
+            MarkdownEvent::End(TagEnd::Emphasis) => close_semantic_span(
+                &mut open_semantic_spans,
+                &mut semantic_spans,
+                TranscriptSemanticStyle::Emphasis,
+                &output,
+            ),
+            MarkdownEvent::End(TagEnd::Heading(_)) => {
+                close_semantic_span(
+                    &mut open_semantic_spans,
+                    &mut semantic_spans,
+                    TranscriptSemanticStyle::Heading,
+                    &output,
+                );
+                ensure_line_break(&mut output);
             }
             MarkdownEvent::End(
                 TagEnd::Paragraph
-                | TagEnd::Heading(_)
                 | TagEnd::BlockQuote(_)
                 | TagEnd::CodeBlock
                 | TagEnd::Item
                 | TagEnd::TableRow,
             ) => ensure_line_break(&mut output),
             MarkdownEvent::End(TagEnd::TableCell) => output.push('\t'),
+            MarkdownEvent::Code(text) => push_inline_semantic_text(
+                &mut output,
+                &mut semantic_spans,
+                &text,
+                TranscriptSemanticStyle::InlineCode,
+            ),
             MarkdownEvent::Text(text)
-            | MarkdownEvent::Code(text)
             | MarkdownEvent::InlineMath(text)
             | MarkdownEvent::DisplayMath(text) => output.push_str(&text),
             MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => output.push_str(&html),
@@ -398,10 +562,23 @@ fn selectable_markdown_text(source: &str) -> String {
         }
     }
 
-    output.trim().to_string()
+    semantic_spans.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then_with(|| left.range.end.cmp(&right.range.end))
+            .then_with(|| left.style.cmp(&right.style))
+    });
+    trim_body_projection(SelectableBodyProjection {
+        text: output,
+        semantic_spans,
+    })
 }
 
-fn selectable_transcript_body(item: &TranscriptItem) -> String {
+fn selectable_transcript_body(
+    item: &TranscriptItem,
+    normalized_content: &str,
+) -> SelectableBodyProjection {
     let append_stable_stream = item.status.as_deref().is_some_and(|status| {
         matches!(
             status,
@@ -416,12 +593,18 @@ fn selectable_transcript_body(item: &TranscriptItem) -> String {
             | TranscriptKind::Plan
     ) {
         if append_stable_stream {
-            item.content.clone()
+            SelectableBodyProjection {
+                text: normalized_content.to_owned(),
+                semantic_spans: Vec::new(),
+            }
         } else {
-            selectable_markdown_text(&item.content)
+            selectable_markdown_text(normalized_content)
         }
     } else {
-        item.content.trim().to_string()
+        SelectableBodyProjection {
+            text: normalized_content.trim().to_owned(),
+            semantic_spans: Vec::new(),
+        }
     }
 }
 
@@ -457,12 +640,13 @@ fn project_transcript_item(
     text.push_str("\n\n");
 
     let body_start = text.len();
-    let body = normalize_buffer_line_endings(selectable_transcript_body(item));
-    if !body.is_empty() {
-        text.push_str(&body);
+    let normalized_content = normalize_buffer_line_endings(item.content.clone());
+    let body = selectable_transcript_body(item, &normalized_content);
+    if !body.text.is_empty() {
+        text.push_str(&body.text);
         text.push('\n');
     }
-    let body_end = body_start + body.len();
+    let body_end = body_start + body.text.len();
     text.push('\n');
 
     let whole_end = text.len();
@@ -475,6 +659,14 @@ fn project_transcript_item(
             whole_range: 0..whole_end,
             header_range: header_start..header_end,
             body_range: body_start..body_end,
+            semantic_spans: body
+                .semantic_spans
+                .into_iter()
+                .map(|span| TranscriptSemanticSpan {
+                    range: shifted_range(&span.range, body_start),
+                    style: span.style,
+                })
+                .collect(),
         },
     })
 }
@@ -494,6 +686,14 @@ fn shifted_segment(
         whole_range: shifted_range(&segment.whole_range, offset),
         header_range: shifted_range(&segment.header_range, offset),
         body_range: shifted_range(&segment.body_range, offset),
+        semantic_spans: segment
+            .semantic_spans
+            .iter()
+            .map(|span| TranscriptSemanticSpan {
+                range: shifted_range(&span.range, offset),
+                style: span.style,
+            })
+            .collect(),
     }
 }
 
@@ -4558,6 +4758,18 @@ mod tests {
                 projection.body_text(),
                 &document.text[segment.body_range.clone()]
             );
+            assert_eq!(
+                segment.semantic_spans,
+                projection
+                    .segment
+                    .semantic_spans
+                    .iter()
+                    .map(|span| TranscriptSemanticSpan {
+                        range: shifted_range(&span.range, segment.whole_range.start),
+                        style: span.style,
+                    })
+                    .collect::<Vec<_>>()
+            );
         }
         assert_eq!(document.segments.len(), model.items.len());
         assert!(
@@ -4578,16 +4790,99 @@ mod tests {
 
         let first = model.item_projection(0).unwrap();
         assert_eq!(first.body_text(), "A **real");
+        assert!(first.segment.semantic_spans.is_empty());
 
         model.items[0].content.push_str(" Vim** composer");
         let second = model.item_projection(0).unwrap();
         assert_eq!(second.body_text(), "A **real Vim** composer");
         assert!(second.body_text().starts_with(first.body_text()));
+        assert!(second.segment.semantic_spans.is_empty());
 
         model.items[0].status = Some("completed".into());
         let completed = model.item_projection(0).unwrap();
         assert_eq!(completed.body_text(), "A real Vim composer");
         assert!(!completed.body_text().contains("**"));
+        assert_eq!(
+            completed
+                .segment
+                .semantic_spans
+                .iter()
+                .map(|span| (span.style, &completed.text[span.range.clone()]))
+                .collect::<Vec<_>>(),
+            [(TranscriptSemanticStyle::Strong, "real Vim")]
+        );
+    }
+
+    #[test]
+    fn completed_markdown_semantics_use_nested_unicode_output_ranges() {
+        let mut model = TranscriptModel::default();
+        model.push_without_splice(replay_item(
+            0,
+            TranscriptKind::Agent,
+            "Codex",
+            "# Hé **bold and *嵌套***\n\nUse `café` at [Zed](https://zed.dev).",
+            json!(null),
+        ));
+
+        let projection = model.item_projection(0).unwrap();
+        assert_eq!(
+            projection.body_text(),
+            "Hé bold and 嵌套\nUse café at Zed (https://zed.dev)."
+        );
+        assert!(
+            !projection
+                .body_text()
+                .chars()
+                .any(|character| ['#', '*', '`', '[', ']'].contains(&character))
+        );
+        assert!(projection.segment.semantic_spans.iter().all(|span| {
+            projection.text.is_char_boundary(span.range.start)
+                && projection.text.is_char_boundary(span.range.end)
+                && projection.segment.body_range.start <= span.range.start
+                && span.range.end <= projection.segment.body_range.end
+        }));
+
+        let semantic_text = |style| {
+            projection
+                .segment
+                .semantic_spans
+                .iter()
+                .filter(|span| span.style == style)
+                .map(|span| &projection.text[span.range.clone()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::Heading),
+            ["Hé bold and 嵌套"]
+        );
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::Strong),
+            ["bold and 嵌套"]
+        );
+        assert_eq!(semantic_text(TranscriptSemanticStyle::Emphasis), ["嵌套"]);
+        assert_eq!(semantic_text(TranscriptSemanticStyle::InlineCode), ["café"]);
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::Link),
+            ["Zed (https://zed.dev)"]
+        );
+    }
+
+    #[test]
+    fn completed_markdown_semantic_metadata_has_a_per_item_cap() {
+        let source = (0..MAX_SEMANTIC_SPANS_PER_ITEM + 500)
+            .map(|index| format!("**value-{index}** "))
+            .collect::<String>();
+        let projection = selectable_markdown_text(&source);
+
+        assert_eq!(projection.semantic_spans.len(), MAX_SEMANTIC_SPANS_PER_ITEM);
+        assert!(projection.semantic_spans.windows(2).all(|pair| {
+            (pair[0].range.start, pair[0].range.end, pair[0].style)
+                <= (pair[1].range.start, pair[1].range.end, pair[1].style)
+        }));
+        assert!(projection.semantic_spans.iter().all(|span| {
+            projection.text.is_char_boundary(span.range.start)
+                && projection.text.is_char_boundary(span.range.end)
+        }));
     }
 
     #[test]
@@ -4630,6 +4925,7 @@ mod tests {
         let body = &document.text[document.segments[0].body_range.clone()];
 
         assert_eq!(body, "# literal output\n**not emphasis**");
+        assert!(document.segments[0].semantic_spans.is_empty());
     }
 
     #[test]
