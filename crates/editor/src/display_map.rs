@@ -130,7 +130,9 @@ use std::{
 };
 
 use crate::{
-    EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
+    EditorStyle, RowExt,
+    inlays::{Inlay, InlayHighlight},
+    movement::TextLayoutDetails,
 };
 
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};

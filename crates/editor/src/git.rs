@@ -639,20 +639,6 @@ impl Editor {
         self.restore_hunks_in_ranges(selections, window, cx);
     }
 
-    pub fn status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
-        if let Some(status) = self
-            .addons
-            .iter()
-            .find_map(|(_, addon)| addon.override_status_for_buffer_id(buffer_id, cx))
-        {
-            return Some(status);
-        }
-        self.project
-            .as_ref()?
-            .read(cx)
-            .status_for_buffer_id(buffer_id, cx)
-    }
-
     pub fn go_to_hunk_before_or_after_position(
         &mut self,
         snapshot: &EditorSnapshot,
@@ -1839,16 +1825,6 @@ impl Editor {
                 false
             }
         })
-    }
-
-    pub(super) fn has_any_expanded_diff_hunks(&self, cx: &App) -> bool {
-        if self.buffer.read(cx).all_diff_hunks_expanded() {
-            return true;
-        }
-        let ranges = vec![Anchor::Min..Anchor::Max];
-        self.buffer
-            .read(cx)
-            .has_expanded_diff_hunks_in_ranges(&ranges, cx)
     }
 
     pub(super) fn toggle_single_diff_hunk(&mut self, range: Range<Anchor>, cx: &mut Context<Self>) {

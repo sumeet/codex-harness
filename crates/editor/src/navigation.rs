@@ -204,14 +204,17 @@ impl Editor {
             return;
         }
 
-        if self
-            .context_menu
-            .borrow_mut()
-            .as_mut()
-            .map(|menu| menu.select_first(self.completion_provider.as_deref(), window, cx))
-            .unwrap_or(false)
+        #[cfg(feature = "project-integration")]
         {
-            return;
+            if self
+                .context_menu
+                .borrow_mut()
+                .as_mut()
+                .map(|menu| menu.select_first(self.completion_provider.as_deref(), window, cx))
+                .unwrap_or(false)
+            {
+                return;
+            }
         }
 
         if matches!(self.mode, EditorMode::SingleLine) {
@@ -323,14 +326,17 @@ impl Editor {
             return;
         }
 
-        if self
-            .context_menu
-            .borrow_mut()
-            .as_mut()
-            .map(|menu| menu.select_last(self.completion_provider.as_deref(), window, cx))
-            .unwrap_or(false)
+        #[cfg(feature = "project-integration")]
         {
-            return;
+            if self
+                .context_menu
+                .borrow_mut()
+                .as_mut()
+                .map(|menu| menu.select_last(self.completion_provider.as_deref(), window, cx))
+                .unwrap_or(false)
+            {
+                return;
+            }
         }
 
         if matches!(self.mode, EditorMode::SingleLine) {
@@ -989,6 +995,7 @@ impl Editor {
         self.go_to_singleton_buffer_range_impl(point..point, false, window, cx);
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_next_document_highlight(
         &mut self,
         _: &GoToNextDocumentHighlight,
@@ -998,6 +1005,7 @@ impl Editor {
         self.go_to_document_highlight_before_or_after_position(Direction::Next, window, cx);
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_prev_document_highlight(
         &mut self,
         _: &GoToPreviousDocumentHighlight,
@@ -1007,6 +1015,7 @@ impl Editor {
         self.go_to_document_highlight_before_or_after_position(Direction::Prev, window, cx);
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_definition(
         &mut self,
         _: &GoToDefinition,
@@ -1034,6 +1043,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_declaration(
         &mut self,
         _: &GoToDeclaration,
@@ -1043,6 +1053,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Declaration, false, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_declaration_split(
         &mut self,
         _: &GoToDeclaration,
@@ -1052,6 +1063,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Declaration, true, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_implementation(
         &mut self,
         _: &GoToImplementation,
@@ -1061,6 +1073,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, false, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_implementation_split(
         &mut self,
         _: &GoToImplementationSplit,
@@ -1070,6 +1083,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Implementation, true, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_type_definition(
         &mut self,
         _: &GoToTypeDefinition,
@@ -1079,6 +1093,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Type, false, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_definition_split(
         &mut self,
         _: &GoToDefinitionSplit,
@@ -1088,6 +1103,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, true, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_type_definition_split(
         &mut self,
         _: &GoToTypeDefinitionSplit,
@@ -1097,6 +1113,7 @@ impl Editor {
         self.go_to_definition_of_kind(GotoDefinitionKind::Type, true, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn open_url(&mut self, _: &OpenUrl, window: &mut Window, cx: &mut Context<Self>) {
         let selection = self.selections.newest_anchor();
         let head = selection.head();
@@ -1181,6 +1198,7 @@ impl Editor {
         .detach();
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn go_to_reference_before_or_after_position(
         &mut self,
         direction: Direction,
@@ -1286,10 +1304,29 @@ impl Editor {
         }))
     }
 
+    /// Without a project there is no LSP reference query, but hosts may still
+    /// supply document-highlight anchor ranges. Preserve Vim's reference
+    /// navigation over those ranges instead of turning the command into a
+    /// project-only API hole.
+    #[cfg(not(feature = "project-integration"))]
+    pub fn go_to_reference_before_or_after_position(
+        &mut self,
+        direction: Direction,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Task<Result<()>>> {
+        for _ in 0..count {
+            self.go_to_document_highlight_before_or_after_position(direction, window, cx);
+        }
+        Some(Task::ready(Ok(())))
+    }
+
     /// Runs the LSP go-to query for `kind` (definition / declaration / type /
     /// implementation) against the symbol under the cursor and returns the raw
     /// target [`Location`]s. The go-to counterpart to
     /// [`Self::find_all_references_locations`]; used by the LSP location pickers.
+    #[cfg(feature = "project-integration")]
     pub fn definition_locations_of_kind(
         &mut self,
         kind: GotoDefinitionKind,
@@ -1323,6 +1360,7 @@ impl Editor {
     /// Runs an LSP "find all references" query for the symbol under the cursor
     /// and returns the raw [`Location`]s. Unlike [`Self::find_all_references`],
     /// this does not group the results or open any UI
+    #[cfg(feature = "project-integration")]
     pub fn find_all_references_locations(
         &mut self,
         project: &Entity<Project>,
@@ -1777,7 +1815,7 @@ impl Editor {
         }
     }
 
-    #[cfg(feature = "workspace-integration")]
+    #[cfg(all(feature = "project-integration", feature = "workspace-integration"))]
     pub fn navigate_to_hover_links(
         &mut self,
         kind: Option<GotoDefinitionKind>,
@@ -2112,7 +2150,10 @@ impl Editor {
         })
     }
 
-    #[cfg(not(feature = "workspace-integration"))]
+    #[cfg(all(
+        feature = "project-integration",
+        not(feature = "workspace-integration")
+    ))]
     pub fn navigate_to_hover_links(
         &mut self,
         _: Option<GotoDefinitionKind>,
@@ -2125,6 +2166,7 @@ impl Editor {
         Task::ready(Ok(Navigated::No))
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn go_to_next_reference(
         &mut self,
         _: &GoToNextReference,
@@ -2137,6 +2179,7 @@ impl Editor {
         };
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn go_to_prev_reference(
         &mut self,
         _: &GoToPreviousReference,
@@ -2149,6 +2192,7 @@ impl Editor {
         };
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn go_to_symbol_by_offset(
         &mut self,
         window: &mut Window,
@@ -2239,6 +2283,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn go_to_next_symbol(
         &mut self,
         _: &GoToNextSymbol,
@@ -2248,6 +2293,7 @@ impl Editor {
         self.go_to_symbol_by_offset(window, cx, 1).detach();
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn go_to_previous_symbol(
         &mut self,
         _: &GoToPreviousSymbol,
@@ -2261,6 +2307,7 @@ impl Editor {
     /// go-to-definition, so selection, autoscroll, and jumplist tagging all
     /// match. `split` opens it in the adjacent pane. Called on the editor the
     /// jump originates from.
+    #[cfg(feature = "project-integration")]
     pub fn open_location(
         &mut self,
         location: Location,
@@ -2410,6 +2457,7 @@ impl Editor {
         Some((editor, pane))
     }
 
+    #[cfg(feature = "workspace-integration")]
     fn navigation_data(&self, cursor_anchor: Anchor, cx: &mut Context<Self>) -> NavigationData {
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let buffer = self.buffer.read(cx).read(cx);
@@ -2467,6 +2515,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     pub(crate) fn go_to_definition_of_kind(
         &mut self,
         kind: GotoDefinitionKind,
@@ -2517,6 +2566,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn compute_target_location(
         &self,
         lsp_location: lsp::Location,

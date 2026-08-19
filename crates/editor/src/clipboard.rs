@@ -10,6 +10,7 @@ pub trait ClipboardPathResolver {
     -> Option<PathBuf>;
 }
 
+#[cfg(feature = "project-integration")]
 impl ClipboardPathResolver for Entity<Project> {
     fn resolve_path(
         &self,
@@ -43,6 +44,7 @@ pub struct ClipboardSelection {
 
 impl ClipboardSelection {
     /// Builds clipboard metadata using the editor's project, preserving the original Zed API.
+    #[cfg(feature = "project-integration")]
     pub fn for_buffer(
         len: usize,
         is_entire_line: bool,
@@ -137,6 +139,7 @@ impl Editor {
         let clipboard_text = Cow::Borrowed(text.as_str());
 
         self.transact(window, cx, |this, window, cx| {
+            #[cfg(feature = "project-integration")]
             let had_active_edit_prediction = this.has_active_edit_prediction();
             let display_map = this.display_snapshot(cx);
             let old_selections = this.selections.all::<MultiBufferOffset>(&display_map);
@@ -305,10 +308,13 @@ impl Editor {
             // | ..                  |   true        true
             // | had_edit_prediction |   false       true
 
-            let trigger_in_words =
-                this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
+            #[cfg(feature = "project-integration")]
+            {
+                let trigger_in_words =
+                    this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
 
-            this.trigger_completion_on_input(text, trigger_in_words, window, cx);
+                this.trigger_completion_on_input(text, trigger_in_words, window, cx);
+            }
         });
     }
 
@@ -344,6 +350,7 @@ impl Editor {
                     .unwrap_or(false)
             };
 
+            #[cfg(feature = "project-integration")]
             if is_markdown {
                 let handled = maybe!({
                     let buffer = self.buffer().read(cx).as_singleton()?;
@@ -382,6 +389,8 @@ impl Editor {
                     return;
                 }
             }
+            #[cfg(not(feature = "project-integration"))]
+            let _ = is_markdown;
         }
 
         let clipboard_string = item.entries().iter().find_map(|entry| match entry {

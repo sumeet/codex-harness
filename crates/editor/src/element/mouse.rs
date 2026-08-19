@@ -2,6 +2,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use collections::HashMap;
+#[cfg(feature = "project-integration")]
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
@@ -11,6 +12,7 @@ use gpui::{
     schedule_kinetic_scroll_frame,
 };
 use multi_buffer::MultiBufferRow;
+#[cfg(feature = "project-integration")]
 use project::DisableAiSettings;
 use settings::Settings;
 use sum_tree::Bias;
@@ -20,11 +22,15 @@ use util::{RangeExt, debug_panic, post_inc};
 
 use super::{EditorElement, EditorLayout, LineNumberLayout, PositionMap, SplitSide};
 use crate::{
-    CURSORS_VISIBLE_FOR, ColumnarMode, DisplayDiffHunk, DisplayPoint, DisplayRow, Editor,
-    EditorSettings, EditorSnapshot, GutterHoverButton, HoveredCursor, JumpData,
-    PhantomDiffReviewIndicator, SelectPhase, Selection, SelectionDragState,
+    CURSORS_VISIBLE_FOR, ColumnarMode, DisplayPoint, DisplayRow, Editor, EditorSettings,
+    EditorSnapshot, HoveredCursor, JumpData, SelectPhase, Selection, SelectionDragState,
     display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
-    hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
+    scroll::ScrollPixelOffset,
+};
+#[cfg(feature = "project-integration")]
+use crate::{
+    DisplayDiffHunk, GutterHoverButton, PhantomDiffReviewIndicator, hover_popover::hover_at,
+    mouse_context_menu,
 };
 
 fn editor_event_synthesizes_momentum(event: &ScrollWheelEvent) -> bool {
@@ -68,235 +74,244 @@ impl EditorElement {
         let point_for_position = position_map.point_for_position(event.position);
         let valid_point = point_for_position.nearest_valid;
 
-        // Update diff review drag state if we're dragging
-        if editor.diff_review_drag_state.is_some() {
-            editor.update_diff_review_drag(valid_point.row(), window, cx);
-        }
+        #[cfg(feature = "project-integration")]
+        {
+            // Update diff review drag state if we're dragging.
+            if editor.diff_review_drag_state.is_some() {
+                editor.update_diff_review_drag(valid_point.row(), window, cx);
+            }
 
-        let hovered_diff_control = position_map
-            .diff_hunk_control_bounds
-            .iter()
-            .find(|(_, bounds)| bounds.contains(&event.position))
-            .map(|(row, _)| *row);
+            let hovered_diff_control = position_map
+                .diff_hunk_control_bounds
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&event.position))
+                .map(|(row, _)| *row);
 
-        let hovered_diff_hunk_row = if let Some(control_row) = hovered_diff_control {
-            Some(control_row)
-        } else if text_hovered {
-            let current_row = valid_point.row();
-            position_map.display_hunks.iter().find_map(|(hunk, _)| {
-                if let DisplayDiffHunk::Unfolded {
-                    display_row_range, ..
-                } = hunk
-                {
-                    if display_row_range.contains(&current_row) {
-                        Some(display_row_range.start)
+            let hovered_diff_hunk_row = if let Some(control_row) = hovered_diff_control {
+                Some(control_row)
+            } else if text_hovered {
+                let current_row = valid_point.row();
+                position_map.display_hunks.iter().find_map(|(hunk, _)| {
+                    if let DisplayDiffHunk::Unfolded {
+                        display_row_range, ..
+                    } = hunk
+                    {
+                        if display_row_range.contains(&current_row) {
+                            Some(display_row_range.start)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
-                } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
-
-        if hovered_diff_hunk_row != editor.hovered_diff_hunk_row {
-            editor.hovered_diff_hunk_row = hovered_diff_hunk_row;
-            cx.notify();
-        }
-
-        if text_hovered
-            && let Some((bounds, buffer_id, blame_entry)) = &position_map.inline_blame_bounds
-        {
-            let mouse_over_inline_blame = bounds.contains(&event.position);
-            let mouse_over_popover = editor
-                .inline_blame_popover
-                .as_ref()
-                .and_then(|state| state.popover_bounds)
-                .is_some_and(|bounds| bounds.contains(&event.position));
-            let keyboard_grace = editor
-                .inline_blame_popover
-                .as_ref()
-                .is_some_and(|state| state.keyboard_grace);
-
-            if mouse_over_inline_blame || mouse_over_popover {
-                editor.show_blame_popover(*buffer_id, blame_entry, event.position, false, cx);
-            } else if !keyboard_grace {
-                editor.hide_blame_popover(false, cx);
-            }
-        } else {
-            let keyboard_grace = editor
-                .inline_blame_popover
-                .as_ref()
-                .is_some_and(|state| state.keyboard_grace);
-            if !keyboard_grace {
-                editor.hide_blame_popover(false, cx);
-            }
-        }
-
-        // Handle diff review indicator when gutter is hovered in diff mode with AI enabled
-        let show_diff_review = editor.show_diff_review_button()
-            && cx.has_flag::<DiffReviewFeatureFlag>()
-            && !DisableAiSettings::is_ai_disabled_for_buffer(
-                editor.buffer.read(cx).as_singleton().as_ref(),
-                cx,
-            );
-
-        let diff_review_indicator = if gutter_hovered && show_diff_review {
-            let is_visible = editor
-                .gutter_diff_review_indicator
-                .0
-                .is_some_and(|indicator| indicator.is_active);
-
-            if !is_visible {
-                editor
-                    .gutter_diff_review_indicator
-                    .1
-                    .get_or_insert_with(|| {
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(200))
-                                .await;
-
-                            this.update(cx, |this, cx| {
-                                if let Some(indicator) =
-                                    this.gutter_diff_review_indicator.0.as_mut()
-                                {
-                                    indicator.is_active = true;
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                        })
-                    });
-            }
-
-            let anchor = position_map
-                .snapshot
-                .display_point_to_anchor(valid_point, Bias::Left);
-            Some(PhantomDiffReviewIndicator {
-                start: anchor,
-                end: anchor,
-                is_active: is_visible,
-            })
-        } else {
-            editor.gutter_diff_review_indicator.1 = None;
-            None
-        };
-
-        if diff_review_indicator != editor.gutter_diff_review_indicator.0 {
-            editor.gutter_diff_review_indicator.0 = diff_review_indicator;
-            cx.notify();
-        }
-
-        // Don't show breakpoint indicator when diff review indicator is active on this row
-        let is_on_diff_review_button_row = diff_review_indicator.is_some_and(|indicator| {
-            let start_row = indicator
-                .start
-                .to_display_point(&position_map.snapshot.display_snapshot)
-                .row();
-            indicator.is_active && start_row == valid_point.row()
-        });
-
-        let gutter_hover_button = if gutter_hovered
-            && !is_on_diff_review_button_row
-            && split_side != Some(SplitSide::Left)
-        {
-            let buffer_anchor = position_map
-                .snapshot
-                .display_point_to_anchor(valid_point, Bias::Left);
-
-            // Breakpoints and bookmarks are keyed by absolute file path, so the
-            // gutter button would be a no-op for buffers without a worktree file
-            // (e.g. untitled buffers). Hide it there.
-            if position_map
-                .snapshot
-                .buffer_snapshot()
-                .anchor_to_buffer_anchor(buffer_anchor)
-                .is_some_and(|(_, buffer_snapshot)| {
-                    project::File::from_dyn(buffer_snapshot.file()).is_some()
                 })
+            } else {
+                None
+            };
+
+            if hovered_diff_hunk_row != editor.hovered_diff_hunk_row {
+                editor.hovered_diff_hunk_row = hovered_diff_hunk_row;
+                cx.notify();
+            }
+
+            if text_hovered
+                && let Some((bounds, buffer_id, blame_entry)) = &position_map.inline_blame_bounds
             {
+                let mouse_over_inline_blame = bounds.contains(&event.position);
+                let mouse_over_popover = editor
+                    .inline_blame_popover
+                    .as_ref()
+                    .and_then(|state| state.popover_bounds)
+                    .is_some_and(|bounds| bounds.contains(&event.position));
+                let keyboard_grace = editor
+                    .inline_blame_popover
+                    .as_ref()
+                    .is_some_and(|state| state.keyboard_grace);
+
+                if mouse_over_inline_blame || mouse_over_popover {
+                    editor.show_blame_popover(*buffer_id, blame_entry, event.position, false, cx);
+                } else if !keyboard_grace {
+                    editor.hide_blame_popover(false, cx);
+                }
+            } else {
+                let keyboard_grace = editor
+                    .inline_blame_popover
+                    .as_ref()
+                    .is_some_and(|state| state.keyboard_grace);
+                if !keyboard_grace {
+                    editor.hide_blame_popover(false, cx);
+                }
+            }
+
+            // Handle diff review indicator when gutter is hovered in diff mode with AI enabled.
+            let show_diff_review = editor.show_diff_review_button()
+                && cx.has_flag::<DiffReviewFeatureFlag>()
+                && !DisableAiSettings::is_ai_disabled_for_buffer(
+                    editor.buffer.read(cx).as_singleton().as_ref(),
+                    cx,
+                );
+
+            let diff_review_indicator = if gutter_hovered && show_diff_review {
                 let is_visible = editor
-                    .gutter_hover_button
+                    .gutter_diff_review_indicator
                     .0
                     .is_some_and(|indicator| indicator.is_active);
 
                 if !is_visible {
-                    editor.gutter_hover_button.1.get_or_insert_with(|| {
-                        cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(200))
-                                .await;
+                    editor
+                        .gutter_diff_review_indicator
+                        .1
+                        .get_or_insert_with(|| {
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(200))
+                                    .await;
 
-                            this.update(cx, |this, cx| {
-                                if let Some(indicator) = this.gutter_hover_button.0.as_mut() {
-                                    indicator.is_active = true;
-                                    cx.notify();
-                                }
+                                this.update(cx, |this, cx| {
+                                    if let Some(indicator) =
+                                        this.gutter_diff_review_indicator.0.as_mut()
+                                    {
+                                        indicator.is_active = true;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
                             })
-                            .ok();
-                        })
-                    });
+                        });
                 }
 
-                Some(GutterHoverButton {
-                    display_row: valid_point.row(),
+                let anchor = position_map
+                    .snapshot
+                    .display_point_to_anchor(valid_point, Bias::Left);
+                Some(PhantomDiffReviewIndicator {
+                    start: anchor,
+                    end: anchor,
                     is_active: is_visible,
                 })
             } else {
-                editor.gutter_hover_button.1 = None;
+                editor.gutter_diff_review_indicator.1 = None;
                 None
+            };
+
+            if diff_review_indicator != editor.gutter_diff_review_indicator.0 {
+                editor.gutter_diff_review_indicator.0 = diff_review_indicator;
+                cx.notify();
             }
-        } else if editor.has_mouse_context_menu() {
-            editor.gutter_hover_button.1 = None;
-            editor.gutter_hover_button.0
-        } else {
-            editor.gutter_hover_button.1 = None;
-            None
-        };
 
-        if &gutter_hover_button != &editor.gutter_hover_button.0 {
-            editor.gutter_hover_button.0 = gutter_hover_button;
-            cx.notify();
-        }
+            // Don't show breakpoint indicator when diff review indicator is active on this row
+            let is_on_diff_review_button_row = diff_review_indicator.is_some_and(|indicator| {
+                let start_row = indicator
+                    .start
+                    .to_display_point(&position_map.snapshot.display_snapshot)
+                    .row();
+                indicator.is_active && start_row == valid_point.row()
+            });
 
-        // Don't trigger hover popover if mouse is hovering over context menu
-        if text_hovered {
-            editor.update_hovered_link(
-                point_for_position,
-                Some(event.position),
-                &position_map.snapshot,
-                modifiers,
-                window,
-                cx,
-            );
+            let gutter_hover_button = if gutter_hovered
+                && !is_on_diff_review_button_row
+                && split_side != Some(SplitSide::Left)
+            {
+                let buffer_anchor = position_map
+                    .snapshot
+                    .display_point_to_anchor(valid_point, Bias::Left);
 
-            if let Some(point) = point_for_position.as_valid() {
-                let anchor = position_map
+                // Breakpoints and bookmarks are keyed by absolute file path, so the
+                // gutter button would be a no-op for buffers without a worktree file
+                // (e.g. untitled buffers). Hide it there.
+                if position_map
                     .snapshot
                     .buffer_snapshot()
-                    .anchor_before(point.to_offset(&position_map.snapshot, Bias::Left));
-                hover_at(editor, Some(anchor), Some(event.position), window, cx);
-                Self::update_visible_cursor(editor, point, position_map, window, cx);
+                    .anchor_to_buffer_anchor(buffer_anchor)
+                    .is_some_and(|(_, buffer_snapshot)| {
+                        project::File::from_dyn(buffer_snapshot.file()).is_some()
+                    })
+                {
+                    let is_visible = editor
+                        .gutter_hover_button
+                        .0
+                        .is_some_and(|indicator| indicator.is_active);
+
+                    if !is_visible {
+                        editor.gutter_hover_button.1.get_or_insert_with(|| {
+                            cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(200))
+                                    .await;
+
+                                this.update(cx, |this, cx| {
+                                    if let Some(indicator) = this.gutter_hover_button.0.as_mut() {
+                                        indicator.is_active = true;
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            })
+                        });
+                    }
+
+                    Some(GutterHoverButton {
+                        display_row: valid_point.row(),
+                        is_active: is_visible,
+                    })
+                } else {
+                    editor.gutter_hover_button.1 = None;
+                    None
+                }
+            } else if editor.has_mouse_context_menu() {
+                editor.gutter_hover_button.1 = None;
+                editor.gutter_hover_button.0
             } else {
-                editor.update_inlay_link_and_hover_points(
-                    &position_map.snapshot,
+                editor.gutter_hover_button.1 = None;
+                None
+            };
+
+            if &gutter_hover_button != &editor.gutter_hover_button.0 {
+                editor.gutter_hover_button.0 = gutter_hover_button;
+                cx.notify();
+            }
+
+            // Don't trigger hover popover if mouse is hovering over context menu.
+            if text_hovered {
+                editor.update_hovered_link(
                     point_for_position,
                     Some(event.position),
-                    modifiers.secondary(),
-                    modifiers.shift,
+                    &position_map.snapshot,
+                    modifiers,
                     window,
                     cx,
                 );
+
+                if let Some(point) = point_for_position.as_valid() {
+                    let anchor = position_map
+                        .snapshot
+                        .buffer_snapshot()
+                        .anchor_before(point.to_offset(&position_map.snapshot, Bias::Left));
+                    hover_at(editor, Some(anchor), Some(event.position), window, cx);
+                    Self::update_visible_cursor(editor, point, position_map, window, cx);
+                } else {
+                    editor.update_inlay_link_and_hover_points(
+                        &position_map.snapshot,
+                        point_for_position,
+                        Some(event.position),
+                        modifiers.secondary(),
+                        modifiers.shift,
+                        window,
+                        cx,
+                    );
+                }
+            } else {
+                editor.hide_hovered_link(cx);
+                hover_at(editor, None, Some(event.position), window, cx);
             }
-        } else {
-            editor.hide_hovered_link(cx);
-            hover_at(editor, None, Some(event.position), window, cx);
+        }
+
+        #[cfg(not(feature = "project-integration"))]
+        if text_hovered && let Some(point) = point_for_position.as_valid() {
+            Self::update_visible_cursor(editor, point, position_map, window, cx);
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn layout_mouse_context_menu(
         &self,
         editor_snapshot: &EditorSnapshot,
@@ -491,6 +506,7 @@ impl EditorElement {
             move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
                     editor.update(cx, |editor, cx| {
+                        #[cfg(feature = "project-integration")]
                         if editor.hover_state.focused(window, cx) {
                             return;
                         }
@@ -709,6 +725,7 @@ impl EditorElement {
         let mut click_count = event.click_count;
         let mut modifiers = event.modifiers;
 
+        #[cfg(feature = "project-integration")]
         if let Some(hovered_hunk) =
             position_map
                 .display_hunks
@@ -726,7 +743,9 @@ impl EditorElement {
             editor.toggle_single_diff_hunk(hovered_hunk, cx);
             cx.notify();
             return;
-        } else if gutter_hitbox.is_hovered(window) {
+        }
+
+        if gutter_hitbox.is_hovered(window) {
             click_count = 3; // Simulate triple-click when clicking the gutter to select lines
         } else if !text_hitbox.is_hovered(window) {
             return;
@@ -869,6 +888,7 @@ impl EditorElement {
         cx.stop_propagation();
     }
 
+    #[cfg(feature = "project-integration")]
     fn mouse_right_down(
         editor: &mut Editor,
         event: &MouseDownEvent,
@@ -911,6 +931,16 @@ impl EditorElement {
         cx.stop_propagation();
     }
 
+    #[cfg(not(feature = "project-integration"))]
+    fn mouse_right_down(
+        _: &mut Editor,
+        _: &MouseDownEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
+    }
+
     fn mouse_middle_down(
         editor: &mut Editor,
         event: &MouseDownEvent,
@@ -944,11 +974,14 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
-        // Handle diff review drag completion
-        if editor.diff_review_drag_state.is_some() {
-            editor.end_diff_review_drag(window, cx);
-            cx.stop_propagation();
-            return;
+        #[cfg(feature = "project-integration")]
+        {
+            // Handle diff review drag completion.
+            if editor.diff_review_drag_state.is_some() {
+                editor.end_diff_review_drag(window, cx);
+                cx.stop_propagation();
+                return;
+            }
         }
 
         let text_hitbox = &position_map.text_hitbox;
@@ -1043,6 +1076,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn click(
         editor: &mut Editor,
         event: &ClickEvent,
@@ -1078,6 +1112,17 @@ impl EditorElement {
         }
     }
 
+    #[cfg(not(feature = "project-integration"))]
+    fn click(
+        _: &mut Editor,
+        _: &ClickEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
+    }
+
+    #[cfg(feature = "project-integration")]
     fn pressure_click(
         editor: &mut Editor,
         event: &MousePressureEvent,
@@ -1098,6 +1143,16 @@ impl EditorElement {
             editor.selection_drag_state = SelectionDragState::None;
             cx.stop_propagation();
         }
+    }
+
+    #[cfg(not(feature = "project-integration"))]
+    fn pressure_click(
+        _: &mut Editor,
+        _: &MousePressureEvent,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
     }
 
     fn mouse_dragged(
@@ -1235,6 +1290,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn update_visible_cursor(
         editor: &mut Editor,
         point: DisplayPoint,
@@ -1285,6 +1341,16 @@ impl EditorElement {
             }),
         );
         cx.notify()
+    }
+
+    #[cfg(not(feature = "project-integration"))]
+    fn update_visible_cursor(
+        _: &mut Editor,
+        _: DisplayPoint,
+        _: &PositionMap,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) {
     }
 }
 

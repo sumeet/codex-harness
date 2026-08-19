@@ -16,19 +16,28 @@ pub mod blink_manager;
 mod bracket_colorization;
 #[cfg(feature = "workspace-integration")]
 mod clangd_ext;
+#[cfg(feature = "project-integration")]
 pub mod code_context_menus;
+#[cfg(feature = "project-integration")]
 mod code_lens;
 pub mod display_map;
+#[cfg(feature = "project-integration")]
 mod document_colors;
+#[cfg(feature = "project-integration")]
 mod document_links;
+#[cfg(feature = "project-integration")]
 mod document_symbols;
 mod editor_settings;
 mod element;
 mod fold;
+#[cfg(feature = "project-integration")]
 mod folding_ranges;
+#[cfg(feature = "project-integration")]
 mod git;
 mod highlight_matching_bracket;
+#[cfg(feature = "project-integration")]
 pub mod hover_links;
+#[cfg(feature = "project-integration")]
 pub mod hover_popover;
 mod indent_guides;
 mod inlays;
@@ -36,16 +45,20 @@ mod inlays;
 pub mod items;
 mod jsx_tag_auto_close;
 mod linked_editing_ranges;
+#[cfg(feature = "project-integration")]
 mod lsp_ext;
+#[cfg(feature = "project-integration")]
 mod mouse_context_menu;
 pub mod movement;
 #[cfg(feature = "workspace-integration")]
 mod persistence;
+#[cfg(feature = "project-integration")]
 mod runnables;
 #[cfg(feature = "workspace-integration")]
 mod rust_analyzer_ext;
 pub mod scroll;
 mod selections_collection;
+#[cfg(feature = "project-integration")]
 pub mod semantic_tokens;
 #[cfg(feature = "workspace-integration")]
 mod split;
@@ -53,24 +66,29 @@ mod split;
 pub mod split_editor_view;
 mod split_patches;
 
+#[cfg(feature = "project-integration")]
 mod bookmarks;
-#[cfg(test)]
+#[cfg(all(test, feature = "project-integration"))]
 mod code_completion_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "project-integration"))]
 mod edit_prediction_tests;
 #[cfg(test)]
 mod editor_block_comment_tests;
 #[cfg(test)]
 mod editor_tests;
+#[cfg(feature = "project-integration")]
 mod signature_help;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 
 mod clipboard;
+#[cfg(feature = "project-integration")]
 mod code_actions;
+#[cfg(feature = "project-integration")]
 mod completions;
 mod config;
 mod diagnostics;
+#[cfg(feature = "project-integration")]
 mod edit_prediction;
 mod input;
 mod markdown_actions;
@@ -80,11 +98,14 @@ mod selection;
 
 pub(crate) use actions::*;
 pub use clipboard::{ClipboardPathResolver, ClipboardSelection};
+#[cfg(feature = "project-integration")]
 pub use code_actions::CodeActionProvider;
 use collections::TypeIdHashMap;
+#[cfg(feature = "project-integration")]
 pub use completions::CompletionProvider;
-#[cfg(test)]
+#[cfg(all(test, feature = "project-integration"))]
 pub(crate) use completions::snippet_candidate_suffixes;
+#[cfg(feature = "project-integration")]
 pub(crate) use completions::split_words;
 use diagnostics::{ActiveDiagnostic, GlobalDiagnosticRenderer, InlineDiagnostic};
 pub use diagnostics::{DiagnosticRenderer, set_diagnostic_renderer};
@@ -92,16 +113,36 @@ pub use display_map::{
     ChunkRenderer, ChunkRendererContext, DisplayPoint, FoldPlaceholder, HighlightKey,
     NavigationOverlayKey, SemanticTokenHighlight,
 };
+#[cfg(feature = "project-integration")]
 pub use edit_prediction::make_suggestion_styles;
+#[cfg(feature = "project-integration")]
 pub(crate) use edit_prediction::{
     EditDisplayMode, EditPrediction, EditPredictionPreview, EditPredictionSettings,
     EditPredictionState, MenuEditPredictionsPolicy, RegisteredEditPredictionDelegate,
 };
-#[cfg(test)]
+#[cfg(all(test, feature = "project-integration"))]
 pub(crate) use edit_prediction::{
     EditPredictionKeybindAction, EditPredictionKeybindSurface, edit_prediction_edit_text,
 };
+#[cfg(feature = "project-integration")]
 pub use edit_prediction_types::EditPredictionRequestTrigger;
+#[cfg(not(feature = "project-integration"))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EditPredictionRequestTrigger {
+    DiagnosticNavigation,
+    Explicit,
+    BufferEdit,
+    LSPCompletionAccepted,
+    PredictionAccepted,
+    PredictionPartiallyAccepted,
+    EditorCreated,
+    ProviderChanged,
+    UserInfoChanged,
+    VimModeChanged,
+    SettingsChanged,
+    #[default]
+    Other,
+}
 pub use editor_settings::{
     CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DiffViewStyle,
     DocumentColorsRenderMode, EditorSettings, EditorSettingsScrollbarProxy, OpenResultsIn,
@@ -114,22 +155,29 @@ pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
     file_status_label_color,
 };
+#[cfg(feature = "project-integration")]
 pub use git::blame::{BlameRenderer, GitBlame};
+#[cfg(feature = "project-integration")]
 pub use git::{
     DiffHunkDelegate, ResolvedDiffHunk, ResolvedDiffHunks, RestoreOnlyDiffHunkDelegate,
     RestoreOnlyUnstagedDiffHunkDelegate, UncommittedDiffHunkDelegate, render_diff_hunk_controls,
     set_blame_renderer,
 };
+#[cfg(feature = "project-integration")]
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
+#[cfg(feature = "project-integration")]
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
+#[cfg(feature = "project-integration")]
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
+#[cfg(feature = "project-integration")]
 pub use hover_popover::hover_markdown_style;
-pub use inlays::Inlay;
+pub use inlays::{Inlay, InlayHighlight};
 #[cfg(feature = "workspace-integration")]
 pub use items::MAX_TAB_TITLE_LEN;
 pub use language::Direction;
 pub use linked_editing_ranges::LinkedEdits;
 pub use lsp::CompletionContext;
+#[cfg(feature = "project-integration")]
 pub use lsp_ext::lsp_tasks;
 pub use multi_buffer::{
     Anchor, AnchorRangeExt, BufferOffset, ExcerptRange, MBTextSummary, MultiBuffer,
@@ -142,23 +190,32 @@ pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
 
-use ::git::{Blame, status::FileStatus};
+#[cfg(feature = "project-integration")]
+use ::git::Blame;
+use ::git::status::FileStatus;
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, BuildError};
 use anyhow::{Context as _, Result, anyhow, bail};
 use blink_manager::BlinkManager;
+#[cfg(feature = "project-integration")]
 use client::{Collaborator, ParticipantIndex, parse_zed_link};
 use clock::ReplicaId;
+#[cfg(feature = "project-integration")]
 use code_context_menus::{
     AvailableCodeAction, CodeActionContents, CodeActionsItem, CodeActionsMenu, CodeContextMenu,
     CompletionsMenu, ContextMenuOrigin,
 };
+#[cfg(feature = "project-integration")]
 use code_lens::CodeLensState;
 use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use convert_case::{Case, Casing};
+#[cfg(feature = "project-integration")]
 use dap::TelemetrySpawnLocation;
 use display_map::*;
+#[cfg(feature = "project-integration")]
 use document_colors::LspColorData;
+#[cfg(feature = "project-integration")]
 use document_links::LspDocumentLinks;
+#[cfg(feature = "project-integration")]
 use edit_prediction_types::{
     EditPredictionDelegate, EditPredictionDelegateHandle, EditPredictionDiscardReason,
     EditPredictionGranularity, SuggestionDisplayType,
@@ -170,6 +227,7 @@ use futures::{
     future::{self, Shared},
 };
 use fuzzy::{StringMatch, StringMatchCandidate};
+#[cfg(feature = "project-integration")]
 use git::blame::GlobalBlameRenderer;
 use gpui::{
     Action, Animation, AnimationExt, AnyElement, App, AppContext, AsyncWindowContext,
@@ -182,10 +240,14 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, WeakFocusHandle, Window, div, point, prelude::*,
     pulsating_between, px, relative, size,
 };
+#[cfg(feature = "project-integration")]
 use hover_links::{HoverLink, HoveredLinkState, find_file};
+#[cfg(feature = "project-integration")]
 use hover_popover::{HoverState, hide_hover};
 use indent_guides::ActiveIndentGuidesState;
-use inlays::{InlaySplice, inlay_hints::InlayHintRefreshReason};
+use inlays::InlaySplice;
+#[cfg(feature = "project-integration")]
+use inlays::inlay_hints::InlayHintRefreshReason;
 use itertools::{Either, Itertools};
 use language::{
     AutoindentMode, BlockCommentConfig, BracketMatch, BracketPair, Buffer, BufferRow,
@@ -201,12 +263,15 @@ use language::{
     },
     point_from_lsp, point_to_lsp, text_diff_with_options,
 };
+#[cfg(feature = "project-integration")]
 use linked_editing_ranges::refresh_linked_ranges;
 use lsp::{
     CodeActionKind, CompletionItemKind, CompletionTriggerKind, InsertTextFormat, InsertTextMode,
     LanguageServerId,
 };
+#[cfg(feature = "project-integration")]
 use markdown::Markdown;
+#[cfg(feature = "project-integration")]
 use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
@@ -216,6 +281,7 @@ use multi_buffer::{
 use parking_lot::Mutex;
 #[cfg(feature = "workspace-integration")]
 use persistence::EditorDb;
+#[cfg(feature = "project-integration")]
 use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
     CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint,
@@ -242,9 +308,10 @@ use rpc::{ErrorCode, ErrorExt, proto::PeerId};
 use scroll::{Autoscroll, ScrollAnchor, ScrollManager, SharedScrollAnchor};
 use selections_collection::{MutableSelectionsCollection, SelectionsCollection};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "project-integration")]
+use settings::GitGutterSetting;
 use settings::{
-    GitGutterSetting, RelativeLineNumbers, Settings, SettingsLocation, SettingsStore,
-    update_settings_file,
+    RelativeLineNumbers, Settings, SettingsLocation, SettingsStore, update_settings_file,
 };
 use smallvec::{SmallVec, smallvec};
 use snippet::Snippet;
@@ -263,6 +330,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+#[cfg(feature = "project-integration")]
 use task::TaskVariables;
 use text::{BufferId, FromAnchor, OffsetUtf16, Rope, ToOffset as _, ToPoint as _};
 use theme::{
@@ -306,6 +374,11 @@ type WorkspaceId = ();
 #[derive(Clone)]
 pub struct NavigationEntry;
 
+#[cfg(feature = "project-integration")]
+type ProjectHandle = Entity<Project>;
+#[cfg(not(feature = "project-integration"))]
+type ProjectHandle = ();
+
 #[cfg(not(feature = "workspace-integration"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ItemBufferKind {
@@ -316,19 +389,20 @@ pub(crate) enum ItemBufferKind {
 pub use zed_actions::editor::RevealInFileManager;
 use zed_actions::editor::{MoveDown, MoveUp};
 
+#[cfg(feature = "project-integration")]
 use crate::{
     code_context_menus::CompletionsMenuSource,
-    editor_settings::MultiCursorModifier,
     hover_links::{find_url, find_url_from_range},
-    inlays::{
-        InlineValueCache,
-        inlay_hints::{LspInlayHintData, inlay_hint_settings},
-    },
+    inlays::inlay_hints::{LspInlayHintData, inlay_hint_settings},
     runnables::{ResolvedTasks, RunnableData, RunnableTaskStatus, RunnableTasks},
-    scroll::{ScrollOffset, ScrollPixelOffset},
-    selections_collection::resolve_selections_wrapping_blocks,
     semantic_tokens::SemanticTokenState,
     signature_help::{SignatureHelpHiddenBy, SignatureHelpState},
+};
+use crate::{
+    editor_settings::MultiCursorModifier,
+    inlays::InlineValueCache,
+    scroll::{ScrollOffset, ScrollPixelOffset},
+    selections_collection::resolve_selections_wrapping_blocks,
 };
 
 pub const FILE_HEADER_HEIGHT: u32 = 2;
@@ -394,6 +468,7 @@ impl Navigated {
 }
 
 pub fn init(cx: &mut App) {
+    #[cfg(feature = "project-integration")]
     cx.set_global(GlobalBlameRenderer(Arc::new(())));
     #[cfg(feature = "workspace-integration")]
     cx.set_global(breadcrumbs::RenderBreadcrumbText(render_breadcrumb_text));
@@ -955,6 +1030,7 @@ struct GutterHoverButton {
     is_active: bool,
 }
 
+#[cfg(feature = "project-integration")]
 enum CodeActionsForSelection {
     None,
     Fetching(Shared<Task<Option<ActionFetchReady>>>),
@@ -962,6 +1038,7 @@ enum CodeActionsForSelection {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "project-integration")]
 struct ActionFetchReady {
     location: Location,
     actions: Rc<[AvailableCodeAction]>,
@@ -1010,10 +1087,13 @@ pub struct Editor {
     inline_diagnostics: Vec<(Anchor, InlineDiagnostic)>,
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     hard_wrap: Option<usize>,
-    project: Option<Entity<Project>>,
+    project: Option<ProjectHandle>,
     clipboard_path_resolver: Option<Rc<dyn ClipboardPathResolver>>,
+    #[cfg(feature = "project-integration")]
     semantics_provider: Option<Rc<dyn SemanticsProvider>>,
+    #[cfg(feature = "project-integration")]
     completion_provider: Option<Rc<dyn CompletionProvider>>,
+    #[cfg(feature = "project-integration")]
     collaboration_hub: Option<Box<dyn CollaborationHub>>,
     blink_manager: Entity<BlinkManager>,
     show_cursor_names: bool,
@@ -1056,23 +1136,37 @@ pub struct Editor {
     nav_history: Option<ItemNavHistory>,
     #[cfg(not(feature = "workspace-integration"))]
     local_navigation_history: LocalNavigationHistory<Anchor>,
+    #[cfg(feature = "project-integration")]
     context_menu: RefCell<Option<CodeContextMenu>>,
+    #[cfg(feature = "project-integration")]
     context_menu_options: Option<ContextMenuOptions>,
+    #[cfg(feature = "project-integration")]
     mouse_context_menu: Option<MouseContextMenu>,
+    #[cfg(feature = "project-integration")]
     completion_tasks: Vec<(CompletionId, Task<()>)>,
+    #[cfg(feature = "project-integration")]
     inline_blame_popover: Option<InlineBlamePopover>,
+    #[cfg(feature = "project-integration")]
     inline_blame_popover_show_task: Option<Task<()>>,
+    #[cfg(feature = "project-integration")]
     signature_help_state: SignatureHelpState,
+    #[cfg(feature = "project-integration")]
     auto_signature_help: Option<bool>,
+    #[cfg(feature = "project-integration")]
     find_all_references_task_sources: Vec<Anchor>,
+    #[cfg(feature = "project-integration")]
     next_completion_id: CompletionId,
+    #[cfg(feature = "project-integration")]
     code_actions_for_selection: CodeActionsForSelection,
+    #[cfg(feature = "project-integration")]
     runnables_for_selection_toggle: Task<()>,
     quick_selection_highlight_task: Option<(Range<Anchor>, Task<()>)>,
     debounced_selection_highlight_task: Option<(Range<Anchor>, Task<()>)>,
     debounced_selection_highlight_complete: bool,
     last_selection_from_search: bool,
+    #[cfg(feature = "project-integration")]
     document_highlights_task: Option<Task<()>>,
+    #[cfg(feature = "project-integration")]
     linked_editing_range_task: Option<Task<Option<()>>>,
     linked_edit_ranges: linked_editing_ranges::LinkedEditingRanges,
     pending_rename: Option<RenameState>,
@@ -1095,21 +1189,33 @@ pub struct Editor {
     read_only: bool,
     leader_id: Option<CollaboratorId>,
     remote_id: Option<ViewId>,
+    #[cfg(feature = "project-integration")]
     pub hover_state: HoverState,
     pending_mouse_down: Option<Rc<RefCell<Option<MouseDownEvent>>>>,
     prev_pressure_stage: Option<PressureStage>,
     gutter_hovered: bool,
+    #[cfg(feature = "project-integration")]
     hovered_link_state: Option<HoveredLinkState>,
+    #[cfg(feature = "project-integration")]
     edit_prediction_provider: Option<RegisteredEditPredictionDelegate>,
+    #[cfg(feature = "project-integration")]
     code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
+    #[cfg(feature = "project-integration")]
     active_edit_prediction: Option<EditPredictionState>,
     /// Used to prevent flickering as the user types while the menu is open
+    #[cfg(feature = "project-integration")]
     stale_edit_prediction_in_menu: Option<EditPredictionState>,
+    #[cfg(feature = "project-integration")]
     edit_prediction_settings: EditPredictionSettings,
+    #[cfg(feature = "project-integration")]
     edit_predictions_hidden_for_vim_mode: bool,
+    #[cfg(feature = "project-integration")]
     show_edit_predictions_override: Option<bool>,
+    #[cfg(feature = "project-integration")]
     show_completions_on_input_override: Option<bool>,
+    #[cfg(feature = "project-integration")]
     menu_edit_predictions_policy: MenuEditPredictionsPolicy,
+    #[cfg(feature = "project-integration")]
     edit_prediction_preview: EditPredictionPreview,
     in_leading_whitespace: bool,
     next_inlay_id: usize,
@@ -1128,14 +1234,21 @@ pub struct Editor {
     use_selection_highlight: bool,
     auto_replace_emoji_shortcode: bool,
     jsx_tag_auto_close_enabled_in_any_buffer: bool,
+    #[cfg(feature = "project-integration")]
     show_git_blame_gutter: bool,
+    #[cfg(feature = "project-integration")]
     show_git_blame_inline: bool,
+    #[cfg(feature = "project-integration")]
     show_git_blame_inline_delay_task: Option<Task<()>>,
+    #[cfg(feature = "project-integration")]
     git_blame_inline_enabled: bool,
     buffer_serialization: Option<BufferSerialization>,
     show_selection_menu: Option<bool>,
+    #[cfg(feature = "project-integration")]
     blame: Option<Entity<GitBlame>>,
+    #[cfg(feature = "project-integration")]
     blame_subscription: Option<Subscription>,
+    #[cfg(feature = "project-integration")]
     pending_blame_hover_observation: Option<Subscription>,
     custom_context_menu: Option<
         Box<
@@ -1161,21 +1274,31 @@ pub struct Editor {
     /// paint over the scrollbar.
     last_horizontal_scrollbar_visible: bool,
     expect_bounds_change: Option<Bounds<Pixels>>,
+    #[cfg(feature = "project-integration")]
     runnables: RunnableData,
+    #[cfg(feature = "project-integration")]
     bookmark_store: Option<Entity<BookmarkStore>>,
+    #[cfg(feature = "project-integration")]
     breakpoint_store: Option<Entity<BreakpointStore>>,
+    #[cfg(feature = "project-integration")]
     gutter_hover_button: (Option<GutterHoverButton>, Option<Task<()>>),
+    #[cfg(feature = "project-integration")]
     pub(crate) gutter_diff_review_indicator: (Option<PhantomDiffReviewIndicator>, Option<Task<()>>),
+    #[cfg(feature = "project-integration")]
     pub(crate) diff_review_drag_state: Option<DiffReviewDragState>,
     /// Active diff review overlays. Multiple overlays can be open simultaneously
     /// when hunks have comments stored.
+    #[cfg(feature = "project-integration")]
     pub(crate) diff_review_overlays: Vec<DiffReviewOverlay>,
     /// Stored review comments grouped by hunk.
     /// Uses a Vec instead of HashMap because DiffHunkKey contains an Anchor
     /// which doesn't implement Hash/Eq in a way suitable for HashMap keys.
+    #[cfg(feature = "project-integration")]
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     /// Counter for generating unique comment IDs.
+    #[cfg(feature = "project-integration")]
     next_review_comment_id: usize,
+    #[cfg(feature = "project-integration")]
     hovered_diff_hunk_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
     in_project_search: bool,
@@ -1184,8 +1307,11 @@ pub struct Editor {
     focused_block: Option<FocusedBlock>,
     next_scroll_position: NextScrollCursorCenterTopBottom,
     addons: TypeIdHashMap<Box<dyn Addon>>,
+    #[cfg(feature = "project-integration")]
     registered_buffers: HashMap<BufferId, OpenLspBufferHandle>,
+    #[cfg(feature = "project-integration")]
     load_diff_task: Option<Shared<Task<()>>>,
+    #[cfg(feature = "project-integration")]
     diff_hunk_delegate: Option<Arc<dyn DiffHunkDelegate>>,
     selection_mark_mode: bool,
     toggle_fold_multiple_buffers: Task<()>,
@@ -1198,13 +1324,20 @@ pub struct Editor {
     number_deleted_lines: bool,
 
     selection_drag_state: SelectionDragState,
+    #[cfg(feature = "project-integration")]
     colors: Option<LspColorData>,
+    #[cfg(feature = "project-integration")]
     code_lens: Option<CodeLensState>,
     post_scroll_update: Task<()>,
+    #[cfg(feature = "project-integration")]
     refresh_colors_task: Task<()>,
+    #[cfg(feature = "project-integration")]
     refresh_code_lens_task: Task<()>,
+    #[cfg(feature = "project-integration")]
     use_document_folding_ranges: bool,
+    #[cfg(feature = "project-integration")]
     refresh_folding_ranges_task: Task<()>,
+    #[cfg(feature = "project-integration")]
     inlay_hints: Option<LspInlayHintData>,
     folding_newlines: Task<()>,
     select_next_is_case_sensitive: Option<bool>,
@@ -1215,12 +1348,18 @@ pub struct Editor {
     applicable_language_settings: HashMap<Option<LanguageName>, LanguageSettings>,
     accent_data: Option<AccentData>,
     bracket_fetched_tree_sitter_chunks: HashMap<Range<text::Anchor>, HashSet<Range<BufferRow>>>,
+    #[cfg(feature = "project-integration")]
     semantic_token_state: SemanticTokenState,
     pub(crate) refresh_matching_bracket_highlights_task: Task<()>,
+    #[cfg(feature = "project-integration")]
     refresh_document_symbols_task: Shared<Task<()>>,
+    #[cfg(feature = "project-integration")]
     lsp_document_links: LspDocumentLinks,
+    #[cfg(feature = "project-integration")]
     lsp_document_symbols: HashMap<BufferId, Vec<OutlineItem<text::Anchor>>>,
+    #[cfg(feature = "project-integration")]
     refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
+    #[cfg(feature = "project-integration")]
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
@@ -1880,7 +2019,7 @@ impl Editor {
     pub fn single_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(EditorMode::SingleLine, buffer, None, window, cx)
+        Self::new_internal(EditorMode::SingleLine, buffer, None, None, window, cx)
     }
 
     pub fn erased(&self, cx: &Context<Self>) -> Arc<dyn ErasedEditor> {
@@ -1890,7 +2029,7 @@ impl Editor {
     pub fn multi_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(EditorMode::full(), buffer, None, window, cx)
+        Self::new_internal(EditorMode::full(), buffer, None, None, window, cx)
     }
 
     pub fn auto_height(
@@ -1901,12 +2040,13 @@ impl Editor {
     ) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(
+        Self::new_internal(
             EditorMode::AutoHeight {
                 min_lines,
                 max_lines: Some(max_lines),
             },
             buffer,
+            None,
             None,
             window,
             cx,
@@ -1922,18 +2062,20 @@ impl Editor {
     ) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
-        Self::new(
+        Self::new_internal(
             EditorMode::AutoHeight {
                 min_lines,
                 max_lines: None,
             },
             buffer,
             None,
+            None,
             window,
             cx,
         )
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn for_buffer(
         buffer: Entity<Buffer>,
         project: Option<Entity<Project>>,
@@ -1954,6 +2096,7 @@ impl Editor {
         Self::new_internal(EditorMode::full(), buffer, None, None, window, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn for_multibuffer(
         buffer: Entity<MultiBuffer>,
         project: Option<Entity<Project>>,
@@ -1973,10 +2116,11 @@ impl Editor {
     }
 
     pub fn clone(&self, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut clone = Self::new(
+        let mut clone = Self::new_internal(
             self.mode.clone(),
             self.buffer.clone(),
             self.project.clone(),
+            None,
             window,
             cx,
         );
@@ -2006,6 +2150,7 @@ impl Editor {
         clone
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn new(
         mode: EditorMode,
         buffer: Entity<MultiBuffer>,
@@ -2090,7 +2235,7 @@ impl Editor {
     fn new_internal(
         mode: EditorMode,
         multi_buffer: Entity<MultiBuffer>,
-        project: Option<Entity<Project>>,
+        project: Option<ProjectHandle>,
         display_map: Option<Entity<DisplayMap>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2171,7 +2316,9 @@ impl Editor {
         let soft_wrap_mode_override =
             matches!(mode, EditorMode::SingleLine).then(|| language_settings::SoftWrap::None);
 
+        #[cfg(feature = "project-integration")]
         let mut project_subscriptions = Vec::new();
+        #[cfg(feature = "project-integration")]
         if full_mode && let Some(project) = project.as_ref() {
             project_subscriptions.push(cx.subscribe_in(
                 project,
@@ -2384,10 +2531,11 @@ impl Editor {
             ));
         }
 
-        let buffer_snapshot = multi_buffer.read(cx).snapshot(cx);
-
-        let inlay_hint_settings =
-            inlay_hint_settings(selections.newest_anchor().head(), &buffer_snapshot, cx);
+        #[cfg(feature = "project-integration")]
+        let inlay_hint_settings = {
+            let buffer_snapshot = multi_buffer.read(cx).snapshot(cx);
+            inlay_hint_settings(selections.newest_anchor().head(), &buffer_snapshot, cx)
+        };
         let focus_handle = cx.focus_handle();
         if !is_minimap {
             cx.on_focus(&focus_handle, window, Self::handle_focus)
@@ -2409,20 +2557,29 @@ impl Editor {
                 None
             };
 
+        #[cfg(feature = "project-integration")]
         let bookmark_store = match (&mode, project.as_ref()) {
             (EditorMode::Full { .. }, Some(project)) => Some(project.read(cx).bookmark_store()),
             _ => None,
         };
 
+        #[cfg(feature = "project-integration")]
         let breakpoint_store = match (&mode, project.as_ref()) {
             (EditorMode::Full { .. }, Some(project)) => Some(project.read(cx).breakpoint_store()),
             _ => None,
         };
 
+        #[cfg(feature = "project-integration")]
         let mut code_action_providers = Vec::new();
+        #[cfg(feature = "project-integration")]
         if let Some(project) = project.clone() {
             code_action_providers.push(Rc::new(project) as Rc<_>);
         }
+
+        #[cfg(feature = "project-integration")]
+        let show_inline_diagnostics = ProjectSettings::get_global(cx).diagnostics.inline.enabled;
+        #[cfg(not(feature = "project-integration"))]
+        let show_inline_diagnostics = false;
 
         let mut editor = Self {
             focus_handle,
@@ -2445,20 +2602,26 @@ impl Editor {
             select_syntax_node_history: SelectSyntaxNodeHistory::default(),
             ime_transaction: None,
             active_diagnostics: ActiveDiagnostic::None,
-            show_inline_diagnostics: ProjectSettings::get_global(cx).diagnostics.inline.enabled,
+            show_inline_diagnostics,
             inline_diagnostics_update: Task::ready(()),
             inline_diagnostics: Vec::new(),
             soft_wrap_mode_override,
             diagnostics_max_severity,
             hard_wrap: None,
+            #[cfg(feature = "project-integration")]
             completion_provider: project.clone().map(|project| Rc::new(project) as _),
+            #[cfg(feature = "project-integration")]
             semantics_provider: project
                 .as_ref()
                 .map(|project| Rc::new(project.downgrade()) as _),
+            #[cfg(feature = "project-integration")]
             collaboration_hub: project.clone().map(|project| Box::new(project) as _),
+            #[cfg(feature = "project-integration")]
             clipboard_path_resolver: project
                 .clone()
                 .map(|project| Rc::new(project) as Rc<dyn ClipboardPathResolver>),
+            #[cfg(not(feature = "project-integration"))]
+            clipboard_path_resolver: None,
             project,
             blink_manager: blink_manager.clone(),
             show_local_selections: true,
@@ -2501,25 +2664,40 @@ impl Editor {
             nav_history: None,
             #[cfg(not(feature = "workspace-integration"))]
             local_navigation_history: LocalNavigationHistory::default(),
+            #[cfg(feature = "project-integration")]
             context_menu: RefCell::new(None),
+            #[cfg(feature = "project-integration")]
             context_menu_options: None,
+            #[cfg(feature = "project-integration")]
             mouse_context_menu: None,
+            #[cfg(feature = "project-integration")]
             completion_tasks: Vec::new(),
+            #[cfg(feature = "project-integration")]
             inline_blame_popover: None,
+            #[cfg(feature = "project-integration")]
             inline_blame_popover_show_task: None,
+            #[cfg(feature = "project-integration")]
             signature_help_state: SignatureHelpState::default(),
+            #[cfg(feature = "project-integration")]
             auto_signature_help: None,
+            #[cfg(feature = "project-integration")]
             find_all_references_task_sources: Vec::new(),
+            #[cfg(feature = "project-integration")]
             next_completion_id: 0,
             next_inlay_id: 0,
+            #[cfg(feature = "project-integration")]
             code_action_providers,
+            #[cfg(feature = "project-integration")]
             code_actions_for_selection: CodeActionsForSelection::None,
+            #[cfg(feature = "project-integration")]
             runnables_for_selection_toggle: Task::ready(()),
             quick_selection_highlight_task: None,
             debounced_selection_highlight_task: None,
             debounced_selection_highlight_complete: false,
             last_selection_from_search: false,
+            #[cfg(feature = "project-integration")]
             document_highlights_task: None,
+            #[cfg(feature = "project-integration")]
             linked_editing_range_task: None,
             pending_rename: None,
             searchable: !is_minimap,
@@ -2543,20 +2721,29 @@ impl Editor {
             jsx_tag_auto_close_enabled_in_any_buffer: false,
             leader_id: None,
             remote_id: None,
+            #[cfg(feature = "project-integration")]
             hover_state: HoverState::default(),
             pending_mouse_down: None,
             prev_pressure_stage: None,
+            #[cfg(feature = "project-integration")]
             hovered_link_state: None,
+            #[cfg(feature = "project-integration")]
             edit_prediction_provider: None,
+            #[cfg(feature = "project-integration")]
             active_edit_prediction: None,
+            #[cfg(feature = "project-integration")]
             stale_edit_prediction_in_menu: None,
+            #[cfg(feature = "project-integration")]
             edit_prediction_preview: EditPredictionPreview::Inactive {
                 released_too_fast: false,
             },
             inline_diagnostics_enabled: full_mode,
             diagnostics_enabled: full_mode,
             word_completions_enabled: full_mode,
+            #[cfg(feature = "project-integration")]
             inline_value_cache: InlineValueCache::new(inlay_hint_settings.show_value_hints),
+            #[cfg(not(feature = "project-integration"))]
+            inline_value_cache: InlineValueCache::new(false),
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
             last_bounds: None,
@@ -2570,19 +2757,29 @@ impl Editor {
             hovered_cursors: HashMap::default(),
             next_editor_action_id: EditorActionId::default(),
             editor_actions: Rc::default(),
+            #[cfg(feature = "project-integration")]
             edit_predictions_hidden_for_vim_mode: false,
+            #[cfg(feature = "project-integration")]
             show_edit_predictions_override: None,
+            #[cfg(feature = "project-integration")]
             show_completions_on_input_override: None,
+            #[cfg(feature = "project-integration")]
             menu_edit_predictions_policy: MenuEditPredictionsPolicy::ByProvider,
+            #[cfg(feature = "project-integration")]
             edit_prediction_settings: EditPredictionSettings::Disabled,
             in_leading_whitespace: false,
             custom_context_menu: None,
+            #[cfg(feature = "project-integration")]
             show_git_blame_gutter: false,
+            #[cfg(feature = "project-integration")]
             show_git_blame_inline: false,
             show_selection_menu: None,
+            #[cfg(feature = "project-integration")]
             show_git_blame_inline_delay_task: None,
+            #[cfg(feature = "project-integration")]
             git_blame_inline_enabled: full_mode
                 && ProjectSettings::get_global(cx).git.inline_blame.enabled,
+            #[cfg(feature = "project-integration")]
             buffer_serialization: is_minimap.not().then(|| {
                 BufferSerialization::new(
                     ProjectSettings::get_global(cx)
@@ -2590,18 +2787,32 @@ impl Editor {
                         .restore_unsaved_buffers,
                 )
             }),
+            #[cfg(not(feature = "project-integration"))]
+            buffer_serialization: None,
+            #[cfg(feature = "project-integration")]
             blame: None,
+            #[cfg(feature = "project-integration")]
             blame_subscription: None,
+            #[cfg(feature = "project-integration")]
             pending_blame_hover_observation: None,
 
+            #[cfg(feature = "project-integration")]
             bookmark_store,
+            #[cfg(feature = "project-integration")]
             breakpoint_store,
+            #[cfg(feature = "project-integration")]
             gutter_hover_button: (None, None),
+            #[cfg(feature = "project-integration")]
             gutter_diff_review_indicator: (None, None),
+            #[cfg(feature = "project-integration")]
             diff_review_drag_state: None,
+            #[cfg(feature = "project-integration")]
             diff_review_overlays: Vec::new(),
+            #[cfg(feature = "project-integration")]
             stored_review_comments: Vec::new(),
+            #[cfg(feature = "project-integration")]
             next_review_comment_id: 0,
+            #[cfg(feature = "project-integration")]
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {
@@ -2616,14 +2827,22 @@ impl Editor {
                     ]
                 })
                 .unwrap_or_default(),
+            #[cfg(feature = "project-integration")]
             runnables: RunnableData::new(),
             pull_diagnostics_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             colors: None,
+            #[cfg(feature = "project-integration")]
             code_lens: None,
+            #[cfg(feature = "project-integration")]
             refresh_colors_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             refresh_code_lens_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             use_document_folding_ranges: false,
+            #[cfg(feature = "project-integration")]
             refresh_folding_ranges_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             inlay_hints: None,
             next_color_inlay_id: 0,
             post_scroll_update: Task::ready(()),
@@ -2634,6 +2853,7 @@ impl Editor {
             focused_block: None,
             next_scroll_position: NextScrollCursorCenterTopBottom::default(),
             addons: Default::default(),
+            #[cfg(feature = "project-integration")]
             registered_buffers: HashMap::default(),
             _scroll_cursor_center_top_bottom_task: Task::ready(()),
             selection_mark_mode: false,
@@ -2641,7 +2861,9 @@ impl Editor {
             serialize_selections: Task::ready(()),
             serialize_folds: Task::ready(()),
             text_style_refinement: None,
+            #[cfg(feature = "project-integration")]
             load_diff_task: None,
+            #[cfg(feature = "project-integration")]
             diff_hunk_delegate: None,
             minimap: None,
             change_list: ChangeList::new(),
@@ -2653,21 +2875,28 @@ impl Editor {
             on_local_selections_changed: None,
             suppress_selection_callback: false,
             applicable_language_settings: HashMap::default(),
+            #[cfg(feature = "project-integration")]
             semantic_token_state: SemanticTokenState::new(cx, full_mode),
             accent_data: None,
             bracket_fetched_tree_sitter_chunks: HashMap::default(),
             number_deleted_lines: false,
             refresh_matching_bracket_highlights_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             refresh_document_symbols_task: Task::ready(()).shared(),
+            #[cfg(feature = "project-integration")]
             lsp_document_links: LspDocumentLinks::new(cx),
+            #[cfg(feature = "project-integration")]
             lsp_document_symbols: HashMap::default(),
+            #[cfg(feature = "project-integration")]
             refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
+            #[cfg(feature = "project-integration")]
             outline_symbols_at_cursor: None,
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
         };
 
+        #[cfg(feature = "project-integration")]
         if let Some(project) = editor.project.clone() {
             editor.load_diff_task = Some(
                 editor
@@ -2687,6 +2916,7 @@ impl Editor {
         editor.applicable_language_settings = editor.fetch_applicable_language_settings(cx);
         editor.accent_data = editor.fetch_accent_data(cx);
 
+        #[cfg(feature = "project-integration")]
         if let Some(breakpoints) = editor.breakpoint_store.as_ref() {
             editor
                 ._subscriptions
@@ -2694,6 +2924,7 @@ impl Editor {
                     cx.notify();
                 }));
         }
+        #[cfg(feature = "project-integration")]
         editor._subscriptions.extend(project_subscriptions);
 
         editor._subscriptions.push(cx.subscribe_in(
@@ -2702,7 +2933,9 @@ impl Editor {
             |editor, _, e: &EditorEvent, window, cx| match e {
                 EditorEvent::ScrollPositionChanged { local, .. } => {
                     if *local {
+                        #[cfg(feature = "project-integration")]
                         editor.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
+                        #[cfg(feature = "project-integration")]
                         editor.hide_blame_popover(true, cx);
                         #[cfg(feature = "workspace-integration")]
                         {
@@ -2718,6 +2951,7 @@ impl Editor {
                             });
                         }
 
+                        #[cfg(feature = "project-integration")]
                         editor.update_data_on_scroll(true, window, cx);
                     }
                     editor.refresh_sticky_headers(&editor.snapshot(window, cx), cx);
@@ -2753,6 +2987,7 @@ impl Editor {
             },
         ));
 
+        #[cfg(feature = "project-integration")]
         if let Some(dap_store) = editor
             .project
             .as_ref()
@@ -2794,25 +3029,31 @@ impl Editor {
             let should_auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
             cx.set_global(ScrollbarAutoHide(should_auto_hide_scrollbars));
 
-            if editor.git_blame_inline_enabled {
-                editor.start_git_blame_inline(false, window, cx);
-            }
+            #[cfg(feature = "project-integration")]
+            {
+                if editor.git_blame_inline_enabled {
+                    editor.start_git_blame_inline(false, window, cx);
+                }
 
-            editor.go_to_active_debug_line(window, cx);
+                editor.go_to_active_debug_line(window, cx);
+            }
 
             editor.minimap =
                 editor.create_minimap(EditorSettings::get_global(cx).minimap, window, cx);
-            editor.colors = Some(LspColorData::new(cx));
-            editor.use_document_folding_ranges = true;
-            editor.inlay_hints = Some(LspInlayHintData::new(inlay_hint_settings));
-            if editor.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline() {
-                editor.code_lens = Some(CodeLensState::default());
-            }
+            #[cfg(feature = "project-integration")]
+            {
+                editor.colors = Some(LspColorData::new(cx));
+                editor.use_document_folding_ranges = true;
+                editor.inlay_hints = Some(LspInlayHintData::new(inlay_hint_settings));
+                if editor.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline() {
+                    editor.code_lens = Some(CodeLensState::default());
+                }
 
-            if let Some(buffer) = multi_buffer.read(cx).as_singleton() {
-                editor.register_buffer(buffer.read(cx).remote_id(), cx);
+                if let Some(buffer) = multi_buffer.read(cx).as_singleton() {
+                    editor.register_buffer(buffer.read(cx).remote_id(), cx);
+                }
+                editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
             }
-            editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
         }
 
         editor
@@ -2822,6 +3063,120 @@ impl Editor {
         self.display_map.update(cx, |map, cx| map.snapshot(cx))
     }
 
+    pub fn status_for_buffer_id(&self, buffer_id: BufferId, cx: &App) -> Option<FileStatus> {
+        if let Some(status) = self
+            .addons
+            .iter()
+            .find_map(|(_, addon)| addon.override_status_for_buffer_id(buffer_id, cx))
+        {
+            return Some(status);
+        }
+        #[cfg(feature = "project-integration")]
+        {
+            self.project
+                .as_ref()?
+                .read(cx)
+                .status_for_buffer_id(buffer_id, cx)
+        }
+        #[cfg(not(feature = "project-integration"))]
+        {
+            None
+        }
+    }
+
+    pub(crate) fn has_any_expanded_diff_hunks(&self, cx: &App) -> bool {
+        if self.buffer.read(cx).all_diff_hunks_expanded() {
+            return true;
+        }
+        let ranges = vec![Anchor::Min..Anchor::Max];
+        self.buffer
+            .read(cx)
+            .has_expanded_diff_hunks_in_ranges(&ranges, cx)
+    }
+
+    pub fn text_layout_details(&self, window: &mut Window, cx: &mut App) -> TextLayoutDetails {
+        TextLayoutDetails {
+            text_system: window.text_system().clone(),
+            editor_style: self.style.clone().unwrap_or_else(|| self.create_style(cx)),
+            rem_size: window.rem_size(),
+            scroll_anchor: self.scroll_manager.shared_scroll_anchor(cx),
+            visible_rows: self.visible_line_count(),
+            vertical_scroll_margin: self.scroll_manager.vertical_scroll_margin,
+        }
+    }
+
+    pub(crate) fn visible_buffer_ranges(
+        &self,
+        cx: &mut Context<Editor>,
+    ) -> Vec<(
+        BufferSnapshot,
+        Range<BufferOffset>,
+        ExcerptRange<text::Anchor>,
+    )> {
+        let display_snapshot = self.display_snapshot(cx);
+        let visible_range = self.multi_buffer_visible_range(&display_snapshot, cx);
+        display_snapshot
+            .buffer_snapshot()
+            .range_to_buffer_ranges(visible_range)
+            .into_iter()
+            .filter(|(_, excerpt_visible_range, _)| !excerpt_visible_range.is_empty())
+            .map(|(buffer_snapshot, buffer_offset_range, excerpt_range)| {
+                (buffer_snapshot.clone(), buffer_offset_range, excerpt_range)
+            })
+            .collect()
+    }
+
+    /// Project-backed edit predictions are unavailable in the standalone
+    /// editor, but Vim still dispatches this host action from its shared input
+    /// path. Keep that path source-compatible and let another handler run.
+    #[cfg(not(feature = "project-integration"))]
+    pub fn accept_edit_prediction(
+        &mut self,
+        _: &AcceptEditPrediction,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.propagate();
+    }
+
+    /// Keep shared editing clients source-compatible when the project-backed
+    /// prediction provider is not linked into the Editor.
+    #[cfg(not(feature = "project-integration"))]
+    pub fn refresh_edit_prediction(
+        &mut self,
+        _: bool,
+        _: bool,
+        _: EditPredictionRequestTrigger,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<()> {
+        None
+    }
+
+    /// Hover popovers are project-backed, so a standalone editor never
+    /// consumes the Vim scroll gesture on their behalf.
+    #[cfg(not(feature = "project-integration"))]
+    pub fn scroll_hover(
+        &mut self,
+        _: scroll::ScrollAmount,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> bool {
+        false
+    }
+
+    /// Preserve Vim's shared settings synchronization without retaining an
+    /// edit-prediction provider in project-free editors.
+    #[cfg(not(feature = "project-integration"))]
+    pub fn set_edit_predictions_hidden_for_vim_mode(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+
+    #[cfg(feature = "project-integration")]
     pub fn deploy_mouse_context_menu(
         &mut self,
         position: gpui::Point<Pixels>,
@@ -2838,6 +3193,7 @@ impl Editor {
         ));
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn mouse_menu_is_focused(&self, window: &Window, cx: &App) -> bool {
         self.mouse_context_menu
             .as_ref()
@@ -2845,7 +3201,11 @@ impl Editor {
     }
 
     pub fn key_context(&self, window: &mut Window, cx: &mut App) -> KeyContext {
-        self.key_context_internal(self.has_active_edit_prediction(), window, cx)
+        #[cfg(feature = "project-integration")]
+        let has_active_edit_prediction = self.has_active_edit_prediction();
+        #[cfg(not(feature = "project-integration"))]
+        let has_active_edit_prediction = false;
+        self.key_context_internal(has_active_edit_prediction, window, cx)
     }
 
     fn key_context_internal(
@@ -2884,29 +3244,37 @@ impl Editor {
             }
         }
 
-        match self.context_menu.borrow().as_ref() {
-            Some(CodeContextMenu::Completions(menu)) => {
-                if menu.visible() {
-                    key_context.add("menu");
-                    key_context.add("showing_completions");
+        #[cfg(feature = "project-integration")]
+        {
+            match self.context_menu.borrow().as_ref() {
+                Some(CodeContextMenu::Completions(menu)) => {
+                    if menu.visible() {
+                        key_context.add("menu");
+                        key_context.add("showing_completions");
+                    }
                 }
-            }
-            Some(CodeContextMenu::CodeActions(menu)) => {
-                if menu.visible() {
-                    key_context.add("menu");
-                    key_context.add("showing_code_actions")
+                Some(CodeContextMenu::CodeActions(menu)) => {
+                    if menu.visible() {
+                        key_context.add("menu");
+                        key_context.add("showing_code_actions")
+                    }
                 }
+                None => {}
             }
-            None => {}
+
+            if self.signature_help_state.has_multiple_signatures() {
+                key_context.add("showing_signature_help");
+            }
         }
 
-        if self.signature_help_state.has_multiple_signatures() {
-            key_context.add("showing_signature_help");
-        }
+        #[cfg(feature = "project-integration")]
+        let mouse_menu_is_focused = self.mouse_menu_is_focused(window, cx);
+        #[cfg(not(feature = "project-integration"))]
+        let mouse_menu_is_focused = false;
 
         // Disable vim contexts when a sub-editor (e.g. rename/inline assistant) is focused.
         if !self.focus_handle(cx).contains_focused(window, cx)
-            || (self.is_focused(window) || self.mouse_menu_is_focused(window, cx))
+            || (self.is_focused(window) || mouse_menu_is_focused)
         {
             for addon in self.addons.values() {
                 addon.extend_key_context(&mut key_context, cx)
@@ -2936,10 +3304,13 @@ impl Editor {
         if self.in_leading_whitespace {
             key_context.add("in_leading_whitespace");
         }
-        if self.edit_prediction_requires_modifier() {
-            key_context.set("edit_prediction_mode", "subtle")
-        } else {
-            key_context.set("edit_prediction_mode", "eager");
+        #[cfg(feature = "project-integration")]
+        {
+            if self.edit_prediction_requires_modifier() {
+                key_context.set("edit_prediction_mode", "subtle")
+            } else {
+                key_context.set("edit_prediction_mode", "eager");
+            }
         }
 
         if self.selection_mark_mode {
@@ -3003,10 +3374,19 @@ impl Editor {
     pub fn target_file_abs_path(&self, cx: &mut Context<Self>) -> Option<PathBuf> {
         self.active_buffer(cx).and_then(|buffer| {
             let buffer = buffer.read(cx);
-            if let Some(project_path) = buffer.project_path(cx) {
-                let project = self.project()?.read(cx);
-                project.absolute_path(&project_path, cx)
-            } else {
+            #[cfg(feature = "project-integration")]
+            {
+                if let Some(project_path) = buffer.project_path(cx) {
+                    let project = self.project()?.read(cx);
+                    project.absolute_path(&project_path, cx)
+                } else {
+                    buffer
+                        .file()
+                        .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                }
+            }
+            #[cfg(not(feature = "project-integration"))]
+            {
                 buffer
                     .file()
                     .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
@@ -3147,6 +3527,7 @@ impl Editor {
         &self.buffer
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn project(&self) -> Option<&Entity<Project>> {
         self.project.as_ref()
     }
@@ -3208,6 +3589,7 @@ impl Editor {
     }
 
     pub fn snapshot(&self, window: &Window, cx: &mut App) -> EditorSnapshot {
+        #[cfg(feature = "project-integration")]
         let git_blame_gutter_max_author_length = self
             .render_git_blame_gutter(cx)
             .then(|| {
@@ -3220,6 +3602,13 @@ impl Editor {
                 }
             })
             .flatten();
+        #[cfg(not(feature = "project-integration"))]
+        let git_blame_gutter_max_author_length = None;
+
+        #[cfg(feature = "project-integration")]
+        let semantic_tokens_enabled = self.semantic_token_state.enabled();
+        #[cfg(not(feature = "project-integration"))]
+        let semantic_tokens_enabled = false;
 
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
 
@@ -3230,7 +3619,7 @@ impl Editor {
             show_line_numbers: self.show_line_numbers,
             number_deleted_lines: self.number_deleted_lines,
             show_git_diff_gutter: self.show_git_diff_gutter,
-            semantic_tokens_enabled: self.semantic_token_state.enabled(),
+            semantic_tokens_enabled,
             show_code_actions: self.show_code_actions,
             show_runnables: self.show_runnables,
             show_bookmarks: self.show_bookmarks,
@@ -3274,10 +3663,12 @@ impl Editor {
         self.mode = mode;
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn collaboration_hub(&self) -> Option<&dyn CollaborationHub> {
         self.collaboration_hub.as_deref()
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn set_collaboration_hub(&mut self, hub: Box<dyn CollaborationHub>) {
         self.collaboration_hub = Some(hub);
     }
@@ -3299,10 +3690,12 @@ impl Editor {
         self.custom_context_menu = Some(Box::new(f))
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn semantics_provider(&self) -> Option<Rc<dyn SemanticsProvider>> {
         self.semantics_provider.clone()
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn set_semantics_provider(&mut self, provider: Option<Rc<dyn SemanticsProvider>>) {
         self.semantics_provider = provider;
     }
@@ -3440,13 +3833,21 @@ impl Editor {
     }
 
     pub fn set_should_serialize(&mut self, should_serialize: bool, cx: &App) {
-        self.buffer_serialization = should_serialize.then(|| {
-            BufferSerialization::new(
-                ProjectSettings::get_global(cx)
-                    .session
-                    .restore_unsaved_buffers,
-            )
-        })
+        #[cfg(feature = "project-integration")]
+        {
+            self.buffer_serialization = should_serialize.then(|| {
+                BufferSerialization::new(
+                    ProjectSettings::get_global(cx)
+                        .session
+                        .restore_unsaved_buffers,
+                )
+            });
+        }
+        #[cfg(not(feature = "project-integration"))]
+        {
+            let _ = cx;
+            self.buffer_serialization = should_serialize.then(|| BufferSerialization::new(false));
+        }
     }
 
     fn should_serialize_buffer(&self) -> bool {
@@ -3540,19 +3941,22 @@ impl Editor {
             cx.notify();
             return;
         }
-        if self.clear_expanded_diff_hunks(cx) {
-            cx.notify();
-            return;
-        }
-        if self.show_git_blame_gutter
-            && !self
-                .blame
-                .as_ref()
-                .is_some_and(|blame| blame.read(cx).is_static())
+        #[cfg(feature = "project-integration")]
         {
-            self.show_git_blame_gutter = false;
-            cx.notify();
-            return;
+            if self.clear_expanded_diff_hunks(cx) {
+                cx.notify();
+                return;
+            }
+            if self.show_git_blame_gutter
+                && !self
+                    .blame
+                    .as_ref()
+                    .is_some_and(|blame| blame.read(cx).is_static())
+            {
+                self.show_git_blame_gutter = false;
+                cx.notify();
+                return;
+            }
         }
 
         if self.mode.is_full()
@@ -3574,21 +3978,32 @@ impl Editor {
         let mut dismissed = false;
 
         dismissed |= self.take_rename(false, window, cx).is_some();
-        dismissed |= self.hide_blame_popover(true, cx);
-        dismissed |= hide_hover(self, cx);
-        dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
-        dismissed |= self.hide_context_menu(window, cx).is_some();
-        dismissed |= self.mouse_context_menu.take().is_some();
-        dismissed |= is_user_requested
-            && self.discard_edit_prediction(EditPredictionDiscardReason::Rejected, cx);
-        dismissed |= self.snippet_stack.pop().is_some();
-        if self.diff_review_drag_state.is_some() {
-            self.cancel_diff_review_drag(cx);
-            dismissed = true;
+        #[cfg(feature = "project-integration")]
+        {
+            dismissed |= self.hide_blame_popover(true, cx);
+            dismissed |= hide_hover(self, cx);
+            dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
+            dismissed |= self.hide_context_menu(window, cx).is_some();
+            dismissed |= self.mouse_context_menu.take().is_some();
+            dismissed |= is_user_requested
+                && self.discard_edit_prediction(EditPredictionDiscardReason::Rejected, cx);
         }
-        if !self.diff_review_overlays.is_empty() {
-            self.dismiss_all_diff_review_overlays(cx);
-            dismissed = true;
+        #[cfg(not(feature = "project-integration"))]
+        let _ = is_user_requested;
+        dismissed |= self.snippet_stack.pop().is_some();
+        #[cfg(feature = "project-integration")]
+        {
+            if self.diff_review_drag_state.is_some() {
+                self.cancel_diff_review_drag(cx);
+                dismissed = true;
+            }
+        }
+        #[cfg(feature = "project-integration")]
+        {
+            if !self.diff_review_overlays.is_empty() {
+                self.dismiss_all_diff_review_overlays(cx);
+                dismissed = true;
+            }
         }
 
         if self.mode.is_full() && self.has_active_diagnostic_group() {
@@ -3740,10 +4155,12 @@ impl Editor {
         Ok(())
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn has_mouse_context_menu(&self) -> bool {
         self.mouse_context_menu.is_some()
     }
 
+    #[cfg(feature = "project-integration")]
     fn refresh_document_highlights(&mut self, cx: &mut Context<Self>) -> Option<()> {
         if self.pending_rename.is_some() {
             return None;
@@ -3888,6 +4305,7 @@ impl Editor {
     }
 
     #[ztracing::instrument(skip_all)]
+    #[cfg(feature = "project-integration")]
     fn update_selection_occurrence_highlights(
         &mut self,
         multi_buffer_snapshot: MultiBufferSnapshot,
@@ -3974,7 +4392,22 @@ impl Editor {
         })
     }
 
+    #[cfg(not(feature = "project-integration"))]
+    fn update_selection_occurrence_highlights(
+        &mut self,
+        _: MultiBufferSnapshot,
+        _: String,
+        _: Range<Anchor>,
+        _: Range<Point>,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Editor>,
+    ) -> Task<()> {
+        Task::ready(())
+    }
+
     #[ztracing::instrument(skip_all)]
+    #[cfg(feature = "project-integration")]
     fn refresh_outline_symbols_at_cursor(&mut self, cx: &mut Context<Editor>) {
         if !self.lsp_data_enabled() {
             return;
@@ -4124,38 +4557,46 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.update_edit_prediction_settings(cx);
-
-        // Ensure that the edit prediction preview is updated, even when not
-        // enabled, if there's an active edit prediction preview.
-        if self.show_edit_predictions_in_menu()
-            || self.edit_prediction_requires_modifier()
-            || matches!(
-                self.edit_prediction_preview,
-                EditPredictionPreview::Active { .. }
-            )
+        #[cfg(feature = "project-integration")]
         {
-            self.update_edit_prediction_preview(&modifiers, window, cx);
+            self.update_edit_prediction_settings(cx);
+
+            // Ensure that the edit prediction preview is updated, even when not
+            // enabled, if there's an active edit prediction preview.
+            if self.show_edit_predictions_in_menu()
+                || self.edit_prediction_requires_modifier()
+                || matches!(
+                    self.edit_prediction_preview,
+                    EditPredictionPreview::Active { .. }
+                )
+            {
+                self.update_edit_prediction_preview(&modifiers, window, cx);
+            }
         }
 
         self.update_selection_mode(&modifiers, position_map, window, cx);
 
         let mouse_position = window.mouse_position();
-        if !position_map.text_hitbox.is_hovered(window) {
-            if self.gutter_hover_button.0.is_some() {
-                cx.notify();
+        #[cfg(feature = "project-integration")]
+        {
+            if !position_map.text_hitbox.is_hovered(window) {
+                if self.gutter_hover_button.0.is_some() {
+                    cx.notify();
+                }
+                return;
             }
-            return;
-        }
 
-        self.update_hovered_link(
-            position_map.point_for_position(mouse_position),
-            Some(mouse_position),
-            &position_map.snapshot,
-            modifiers,
-            window,
-            cx,
-        )
+            self.update_hovered_link(
+                position_map.point_for_position(mouse_position),
+                Some(mouse_position),
+                &position_map.snapshot,
+                modifiers,
+                window,
+                cx,
+            )
+        }
+        #[cfg(not(feature = "project-integration"))]
+        let _ = mouse_position;
     }
 
     fn is_cmd_or_ctrl_pressed(modifiers: &Modifiers, cx: &mut Context<Self>) -> bool {
@@ -4219,6 +4660,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "project-integration")]
     fn active_run_indicators(
         &mut self,
         range: Range<DisplayRow>,
@@ -4270,6 +4712,7 @@ impl Editor {
             .collect()
     }
 
+    #[cfg(feature = "project-integration")]
     fn active_bookmarks(
         &self,
         range: Range<DisplayRow>,
@@ -4327,6 +4770,7 @@ impl Editor {
         bookmark_display_points
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_bookmark(&self, row: DisplayRow, cx: &mut Context<Self>) -> IconButton {
         let focus_handle = self.focus_handle.clone();
         IconButton::new(("bookmark indicator", row.0 as usize), IconName::Bookmark)
@@ -4356,6 +4800,7 @@ impl Editor {
     /// This function is used to handle overlaps between breakpoints and Code action/runner symbol.
     /// It's also used to set the color of line numbers with breakpoints to the breakpoint color.
     /// TODO debugger: Use this function to color toggle symbols that house nested breakpoints
+    #[cfg(feature = "project-integration")]
     fn active_breakpoints(
         &self,
         range: Range<DisplayRow>,
@@ -4410,6 +4855,7 @@ impl Editor {
         breakpoint_display_points
     }
 
+    #[cfg(feature = "project-integration")]
     fn gutter_context_menu(
         &self,
         anchor: Anchor,
@@ -4676,6 +5122,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_breakpoint(
         &self,
         position: Anchor,
@@ -4763,6 +5210,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_gutter_hover_button(
         &self,
         position: Anchor,
@@ -4835,6 +5283,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "project-integration")]
     fn build_tasks_context(
         project: &Entity<Project>,
         buffer: &Entity<Buffer>,
@@ -4863,6 +5312,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_visible(&self) -> bool {
         !self.edit_prediction_preview_is_active()
             && self
@@ -4872,6 +5322,7 @@ impl Editor {
                 .is_some_and(|menu| menu.visible())
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_origin(&self) -> Option<ContextMenuOrigin> {
         self.context_menu
             .borrow()
@@ -4879,6 +5330,7 @@ impl Editor {
             .map(|menu| menu.origin())
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn set_context_menu_options(&mut self, options: ContextMenuOptions) {
         self.context_menu_options = Some(options);
     }
@@ -4891,6 +5343,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn render_context_menu(
         &mut self,
         max_height_in_lines: u32,
@@ -4907,6 +5360,7 @@ impl Editor {
             .map(|style| menu.render(style, max_height_in_lines, window, cx))
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_context_menu_aside(
         &mut self,
         max_size: Size<Pixels>,
@@ -4922,6 +5376,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn hide_context_menu(
         &mut self,
         window: &mut Window,
@@ -4940,6 +5395,7 @@ impl Editor {
         context_menu
     }
 
+    #[cfg(feature = "project-integration")]
     fn show_snippet_choices(
         &mut self,
         choices: &Vec<String>,
@@ -5044,7 +5500,10 @@ impl Editor {
             if let Some(choices) = &tabstop.choices
                 && let Some(selection) = tabstop.ranges.first()
             {
-                self.show_snippet_choices(choices, selection.clone(), cx)
+                #[cfg(feature = "project-integration")]
+                {
+                    self.show_snippet_choices(choices, selection.clone(), cx);
+                }
             }
 
             // If we're already at the last tabstop and it's at the end of the snippet,
@@ -5180,7 +5639,10 @@ impl Editor {
                 if let Some(choices) = &snippet.choices[snippet.active_index]
                     && let Some(selection) = current_ranges.first()
                 {
+                    #[cfg(feature = "project-integration")]
                     self.show_snippet_choices(choices, selection.clone(), cx);
+                    #[cfg(not(feature = "project-integration"))]
+                    let _ = (choices, selection);
                 }
 
                 // If snippet state is not at the last tabstop, push it back on the stack
@@ -5248,6 +5710,7 @@ impl Editor {
             this.change_selections(Default::default(), window, cx, |s| s.select(selections));
             this.insert("", window, cx);
             linked_edits.apply_with_left_expansion(cx);
+            #[cfg(feature = "project-integration")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -5255,6 +5718,7 @@ impl Editor {
                 window,
                 cx,
             );
+            #[cfg(feature = "project-integration")]
             refresh_linked_ranges(this, window, cx);
         });
     }
@@ -5277,6 +5741,7 @@ impl Editor {
             let linked_edits = this.linked_edits_for_selections(Arc::from(""), cx);
             this.insert("", window, cx);
             linked_edits.apply(cx);
+            #[cfg(feature = "project-integration")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -5284,6 +5749,7 @@ impl Editor {
                 window,
                 cx,
             );
+            #[cfg(feature = "project-integration")]
             refresh_linked_ranges(this, window, cx);
         });
     }
@@ -5468,6 +5934,7 @@ impl Editor {
         self.transact(window, cx, |this, window, cx| {
             this.buffer.update(cx, |b, cx| b.edit(edits, None, cx));
             this.change_selections(Default::default(), window, cx, |s| s.select(selections));
+            #[cfg(feature = "project-integration")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -6075,6 +6542,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn reload_file(&mut self, _: &ReloadFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(project) = self.project.clone() else {
             return;
@@ -6083,7 +6551,10 @@ impl Editor {
         self.detach_and_notify_err(task, window, cx);
     }
 
-    #[cfg(not(feature = "workspace-integration"))]
+    #[cfg(all(
+        feature = "project-integration",
+        not(feature = "workspace-integration")
+    ))]
     fn reload(
         &mut self,
         project: Entity<Project>,
@@ -6141,6 +6612,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn set_gutter_context_menu(
         &mut self,
         display_row: DisplayRow,
@@ -6179,6 +6651,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "project-integration")]
     fn add_edit_block(
         &mut self,
         anchor: Anchor,
@@ -6229,6 +6702,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "project-integration")]
     fn add_edit_breakpoint_block(
         &mut self,
         anchor: Anchor,
@@ -6284,6 +6758,7 @@ impl Editor {
         );
     }
 
+    #[cfg(feature = "project-integration")]
     pub(crate) fn breakpoint_at_row(
         &self,
         row: u32,
@@ -6296,6 +6771,7 @@ impl Editor {
         self.breakpoint_at_anchor(breakpoint_position, &snapshot, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub(crate) fn breakpoint_at_anchor(
         &self,
         breakpoint_position: Anchor,
@@ -6344,6 +6820,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "project-integration")]
     pub(crate) fn bookmark_at_row(
         &self,
         row: u32,
@@ -6356,6 +6833,7 @@ impl Editor {
         self.bookmark_at_anchor(bookmark_position, &snapshot, cx)
     }
 
+    #[cfg(feature = "project-integration")]
     pub(crate) fn bookmark_at_anchor(
         &self,
         bookmark_position: Anchor,
@@ -6403,6 +6881,7 @@ impl Editor {
             })
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn edit_log_breakpoint(
         &mut self,
         _: &EditLogBreakpoint,
@@ -6431,6 +6910,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn breakpoints_at_cursors(
         &self,
         window: &mut Window,
@@ -6466,6 +6946,7 @@ impl Editor {
         cursors.into_iter().collect()
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn enable_breakpoint(
         &mut self,
         _: &crate::actions::EnableBreakpoint,
@@ -6626,6 +7107,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn disable_breakpoint(
         &mut self,
         _: &crate::actions::DisableBreakpoint,
@@ -6649,6 +7131,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn toggle_breakpoint(
         &mut self,
         _: &crate::actions::ToggleBreakpoint,
@@ -6678,6 +7161,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn edit_breakpoint_at_anchor(
         &mut self,
         breakpoint_position: Anchor,
@@ -6712,11 +7196,12 @@ impl Editor {
         cx.notify();
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(all(feature = "project-integration", any(test, feature = "test-support")))]
     pub fn breakpoint_store(&self) -> Option<Entity<BreakpointStore>> {
         self.breakpoint_store.clone()
     }
 
+    #[cfg(feature = "project-integration")]
     fn go_to_active_debug_line(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         maybe!({
             let breakpoint_store = self.breakpoint_store.as_ref()?;
@@ -7948,6 +8433,7 @@ impl Editor {
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
+            #[cfg(feature = "project-integration")]
             self.refresh_edit_prediction(
                 true,
                 false,
@@ -7973,6 +8459,7 @@ impl Editor {
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
+            #[cfg(feature = "project-integration")]
             self.refresh_edit_prediction(
                 true,
                 false,
@@ -7994,6 +8481,7 @@ impl Editor {
             .update(cx, |buffer, cx| buffer.group_until_transaction(tx_id, cx));
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_first(
         &mut self,
         _: &ContextMenuFirst,
@@ -8005,6 +8493,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_prev(
         &mut self,
         _: &ContextMenuPrevious,
@@ -8016,6 +8505,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_next(
         &mut self,
         _: &ContextMenuNext,
@@ -8027,6 +8517,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn context_menu_last(
         &mut self,
         _: &ContextMenuLast,
@@ -8038,6 +8529,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn signature_help_prev(
         &mut self,
         _: &SignatureHelpPrevious,
@@ -8054,6 +8546,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn signature_help_next(
         &mut self,
         _: &SignatureHelpNext,
@@ -8070,6 +8563,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn rename(
         &mut self,
         _: &Rename,
@@ -8364,6 +8858,7 @@ impl Editor {
                 s.select_ranges(vec![cursor_in_editor..cursor_in_editor])
             });
         } else {
+            #[cfg(feature = "project-integration")]
             self.refresh_document_highlights(cx);
         }
 
@@ -8374,6 +8869,7 @@ impl Editor {
         self.pending_rename.as_ref()
     }
 
+    #[cfg(feature = "project-integration")]
     fn can_format_selections(&self, cx: &App) -> bool {
         if !self.mode.is_full() {
             return false;
@@ -8395,6 +8891,12 @@ impl Editor {
             .any(|buffer| project.supports_range_formatting(&buffer, cx))
     }
 
+    #[cfg(not(feature = "project-integration"))]
+    fn can_format_selections(&self, _: &App) -> bool {
+        false
+    }
+
+    #[cfg(feature = "project-integration")]
     fn format(
         &mut self,
         _: &Format,
@@ -8419,6 +8921,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "project-integration")]
     fn format_selections(
         &mut self,
         _: &FormatSelections,
@@ -8450,6 +8953,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "project-integration")]
     fn perform_format(
         &mut self,
         project: Entity<Project>,
@@ -8540,6 +9044,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn organize_imports(
         &mut self,
         _: &OrganizeImports,
@@ -8561,6 +9066,7 @@ impl Editor {
         ))
     }
 
+    #[cfg(feature = "project-integration")]
     fn perform_code_action_kind(
         &mut self,
         project: Entity<Project>,
@@ -8595,6 +9101,7 @@ impl Editor {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn restart_language_server(
         &mut self,
         _: &RestartLanguageServer,
@@ -8615,6 +9122,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn stop_language_server(
         &mut self,
         _: &StopLanguageServer,
@@ -8974,11 +9482,16 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if let Some(path) = self.target_file_abs_path(cx) {
-            if let Some(project) = self.project() {
-                project.update(cx, |project, cx| project.reveal_path(&path, cx));
-            } else {
-                cx.reveal_path(&path);
+            #[cfg(feature = "project-integration")]
+            {
+                if let Some(project) = self.project() {
+                    project.update(cx, |project, cx| project.reveal_path(&path, cx));
+                } else {
+                    cx.reveal_path(&path);
+                }
             }
+            #[cfg(not(feature = "project-integration"))]
+            cx.reveal_path(&path);
         }
     }
 
@@ -9003,6 +9516,7 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "project-integration")]
         if let Some(path) = self.active_buffer(cx).and_then(|buffer| {
             let project = self.project()?.read(cx);
             let path = buffer.read(cx).file()?.path();
@@ -9010,6 +9524,17 @@ impl Editor {
             Some(path)
         }) {
             cx.write_to_clipboard(ClipboardItem::new_string(path.to_string()));
+        } else {
+            cx.propagate();
+        }
+
+        #[cfg(not(feature = "project-integration"))]
+        if let Some(path) = self.active_buffer(cx).and_then(|buffer| {
+            let buffer = buffer.read(cx);
+            let file = buffer.file()?;
+            Some(file.path().display(file.path_style(cx)).into_owned())
+        }) {
+            cx.write_to_clipboard(ClipboardItem::new_string(path));
         } else {
             cx.propagate();
         }
@@ -9067,9 +9592,14 @@ impl Editor {
                 end_line
             };
 
-            let project = self.project()?.read(cx);
             let file = buffer.file()?;
-            let path = file.path().display(project.path_style(cx));
+            #[cfg(feature = "project-integration")]
+            let path = {
+                let project = self.project()?.read(cx);
+                file.path().display(project.path_style(cx)).to_string()
+            };
+            #[cfg(not(feature = "project-integration"))]
+            let path = file.path().display(file.path_style(cx)).into_owned();
 
             let location = if start_line == end_line {
                 format!("{path}:{start_line}")
@@ -9118,6 +9648,7 @@ impl Editor {
                     (selection.range(), uuid.to_string())
                 });
             this.edit(edits, cx);
+            #[cfg(feature = "project-integration")]
             this.refresh_edit_prediction(
                 true,
                 false,
@@ -9809,6 +10340,7 @@ impl Editor {
         cx.notify();
     }
 
+    #[cfg(feature = "project-integration")]
     fn on_debug_session_event(
         &mut self,
         _session: Entity<Session>,
@@ -9820,6 +10352,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn refresh_inline_values(&mut self, cx: &mut Context<Self>) {
         let Some(semantics) = self.semantics_provider.clone() else {
             return;
@@ -9920,19 +10453,24 @@ impl Editor {
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
+                #[cfg(feature = "project-integration")]
                 self.refresh_code_actions_for_selection(window, cx);
                 self.refresh_single_line_folds(window, cx);
                 let snapshot = self.snapshot(window, cx);
                 self.refresh_matching_bracket_highlights(&snapshot, cx);
+                #[cfg(feature = "project-integration")]
                 self.refresh_outline_symbols_at_cursor(cx);
                 self.refresh_sticky_headers(&snapshot, cx);
+                #[cfg(feature = "project-integration")]
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
                 }
 
                 // Clean up orphaned review comments after edits
+                #[cfg(feature = "project-integration")]
                 self.cleanup_orphaned_review_comments(cx);
 
+                #[cfg(feature = "project-integration")]
                 if let Some(buffer) = edited_buffer {
                     if buffer.read(cx).file().is_none() {
                         cx.emit(EditorEvent::TitleChanged);
@@ -9953,39 +10491,50 @@ impl Editor {
                 #[cfg(feature = "workspace-integration")]
                 cx.emit(SearchEvent::MatchesInvalidated);
 
-                let Some(project) = &self.project else { return };
-                let (telemetry, is_via_ssh) = {
-                    let project = project.read(cx);
-                    let telemetry = project.client().telemetry().clone();
-                    let is_via_ssh = project.is_via_remote_server();
-                    (telemetry, is_via_ssh)
-                };
-                telemetry.log_edit_event("editor", is_via_ssh);
+                #[cfg(feature = "project-integration")]
+                {
+                    let Some(project) = &self.project else { return };
+                    let (telemetry, is_via_ssh) = {
+                        let project = project.read(cx);
+                        let telemetry = project.client().telemetry().clone();
+                        let is_via_ssh = project.is_via_remote_server();
+                        (telemetry, is_via_ssh)
+                    };
+                    telemetry.log_edit_event("editor", is_via_ssh);
+                }
             }
             multi_buffer::Event::BufferRangesUpdated {
                 buffer,
                 ranges,
                 path_key,
             } => {
+                #[cfg(feature = "project-integration")]
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
+                #[cfg(feature = "project-integration")]
                 self.refresh_document_highlights(cx);
                 let buffer_id = buffer.read(cx).remote_id();
+                #[cfg(feature = "project-integration")]
                 if self.buffer.read(cx).diff_for(buffer_id).is_none()
                     && let Some(project) = self.project.clone()
                 {
                     self.update_uncommitted_diff_for_buffer(&project, [buffer.clone()], cx)
                         .detach();
                 }
+                #[cfg(feature = "project-integration")]
                 self.register_visible_buffers(cx);
+                #[cfg(feature = "project-integration")]
                 self.update_lsp_data(Some(buffer_id), window, cx);
+                #[cfg(feature = "project-integration")]
                 self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+                #[cfg(feature = "project-integration")]
                 self.refresh_runnables(None, window, cx);
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
                 self.colorize_brackets(false, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
+                #[cfg(feature = "project-integration")]
                 self.semantic_token_state.invalidate_buffer(&buffer_id);
                 cx.emit(EditorEvent::BufferRangesUpdated {
                     buffer: buffer.clone(),
@@ -9994,23 +10543,26 @@ impl Editor {
                 });
             }
             multi_buffer::Event::BuffersRemoved { removed_buffer_ids } => {
-                if let Some(inlay_hints) = &mut self.inlay_hints {
-                    inlay_hints.remove_inlay_chunk_data(removed_buffer_ids);
-                }
-                self.refresh_inlay_hints(
-                    InlayHintRefreshReason::BuffersRemoved(removed_buffer_ids.clone()),
-                    cx,
-                );
-                for buffer_id in removed_buffer_ids {
-                    self.registered_buffers.remove(buffer_id);
-                    self.clear_runnables(Some(*buffer_id));
-                    self.semantic_token_state.invalidate_buffer(buffer_id);
-                    self.lsp_document_symbols.remove(buffer_id);
-                    self.lsp_document_links.per_buffer.remove(buffer_id);
-                    self.display_map.update(cx, |display_map, cx| {
-                        display_map.invalidate_semantic_highlights(*buffer_id);
-                        display_map.clear_lsp_folding_ranges(*buffer_id, cx);
-                    });
+                #[cfg(feature = "project-integration")]
+                {
+                    if let Some(inlay_hints) = &mut self.inlay_hints {
+                        inlay_hints.remove_inlay_chunk_data(removed_buffer_ids);
+                    }
+                    self.refresh_inlay_hints(
+                        InlayHintRefreshReason::BuffersRemoved(removed_buffer_ids.clone()),
+                        cx,
+                    );
+                    for buffer_id in removed_buffer_ids {
+                        self.registered_buffers.remove(buffer_id);
+                        self.clear_runnables(Some(*buffer_id));
+                        self.semantic_token_state.invalidate_buffer(buffer_id);
+                        self.lsp_document_symbols.remove(buffer_id);
+                        self.lsp_document_links.per_buffer.remove(buffer_id);
+                        self.display_map.update(cx, |display_map, cx| {
+                            display_map.invalidate_semantic_highlights(*buffer_id);
+                            display_map.clear_lsp_folding_ranges(*buffer_id, cx);
+                        });
+                    }
                 }
 
                 self.display_map.update(cx, |display_map, cx| {
@@ -10031,6 +10583,7 @@ impl Editor {
                 });
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
+                #[cfg(feature = "project-integration")]
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
@@ -10039,14 +10592,19 @@ impl Editor {
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
             multi_buffer::Event::DiffHunksToggled => {
+                #[cfg(feature = "project-integration")]
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
+                #[cfg(feature = "project-integration")]
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
+                #[cfg(not(feature = "project-integration"))]
+                let _ = is_fresh_language;
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
+                #[cfg(feature = "project-integration")]
                 self.update_edit_prediction_settings(cx);
                 cx.notify();
             }
@@ -10151,16 +10709,19 @@ impl Editor {
                 .unwrap_or(DiagnosticSeverity::Hint);
             self.set_max_diagnostics_severity(new_severity, cx);
         }
-        self.refresh_runnables(None, window, cx);
-        self.update_edit_prediction_settings(cx);
-        self.refresh_edit_prediction(
-            true,
-            false,
-            EditPredictionRequestTrigger::SettingsChanged,
-            window,
-            cx,
-        );
-        self.refresh_inline_values(cx);
+        #[cfg(feature = "project-integration")]
+        {
+            self.refresh_runnables(None, window, cx);
+            self.update_edit_prediction_settings(cx);
+            self.refresh_edit_prediction(
+                true,
+                false,
+                EditPredictionRequestTrigger::SettingsChanged,
+                window,
+                cx,
+            );
+            self.refresh_inline_values(cx);
+        }
 
         let old_cursor_shape = self.cursor_shape;
         let old_breadcrumbs_visible = self.breadcrumbs_visible();
@@ -10185,28 +10746,33 @@ impl Editor {
             cx.emit(EditorEvent::BreadcrumbsChanged);
         }
 
-        let (restore_unsaved_buffers, show_inline_diagnostics, inline_blame_enabled) = {
-            let project_settings = ProjectSettings::get_global(cx);
-            (
-                project_settings.session.restore_unsaved_buffers,
-                project_settings.diagnostics.inline.enabled,
-                project_settings.git.inline_blame.enabled,
-            )
-        };
-        self.buffer_serialization = self
-            .should_serialize_buffer()
-            .then(|| BufferSerialization::new(restore_unsaved_buffers));
+        #[cfg(feature = "project-integration")]
+        {
+            let (restore_unsaved_buffers, show_inline_diagnostics, inline_blame_enabled) = {
+                let project_settings = ProjectSettings::get_global(cx);
+                (
+                    project_settings.session.restore_unsaved_buffers,
+                    project_settings.diagnostics.inline.enabled,
+                    project_settings.git.inline_blame.enabled,
+                )
+            };
+            self.buffer_serialization = self
+                .should_serialize_buffer()
+                .then(|| BufferSerialization::new(restore_unsaved_buffers));
+
+            if self.mode.is_full() {
+                if self.show_inline_diagnostics != show_inline_diagnostics {
+                    self.show_inline_diagnostics = show_inline_diagnostics;
+                    self.refresh_inline_diagnostics(false, window, cx);
+                }
+
+                if self.git_blame_inline_enabled != inline_blame_enabled {
+                    self.toggle_git_blame_inline_internal(false, window, cx);
+                }
+            }
+        }
 
         if self.mode.is_full() {
-            if self.show_inline_diagnostics != show_inline_diagnostics {
-                self.show_inline_diagnostics = show_inline_diagnostics;
-                self.refresh_inline_diagnostics(false, window, cx);
-            }
-
-            if self.git_blame_inline_enabled != inline_blame_enabled {
-                self.toggle_git_blame_inline_internal(false, window, cx);
-            }
-
             let minimap_settings = EditorSettings::get_global(cx).minimap;
             if self.minimap_visibility != MinimapVisibility::Disabled {
                 if self.minimap_visibility.settings_visibility()
@@ -10228,58 +10794,61 @@ impl Editor {
                 self.colorize_brackets(true, cx);
             }
 
-            if language_settings_changed {
-                self.clear_disabled_lsp_folding_ranges(window, cx);
-                self.refresh_document_symbols(None, cx);
-                self.refresh_outline_symbols_at_cursor(cx);
-            }
-
-            if let Some(inlay_splice) = self.colors.as_mut().and_then(|colors| {
-                colors.render_mode_updated(EditorSettings::get_global(cx).lsp_document_colors)
-            }) {
-                if !inlay_splice.is_empty() {
-                    self.splice_inlays(&inlay_splice.to_remove, inlay_splice.to_insert, cx);
+            #[cfg(feature = "project-integration")]
+            {
+                if language_settings_changed {
+                    self.clear_disabled_lsp_folding_ranges(window, cx);
+                    self.refresh_document_symbols(None, cx);
+                    self.refresh_outline_symbols_at_cursor(cx);
                 }
-                self.refresh_document_colors(None, window, cx);
-            }
 
-            let code_lens_inline =
-                self.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline();
-            let was_inline = self.code_lens.is_some();
-            if code_lens_inline != was_inline {
-                self.toggle_code_lens(code_lens_inline, window, cx);
-            }
-
-            let lsp_document_links_enabled = EditorSettings::get_global(cx).lsp_document_links;
-            if lsp_document_links_enabled != self.lsp_document_links.enabled {
-                self.lsp_document_links.enabled = lsp_document_links_enabled;
-                if lsp_document_links_enabled {
-                    self.refresh_document_links(None, cx);
-                } else {
-                    self.lsp_document_links.per_buffer.clear();
-                    self.lsp_document_links.refresh_task = Task::ready(());
+                if let Some(inlay_splice) = self.colors.as_mut().and_then(|colors| {
+                    colors.render_mode_updated(EditorSettings::get_global(cx).lsp_document_colors)
+                }) {
+                    if !inlay_splice.is_empty() {
+                        self.splice_inlays(&inlay_splice.to_remove, inlay_splice.to_insert, cx);
+                    }
+                    self.refresh_document_colors(None, window, cx);
                 }
-            }
 
-            self.refresh_inlay_hints(
-                InlayHintRefreshReason::SettingsChange(inlay_hint_settings(
-                    self.selections.newest_anchor().head(),
-                    &self.buffer.read(cx).snapshot(cx),
+                let code_lens_inline =
+                    self.enable_code_lens && EditorSettings::get_global(cx).code_lens.inline();
+                let was_inline = self.code_lens.is_some();
+                if code_lens_inline != was_inline {
+                    self.toggle_code_lens(code_lens_inline, window, cx);
+                }
+
+                let lsp_document_links_enabled = EditorSettings::get_global(cx).lsp_document_links;
+                if lsp_document_links_enabled != self.lsp_document_links.enabled {
+                    self.lsp_document_links.enabled = lsp_document_links_enabled;
+                    if lsp_document_links_enabled {
+                        self.refresh_document_links(None, cx);
+                    } else {
+                        self.lsp_document_links.per_buffer.clear();
+                        self.lsp_document_links.refresh_task = Task::ready(());
+                    }
+                }
+
+                self.refresh_inlay_hints(
+                    InlayHintRefreshReason::SettingsChange(inlay_hint_settings(
+                        self.selections.newest_anchor().head(),
+                        &self.buffer.read(cx).snapshot(cx),
+                        cx,
+                    )),
                     cx,
-                )),
-                cx,
-            );
+                );
 
-            let new_semantic_token_rules = ProjectSettings::get_global(cx)
-                .global_lsp_settings
-                .semantic_token_rules
-                .clone();
-            let semantic_token_rules_changed = self
-                .semantic_token_state
-                .update_rules(new_semantic_token_rules);
-            if language_settings_changed || semantic_token_rules_changed {
-                self.invalidate_semantic_tokens(None);
-                self.refresh_semantic_tokens(None, false, cx);
+                let new_semantic_token_rules = ProjectSettings::get_global(cx)
+                    .global_lsp_settings
+                    .semantic_token_rules
+                    .clone();
+                let semantic_token_rules_changed = self
+                    .semantic_token_state
+                    .update_rules(new_semantic_token_rules);
+                if language_settings_changed || semantic_token_rules_changed {
+                    self.invalidate_semantic_tokens(None);
+                    self.refresh_semantic_tokens(None, false, cx);
+                }
             }
         }
 
@@ -10297,9 +10866,12 @@ impl Editor {
             self.colorize_brackets(true, cx);
         }
 
-        self.invalidate_semantic_tokens(None);
-        self.refresh_semantic_tokens(None, false, cx);
-        self.refresh_outline_symbols_at_cursor(cx);
+        #[cfg(feature = "project-integration")]
+        {
+            self.invalidate_semantic_tokens(None);
+            self.refresh_semantic_tokens(None, false, cx);
+            self.refresh_outline_symbols_at_cursor(cx);
+        }
     }
 
     pub fn set_searchable(&mut self, searchable: bool) {
@@ -10603,6 +11175,7 @@ impl Editor {
             .collect()
     }
 
+    #[cfg(feature = "project-integration")]
     fn report_editor_event(
         &self,
         reported_event: ReportEditorEvent,
@@ -10755,6 +11328,7 @@ impl Editor {
         cx.write_to_clipboard(ClipboardItem::new_string(lines));
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn open_context_menu(
         &mut self,
         _: &OpenContextMenu,
@@ -10783,6 +11357,7 @@ impl Editor {
         {
             window.focus(&descendant, cx);
         } else {
+            #[cfg(feature = "project-integration")]
             if let Some(blame) = self.blame.as_ref() {
                 blame.update(cx, GitBlame::focus)
             }
@@ -10834,6 +11409,7 @@ impl Editor {
             self.last_focused_descendant = Some(event.blurred);
         }
         self.selection_drag_state = SelectionDragState::None;
+        #[cfg(feature = "project-integration")]
         self.refresh_inlay_hints(InlayHintRefreshReason::ModifiersChanged(false), cx);
     }
 
@@ -10842,21 +11418,25 @@ impl Editor {
         self.buffer
             .update(cx, |buffer, cx| buffer.remove_active_selections(cx));
 
+        #[cfg(feature = "project-integration")]
         if let Some(blame) = self.blame.as_ref() {
             blame.update(cx, GitBlame::blur)
         }
-        if !self.hover_state.focused(window, cx) {
-            hide_hover(self, cx);
-        }
-        if !self
-            .context_menu
-            .borrow()
-            .as_ref()
-            .is_some_and(|context_menu| context_menu.focused(window, cx))
+        #[cfg(feature = "project-integration")]
         {
-            self.hide_context_menu(window, cx);
+            if !self.hover_state.focused(window, cx) {
+                hide_hover(self, cx);
+            }
+            if !self
+                .context_menu
+                .borrow()
+                .as_ref()
+                .is_some_and(|context_menu| context_menu.focused(window, cx))
+            {
+                self.hide_context_menu(window, cx);
+            }
+            self.take_active_edit_prediction(true, cx);
         }
-        self.take_active_edit_prediction(true, cx);
         cx.emit(EditorEvent::Blurred);
         cx.notify();
     }
@@ -11013,6 +11593,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn wait_for_diff_to_load(&self) -> Option<Shared<Task<()>>> {
         self.load_diff_task.clone()
     }
@@ -11190,6 +11771,7 @@ impl Editor {
         self.enable_lsp_data && self.mode().is_full()
     }
 
+    #[cfg(feature = "project-integration")]
     fn update_lsp_data(
         &mut self,
         for_buffer: Option<BufferId>,
@@ -11211,6 +11793,7 @@ impl Editor {
         self.refresh_document_symbols(for_buffer, cx);
     }
 
+    #[cfg(feature = "project-integration")]
     fn register_visible_buffers(&mut self, cx: &mut Context<Self>) {
         if !self.lsp_data_enabled() {
             return;
@@ -11225,6 +11808,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn register_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
         if !self.lsp_data_enabled() {
             return;
@@ -11282,6 +11866,14 @@ impl Editor {
             EditorMode::Minimap { .. } => cx.theme().colors().editor_background.opacity(0.7),
         };
 
+        #[cfg(feature = "project-integration")]
+        let edit_prediction_styles = make_suggestion_styles(cx);
+        #[cfg(not(feature = "project-integration"))]
+        let edit_prediction_styles = EditPredictionStyles {
+            insertion: HighlightStyle::default(),
+            whitespace: HighlightStyle::default(),
+        };
+
         EditorStyle {
             background,
             border: cx.theme().colors().border,
@@ -11291,7 +11883,7 @@ impl Editor {
             syntax: cx.theme().syntax().clone(),
             status: cx.theme().status().clone(),
             inlay_hints_style: make_inlay_hints_style(cx),
-            edit_prediction_styles: make_suggestion_styles(cx),
+            edit_prediction_styles,
             unnecessary_code_fade: settings.unnecessary_code_fade,
             show_underlines: self.diagnostics_enabled(),
         }
@@ -11302,16 +11894,18 @@ impl Editor {
         // In a multi-buffer layout, we don't want to include the filename in the breadcrumbs
         let mut breadcrumbs = if let Some(buffer) = multi_buffer.as_singleton() {
             let text = self.breadcrumb_header.clone().unwrap_or_else(|| {
+                #[cfg(feature = "project-integration")]
+                let include_root_name = self
+                    .project
+                    .as_ref()
+                    .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
+                    .unwrap_or_default();
+                #[cfg(not(feature = "project-integration"))]
+                let include_root_name = false;
                 buffer
                     .read(cx)
                     .snapshot()
-                    .resolve_file_path(
-                        self.project
-                            .as_ref()
-                            .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
-                            .unwrap_or_default(),
-                        cx,
-                    )
+                    .resolve_file_path(include_root_name, cx)
                     .unwrap_or_else(|| multi_buffer.title(cx).to_string())
             });
             vec![HighlightedText {
@@ -11322,13 +11916,16 @@ impl Editor {
             Vec::new()
         };
 
-        if let Some((buffer_id, symbols)) = self.outline_symbols_at_cursor.as_ref()
-            && multi_buffer.buffer(*buffer_id).is_some()
+        #[cfg(feature = "project-integration")]
         {
-            breadcrumbs.extend(symbols.iter().map(|symbol| HighlightedText {
-                text: symbol.text.clone(),
-                highlights: symbol.highlight_ranges.clone(),
-            }));
+            if let Some((buffer_id, symbols)) = self.outline_symbols_at_cursor.as_ref()
+                && multi_buffer.buffer(*buffer_id).is_some()
+            {
+                breadcrumbs.extend(symbols.iter().map(|symbol| HighlightedText {
+                    text: symbol.text.clone(),
+                    highlights: symbol.highlight_ranges.clone(),
+                }));
+            }
         }
 
         if breadcrumbs.is_empty() {
@@ -11338,14 +11935,17 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn disable_lsp_data(&mut self) {
         self.enable_lsp_data = false;
     }
 
+    #[cfg(feature = "project-integration")]
     fn disable_runnables(&mut self) {
         self.enable_runnables = false;
     }
 
+    #[cfg(feature = "project-integration")]
     pub fn disable_code_lens(&mut self, cx: &mut Context<Self>) {
         self.enable_code_lens = false;
         self.clear_code_lenses(cx);
@@ -11355,6 +11955,7 @@ impl Editor {
         self.enable_mouse_wheel_zoom = false;
     }
 
+    #[cfg(feature = "project-integration")]
     fn update_data_on_scroll(
         &mut self,
         debounce: bool,
@@ -11378,6 +11979,12 @@ impl Editor {
         }
     }
 
+    #[cfg(not(feature = "project-integration"))]
+    fn update_data_on_scroll(&mut self, _: bool, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.colorize_brackets(false, cx);
+    }
+
+    #[cfg(feature = "project-integration")]
     fn do_update_data_on_scroll(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
         self.register_visible_buffers(cx);
         self.colorize_brackets(false, cx);
@@ -11413,6 +12020,7 @@ impl Editor {
     }
 }
 
+#[cfg(feature = "project-integration")]
 fn process_completion_for_edit(
     completion: &Completion,
     intent: CompletionIntent,
@@ -11554,18 +12162,21 @@ fn process_completion_for_edit(
     }
 }
 
+#[cfg(feature = "project-integration")]
 struct CompletionEdit {
     new_text: String,
     replace_range: Range<text::Anchor>,
     snippet: Option<Snippet>,
 }
 
+#[cfg(feature = "project-integration")]
 pub trait CollaborationHub {
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator>;
     fn user_participant_indices<'a>(&self, cx: &'a App) -> &'a HashMap<u64, ParticipantIndex>;
     fn user_names(&self, cx: &App) -> HashMap<u64, SharedString>;
 }
 
+#[cfg(feature = "project-integration")]
 impl CollaborationHub for Entity<Project> {
     fn collaborators<'a>(&self, cx: &'a App) -> &'a HashMap<PeerId, Collaborator> {
         self.read(cx).collaborators()
@@ -11582,6 +12193,7 @@ impl CollaborationHub for Entity<Project> {
     }
 }
 
+#[cfg(feature = "project-integration")]
 pub trait SemanticsProvider {
     fn hover(
         &self,
@@ -11656,6 +12268,7 @@ pub trait SemanticsProvider {
     ) -> Option<Task<Result<ProjectTransaction>>>;
 }
 
+#[cfg(feature = "project-integration")]
 impl SemanticsProvider for WeakEntity<Project> {
     fn hover(
         &self,
@@ -11874,6 +12487,7 @@ fn ending_row(next_selection: &Selection<Point>, display_map: &DisplaySnapshot) 
 }
 
 impl EditorSnapshot {
+    #[cfg(feature = "project-integration")]
     pub fn remote_selections_in_range<'a>(
         &'a self,
         range: &'a Range<Anchor>,
@@ -11958,12 +12572,15 @@ impl EditorSnapshot {
             && let Some(ch_width) = cx.text_system().ch_width(font_id, font_size).log_err()
             && let Some(ch_advance) = cx.text_system().ch_advance(font_id, font_size).log_err()
         {
+            #[cfg(feature = "project-integration")]
             let show_git_gutter = self.show_git_diff_gutter.unwrap_or_else(|| {
                 matches!(
                     ProjectSettings::get_global(cx).git.git_gutter,
                     GitGutterSetting::TrackedFiles
                 )
             });
+            #[cfg(not(feature = "project-integration"))]
+            let show_git_gutter = self.show_git_diff_gutter.unwrap_or(false);
             let gutter_settings = EditorSettings::get_global(cx).gutter;
             let show_line_numbers = self
                 .show_line_numbers
@@ -11983,6 +12600,7 @@ impl EditorSnapshot {
             let show_breakpoints = self.show_breakpoints.unwrap_or(gutter_settings.breakpoints);
             let show_bookmarks = self.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
+            #[cfg(feature = "project-integration")]
             let git_blame_entries_width =
                 self.git_blame_gutter_max_author_length
                     .map(|max_author_length| {
@@ -11996,6 +12614,8 @@ impl EditorSnapshot {
                         ch_advance * max_char_count
                             + renderer.blame_entry_non_text_width(window, cx)
                     });
+            #[cfg(not(feature = "project-integration"))]
+            let git_blame_entries_width = None;
 
             let is_singleton = self.buffer_snapshot().is_singleton();
 
@@ -12635,17 +13255,21 @@ fn collapse_multiline_range(range: Range<Point>) -> Range<Point> {
     }
 }
 
+#[cfg(feature = "project-integration")]
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 
 #[derive(Copy, Clone, Debug)]
+#[cfg(feature = "project-integration")]
 enum BreakpointPromptEditAction {
     Log,
     Condition,
     HitCondition,
 }
 
+#[cfg(feature = "project-integration")]
 type PromptEditorCallback = Box<dyn FnOnce(String, &mut Editor, &mut Context<Editor>) + 'static>;
 
+#[cfg(feature = "project-integration")]
 struct PromptEditor {
     pub(crate) prompt: Entity<Editor>,
     editor: WeakEntity<Editor>,
@@ -12656,6 +13280,7 @@ struct PromptEditor {
     _subscriptions: Vec<Subscription>,
 }
 
+#[cfg(feature = "project-integration")]
 impl PromptEditor {
     const MAX_LINES: u8 = 4;
 
@@ -12813,6 +13438,7 @@ impl PromptEditor {
     }
 }
 
+#[cfg(feature = "project-integration")]
 impl Render for PromptEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font_size = ThemeSettings::get_global(cx).ui_font_size(cx);
@@ -12858,6 +13484,7 @@ impl Render for PromptEditor {
     }
 }
 
+#[cfg(feature = "project-integration")]
 impl Focusable for PromptEditor {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.prompt.focus_handle(cx)

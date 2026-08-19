@@ -7,16 +7,13 @@ pub use header::file_status_label_color;
 pub(crate) use header::{header_jump_data, render_buffer_header};
 
 use crate::{
-    BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CodeActionSource,
-    CollaboratorId, ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs,
-    ConflictsTheirsMarker, ContextMenuPlacement, CursorShape, CustomBlockId, DisplayDiffHunk,
-    DisplayPoint, DisplayRow, EditDisplayMode, EditPrediction, Editor, EditorMode, EditorSettings,
+    BUFFER_HEADER_PADDING, BlockId, ChunkRendererContext, ChunkReplacement, CollaboratorId,
+    ConflictsOurs, ConflictsOursMarker, ConflictsOuter, ConflictsTheirs, ConflictsTheirsMarker,
+    CursorShape, CustomBlockId, DisplayPoint, DisplayRow, Editor, EditorMode, EditorSettings,
     EditorSnapshot, EditorStyle, FILE_HEADER_HEIGHT, FocusedBlock, GutterDimensions, HalfPageDown,
-    HalfPageUp, HandleInput, HoveredCursor, InlayHintRefreshReason, ItemBufferKind, LineDown,
-    LineHighlight, LineUp, MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt,
-    RowRangeExt, Selection, SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
-    code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
-    column_pixels,
+    HalfPageUp, HandleInput, HoveredCursor, ItemBufferKind, LineDown, LineHighlight, LineUp,
+    MAX_LINE_LEN, MINIMAP_FONT_SIZE, PageDown, PageUp, Point, RowExt, RowRangeExt, Selection,
+    SelectionDragState, SizingBehavior, SoftWrap, ToPoint, column_pixels,
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
         HighlightKey, HighlightedChunk, ToDisplayPoint,
@@ -25,20 +22,28 @@ use crate::{
         CurrentLineHighlight, DocumentColorsRenderMode, Minimap, MinimapThumb, MinimapThumbBorder,
         ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
+    scroll::{
+        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
+        scroll_amount::ScrollAmount,
+    },
+};
+#[cfg(feature = "project-integration")]
+use crate::{
+    CodeActionSource, ContextMenuPlacement, DisplayDiffHunk, EditDisplayMode, EditPrediction,
+    InlayHintRefreshReason,
+    code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
         POPOVER_RIGHT_OFFSET,
     },
     inlay_hint_settings,
-    scroll::{
-        ActiveScrollbarState, ScrollOffset, ScrollPixelOffset, ScrollbarThumbState,
-        scroll_amount::ScrollAmount,
-    },
 };
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "project-integration")]
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
+#[cfg(feature = "project-integration")]
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
@@ -56,20 +61,21 @@ use language::{
     HighlightedText, IndentGuideSettings, LanguageAwareStyling,
     language_settings::ShowWhitespaceSetting,
 };
+#[cfg(feature = "project-integration")]
 use markdown::Markdown;
 use multi_buffer::{
     Anchor, ExpandExcerptDirection, ExpandInfo, MultiBufferOffset, MultiBufferPoint,
     MultiBufferRow, RowInfo, ToOffset,
 };
 
+#[cfg(feature = "project-integration")]
 use project::{
     debugger::breakpoint_store::{Breakpoint, BreakpointSessionState},
     project_settings::{InlineBlameLocation, ProjectSettings},
 };
-use settings::{
-    GitGutterSetting, GitHunkStyleSetting, IndentGuideBackgroundColoring, IndentGuideColoring,
-    Settings,
-};
+#[cfg(feature = "project-integration")]
+use settings::{GitGutterSetting, GitHunkStyleSetting};
+use settings::{IndentGuideBackgroundColoring, IndentGuideColoring, Settings};
 use smallvec::{SmallVec, smallvec};
 use std::{
     any::TypeId,
@@ -147,6 +153,7 @@ struct SelectionLayout {
     user_name: Option<SharedString>,
 }
 
+#[cfg(feature = "project-integration")]
 struct InlineBlameLayout {
     element: AnyElement,
     bounds: Bounds<Pixels>,
@@ -280,6 +287,7 @@ impl EditorElement {
             crate::clangd_ext::apply_related_actions(editor, window, cx);
         }
 
+        #[cfg(feature = "project-integration")]
         register_action(editor, window, Editor::open_context_menu);
         register_action(editor, window, Editor::move_left);
         register_action(editor, window, Editor::move_right);
@@ -292,6 +300,7 @@ impl EditorElement {
         register_action(editor, window, Editor::select_page_down);
         register_action(editor, window, Editor::select_page_up);
         register_action(editor, window, Editor::cancel);
+        #[cfg(feature = "project-integration")]
         register_action(editor, window, Editor::blame_hover);
         register_action(editor, window, Editor::next_snippet_tabstop);
         register_action(editor, window, Editor::previous_snippet_tabstop);
@@ -403,50 +412,54 @@ impl EditorElement {
         }
         register_action(editor, window, Editor::go_to_diagnostic);
         register_action(editor, window, Editor::go_to_prev_diagnostic);
-        register_action(editor, window, Editor::go_to_next_hunk);
-        register_action(editor, window, Editor::go_to_prev_hunk);
-        register_action(editor, window, Editor::go_to_next_document_highlight);
-        register_action(editor, window, Editor::go_to_prev_document_highlight);
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_definition(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_definition_split(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_declaration(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_declaration_split(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_implementation(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_implementation_split(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_type_definition(action, window, cx)
-                .detach_and_log_err(cx);
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            editor
-                .go_to_type_definition_split(action, window, cx)
-                .detach_and_log_err(cx);
-        });
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, Editor::go_to_next_hunk);
+            register_action(editor, window, Editor::go_to_prev_hunk);
+            register_action(editor, window, Editor::go_to_next_document_highlight);
+            register_action(editor, window, Editor::go_to_prev_document_highlight);
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_definition(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_definition_split(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_declaration(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_declaration_split(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_implementation(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_implementation_split(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_type_definition(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                editor
+                    .go_to_type_definition_split(action, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        }
+        #[cfg(feature = "project-integration")]
         register_action(editor, window, Editor::open_url);
         #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::open_selected_filename);
@@ -479,11 +492,14 @@ impl EditorElement {
             register_action(editor, window, Editor::local_navigation_forward);
         }
         register_action(editor, window, Editor::swap_selection_ends);
-        register_action(editor, window, Editor::show_completions);
-        register_action(editor, window, Editor::show_word_completions);
-        register_action(editor, window, Editor::toggle_code_actions);
-        register_action(editor, window, Editor::open_excerpts);
-        register_action(editor, window, Editor::open_excerpts_in_split);
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, Editor::show_completions);
+            register_action(editor, window, Editor::show_word_completions);
+            register_action(editor, window, Editor::toggle_code_actions);
+            register_action(editor, window, Editor::open_excerpts);
+            register_action(editor, window, Editor::open_excerpts_in_split);
+        }
         register_action(editor, window, Editor::toggle_soft_wrap);
         #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::toggle_tab_bar);
@@ -491,13 +507,16 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_line_numbers);
         register_action(editor, window, Editor::toggle_relative_line_numbers);
         register_action(editor, window, Editor::toggle_indent_guides);
-        register_action(editor, window, Editor::toggle_inline_values);
-        register_action(editor, window, Editor::toggle_edit_predictions);
-        if editor.read(cx).lsp_data_enabled() {
-            register_action(editor, window, Editor::toggle_inlay_hints);
-            register_action(editor, window, Editor::toggle_code_lens_action);
-            register_action(editor, window, Editor::toggle_semantic_highlights);
-            register_action(editor, window, Editor::toggle_diagnostics);
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, Editor::toggle_inline_values);
+            register_action(editor, window, Editor::toggle_edit_predictions);
+            if editor.read(cx).lsp_data_enabled() {
+                register_action(editor, window, Editor::toggle_inlay_hints);
+                register_action(editor, window, Editor::toggle_code_lens_action);
+                register_action(editor, window, Editor::toggle_semantic_highlights);
+                register_action(editor, window, Editor::toggle_diagnostics);
+            }
         }
         if editor.read(cx).inline_diagnostics_enabled() {
             register_action(editor, window, Editor::toggle_inline_diagnostics);
@@ -505,67 +524,73 @@ impl EditorElement {
         if editor.read(cx).supports_minimap(cx) {
             register_action(editor, window, Editor::toggle_minimap);
         }
-        register_action(editor, window, hover_popover::hover);
-        register_action(editor, window, Editor::reveal_in_finder);
-        register_action(editor, window, Editor::copy_path);
-        register_action(editor, window, Editor::copy_relative_path);
-        register_action(editor, window, Editor::copy_file_name);
-        register_action(editor, window, Editor::copy_file_name_without_extension);
-        register_action(editor, window, Editor::copy_highlight_json);
-        register_action(editor, window, Editor::copy_permalink_to_line);
-        register_action(editor, window, Editor::open_permalink_to_line);
-        register_action(editor, window, Editor::copy_file_location);
-        register_action(editor, window, Editor::toggle_git_blame);
-        register_action(editor, window, Editor::toggle_git_blame_inline);
-        if editor.read(cx).blame().is_some() {
-            register_action(editor, window, Editor::open_git_blame_commit);
-            register_action(editor, window, Editor::blame_revision);
-            register_action(editor, window, Editor::blame_previous_revision);
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, hover_popover::hover);
+            register_action(editor, window, Editor::reveal_in_finder);
+            register_action(editor, window, Editor::copy_path);
+            register_action(editor, window, Editor::copy_relative_path);
+            register_action(editor, window, Editor::copy_file_name);
+            register_action(editor, window, Editor::copy_file_name_without_extension);
+            register_action(editor, window, Editor::copy_highlight_json);
+            register_action(editor, window, Editor::copy_permalink_to_line);
+            register_action(editor, window, Editor::open_permalink_to_line);
+            register_action(editor, window, Editor::copy_file_location);
+            register_action(editor, window, Editor::toggle_git_blame);
+            register_action(editor, window, Editor::toggle_git_blame_inline);
+            if editor.read(cx).blame().is_some() {
+                register_action(editor, window, Editor::open_git_blame_commit);
+                register_action(editor, window, Editor::blame_revision);
+                register_action(editor, window, Editor::blame_previous_revision);
+            }
+            register_action(editor, window, Editor::toggle_selected_diff_hunks);
+            register_action(editor, window, Editor::toggle_staged_selected_diff_hunks);
+            register_action(editor, window, Editor::stage_and_next);
+            register_action(editor, window, Editor::unstage_and_next);
+            register_action(editor, window, Editor::expand_all_diff_hunks);
+            register_action(editor, window, Editor::collapse_all_diff_hunks);
+            register_action(editor, window, Editor::toggle_all_diff_hunks);
+            register_action(editor, window, Editor::toggle_review_comments_expanded);
+            register_action(editor, window, Editor::submit_diff_review_comment_action);
+            register_action(editor, window, Editor::edit_review_comment);
+            register_action(editor, window, Editor::delete_review_comment);
+            register_action(editor, window, Editor::confirm_edit_review_comment_action);
+            register_action(editor, window, Editor::cancel_edit_review_comment_action);
+            register_action(editor, window, Editor::go_to_previous_change);
+            register_action(editor, window, Editor::go_to_next_change);
+            register_action(editor, window, Editor::go_to_prev_reference);
+            register_action(editor, window, Editor::go_to_next_reference);
+            register_action(editor, window, Editor::go_to_previous_symbol);
+            register_action(editor, window, Editor::go_to_next_symbol);
+            register_action(editor, window, Editor::restart_language_server);
+            register_action(editor, window, Editor::stop_language_server);
         }
-        register_action(editor, window, Editor::toggle_selected_diff_hunks);
-        register_action(editor, window, Editor::toggle_staged_selected_diff_hunks);
-        register_action(editor, window, Editor::stage_and_next);
-        register_action(editor, window, Editor::unstage_and_next);
-        register_action(editor, window, Editor::expand_all_diff_hunks);
-        register_action(editor, window, Editor::collapse_all_diff_hunks);
-        register_action(editor, window, Editor::toggle_all_diff_hunks);
-        register_action(editor, window, Editor::toggle_review_comments_expanded);
-        register_action(editor, window, Editor::submit_diff_review_comment_action);
-        register_action(editor, window, Editor::edit_review_comment);
-        register_action(editor, window, Editor::delete_review_comment);
-        register_action(editor, window, Editor::confirm_edit_review_comment_action);
-        register_action(editor, window, Editor::cancel_edit_review_comment_action);
-        register_action(editor, window, Editor::go_to_previous_change);
-        register_action(editor, window, Editor::go_to_next_change);
-        register_action(editor, window, Editor::go_to_prev_reference);
-        register_action(editor, window, Editor::go_to_next_reference);
-        register_action(editor, window, Editor::go_to_previous_symbol);
-        register_action(editor, window, Editor::go_to_next_symbol);
-        register_action(editor, window, Editor::restart_language_server);
-        register_action(editor, window, Editor::stop_language_server);
         register_action(editor, window, Editor::show_character_palette);
-        register_action(editor, window, |editor, action, window, cx| {
-            if let Some(task) = editor.compose_completion(action, window, cx) {
-                editor.detach_and_notify_err(task, window, cx);
-            } else {
-                cx.propagate();
-            }
-        });
-        register_action(editor, window, |editor, action, window, cx| {
-            if let Some(task) = editor.find_all_references(action, window, cx) {
-                task.detach_and_log_err(cx);
-            } else {
-                cx.propagate();
-            }
-        });
-        register_action(editor, window, Editor::show_signature_help);
-        register_action(editor, window, Editor::signature_help_prev);
-        register_action(editor, window, Editor::signature_help_next);
-        register_action(editor, window, Editor::show_edit_prediction);
-        register_action(editor, window, Editor::context_menu_first);
-        register_action(editor, window, Editor::context_menu_prev);
-        register_action(editor, window, Editor::context_menu_next);
-        register_action(editor, window, Editor::context_menu_last);
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, |editor, action, window, cx| {
+                if let Some(task) = editor.compose_completion(action, window, cx) {
+                    editor.detach_and_notify_err(task, window, cx);
+                } else {
+                    cx.propagate();
+                }
+            });
+            register_action(editor, window, |editor, action, window, cx| {
+                if let Some(task) = editor.find_all_references(action, window, cx) {
+                    task.detach_and_log_err(cx);
+                } else {
+                    cx.propagate();
+                }
+            });
+            register_action(editor, window, Editor::show_signature_help);
+            register_action(editor, window, Editor::signature_help_prev);
+            register_action(editor, window, Editor::signature_help_next);
+            register_action(editor, window, Editor::show_edit_prediction);
+            register_action(editor, window, Editor::context_menu_first);
+            register_action(editor, window, Editor::context_menu_prev);
+            register_action(editor, window, Editor::context_menu_next);
+            register_action(editor, window, Editor::context_menu_last);
+        }
         register_action(editor, window, Editor::display_cursor_names);
         #[cfg(feature = "workspace-integration")]
         {
@@ -574,17 +599,21 @@ impl EditorElement {
         }
         #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::open_selections_in_multibuffer);
-        register_action(editor, window, Editor::toggle_bookmark);
-        register_action(editor, window, Editor::toggle_bookmark_with_label);
-        register_action(editor, window, Editor::edit_bookmark);
-        register_action(editor, window, Editor::go_to_next_bookmark);
-        register_action(editor, window, Editor::go_to_previous_bookmark);
-        register_action(editor, window, Editor::toggle_breakpoint);
-        register_action(editor, window, Editor::edit_log_breakpoint);
-        register_action(editor, window, Editor::enable_breakpoint);
-        register_action(editor, window, Editor::disable_breakpoint);
+        #[cfg(feature = "project-integration")]
+        {
+            register_action(editor, window, Editor::toggle_bookmark);
+            register_action(editor, window, Editor::toggle_bookmark_with_label);
+            register_action(editor, window, Editor::edit_bookmark);
+            register_action(editor, window, Editor::go_to_next_bookmark);
+            register_action(editor, window, Editor::go_to_previous_bookmark);
+            register_action(editor, window, Editor::toggle_breakpoint);
+            register_action(editor, window, Editor::edit_log_breakpoint);
+            register_action(editor, window, Editor::enable_breakpoint);
+            register_action(editor, window, Editor::disable_breakpoint);
+        }
         #[cfg(feature = "workspace-integration")]
         register_action(editor, window, Editor::toggle_read_only);
+        #[cfg(feature = "project-integration")]
         register_action(editor, window, Editor::reload_file);
 
         if !editor.read(cx).read_only(cx) {
@@ -651,14 +680,17 @@ impl EditorElement {
             register_action(editor, window, Editor::toggle_block_comments);
             register_action(editor, window, Editor::toggle_markdown_block_quote);
             register_action(editor, window, Editor::unwrap_syntax_node);
-            register_action(editor, window, Editor::accept_next_word_edit_prediction);
-            register_action(editor, window, Editor::accept_next_line_edit_prediction);
-            register_action(editor, window, Editor::accept_edit_prediction);
-            register_action(editor, window, Editor::restore_file);
-            register_action(editor, window, Editor::git_restore);
-            register_action(editor, window, Editor::restore_and_next);
-            register_action(editor, window, Editor::apply_all_diff_hunks);
-            register_action(editor, window, Editor::apply_selected_diff_hunks);
+            #[cfg(feature = "project-integration")]
+            {
+                register_action(editor, window, Editor::accept_next_word_edit_prediction);
+                register_action(editor, window, Editor::accept_next_line_edit_prediction);
+                register_action(editor, window, Editor::accept_edit_prediction);
+                register_action(editor, window, Editor::restore_file);
+                register_action(editor, window, Editor::git_restore);
+                register_action(editor, window, Editor::restore_and_next);
+                register_action(editor, window, Editor::apply_all_diff_hunks);
+                register_action(editor, window, Editor::apply_selected_diff_hunks);
+            }
             register_action(editor, window, Editor::insert_uuid_v4);
             register_action(editor, window, Editor::insert_uuid_v7);
             register_action(editor, window, Editor::align_selections);
@@ -675,64 +707,67 @@ impl EditorElement {
                     editor.handle_input(text, window, cx);
                 },
             );
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.format(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            if editor.read(cx).can_format_selections(cx) {
+            #[cfg(feature = "project-integration")]
+            {
                 register_action(editor, window, |editor, action, window, cx| {
-                    if let Some(task) = editor.format_selections(action, window, cx) {
+                    if let Some(task) = editor.format(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                if editor.read(cx).can_format_selections(cx) {
+                    register_action(editor, window, |editor, action, window, cx| {
+                        if let Some(task) = editor.format_selections(action, window, cx) {
+                            editor.detach_and_notify_err(task, window, cx);
+                        } else {
+                            cx.propagate();
+                        }
+                    });
+                }
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.organize_imports(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.confirm_completion(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.confirm_completion_replace(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.confirm_completion_insert(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.confirm_code_action(action, window, cx) {
+                        editor.detach_and_notify_err(task, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                });
+                register_action(editor, window, |editor, action, window, cx| {
+                    if let Some(task) = editor.rename(action, window, cx) {
                         editor.detach_and_notify_err(task, window, cx);
                     } else {
                         cx.propagate();
                     }
                 });
             }
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.organize_imports(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.confirm_completion(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.confirm_completion_replace(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.confirm_completion_insert(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.confirm_code_action(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
-            register_action(editor, window, |editor, action, window, cx| {
-                if let Some(task) = editor.rename(action, window, cx) {
-                    editor.detach_and_notify_err(task, window, cx);
-                } else {
-                    cx.propagate();
-                }
-            });
             #[cfg(feature = "workspace-integration")]
             register_action(editor, window, |editor, action, window, cx| {
                 if let Some(task) = editor.confirm_rename(action, window, cx) {
@@ -753,25 +788,29 @@ impl EditorElement {
                     return;
                 }
                 editor.update(cx, |editor, cx| {
-                    let inlay_hint_settings = inlay_hint_settings(
-                        editor.selections.newest_anchor().head(),
-                        &editor.buffer.read(cx).snapshot(cx),
-                        cx,
-                    );
-
-                    if let Some(inlay_modifiers) = inlay_hint_settings
-                        .toggle_on_modifiers_press
-                        .as_ref()
-                        .filter(|modifiers| modifiers.modified())
+                    #[cfg(feature = "project-integration")]
                     {
-                        editor.refresh_inlay_hints(
-                            InlayHintRefreshReason::ModifiersChanged(
-                                inlay_modifiers == &event.modifiers,
-                            ),
+                        let inlay_hint_settings = inlay_hint_settings(
+                            editor.selections.newest_anchor().head(),
+                            &editor.buffer.read(cx).snapshot(cx),
                             cx,
                         );
+
+                        if let Some(inlay_modifiers) = inlay_hint_settings
+                            .toggle_on_modifiers_press
+                            .as_ref()
+                            .filter(|modifiers| modifiers.modified())
+                        {
+                            editor.refresh_inlay_hints(
+                                InlayHintRefreshReason::ModifiersChanged(
+                                    inlay_modifiers == &event.modifiers,
+                                ),
+                                cx,
+                            );
+                        }
                     }
 
+                    #[cfg(feature = "project-integration")]
                     if editor.hover_state.focused(window, cx) {
                         return;
                     }
@@ -875,6 +914,7 @@ impl EditorElement {
                 }
             }
 
+            #[cfg(feature = "project-integration")]
             if let Some(collaboration_hub) = &editor.collaboration_hub {
                 // When following someone, render the local selections in their color.
                 if let Some(leader_id) = editor.leader_id {
@@ -959,9 +999,33 @@ impl EditorElement {
                 let player = editor.current_user_player_color(cx);
                 selections.push((player, layouts));
             }
+
+            #[cfg(not(feature = "project-integration"))]
+            if !editor.is_focused(window) && editor.show_cursor_when_unfocused {
+                let cursor_offset_on_selection = editor.cursor_offset_on_selection;
+
+                let layouts = snapshot
+                    .buffer_snapshot()
+                    .selections_in_range(&(start_anchor..end_anchor), true)
+                    .map(move |(_, line_mode, cursor_shape, selection)| {
+                        SelectionLayout::new(
+                            selection,
+                            line_mode,
+                            cursor_offset_on_selection,
+                            cursor_shape,
+                            &snapshot.display_snapshot,
+                            false,
+                            false,
+                            None,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let player = editor.current_user_player_color(cx);
+                selections.push((player, layouts));
+            }
         });
 
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, feature = "project-integration"))]
         Self::layout_debug_ranges(
             &mut selections,
             start_anchor..end_anchor,
@@ -984,6 +1048,7 @@ impl EditorElement {
             cursors.push((anchor.to_display_point(&snapshot.display_snapshot), color));
         };
         // Remote cursors
+        #[cfg(feature = "project-integration")]
         if let Some(collaboration_hub) = &editor.collaboration_hub {
             for remote_selection in snapshot.remote_selections_in_range(
                 &(Anchor::Min..Anchor::Max),
@@ -1670,6 +1735,7 @@ impl EditorElement {
 
     // Folds contained in a hunk are ignored apart from shrinking visual size
     // If a fold contains any hunks then that fold line is marked as modified
+    #[cfg(feature = "project-integration")]
     fn layout_gutter_diff_hunks(
         &self,
         line_height: Pixels,
@@ -1705,6 +1771,7 @@ impl EditorElement {
         display_hunks
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_inline_diagnostics(
         &self,
         line_layouts: &[LineWithInvisibles],
@@ -1867,6 +1934,7 @@ impl EditorElement {
         elements
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_inline_code_actions(
         &self,
         display_point: DisplayPoint,
@@ -2027,6 +2095,7 @@ impl EditorElement {
         Some(button)
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -2117,7 +2186,7 @@ impl EditorElement {
         })
     }
 
-    #[cfg(feature = "workspace-integration")]
+    #[cfg(all(feature = "project-integration", feature = "workspace-integration"))]
     fn layout_blame_popover(
         &self,
         editor_snapshot: &EditorSnapshot,
@@ -2217,7 +2286,10 @@ impl EditorElement {
         }
     }
 
-    #[cfg(not(feature = "workspace-integration"))]
+    #[cfg(all(
+        feature = "project-integration",
+        not(feature = "workspace-integration")
+    ))]
     fn layout_blame_popover(
         &self,
         _: &EditorSnapshot,
@@ -2228,7 +2300,7 @@ impl EditorElement {
     ) {
     }
 
-    #[cfg(feature = "workspace-integration")]
+    #[cfg(all(feature = "project-integration", feature = "workspace-integration"))]
     fn layout_blame_entries(
         &self,
         buffer_rows: &[RowInfo],
@@ -2301,7 +2373,10 @@ impl EditorElement {
         Some(shaped_lines)
     }
 
-    #[cfg(not(feature = "workspace-integration"))]
+    #[cfg(all(
+        feature = "project-integration",
+        not(feature = "workspace-integration")
+    ))]
     fn layout_blame_entries(
         &self,
         _: &[RowInfo],
@@ -2500,6 +2575,7 @@ impl EditorElement {
         (offset_y, length, row_range)
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_bookmarks(
         &self,
         gutter: &Gutter<'_>,
@@ -2526,6 +2602,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_gutter_hover_button(
         &self,
         gutter: &Gutter,
@@ -2552,6 +2629,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_breakpoints(
         &self,
         gutter: &Gutter,
@@ -2582,6 +2660,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn should_render_diff_review_button(
         &self,
         range: Range<DisplayRow>,
@@ -2625,6 +2704,7 @@ impl EditorElement {
         Some((display_row, buffer_row))
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_run_indicators(
         &self,
         gutter: &Gutter,
@@ -3829,6 +3909,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_cursor_popovers(
         &self,
         line_height: Pixels,
@@ -4046,6 +4127,7 @@ impl EditorElement {
         None
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_gutter_menu(
         &self,
         line_height: Pixels,
@@ -4114,6 +4196,7 @@ impl EditorElement {
         );
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_popovers_above_or_below_line(
         &self,
         target_position: gpui::Point<Pixels>,
@@ -4240,6 +4323,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_context_menu_aside(
         &self,
         y_flipped: bool,
@@ -4332,6 +4416,7 @@ impl EditorElement {
         None
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_context_menu(
         &self,
         line_height: Pixels,
@@ -4345,6 +4430,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "project-integration")]
     fn render_context_menu_aside(
         &self,
         max_size: Size<Pixels>,
@@ -4360,6 +4446,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_hover_popovers(
         &self,
         snapshot: &EditorSnapshot,
@@ -4622,6 +4709,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_word_diff_highlights(
         display_hunks: &[(DisplayDiffHunk, Option<Hitbox>)],
         row_infos: &[RowInfo],
@@ -4684,6 +4772,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_diff_hunk_controls(
         &self,
         row_range: Range<DisplayRow>,
@@ -4805,6 +4894,7 @@ impl EditorElement {
         (controls, control_bounds)
     }
 
+    #[cfg(feature = "project-integration")]
     fn layout_signature_help(
         &self,
         hitbox: &Hitbox,
@@ -5255,6 +5345,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_gutter_diff_hunks(
         &self,
         layout: &mut EditorLayout,
@@ -5370,6 +5461,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn diff_hunk_bounds(
         scroll_position: gpui::Point<ScrollOffset>,
         line_height: Pixels,
@@ -5470,20 +5562,26 @@ impl EditorElement {
                 }
             });
 
-            for bookmark in layout.bookmarks.iter_mut() {
-                bookmark.paint(window, cx);
-            }
+            #[cfg(feature = "project-integration")]
+            {
+                for bookmark in layout.bookmarks.iter_mut() {
+                    bookmark.paint(window, cx);
+                }
 
-            for breakpoint in layout.breakpoints.iter_mut() {
-                breakpoint.paint(window, cx);
+                for breakpoint in layout.breakpoints.iter_mut() {
+                    breakpoint.paint(window, cx);
+                }
             }
 
             for test_indicator in layout.test_indicators.iter_mut() {
                 test_indicator.paint(window, cx);
             }
 
-            if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
-                diff_review_button.paint(window, cx);
+            #[cfg(feature = "project-integration")]
+            {
+                if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
+                    diff_review_button.paint(window, cx);
+                }
             }
         });
     }
@@ -5494,31 +5592,34 @@ impl EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        for (_, hunk_hitbox) in &layout.display_hunks {
-            if let Some(hunk_hitbox) = hunk_hitbox
-                && !self
-                    .editor
-                    .read(cx)
-                    .buffer()
-                    .read(cx)
-                    .all_diff_hunks_expanded()
-            {
-                window.set_cursor_style(CursorStyle::PointingHand, hunk_hitbox);
+        #[cfg(feature = "project-integration")]
+        {
+            for (_, hunk_hitbox) in &layout.display_hunks {
+                if let Some(hunk_hitbox) = hunk_hitbox
+                    && !self
+                        .editor
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .all_diff_hunks_expanded()
+                {
+                    window.set_cursor_style(CursorStyle::PointingHand, hunk_hitbox);
+                }
             }
-        }
 
-        let show_git_gutter = layout
-            .position_map
-            .snapshot
-            .show_git_diff_gutter
-            .unwrap_or_else(|| {
-                matches!(
-                    ProjectSettings::get_global(cx).git.git_gutter,
-                    GitGutterSetting::TrackedFiles
-                )
-            });
-        if show_git_gutter {
-            self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
+            let show_git_gutter = layout
+                .position_map
+                .snapshot
+                .show_git_diff_gutter
+                .unwrap_or_else(|| {
+                    matches!(
+                        ProjectSettings::get_global(cx).git.git_gutter,
+                        GitGutterSetting::TrackedFiles
+                    )
+                });
+            if show_git_gutter {
+                self.paint_gutter_diff_hunks(layout, self.split_side, window, cx)
+            }
         }
 
         let highlight_width = 0.275 * layout.position_map.line_height;
@@ -5557,6 +5658,7 @@ impl EditorElement {
         });
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_blamed_display_rows(
         &self,
         layout: &mut EditorLayout,
@@ -5581,6 +5683,13 @@ impl EditorElement {
             }),
             |window| {
                 let editor = self.editor.read(cx);
+                #[cfg(feature = "project-integration")]
+                let has_hovered_link = editor
+                    .hovered_link_state
+                    .as_ref()
+                    .is_some_and(|hovered_link_state| !hovered_link_state.links.is_empty());
+                #[cfg(not(feature = "project-integration"))]
+                let has_hovered_link = false;
                 if let SelectionDragState::ReadyToDrag {
                     mouse_down_time, ..
                 } = &editor.selection_drag_state
@@ -5603,11 +5712,7 @@ impl EditorElement {
                 ) {
                     window
                         .set_cursor_style(CursorStyle::DragCopy, &layout.position_map.text_hitbox);
-                } else if editor
-                    .hovered_link_state
-                    .as_ref()
-                    .is_some_and(|hovered_link_state| !hovered_link_state.links.is_empty())
-                {
+                } else if has_hovered_link {
                     window.set_cursor_style(
                         CursorStyle::PointingHand,
                         &layout.position_map.text_hitbox,
@@ -5618,15 +5723,19 @@ impl EditorElement {
 
                 self.paint_lines_background(layout, window, cx);
                 let invisible_display_ranges = self.paint_highlights(layout, window, cx);
+                #[cfg(feature = "project-integration")]
                 self.paint_document_colors(layout, window);
                 self.paint_lines(&invisible_display_ranges, layout, window, cx);
                 self.paint_redactions(layout, window);
                 self.paint_navigation_overlays(layout, window, cx);
                 self.paint_cursors(layout, window, cx);
                 self.paint_inline_diagnostics(layout, window, cx);
-                self.paint_inline_blame(layout, window, cx);
-                self.paint_inline_code_actions(layout, window, cx);
-                self.paint_diff_hunk_controls(layout, window, cx);
+                #[cfg(feature = "project-integration")]
+                {
+                    self.paint_inline_blame(layout, window, cx);
+                    self.paint_inline_code_actions(layout, window, cx);
+                    self.paint_diff_hunk_controls(layout, window, cx);
+                }
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
                         trailer.element.paint(window, cx);
@@ -5768,6 +5877,7 @@ impl EditorElement {
         });
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_document_colors(&self, layout: &mut EditorLayout, window: &mut Window) {
         let Some((colors_render_mode, image_colors)) = &layout.document_colors else {
             return;
@@ -6341,6 +6451,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_inline_blame(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(mut blame_layout) = layout.inline_blame_layout.take() {
             window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
@@ -6349,6 +6460,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_inline_code_actions(
         &mut self,
         layout: &mut EditorLayout,
@@ -6362,6 +6474,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_diff_hunk_controls(
         &mut self,
         layout: &mut EditorLayout,
@@ -6599,6 +6712,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_edit_prediction_popover(
         &mut self,
         layout: &mut EditorLayout,
@@ -6610,6 +6724,7 @@ impl EditorElement {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     fn paint_mouse_context_menu(
         &mut self,
         layout: &mut EditorLayout,
@@ -6641,6 +6756,7 @@ impl EditorElement {
         )
     }
 
+    #[cfg(feature = "project-integration")]
     fn diff_hunk_hollow(&self, status: DiffHunkStatus, cx: &mut App) -> bool {
         let unstaged = !self
             .editor
@@ -6656,6 +6772,7 @@ impl EditorElement {
     }
 
     #[cfg(debug_assertions)]
+    #[cfg(feature = "project-integration")]
     fn layout_debug_ranges(
         selections: &mut Vec<(PlayerColor, Vec<SelectionLayout>)>,
         anchor_range: Range<Anchor>,
@@ -6998,6 +7115,7 @@ fn apply_dirty_filename_style(
     )
 }
 
+#[cfg(feature = "project-integration")]
 fn render_inline_blame_entry(
     blame_entry: BlameEntry,
     style: &EditorStyle,
@@ -7007,7 +7125,7 @@ fn render_inline_blame_entry(
     renderer.render_inline_blame_entry(&style.text, blame_entry, cx)
 }
 
-#[cfg(feature = "workspace-integration")]
+#[cfg(all(feature = "project-integration", feature = "workspace-integration"))]
 fn render_blame_entry_popover(
     blame_entry: BlameEntry,
     scroll_handle: ScrollHandle,
@@ -7040,7 +7158,7 @@ fn render_blame_entry_popover(
     )
 }
 
-#[cfg(feature = "workspace-integration")]
+#[cfg(all(feature = "project-integration", feature = "workspace-integration"))]
 fn render_blame_entry(
     ix: usize,
     blame: &Entity<GitBlame>,
@@ -8297,83 +8415,86 @@ impl Element for EditorElement {
                         })
                         .unwrap_or_default();
 
-                    struct DiffHunkHighlightColors {
-                        filled_background: Hsla,
-                        hollow_background: Hsla,
-                        hollow_border: Hsla,
-                    }
+                    #[cfg(feature = "project-integration")]
+                    {
+                        struct DiffHunkHighlightColors {
+                            filled_background: Hsla,
+                            hollow_background: Hsla,
+                            hollow_border: Hsla,
+                        }
 
-                    let colors = cx.theme().colors();
-                    let added_diff_hunk_colors = DiffHunkHighlightColors {
-                        filled_background: colors.editor_diff_hunk_added_background,
-                        hollow_background: colors.editor_diff_hunk_added_hollow_background,
-                        hollow_border: colors.editor_diff_hunk_added_hollow_border,
-                    };
-                    let deleted_diff_hunk_colors = DiffHunkHighlightColors {
-                        filled_background: colors.editor_diff_hunk_deleted_background,
-                        hollow_background: colors.editor_diff_hunk_deleted_hollow_background,
-                        hollow_border: colors.editor_diff_hunk_deleted_hollow_border,
-                    };
-                    let drag_highlight_color = colors.editor_active_line_background;
-                    let drag_border_color = colors.border_focused;
-
-                    for (ix, row_info) in row_infos.iter().enumerate() {
-                        let Some(diff_status) = row_info.diff_status else {
-                            continue;
+                        let colors = cx.theme().colors();
+                        let added_diff_hunk_colors = DiffHunkHighlightColors {
+                            filled_background: colors.editor_diff_hunk_added_background,
+                            hollow_background: colors.editor_diff_hunk_added_hollow_background,
+                            hollow_border: colors.editor_diff_hunk_added_hollow_border,
                         };
+                        let deleted_diff_hunk_colors = DiffHunkHighlightColors {
+                            filled_background: colors.editor_diff_hunk_deleted_background,
+                            hollow_background: colors.editor_diff_hunk_deleted_hollow_background,
+                            hollow_border: colors.editor_diff_hunk_deleted_hollow_border,
+                        };
+                        let drag_highlight_color = colors.editor_active_line_background;
+                        let drag_border_color = colors.border_focused;
 
-                        let diff_hunk_colors = match diff_status.kind {
-                            DiffHunkStatusKind::Added => &added_diff_hunk_colors,
-                            DiffHunkStatusKind::Deleted => &deleted_diff_hunk_colors,
-                            DiffHunkStatusKind::Modified => {
-                                debug_panic!("modified diff status for row info");
+                        for (ix, row_info) in row_infos.iter().enumerate() {
+                            let Some(diff_status) = row_info.diff_status else {
                                 continue;
-                            }
-                        };
+                            };
 
-                        let hollow_highlight = LineHighlight {
-                            background: diff_hunk_colors.hollow_background.into(),
-                            border: Some(diff_hunk_colors.hollow_border),
-                            include_gutter: true,
-                            type_id: None,
-                        };
+                            let diff_hunk_colors = match diff_status.kind {
+                                DiffHunkStatusKind::Added => &added_diff_hunk_colors,
+                                DiffHunkStatusKind::Deleted => &deleted_diff_hunk_colors,
+                                DiffHunkStatusKind::Modified => {
+                                    debug_panic!("modified diff status for row info");
+                                    continue;
+                                }
+                            };
 
-                        let filled_highlight = LineHighlight {
-                            background: solid_background(diff_hunk_colors.filled_background),
-                            border: None,
-                            include_gutter: true,
-                            type_id: None,
-                        };
+                            let hollow_highlight = LineHighlight {
+                                background: diff_hunk_colors.hollow_background.into(),
+                                border: Some(diff_hunk_colors.hollow_border),
+                                include_gutter: true,
+                                type_id: None,
+                            };
 
-                        let background = if self.diff_hunk_hollow(diff_status, cx) {
-                            hollow_highlight
-                        } else {
-                            filled_highlight
-                        };
+                            let filled_highlight = LineHighlight {
+                                background: solid_background(diff_hunk_colors.filled_background),
+                                border: None,
+                                include_gutter: true,
+                                type_id: None,
+                            };
 
-                        let base_display_point =
-                            DisplayPoint::new(start_row + DisplayRow(ix as u32), 0);
+                            let background = if self.diff_hunk_hollow(diff_status, cx) {
+                                hollow_highlight
+                            } else {
+                                filled_highlight
+                            };
 
-                        highlighted_rows
-                            .entry(base_display_point.row())
-                            .or_insert(background);
-                    }
+                            let base_display_point =
+                                DisplayPoint::new(start_row + DisplayRow(ix as u32), 0);
 
-                    // Add diff review drag selection highlight to text area
-                    if let Some(drag_state) = &self.editor.read(cx).diff_review_drag_state {
-                        let range = drag_state.row_range(&snapshot.display_snapshot);
-                        let start_row = range.start().0;
-                        let end_row = range.end().0;
-                        let drag_highlight = LineHighlight {
-                            background: solid_background(drag_highlight_color),
-                            border: Some(drag_border_color),
-                            include_gutter: true,
-                            type_id: None,
-                        };
-                        for row_num in start_row..=end_row {
                             highlighted_rows
-                                .entry(DisplayRow(row_num))
-                                .or_insert(drag_highlight);
+                                .entry(base_display_point.row())
+                                .or_insert(background);
+                        }
+
+                        // Add diff review drag selection highlight to text area.
+                        if let Some(drag_state) = &self.editor.read(cx).diff_review_drag_state {
+                            let range = drag_state.row_range(&snapshot.display_snapshot);
+                            let start_row = range.start().0;
+                            let end_row = range.end().0;
+                            let drag_highlight = LineHighlight {
+                                background: solid_background(drag_highlight_color),
+                                border: Some(drag_border_color),
+                                include_gutter: true,
+                                type_id: None,
+                            };
+                            for row_num in start_row..=end_row {
+                                highlighted_rows
+                                    .entry(DisplayRow(row_num))
+                                    .or_insert(drag_highlight);
+                            }
                         }
                     }
 
@@ -8384,6 +8505,7 @@ impl Element for EditorElement {
                             cx,
                         );
 
+                    #[cfg(feature = "project-integration")]
                     let document_colors = self
                         .editor
                         .read(cx)
@@ -8516,19 +8638,22 @@ impl Element for EditorElement {
                         })
                     });
 
-                    let run_indicator_rows = self.editor.update(cx, |editor, cx| {
-                        editor.active_run_indicators(start_row..end_row, window, cx)
-                    });
+                    #[cfg(feature = "project-integration")]
+                    let (run_indicator_rows, mut breakpoint_rows) = {
+                        let run_indicator_rows = self.editor.update(cx, |editor, cx| {
+                            editor.active_run_indicators(start_row..end_row, window, cx)
+                        });
+                        let breakpoint_rows = self.editor.update(cx, |editor, cx| {
+                            editor.active_breakpoints(start_row..end_row, window, cx)
+                        });
 
-                    let mut breakpoint_rows = self.editor.update(cx, |editor, cx| {
-                        editor.active_breakpoints(start_row..end_row, window, cx)
-                    });
-
-                    for (display_row, (_, bp, state)) in &breakpoint_rows {
-                        if bp.is_enabled() && state.is_none_or(|s| s.verified) {
-                            active_rows.entry(*display_row).or_default().breakpoint = true;
+                        for (display_row, (_, bp, state)) in &breakpoint_rows {
+                            if bp.is_enabled() && state.is_none_or(|s| s.verified) {
+                                active_rows.entry(*display_row).or_default().breakpoint = true;
+                            }
                         }
-                    }
+                        (run_indicator_rows, breakpoint_rows)
+                    };
 
                     let gutter = Gutter {
                         line_height,
@@ -8584,6 +8709,7 @@ impl Element for EditorElement {
                             )
                         });
 
+                    #[cfg(feature = "project-integration")]
                     let display_hunks = self.layout_gutter_diff_hunks(
                         line_height,
                         &gutter_hitbox,
@@ -8594,6 +8720,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "project-integration")]
                     Self::layout_word_diff_highlights(
                         &display_hunks,
                         &row_infos,
@@ -8603,6 +8730,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "project-integration")]
                     let bg_segments_per_row = Self::bg_segments_per_row(
                         start_row..end_row,
                         &selections,
@@ -8611,6 +8739,13 @@ impl Element for EditorElement {
                                 .iter()
                                 .flat_map(|(_, colors)| colors.iter().cloned()),
                         ),
+                        self.style.background,
+                    );
+                    #[cfg(not(feature = "project-integration"))]
+                    let bg_segments_per_row = Self::bg_segments_per_row(
+                        start_row..end_row,
+                        &selections,
+                        highlighted_ranges.iter().cloned(),
                         self.style.background,
                     );
 
@@ -8653,6 +8788,7 @@ impl Element for EditorElement {
                         );
                     }
 
+                    #[cfg(feature = "project-integration")]
                     let longest_line_blame_width = self
                         .editor
                         .update(cx, |editor, cx| {
@@ -8687,6 +8823,8 @@ impl Element for EditorElement {
                             )
                         })
                         .unwrap_or(Pixels::ZERO);
+                    #[cfg(not(feature = "project-integration"))]
+                    let longest_line_blame_width = Pixels::ZERO;
 
                     let longest_line_width = layout_line(
                         snapshot.longest_row(),
@@ -8915,6 +9053,7 @@ impl Element for EditorElement {
                             )
                         });
 
+                    #[cfg(feature = "project-integration")]
                     let (edit_prediction_popover, edit_prediction_popover_origin) = self
                         .editor
                         .update(cx, |editor, cx| {
@@ -8939,6 +9078,7 @@ impl Element for EditorElement {
                         })
                         .unzip();
 
+                    #[cfg(feature = "project-integration")]
                     let mut inline_diagnostics = self.layout_inline_diagnostics(
                         &line_layouts,
                         &crease_trailers,
@@ -8955,9 +9095,14 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    #[cfg(not(feature = "project-integration"))]
+                    let inline_diagnostics = HashMap::default();
 
+                    #[cfg(feature = "project-integration")]
                     let mut inline_blame_layout = None;
+                    #[cfg(feature = "project-integration")]
                     let mut inline_code_actions = None;
+                    #[cfg(feature = "project-integration")]
                     if let Some(newest_selection_head) = newest_selection_head {
                         let display_row = newest_selection_head.row();
                         if (start_row..end_row).contains(&display_row)
@@ -9012,6 +9157,7 @@ impl Element for EditorElement {
                         }
                     }
 
+                    #[cfg(feature = "project-integration")]
                     let blamed_display_rows = self.layout_blame_entries(
                         &row_infos,
                         em_width,
@@ -9111,6 +9257,7 @@ impl Element for EditorElement {
 
                     let gutter_settings = EditorSettings::get_global(cx).gutter;
 
+                    #[cfg(feature = "project-integration")]
                     let context_menu_layout =
                         if let Some(newest_selection_head) = newest_selection_head {
                             let newest_selection_point =
@@ -9137,6 +9284,7 @@ impl Element for EditorElement {
                             None
                         };
 
+                    #[cfg(feature = "project-integration")]
                     self.layout_gutter_menu(
                         line_height,
                         &text_hitbox,
@@ -9148,6 +9296,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "project-integration")]
                     let test_indicators = if gutter_settings.runnables {
                         self.layout_run_indicators(
                             &gutter,
@@ -9159,10 +9308,14 @@ impl Element for EditorElement {
                     } else {
                         Vec::new()
                     };
+                    #[cfg(not(feature = "project-integration"))]
+                    let test_indicators = Vec::new();
 
+                    #[cfg(feature = "project-integration")]
                     let show_bookmarks =
                         snapshot.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
+                    #[cfg(feature = "project-integration")]
                     let bookmark_rows = self.editor.update(cx, |editor, cx| {
                         let mut rows = editor.active_bookmarks(start_row..end_row, window, cx);
                         rows.retain(|k| !run_indicator_rows.contains(k));
@@ -9170,23 +9323,28 @@ impl Element for EditorElement {
                         rows
                     });
 
+                    #[cfg(feature = "project-integration")]
                     let bookmarks = if show_bookmarks {
                         self.layout_bookmarks(&gutter, &bookmark_rows, window, cx)
                     } else {
                         Vec::new()
                     };
 
+                    #[cfg(feature = "project-integration")]
                     let show_breakpoints = snapshot
                         .show_breakpoints
                         .unwrap_or(gutter_settings.breakpoints);
 
+                    #[cfg(feature = "project-integration")]
                     breakpoint_rows.retain(|k, _| !run_indicator_rows.contains(k));
+                    #[cfg(feature = "project-integration")]
                     let mut breakpoints = if show_breakpoints {
                         self.layout_breakpoints(&gutter, &breakpoint_rows, window, cx)
                     } else {
                         Vec::new()
                     };
 
+                    #[cfg(feature = "project-integration")]
                     let gutter_hover_button = self
                         .editor
                         .read(cx)
@@ -9195,6 +9353,7 @@ impl Element for EditorElement {
                         .filter(|phantom| phantom.is_active)
                         .map(|phantom| phantom.display_row);
 
+                    #[cfg(feature = "project-integration")]
                     if let Some(row) = gutter_hover_button
                         && !breakpoint_rows.contains_key(&row)
                         && !run_indicator_rows.contains(&row)
@@ -9208,12 +9367,15 @@ impl Element for EditorElement {
                         );
                     }
 
+                    #[cfg(feature = "project-integration")]
                     let git_gutter_width = Self::gutter_strip_width(line_height, cx)
                         + gutter_dimensions
                             .git_blame_entries_width
                             .unwrap_or_default();
+                    #[cfg(feature = "project-integration")]
                     let available_width = gutter_dimensions.left_padding - git_gutter_width;
 
+                    #[cfg(feature = "project-integration")]
                     let max_line_number_length = self
                         .editor
                         .read(cx)
@@ -9224,6 +9386,7 @@ impl Element for EditorElement {
                         .ilog10()
                         + 1;
 
+                    #[cfg(feature = "project-integration")]
                     let diff_review_button = self
                         .should_render_diff_review_button(
                             start_row..end_row,
@@ -9254,6 +9417,7 @@ impl Element for EditorElement {
                             gutter.prepaint_button(button, display_row, window, cx)
                         });
 
+                    #[cfg(feature = "project-integration")]
                     self.layout_signature_help(
                         &hitbox,
                         content_origin,
@@ -9268,6 +9432,7 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    #[cfg(feature = "project-integration")]
                     if !cx.has_active_drag() {
                         self.layout_hover_popovers(
                             &snapshot,
@@ -9286,6 +9451,7 @@ impl Element for EditorElement {
                         self.layout_blame_popover(&snapshot, &hitbox, line_height, window, cx);
                     }
 
+                    #[cfg(feature = "project-integration")]
                     let mouse_context_menu = self.layout_mouse_context_menu(
                         &snapshot,
                         start_row..end_row,
@@ -9407,6 +9573,7 @@ impl Element for EditorElement {
                         sticky_scroll_header_height
                     };
 
+                    #[cfg(feature = "project-integration")]
                     let (diff_hunk_controls, diff_hunk_control_bounds) =
                         if is_read_only && self.editor.read(cx).diff_hunk_delegate.is_none() {
                             (vec![], vec![])
@@ -9443,10 +9610,13 @@ impl Element for EditorElement {
                         content_width: text_hitbox.size.width,
                         gutter_hitbox: gutter_hitbox.clone(),
                         text_hitbox: text_hitbox.clone(),
+                        #[cfg(feature = "project-integration")]
                         inline_blame_bounds: inline_blame_layout
                             .as_ref()
                             .map(|layout| (layout.bounds, layout.buffer_id, layout.entry.clone())),
+                        #[cfg(feature = "project-integration")]
                         display_hunks: display_hunks.clone(),
+                        #[cfg(feature = "project-integration")]
                         diff_hunk_control_bounds,
                     });
 
@@ -9469,6 +9639,7 @@ impl Element for EditorElement {
                         indent_guides,
                         hitbox,
                         gutter_hitbox,
+                        #[cfg(feature = "project-integration")]
                         display_hunks,
                         content_origin,
                         scrollbars_layout,
@@ -9478,12 +9649,16 @@ impl Element for EditorElement {
                         highlighted_ranges,
                         highlighted_gutter_ranges,
                         redacted_ranges,
+                        #[cfg(feature = "project-integration")]
                         document_colors,
                         line_elements,
                         line_numbers,
+                        #[cfg(feature = "project-integration")]
                         blamed_display_rows,
                         inline_diagnostics,
+                        #[cfg(feature = "project-integration")]
                         inline_blame_layout,
+                        #[cfg(feature = "project-integration")]
                         inline_code_actions,
                         blocks,
                         spacer_blocks,
@@ -9491,12 +9666,18 @@ impl Element for EditorElement {
                         visible_cursors,
                         navigation_overlay_paint_commands,
                         selections,
+                        #[cfg(feature = "project-integration")]
                         edit_prediction_popover,
+                        #[cfg(feature = "project-integration")]
                         diff_hunk_controls,
+                        #[cfg(feature = "project-integration")]
                         mouse_context_menu,
                         test_indicators,
+                        #[cfg(feature = "project-integration")]
                         bookmarks,
+                        #[cfg(feature = "project-integration")]
                         breakpoints,
+                        #[cfg(feature = "project-integration")]
                         diff_review_button,
                         crease_toggles,
                         crease_trailers,
@@ -9578,6 +9759,7 @@ impl Element for EditorElement {
                         self.paint_indent_guides(layout, window, cx);
 
                         if layout.gutter_hitbox.size.width > Pixels::ZERO {
+                            #[cfg(feature = "project-integration")]
                             self.paint_blamed_display_rows(layout, window, cx);
                             self.paint_line_numbers(layout, window, cx);
                         }
@@ -9611,8 +9793,11 @@ impl Element for EditorElement {
                     self.paint_sticky_headers(layout, window, cx);
                     self.paint_minimap(layout, window, cx);
                     self.paint_scrollbars(layout, window, cx);
-                    self.paint_edit_prediction_popover(layout, window, cx);
-                    self.paint_mouse_context_menu(layout, window, cx);
+                    #[cfg(feature = "project-integration")]
+                    {
+                        self.paint_edit_prediction_popover(layout, window, cx);
+                        self.paint_mouse_context_menu(layout, window, cx);
+                    }
                 });
             })
         })
@@ -9629,6 +9814,7 @@ pub(super) fn gutter_bounds(
     }
 }
 
+#[cfg(feature = "project-integration")]
 #[derive(Clone, Copy)]
 struct ContextMenuLayout {
     y_flipped: bool,
@@ -9695,10 +9881,14 @@ pub struct EditorLayout {
     highlighted_rows: BTreeMap<DisplayRow, LineHighlight>,
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
+    #[cfg(feature = "project-integration")]
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
+    #[cfg(feature = "project-integration")]
     blamed_display_rows: Option<Vec<AnyElement>>,
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
+    #[cfg(feature = "project-integration")]
     inline_blame_layout: Option<InlineBlameLayout>,
+    #[cfg(feature = "project-integration")]
     inline_code_actions: Option<AnyElement>,
     blocks: Vec<BlockLayout>,
     spacer_blocks: Vec<BlockLayout>,
@@ -9710,19 +9900,26 @@ pub struct EditorLayout {
     navigation_overlay_paint_commands: Vec<NavigationOverlayPaintCommand>,
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
     test_indicators: Vec<AnyElement>,
+    #[cfg(feature = "project-integration")]
     bookmarks: Vec<AnyElement>,
+    #[cfg(feature = "project-integration")]
     breakpoints: Vec<AnyElement>,
+    #[cfg(feature = "project-integration")]
     diff_review_button: Option<AnyElement>,
     crease_toggles: Vec<Option<AnyElement>>,
     expand_toggles: Vec<Option<(AnyElement, gpui::Point<Pixels>)>>,
+    #[cfg(feature = "project-integration")]
     diff_hunk_controls: Vec<AnyElement>,
     crease_trailers: Vec<Option<CreaseTrailerLayout>>,
+    #[cfg(feature = "project-integration")]
     edit_prediction_popover: Option<AnyElement>,
+    #[cfg(feature = "project-integration")]
     mouse_context_menu: Option<AnyElement>,
     tab_invisible: ShapedLine,
     space_invisible: ShapedLine,
     sticky_buffer_header: Option<AnyElement>,
     sticky_headers: Option<header::StickyHeaders>,
+    #[cfg(feature = "project-integration")]
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
     text_align: TextAlign,
     content_width: Pixels,
@@ -10172,8 +10369,11 @@ pub(crate) struct PositionMap {
     pub content_width: Pixels,
     pub text_hitbox: Hitbox,
     pub gutter_hitbox: Hitbox,
+    #[cfg(feature = "project-integration")]
     pub inline_blame_bounds: Option<(Bounds<Pixels>, BufferId, BlameEntry)>,
+    #[cfg(feature = "project-integration")]
     pub display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
+    #[cfg(feature = "project-integration")]
     pub diff_hunk_control_bounds: Vec<(DisplayRow, Bounds<Pixels>)>,
 }
 
@@ -10683,6 +10883,7 @@ impl HighlightedRange {
     }
 }
 
+#[cfg(feature = "project-integration")]
 enum CursorPopoverType {
     CodeContextMenu,
     EditPrediction,

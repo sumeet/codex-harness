@@ -1,9 +1,14 @@
 use collections::HashMap;
-use gpui::{AppContext, Context, Entity, Window};
+#[cfg(feature = "project-integration")]
+use gpui::{AppContext, Window};
+use gpui::{Context, Entity};
 use itertools::Itertools;
 use language::Buffer;
-use std::{ops::Range, sync::Arc, time::Duration};
+#[cfg(feature = "project-integration")]
+use std::time::Duration;
+use std::{ops::Range, sync::Arc};
 use text::{Anchor, AnchorRangeExt, Bias, BufferId, ToOffset, ToPoint};
+#[cfg(feature = "project-integration")]
 use util::ResultExt;
 
 use crate::Editor;
@@ -41,9 +46,11 @@ impl LinkedEditingRanges {
     }
 }
 
+#[cfg(feature = "project-integration")]
 const UPDATE_DEBOUNCE: Duration = Duration::from_millis(50);
 
 // TODO do not refresh anything at all, if the settings/capabilities do not have it enabled.
+#[cfg(feature = "project-integration")]
 pub(super) fn refresh_linked_ranges(
     editor: &mut Editor,
     window: &mut Window,

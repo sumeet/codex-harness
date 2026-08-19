@@ -476,6 +476,7 @@ impl Editor {
                 );
             }
 
+            #[cfg(feature = "project-integration")]
             let had_active_edit_prediction = this.has_active_edit_prediction();
             this.change_selections(
                 SelectionEffects::scroll(Autoscroll::fit()).completions(false),
@@ -484,21 +485,25 @@ impl Editor {
                 |s| s.select(new_selections),
             );
 
-            if !bracket_inserted
-                && let Some(on_type_format_task) =
-                    this.trigger_on_type_formatting(text.to_string(), window, cx)
+            #[cfg(feature = "project-integration")]
             {
-                on_type_format_task.detach_and_log_err(cx);
+                if !bracket_inserted
+                    && let Some(on_type_format_task) =
+                        this.trigger_on_type_formatting(text.to_string(), window, cx)
+                {
+                    on_type_format_task.detach_and_log_err(cx);
+                }
+
+                let editor_settings = EditorSettings::get_global(cx);
+                if bracket_inserted
+                    && (editor_settings.auto_signature_help
+                        || editor_settings.show_signature_help_after_edits)
+                {
+                    this.show_signature_help(&ShowSignatureHelp, window, cx);
+                }
             }
 
-            let editor_settings = EditorSettings::get_global(cx);
-            if bracket_inserted
-                && (editor_settings.auto_signature_help
-                    || editor_settings.show_signature_help_after_edits)
-            {
-                this.show_signature_help(&ShowSignatureHelp, window, cx);
-            }
-
+            #[cfg(feature = "project-integration")]
             let trigger_in_words =
                 this.show_edit_predictions_in_menu() || !had_active_edit_prediction;
             if this.hard_wrap.is_some() {
@@ -521,15 +526,18 @@ impl Editor {
                     )
                 }
             }
-            this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
-            refresh_linked_ranges(this, window, cx);
-            this.refresh_edit_prediction(
-                true,
-                false,
-                EditPredictionRequestTrigger::BufferEdit,
-                window,
-                cx,
-            );
+            #[cfg(feature = "project-integration")]
+            {
+                this.trigger_completion_on_input(&text, trigger_in_words, window, cx);
+                refresh_linked_ranges(this, window, cx);
+                this.refresh_edit_prediction(
+                    true,
+                    false,
+                    EditPredictionRequestTrigger::BufferEdit,
+                    window,
+                    cx,
+                );
+            }
             jsx_tag_auto_close::handle_from(this, initial_buffer_versions, window, cx);
         });
     }
@@ -772,15 +780,18 @@ impl Editor {
                 .collect();
 
             this.change_selections(Default::default(), window, cx, |s| s.select(new_selections));
-            this.refresh_edit_prediction(
-                true,
-                false,
-                EditPredictionRequestTrigger::BufferEdit,
-                window,
-                cx,
-            );
-            if let Some(task) = this.trigger_on_type_formatting("\n".to_owned(), window, cx) {
-                task.detach_and_log_err(cx);
+            #[cfg(feature = "project-integration")]
+            {
+                this.refresh_edit_prediction(
+                    true,
+                    false,
+                    EditPredictionRequestTrigger::BufferEdit,
+                    window,
+                    cx,
+                );
+                if let Some(task) = this.trigger_on_type_formatting("\n".to_owned(), window, cx) {
+                    task.detach_and_log_err(cx);
+                }
             }
         });
     }
@@ -848,6 +859,7 @@ impl Editor {
                 }
             }
             editor.edit(indent_edits, cx);
+            #[cfg(feature = "project-integration")]
             if let Some(format) = editor.trigger_on_type_formatting("\n".to_owned(), window, cx) {
                 format.detach_and_log_err(cx);
             }
@@ -932,6 +944,7 @@ impl Editor {
                 }
             }
             editor.edit(indent_edits, cx);
+            #[cfg(feature = "project-integration")]
             if let Some(format) = editor.trigger_on_type_formatting("\n".to_owned(), window, cx) {
                 format.detach_and_log_err(cx);
             }
@@ -1998,6 +2011,7 @@ impl Editor {
                 s.select_anchors(selection_anchors);
             });
 
+            #[cfg(feature = "project-integration")]
             if apply_linked_edits {
                 refresh_linked_ranges(this, window, cx);
             }
@@ -2208,14 +2222,22 @@ impl Editor {
                 bail!("`snippet` is mutually exclusive with `language` and `name`")
             }
         } else if let Some(name) = &action.name {
-            let project = self.project().context("no project")?;
-            let snippet_store = project.read(cx).snippets().read(cx);
-            let snippet = snippet_store
-                .snippets_for(action.language.clone(), cx)
-                .into_iter()
-                .find(|snippet| snippet.name == *name)
-                .context("snippet not found")?;
-            Snippet::parse(&snippet.body)?
+            #[cfg(feature = "project-integration")]
+            {
+                let project = self.project().context("no project")?;
+                let snippet_store = project.read(cx).snippets().read(cx);
+                let snippet = snippet_store
+                    .snippets_for(action.language.clone(), cx)
+                    .into_iter()
+                    .find(|snippet| snippet.name == *name)
+                    .context("snippet not found")?;
+                Snippet::parse(&snippet.body)?
+            }
+            #[cfg(not(feature = "project-integration"))]
+            {
+                let _ = (name, cx);
+                bail!("named snippets require project integration")
+            }
         } else {
             // todo(andrew): open modal to select snippet
             bail!("`name` or `snippet` is required")

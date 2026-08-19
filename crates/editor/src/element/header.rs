@@ -13,6 +13,7 @@ use gpui::{
 };
 use language::language_settings::ShowWhitespaceSetting;
 use multi_buffer::{Anchor, ExcerptBoundaryInfo, MultiBuffer};
+#[cfg(feature = "workspace-integration")]
 use project::Entry;
 use settings::{RelativeLineNumbers, Settings};
 use smallvec::SmallVec;
@@ -683,11 +684,14 @@ pub(crate) fn render_buffer_header(
         indicator_color.map(|indicator_color| Indicator::dot().color(indicator_color))
     });
 
+    #[cfg(feature = "project-integration")]
     let include_root = editor_read
         .project
         .as_ref()
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
+    #[cfg(not(feature = "project-integration"))]
+    let include_root = false;
     let file = buffer.file();
     let can_open_excerpts = file.is_none_or(|file| file.can_open());
     let path_style = file.map(|file| file.path_style(cx));

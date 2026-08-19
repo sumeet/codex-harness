@@ -1,3 +1,4 @@
+pub use crate::inlays::InlayHighlight;
 use crate::{
     Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinitionSplit,
     GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind, HighlightKey, Navigated,
@@ -106,13 +107,6 @@ pub fn document_link_target_to_hover_link(target: &str, server_id: LanguageServe
         );
     }
     HoverLink::Url(target.to_string())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InlayHighlight {
-    pub inlay: InlayId,
-    pub inlay_position: Anchor,
-    pub range: Range<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
