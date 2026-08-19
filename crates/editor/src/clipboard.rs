@@ -1,6 +1,32 @@
 use super::*;
 use util::rel_path::RelPath;
 
+/// Resolves a buffer location to the absolute path stored in clipboard metadata.
+///
+/// Full Zed editors install their project as the resolver. Standalone editor hosts may install a
+/// local resolver without otherwise depending on project state.
+pub trait ClipboardPathResolver {
+    fn resolve_path(&self, buffer: &MultiBufferSnapshot, point: Point, cx: &App)
+    -> Option<PathBuf>;
+}
+
+impl ClipboardPathResolver for Entity<Project> {
+    fn resolve_path(
+        &self,
+        buffer: &MultiBufferSnapshot,
+        point: Point,
+        cx: &App,
+    ) -> Option<PathBuf> {
+        let project = self.read(cx);
+        let file = buffer.file_at(point)?;
+        let project_path = ProjectPath {
+            worktree_id: file.worktree_id(cx),
+            path: file.path().clone(),
+        };
+        project.absolute_path(&project_path, cx)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ClipboardSelection {
     /// The number of bytes in this selection.
@@ -16,6 +42,7 @@ pub struct ClipboardSelection {
 }
 
 impl ClipboardSelection {
+    /// Builds clipboard metadata using the editor's project, preserving the original Zed API.
     pub fn for_buffer(
         len: usize,
         is_entire_line: bool,
@@ -24,19 +51,31 @@ impl ClipboardSelection {
         project: Option<&Entity<Project>>,
         cx: &App,
     ) -> Self {
+        Self::for_buffer_with_path_resolver(
+            len,
+            is_entire_line,
+            range,
+            buffer,
+            project.map(|project| project as &dyn ClipboardPathResolver),
+            cx,
+        )
+    }
+
+    /// Builds clipboard metadata using a project-neutral path resolver.
+    pub fn for_buffer_with_path_resolver(
+        len: usize,
+        is_entire_line: bool,
+        range: Range<Point>,
+        buffer: &MultiBufferSnapshot,
+        path_resolver: Option<&dyn ClipboardPathResolver>,
+        cx: &App,
+    ) -> Self {
         let first_line_indent = buffer
             .indent_size_for_line(MultiBufferRow(range.start.row))
             .len;
 
-        let file_path = util::maybe!({
-            let project = project?.read(cx);
-            let file = buffer.file_at(range.start)?;
-            let project_path = ProjectPath {
-                worktree_id: file.worktree_id(cx),
-                path: file.path().clone(),
-            };
-            project.absolute_path(&project_path, cx)
-        });
+        let file_path =
+            path_resolver.and_then(|resolver| resolver.resolve_path(buffer, range.start, cx));
 
         let line_range = if file_path.is_some() {
             buffer
@@ -57,6 +96,30 @@ impl ClipboardSelection {
 }
 
 impl Editor {
+    /// Overrides how clipboard metadata resolves file paths for this editor.
+    pub fn set_clipboard_path_resolver(&mut self, resolver: Option<Rc<dyn ClipboardPathResolver>>) {
+        self.clipboard_path_resolver = resolver;
+    }
+
+    /// Builds clipboard metadata without exposing project ownership to editing clients such as Vim.
+    pub fn clipboard_selection(
+        &self,
+        len: usize,
+        is_entire_line: bool,
+        range: Range<Point>,
+        buffer: &MultiBufferSnapshot,
+        cx: &App,
+    ) -> ClipboardSelection {
+        ClipboardSelection::for_buffer_with_path_resolver(
+            len,
+            is_entire_line,
+            range,
+            buffer,
+            self.clipboard_path_resolver.as_deref(),
+            cx,
+        )
+    }
+
     pub fn do_paste(
         &mut self,
         text: &String,
@@ -395,12 +458,11 @@ impl Editor {
                     len += chunk.len();
                 }
 
-                clipboard_selections.push(ClipboardSelection::for_buffer(
+                clipboard_selections.push(self.clipboard_selection(
                     len,
                     is_entire_line,
                     selection.range(),
                     &buffer,
-                    self.project.as_ref(),
                     cx,
                 ));
             }
@@ -663,12 +725,11 @@ impl Editor {
             }
             prev_selection_was_entire_line = is_entire_line && !is_multiline_trim;
 
-            clipboard_selections.push(ClipboardSelection::for_buffer(
+            clipboard_selections.push(self.clipboard_selection(
                 selection_len,
                 is_entire_line,
                 start..end,
                 &buffer,
-                self.project.as_ref(),
                 cx,
             ));
         }

@@ -7,10 +7,10 @@ use gpui::{
     App, AsyncWindowContext, Context, Entity, Focusable, HighlightStyle, Modifiers, Pixels, Task,
     UnderlineStyle, Window, px,
 };
-use language::{Bias, ToOffset};
+use language::{Bias, InlayId, ToOffset};
 use linkify::{LinkFinder, LinkKind};
 use lsp::LanguageServerId;
-use project::{InlayId, LocationLink, Project, ResolvedPath};
+use project::{LocationLink, Project, ResolvedPath};
 use regex::Regex;
 use settings::Settings;
 use std::{ops::Range, str::FromStr as _, sync::LazyLock};

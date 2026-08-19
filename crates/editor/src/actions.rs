@@ -1,7 +1,7 @@
 //! This module contains all actions supported by [`Editor`].
 use super::*;
 use gpui::{Action, actions};
-use project::project_settings::GoToDiagnosticSeverityFilter;
+use language::GoToDiagnosticSeverityFilter;
 use schemars::JsonSchema;
 use util::serde::default_true;
 

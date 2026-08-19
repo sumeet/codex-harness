@@ -7,7 +7,7 @@ use crate::{
     state::{Mode, Register},
 };
 use collections::HashMap;
-use editor::{ClipboardSelection, Editor, HighlightKey, SelectionEffects};
+use editor::{Editor, HighlightKey, SelectionEffects};
 use gpui::Context;
 use gpui::Window;
 use language::Point;
@@ -195,12 +195,11 @@ impl Vim {
                 if kind.linewise() {
                     text.push('\n');
                 }
-                clipboard_selections.push(ClipboardSelection::for_buffer(
+                clipboard_selections.push(editor.clipboard_selection(
                     text.len() - initial_len,
                     false,
                     start..end,
                     &buffer,
-                    editor.project(),
                     cx,
                 ));
             }

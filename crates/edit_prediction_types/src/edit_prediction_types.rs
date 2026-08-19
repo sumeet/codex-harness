@@ -27,6 +27,7 @@ pub enum EditPredictionRequestTrigger {
 }
 
 use icons::IconName;
+pub use language::Direction;
 use language::{Anchor, Buffer, OffsetRangeExt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,16 +106,6 @@ pub enum SuggestionDisplayType {
     GhostText,
     DiffPopover,
     Jump,
-}
-
-// TODO: Find a better home for `Direction`.
-//
-// This should live in an ancestor crate of `editor` and `edit_prediction`,
-// but at time of writing there isn't an obvious spot.
-#[derive(Copy, Clone, PartialEq, Eq)]
-pub enum Direction {
-    Prev,
-    Next,
 }
 
 #[derive(Clone)]
