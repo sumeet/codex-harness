@@ -8,7 +8,9 @@ jobs=${HARNESS_BUILD_JOBS:-1}
 
 case "$profile" in
     dev)
-        profile_arguments=""
+        # Keep assertions, overflow checks, line tables, and incremental
+        # compilation while optimizing only Harness's interactive hot path.
+        profile_arguments="--profile harness-dev"
         ;;
     release-fast)
         profile_arguments="--profile release-fast"

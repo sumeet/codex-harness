@@ -1009,6 +1009,51 @@ debug = "full"
 [profile.dbg.build-override]
 debug = "full"
 
+[profile.harness-dev]
+inherits = "dev"
+# Harness's normal interactive build keeps the development diagnostics that
+# matter while optimizing only the crates on its frame, input, Editor, text,
+# and GPU submission paths. This remains incremental and deliberately avoids
+# release LTO so ordinary app edits do not pay release-build turnaround.
+debug = "limited"
+debug-assertions = true
+overflow-checks = true
+incremental = true
+codegen-units = 16
+
+[profile.harness-dev.package]
+# Harness-owned presentation and protocol work.
+harness_app = { opt-level = 2 }
+harness_editor = { opt-level = 2 }
+harness_protocol = { opt-level = 2 }
+
+# Immediate-mode layout, input dispatch, and platform presentation.
+gpui = { opt-level = 2 }
+gpui_platform = { opt-level = 2 }
+gpui_linux = { opt-level = 2 }
+gpui_wgpu = { opt-level = 2 }
+ui = { opt-level = 2 }
+editor = { opt-level = 2 }
+vim = { opt-level = 2 }
+markdown = { opt-level = 2 }
+
+# Selectable transcript snapshots, wrapping, and incremental text storage.
+language = { opt-level = 2 }
+multi_buffer = { opt-level = 2 }
+text = { opt-level = 2 }
+rope = { opt-level = 2 }
+sum_tree = { opt-level = 2 }
+collections = { opt-level = 2 }
+
+# Linux shaping/rasterization and the stable GPU submission stack. These
+# dependencies change rarely, so their one-time optimized build does not slow
+# the common Harness-only incremental edit.
+"cosmic-text" = { opt-level = 2 }
+swash = { opt-level = 2 }
+wgpu = { opt-level = 2 }
+wgpu-core = { opt-level = 2 }
+wgpu-hal = { opt-level = 2 }
+
 [profile.dev.package]
 # proc-macros start
 gpui_macros = { opt-level = 3 }

@@ -7,7 +7,7 @@ profile=${HARNESS_PROFILE:-dev}
 
 case "$profile" in
     dev)
-        binary="$project_dir/target/debug/harness"
+        binary="$project_dir/target/harness-dev/harness"
         ;;
     release-fast)
         binary="$project_dir/target/release-fast/harness"
