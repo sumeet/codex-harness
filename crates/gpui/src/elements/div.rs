@@ -18,13 +18,14 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
-    FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
-    IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    FocusHandle, GestureTuning, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId,
+    InspectorElementId, IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton,
+    KeyboardClickEvent, KineticScroll, LayoutId, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
+    ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px,
+    schedule_kinetic_scroll_frame, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -48,6 +49,110 @@ use super::ImageCacheProvider;
 const DRAG_THRESHOLD: f64 = 2.;
 const DEFAULT_TOOLTIP_SHOW_DELAY: Duration = Duration::from_millis(500);
 const HOVERABLE_TOOLTIP_HIDE_DELAY: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Default)]
+pub(crate) struct DivScrollKinetics {
+    max_offset: Point<Pixels>,
+    overflow: Point<Overflow>,
+    kinetic_scroll: KineticScroll,
+}
+
+fn div_scroll_tuning(cx: &App) -> GestureTuning {
+    cx.platform
+        .gestures()
+        .map(|gestures| gestures.tuning())
+        .unwrap_or_default()
+}
+
+fn div_event_synthesizes_momentum(event: &ScrollWheelEvent) -> bool {
+    event.synthesize_momentum && matches!(event.delta, ScrollDelta::Pixels(_))
+}
+
+fn div_scroll_delta(
+    delta: Point<Pixels>,
+    overflow: Point<Overflow>,
+    allow_concurrent_scroll: bool,
+    restrict_scroll_to_axis: bool,
+) -> Point<Pixels> {
+    let mut delta_x = match overflow.x {
+        Overflow::Scroll if !delta.x.is_zero() => delta.x,
+        Overflow::Scroll if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll => delta.y,
+        _ => Pixels::ZERO,
+    };
+    let mut delta_y = match overflow.y {
+        Overflow::Scroll if !delta.y.is_zero() => delta.y,
+        Overflow::Scroll if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll => delta.x,
+        _ => Pixels::ZERO,
+    };
+    if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
+        if delta_x.abs() > delta_y.abs() {
+            delta_y = Pixels::ZERO;
+        } else {
+            delta_x = Pixels::ZERO;
+        }
+    }
+    point(delta_x, delta_y)
+}
+
+fn apply_div_scroll_delta(
+    scroll_offset: &mut Point<Pixels>,
+    requested: Point<Pixels>,
+    max_offset: Point<Pixels>,
+    overflow: Point<Overflow>,
+) -> Point<Pixels> {
+    let old_scroll_offset = *scroll_offset;
+    if overflow.x == Overflow::Scroll {
+        scroll_offset.x = (scroll_offset.x + requested.x).clamp(-max_offset.x, px(0.));
+    }
+    if overflow.y == Overflow::Scroll {
+        scroll_offset.y = (scroll_offset.y + requested.y).clamp(-max_offset.y, px(0.));
+    }
+    *scroll_offset - old_scroll_offset
+}
+
+fn schedule_div_kinetic_scroll(
+    scroll_offset: Rc<RefCell<Point<Pixels>>>,
+    scroll_kinetics: Rc<RefCell<DivScrollKinetics>>,
+    generation: u64,
+    current_view: EntityId,
+    window: &mut Window,
+) {
+    schedule_kinetic_scroll_frame(window, move |now, window, cx| {
+        let tuning = div_scroll_tuning(cx);
+        let Some((step, max_offset, overflow)) = ({
+            let mut scroll_kinetics = scroll_kinetics.borrow_mut();
+            let step = scroll_kinetics
+                .kinetic_scroll
+                .frame_at(generation, now, tuning);
+            step.map(|step| (step, scroll_kinetics.max_offset, scroll_kinetics.overflow))
+        }) else {
+            return;
+        };
+        let consumed = apply_div_scroll_delta(
+            &mut scroll_offset.borrow_mut(),
+            step.delta,
+            max_offset,
+            overflow,
+        );
+        if !consumed.is_zero() {
+            cx.notify(current_view);
+        }
+        let continues = step.continues
+            && scroll_kinetics
+                .borrow_mut()
+                .kinetic_scroll
+                .consume(generation, step.delta, consumed);
+        if continues {
+            schedule_div_kinetic_scroll(
+                scroll_offset,
+                scroll_kinetics,
+                generation,
+                current_view,
+                window,
+            );
+        }
+    });
+}
 
 /// The styling information for a given group.
 pub struct GroupStyle {
@@ -2039,6 +2144,7 @@ pub struct Interactivity {
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) scroll_kinetics: Option<Rc<RefCell<DivScrollKinetics>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2163,6 +2269,7 @@ impl Interactivity {
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
+                    self.scroll_kinetics = Some(scroll_handle_state.scroll_kinetics.clone());
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
@@ -2177,6 +2284,12 @@ impl Interactivity {
                         element_state
                             .ongoing_scroll
                             .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
+                            .clone(),
+                    );
+                    self.scroll_kinetics = Some(
+                        element_state
+                            .scroll_kinetics
+                            .get_or_insert_with(Rc::default)
                             .clone(),
                     );
                 }
@@ -2354,6 +2467,7 @@ impl Interactivity {
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            let old_scroll_offset = *scroll_offset;
 
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
@@ -2361,10 +2475,19 @@ impl Interactivity {
             } else {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
             }
+            let was_clamped = *scroll_offset != old_scroll_offset;
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
                 scroll_handle_state.max_offset = scroll_max;
                 scroll_handle_state.bounds = bounds;
+            }
+            if let Some(scroll_kinetics) = self.scroll_kinetics.as_ref() {
+                let mut scroll_kinetics = scroll_kinetics.borrow_mut();
+                scroll_kinetics.max_offset = scroll_max;
+                scroll_kinetics.overflow = style.overflow;
+                if was_clamped {
+                    scroll_kinetics.kinetic_scroll.cancel();
+                }
             }
 
             *scroll_offset
@@ -3194,6 +3317,7 @@ impl Interactivity {
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
             let ongoing_scroll = self.ongoing_scroll.clone();
+            let scroll_kinetics = self.scroll_kinetics.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
             let restrict_scroll_to_axis = style.restrict_scroll_to_axis;
@@ -3202,6 +3326,37 @@ impl Interactivity {
             let current_view = window.current_view();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    let synthesize_momentum = div_event_synthesizes_momentum(event);
+                    let now = cx.background_executor().now();
+                    let tuning = div_scroll_tuning(cx);
+
+                    if event.touch_phase == TouchPhase::Cancelled {
+                        if let Some(ongoing_scroll) = &ongoing_scroll {
+                            let mut delta = event.delta.pixel_delta(line_height);
+                            ongoing_scroll
+                                .borrow_mut()
+                                .filter(&mut delta, event.touch_phase);
+                        }
+                        if let Some(scroll_kinetics) = &scroll_kinetics {
+                            scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
+                        }
+                        return;
+                    }
+
+                    if let Some(scroll_kinetics) = &scroll_kinetics {
+                        if synthesize_momentum {
+                            if event.touch_phase == TouchPhase::Started {
+                                scroll_kinetics.borrow_mut().kinetic_scroll.begin_at(now);
+                            } else if event.touch_phase == TouchPhase::Moved
+                                && !scroll_kinetics.borrow().kinetic_scroll.is_recording()
+                            {
+                                scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
+                            }
+                        } else {
+                            scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
+                        }
+                    }
+
                     if event.is_lifecycle_only() {
                         if let Some(ongoing_scroll) = &ongoing_scroll {
                             let mut delta = event.delta.pixel_delta(line_height);
@@ -3209,10 +3364,24 @@ impl Interactivity {
                                 .borrow_mut()
                                 .filter(&mut delta, event.touch_phase);
                         }
+                        if synthesize_momentum
+                            && event.touch_phase == TouchPhase::Ended
+                            && let Some(scroll_kinetics) = &scroll_kinetics
+                            && let Some(generation) = scroll_kinetics
+                                .borrow_mut()
+                                .kinetic_scroll
+                                .finish_at(now, tuning)
+                        {
+                            schedule_div_kinetic_scroll(
+                                scroll_offset.clone(),
+                                scroll_kinetics.clone(),
+                                generation,
+                                current_view,
+                                window,
+                            );
+                        }
                         return;
                     }
-                    let mut scroll_offset = scroll_offset.borrow_mut();
-                    let old_scroll_offset = *scroll_offset;
                     let mut delta = event.delta.pixel_delta(line_height);
 
                     if restrict_scroll_to_axis
@@ -3224,35 +3393,54 @@ impl Interactivity {
                             .filter(&mut delta, event.touch_phase);
                     }
 
-                    let mut delta_x = match overflow.x {
-                        Overflow::Scroll if !delta.x.is_zero() => delta.x,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.y != Overflow::Scroll =>
-                        {
-                            delta.y
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    let mut delta_y = match overflow.y {
-                        Overflow::Scroll if !delta.y.is_zero() => delta.y,
-                        Overflow::Scroll
-                            if !restrict_scroll_to_axis && overflow.x != Overflow::Scroll =>
-                        {
-                            delta.x
-                        }
-                        _ => Pixels::ZERO,
-                    };
-                    if !allow_concurrent_scroll && !delta_x.is_zero() && !delta_y.is_zero() {
-                        if delta_x.abs() > delta_y.abs() {
-                            delta_y = Pixels::ZERO;
-                        } else {
-                            delta_x = Pixels::ZERO;
-                        }
-                    }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    let requested = div_scroll_delta(
+                        delta,
+                        overflow,
+                        allow_concurrent_scroll,
+                        restrict_scroll_to_axis,
+                    );
+                    let max_offset = scroll_kinetics
+                        .as_ref()
+                        .map(|state| state.borrow().max_offset)
+                        .unwrap_or_default();
+                    let consumed = apply_div_scroll_delta(
+                        &mut scroll_offset.borrow_mut(),
+                        requested,
+                        max_offset,
+                        overflow,
+                    );
+                    if !consumed.is_zero() {
                         cx.notify(current_view);
+                        cx.stop_propagation();
+                    }
+
+                    let generation = if synthesize_momentum {
+                        scroll_kinetics.as_ref().and_then(|scroll_kinetics| {
+                            let mut scroll_kinetics = scroll_kinetics.borrow_mut();
+                            if consumed.is_zero() {
+                                scroll_kinetics.kinetic_scroll.cancel();
+                            } else {
+                                scroll_kinetics
+                                    .kinetic_scroll
+                                    .record_movement_at(consumed, now);
+                            }
+                            (event.touch_phase == TouchPhase::Ended)
+                                .then(|| scroll_kinetics.kinetic_scroll.finish_at(now, tuning))
+                                .flatten()
+                        })
+                    } else {
+                        None
+                    };
+                    if let (Some(generation), Some(scroll_kinetics)) =
+                        (generation, scroll_kinetics.as_ref())
+                    {
+                        schedule_div_kinetic_scroll(
+                            scroll_offset.clone(),
+                            scroll_kinetics.clone(),
+                            generation,
+                            current_view,
+                            window,
+                        );
                     }
                 }
             });
@@ -3493,6 +3681,7 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    scroll_kinetics: Option<Rc<RefCell<DivScrollKinetics>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
 }
 
@@ -4035,6 +4224,7 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    scroll_kinetics: Rc<RefCell<DivScrollKinetics>>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4129,6 +4319,7 @@ impl ScrollHandle {
     /// Update [ScrollHandleState]'s active item for scrolling to in prepaint
     pub fn scroll_to_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::default(),
@@ -4139,6 +4330,7 @@ impl ScrollHandle {
     /// This scrolls the minimal amount to ensure that the child is the first visible element
     pub fn scroll_to_top_of_item(&self, ix: usize) {
         let mut state = self.0.borrow_mut();
+        state.scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
         state.active_item = Some(ScrollActiveItem {
             index: ix,
             strategy: ScrollStrategy::Top,
@@ -4199,14 +4391,16 @@ impl ScrollHandle {
     /// Scrolls to the bottom.
     pub fn scroll_to_bottom(&self) {
         let mut state = self.0.borrow_mut();
+        state.scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
         state.scroll_to_bottom = true;
     }
 
     /// Set the offset explicitly. The offset is the distance from the top left of the
     /// parent container to the top left of the first child.
     /// As you scroll further down the offset becomes more negative.
-    pub fn set_offset(&self, mut position: Point<Pixels>) {
+    pub fn set_offset(&self, position: Point<Pixels>) {
         let state = self.0.borrow();
+        state.scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
         *state.offset.borrow_mut() = position;
     }
 
@@ -4615,6 +4809,168 @@ mod tests {
         handle.scroll_to_active_item();
 
         assert_eq!(handle.offset().y, px(-25.));
+    }
+
+    #[test]
+    fn div_scroll_clamps_immediately_and_reports_only_consumed_pixels() {
+        let mut offset = Point::default();
+        let overflow = point(Overflow::Scroll, Overflow::Scroll);
+        let max_offset = point(px(100.), px(100.));
+
+        let first = apply_div_scroll_delta(
+            &mut offset,
+            point(px(-150.), px(-40.)),
+            max_offset,
+            overflow,
+        );
+        assert_eq!(first, point(px(-100.), px(-40.)));
+        assert_eq!(offset, point(px(-100.), px(-40.)));
+
+        let second =
+            apply_div_scroll_delta(&mut offset, point(px(-20.), px(-80.)), max_offset, overflow);
+        assert_eq!(second, point(px(0.), px(-60.)));
+        assert_eq!(offset, point(px(-100.), px(-100.)));
+    }
+
+    #[test]
+    fn only_explicit_precise_events_can_synthesize_div_momentum() {
+        let precise_finger = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let line_wheel = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let native_momentum = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: false,
+            ..Default::default()
+        };
+
+        assert!(div_event_synthesizes_momentum(&precise_finger));
+        assert!(!div_event_synthesizes_momentum(&line_wheel));
+        assert!(!div_event_synthesizes_momentum(&native_momentum));
+    }
+
+    #[gpui::test]
+    fn tracked_div_finger_scroll_flings_and_programmatic_scroll_cancels_callbacks(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let handle = ScrollHandle::new();
+
+        struct TestView(ScrollHandle);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("tracked-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.0)
+                    .child(div().w_full().h(px(400.)).flex_none())
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(handle.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let movement = |touch_phase| ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+            touch_phase,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        cx.simulate_event(movement(TouchPhase::Started));
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.simulate_event(movement(TouchPhase::Moved));
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.simulate_event(movement(TouchPhase::Moved));
+        assert_eq!(handle.offset().y, px(-30.));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(Point::default()),
+            touch_phase: TouchPhase::Ended,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+        assert!(handle.offset().y < px(-30.));
+
+        handle.set_offset(Point::default());
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)),
+            1,
+            "the already queued callback should drain once"
+        );
+        assert_eq!(handle.offset(), Point::default());
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)),
+            0,
+            "cancellation must not leave a recurring callback"
+        );
+    }
+
+    #[gpui::test]
+    fn untracked_stateful_div_claims_consumed_scroll_and_chains_at_its_edge(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let parent_events = Rc::new(Cell::new(0));
+
+        struct TestView(Rc<Cell<usize>>);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let parent_events = self.0.clone();
+                div()
+                    .size_full()
+                    .on_scroll_wheel(move |_, _, _| {
+                        parent_events.set(parent_events.get() + 1);
+                    })
+                    .child(
+                        div()
+                            .id("inner-scroll")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .child(div().w_full().h(px(200.)).flex_none()),
+                    )
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(parent_events.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let movement = |distance| ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(distance))),
+            touch_phase: TouchPhase::Started,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        cx.simulate_event(movement(-10.));
+        assert_eq!(parent_events.get(), 0, "the moving child owns the input");
+        cx.simulate_event(movement(-1_000.));
+        assert_eq!(parent_events.get(), 0, "movement to the bound is consumed");
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        cx.simulate_event(movement(-10.));
+        assert_eq!(
+            parent_events.get(),
+            1,
+            "the child leaves input at its bound available for its parent"
+        );
     }
 
     fn setup_tooltip_owner_test(
