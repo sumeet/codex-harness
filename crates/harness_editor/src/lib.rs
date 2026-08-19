@@ -125,6 +125,7 @@ fn embedded_language(name: &str, grammar: tree_sitter::Language) -> anyhow::Resu
 
 pub struct LocalEditor {
     editor: Entity<Editor>,
+    typography_profile: TranscriptTypographyProfile,
 }
 
 /// Emitted whenever a host-owned local editor's Buffer text changes.
@@ -134,6 +135,7 @@ impl EventEmitter<LocalEditorChanged> for LocalEditor {}
 
 impl LocalEditor {
     pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let typography_profile = TranscriptTypographyProfile::Reading;
         let (language_registry, markdown) = {
             let languages = cx.global::<HarnessLanguageSet>();
             (languages.registry.clone(), languages.markdown.clone())
@@ -148,6 +150,7 @@ impl LocalEditor {
                     buffer.set_language(Some(markdown), cx);
                 });
             }
+            apply_typography_profile_to_editor(&mut editor, typography_profile, window, cx);
             editor
         });
         cx.subscribe(&editor, |_, _, event, cx| {
@@ -156,7 +159,10 @@ impl LocalEditor {
             }
         })
         .detach();
-        Self { editor }
+        Self {
+            editor,
+            typography_profile,
+        }
     }
 
     pub fn plain_single_line(
@@ -177,7 +183,13 @@ impl LocalEditor {
             }
         })
         .detach();
-        Self { editor }
+        Self {
+            editor,
+            // Zed's single-line and auto-height Editors both use the UI font
+            // by default. Record that identity explicitly so a host can apply
+            // the same Reading/Mono choice without replacing the Editor.
+            typography_profile: TranscriptTypographyProfile::Reading,
+        }
     }
 
     pub fn text(&self, cx: &App) -> String {
@@ -199,6 +211,33 @@ impl LocalEditor {
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
         self.editor
             .update(cx, |editor, cx| editor.set_masked(masked, cx));
+    }
+
+    pub fn typography_profile(&self) -> TranscriptTypographyProfile {
+        self.typography_profile
+    }
+
+    /// Switch only this Editor's font identity.
+    ///
+    /// The Buffer, selections, focus handle, Vim state, and undo history stay
+    /// on the existing Editor entity. `Editor::set_style` propagates the new
+    /// font metrics into the display map so soft wrapping is recalculated.
+    pub fn set_typography_profile(
+        &mut self,
+        profile: TranscriptTypographyProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !typography_profile_changed(self.typography_profile, profile) {
+            return false;
+        }
+
+        self.editor.update(cx, |editor, cx| {
+            apply_typography_profile_to_editor(editor, profile, window, cx)
+        });
+        self.typography_profile = profile;
+        cx.notify();
+        true
     }
 
     /// Put a modal host input into Vim Insert mode after focus transfer.
@@ -250,11 +289,11 @@ pub struct TranscriptEditor {
     pending_tail_intent: Option<PendingTailIntent>,
 }
 
-/// The font geometry used by the selectable transcript Editor.
+/// The font geometry used by Harness's full Editor surfaces.
 ///
-/// Both profiles retain Zed's native Buffer, display map, selections, and Vim
-/// implementation. `Reading` changes only the whole-surface font identity;
-/// size and line height remain those of the user's buffer settings.
+/// Both profiles retain Zed's native Buffer, display map, selections, Vim, and
+/// undo implementation. `Reading` changes only the whole-surface font identity;
+/// size and line height remain those of the surface's existing Editor style.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TranscriptTypographyProfile {
     Buffer,
@@ -294,6 +333,19 @@ fn apply_typography_font(style: &mut TextStyle, font: &Font) {
     style.font_fallbacks.clone_from(&font.fallbacks);
     style.font_weight = font.weight;
     style.font_style = font.style;
+}
+
+fn apply_typography_profile_to_editor(
+    editor: &mut Editor,
+    profile: TranscriptTypographyProfile,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let font = font_for_typography_profile(profile, cx);
+    editor.set_text_style_refinement(typography_refinement(&font));
+    let mut style = editor.style(cx).clone();
+    apply_typography_font(&mut style.text, &font);
+    editor.set_style(style, window, cx);
 }
 
 /// Marks only the transcript's Zed Editor in its intrinsic key context.
@@ -1300,12 +1352,8 @@ impl TranscriptEditor {
             return false;
         }
 
-        let font = font_for_typography_profile(profile, cx);
         self.editor.update(cx, |editor, cx| {
-            editor.set_text_style_refinement(typography_refinement(&font));
-            let mut style = editor.style(cx).clone();
-            apply_typography_font(&mut style.text, &font);
-            editor.set_style(style, window, cx);
+            apply_typography_profile_to_editor(editor, profile, window, cx)
         });
         self.typography_profile = profile;
         cx.notify();
@@ -2858,6 +2906,31 @@ mod tests {
         assert_eq!(refinement.font_family, Some(font.family));
         assert_eq!(refinement.font_size, None);
         assert_eq!(refinement.line_height, None);
+    }
+
+    #[test]
+    fn typography_switch_is_paint_only_for_the_persistent_editor() {
+        let source = include_str!("lib.rs");
+        let method = source
+            .split_once("fn apply_typography_profile_to_editor(")
+            .and_then(|(_, after)| after.split_once("/// Marks only the transcript's Zed Editor"))
+            .map(|(method, _)| method)
+            .expect("the shared typography helper must remain independently auditable");
+
+        assert!(method.contains("editor.set_text_style_refinement("));
+        assert!(method.contains("editor.set_style("));
+        for forbidden in [
+            "set_text(",
+            "buffer.edit(",
+            "change_selections(",
+            "focus(",
+            "undo(",
+        ] {
+            assert!(
+                !method.contains(forbidden),
+                "typography must not mutate persistent Editor state via {forbidden}"
+            );
+        }
     }
 
     #[test]
