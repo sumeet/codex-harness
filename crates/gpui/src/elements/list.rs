@@ -9,9 +9,10 @@
 
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
-    FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent, Size, Style, StyleRefinement, Styled,
-    Window, point, px, size,
+    FocusHandle, GestureTuning, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
+    IntoElement, IsZero, KineticScroll, Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent,
+    Size, Style, StyleRefinement, Styled, TouchPhase, Window, point, px,
+    schedule_kinetic_scroll_frame, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -49,6 +50,47 @@ impl List {
     }
 }
 
+fn kinetic_scroll_tuning(cx: &App) -> GestureTuning {
+    cx.platform
+        .gestures()
+        .map(|gestures| gestures.tuning())
+        .unwrap_or_default()
+}
+
+fn list_event_synthesizes_momentum(event: &ScrollWheelEvent) -> bool {
+    event.synthesize_momentum && matches!(event.delta, ScrollDelta::Pixels(_))
+}
+
+fn schedule_list_kinetic_scroll(
+    list_state: ListState,
+    generation: u64,
+    current_view: EntityId,
+    window: &mut Window,
+) {
+    schedule_kinetic_scroll_frame(window, move |now, window, cx| {
+        let tuning = kinetic_scroll_tuning(cx);
+        let continues = {
+            let state = &mut *list_state.0.borrow_mut();
+            let Some(step) = state.kinetic_scroll.frame_at(generation, now, tuning) else {
+                return;
+            };
+            let Some(height) = state.last_layout_bounds.map(|bounds| bounds.size.height) else {
+                state.kinetic_scroll.cancel();
+                return;
+            };
+            let scroll_top = state.logical_scroll_top();
+            let consumed = state.scroll(&scroll_top, height, step.delta, current_view, window, cx);
+            step.continues
+                && state
+                    .kinetic_scroll
+                    .consume(generation, step.delta, consumed)
+        };
+        if continues {
+            schedule_list_kinetic_scroll(list_state, generation, current_view, window);
+        }
+    });
+}
+
 /// The list state that views must hold on behalf of the list element.
 #[derive(Clone)]
 pub struct ListState(Rc<RefCell<StateInner>>);
@@ -73,6 +115,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    kinetic_scroll: KineticScroll,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +368,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            kinetic_scroll: KineticScroll::default(),
         })));
         this.splice(0..0, item_count);
         this
@@ -360,6 +404,7 @@ impl ListState {
             state.logical_scroll_top = None;
             state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
+            state.kinetic_scroll.cancel();
             state.items.summary().count
         };
 
@@ -569,6 +614,7 @@ impl ListState {
 
         let current_offset = self.logical_scroll_top();
         let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
 
         if distance < px(0.) {
             state.follow_state.stop_following();
@@ -602,6 +648,7 @@ impl ListState {
     /// growing (e.g. during streaming).
     pub fn scroll_to_end(&self) {
         let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
         let item_count = state.items.summary().count;
         state.pending_scroll = None;
         state.logical_scroll_top = Some(ListOffset {
@@ -616,6 +663,7 @@ impl ListState {
     /// following occurs.
     pub fn set_follow_mode(&self, mode: FollowMode) {
         let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
 
         match mode {
             FollowMode::Normal => {
@@ -644,7 +692,9 @@ impl ListState {
     /// diagram) and the current position should stay put rather than snapping
     /// to the end.
     pub fn pause_following_tail(&self) {
-        self.0.borrow_mut().follow_state.stop_following();
+        let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
+        state.follow_state.stop_following();
     }
 
     /// Returns whether the list is currently actively following the
@@ -659,6 +709,7 @@ impl ListState {
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
         let item_count = state.items.summary().count;
         if scroll_top.item_ix >= item_count {
             scroll_top.item_ix = item_count;
@@ -676,6 +727,7 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state
@@ -742,6 +794,7 @@ impl ListState {
     /// as items in the overdraw get measured, and help offset scroll position changes accordingly.
     pub fn scrollbar_drag_started(&self) {
         let mut state = self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
         state.scrollbar_drag_start_height = Some(state.items.summary().height);
     }
 
@@ -764,7 +817,9 @@ impl ListState {
 
     /// Set the offset from the scrollbar
     pub fn set_offset_from_scrollbar(&self, point: Point<Pixels>) {
-        self.0.borrow_mut().set_offset_from_scrollbar(point);
+        let state = &mut *self.0.borrow_mut();
+        state.kinetic_scroll.cancel();
+        state.set_offset_from_scrollbar(point);
     }
 
     /// Returns the maximum scroll offset according to the items we have measured.
@@ -903,19 +958,23 @@ impl StateInner {
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
-    ) {
+    ) -> Point<Pixels> {
         // Drop scroll events after a reset, since we can't calculate
         // the new logical scroll top without the item heights
         if self.reset {
-            return;
+            return Point::default();
         }
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
+        let previous_scroll_top = self.scroll_top(&self.logical_scroll_top());
         let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
             .max(px(0.))
             .min(scroll_max);
+        if new_scroll_top == previous_scroll_top {
+            return Point::default();
+        }
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
             self.pending_scroll = None;
@@ -939,8 +998,9 @@ impl StateInner {
             self.follow_state.stop_following();
         }
 
+        let resolved_scroll_top = self.logical_scroll_top();
         if let Some(handler) = self.scroll_handler.as_mut() {
-            let visible_range = Self::visible_range(&self.items, height, scroll_top);
+            let visible_range = Self::visible_range(&self.items, height, &resolved_scroll_top);
             handler(
                 &ListScrollEvent {
                     visible_range,
@@ -957,6 +1017,7 @@ impl StateInner {
         }
 
         cx.notify(current_view);
+        point(px(0.), previous_scroll_top - new_scroll_top)
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1600,19 +1661,78 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                if event.is_lifecycle_only() {
+                let synthesize_momentum = list_event_synthesizes_momentum(event);
+                let tuning = kinetic_scroll_tuning(cx);
+                let now = cx.background_executor().now();
+
+                if event.touch_phase == TouchPhase::Cancelled {
+                    list_state.0.borrow_mut().kinetic_scroll.cancel();
                     return;
                 }
+                if synthesize_momentum {
+                    if event.touch_phase == TouchPhase::Started {
+                        accumulated_scroll_delta = ScrollDelta::default();
+                        list_state.0.borrow_mut().kinetic_scroll.begin_at(now);
+                    } else if event.touch_phase == TouchPhase::Moved
+                        && !list_state.0.borrow().kinetic_scroll.is_recording()
+                    {
+                        // A source-less movement must not inherit momentum
+                        // from a completed gesture or open a new recorder.
+                        list_state.0.borrow_mut().kinetic_scroll.cancel();
+                    }
+                } else {
+                    list_state.0.borrow_mut().kinetic_scroll.cancel();
+                }
+
+                if event.is_lifecycle_only() {
+                    if synthesize_momentum
+                        && event.touch_phase == TouchPhase::Ended
+                        && let Some(generation) = list_state
+                            .0
+                            .borrow_mut()
+                            .kinetic_scroll
+                            .finish_at(now, tuning)
+                    {
+                        schedule_list_kinetic_scroll(
+                            list_state.clone(),
+                            generation,
+                            current_view,
+                            window,
+                        );
+                    }
+                    return;
+                }
+
                 accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
                 let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                list_state.0.borrow_mut().scroll(
-                    &scroll_top,
-                    height,
-                    pixel_delta,
-                    current_view,
-                    window,
-                    cx,
-                )
+                let generation = {
+                    let state = &mut *list_state.0.borrow_mut();
+                    let consumed =
+                        state.scroll(&scroll_top, height, pixel_delta, current_view, window, cx);
+                    if !consumed.is_zero() {
+                        cx.stop_propagation();
+                    }
+                    if synthesize_momentum {
+                        if consumed.is_zero() {
+                            state.kinetic_scroll.cancel();
+                        } else {
+                            state
+                                .kinetic_scroll
+                                .record_movement_at(point(px(0.), consumed.y), now);
+                        }
+                    }
+                    (synthesize_momentum && event.touch_phase == TouchPhase::Ended)
+                        .then(|| state.kinetic_scroll.finish_at(now, tuning))
+                        .flatten()
+                };
+                if let Some(generation) = generation {
+                    schedule_list_kinetic_scroll(
+                        list_state.clone(),
+                        generation,
+                        current_view,
+                        window,
+                    );
+                }
             }
         });
 
@@ -1728,8 +1848,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, Render, Styled, TestAppContext, Window, canvas, div, list, point,
-        px, size,
+        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div,
+        list, point, px, size,
     };
 
     #[gpui::test]
@@ -1820,6 +1940,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(1.), px(1.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-500.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -1851,6 +1972,7 @@ mod test {
             position: point(px(1.), px(1.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-15.))),
             touch_phase: TouchPhase::Started,
+            synthesize_momentum: false,
             ..Default::default()
         });
         let after_movement = state.logical_scroll_top();
@@ -1863,6 +1985,7 @@ mod test {
             position: point(px(1.), px(1.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
             touch_phase: TouchPhase::Ended,
+            synthesize_momentum: false,
             ..Default::default()
         });
         let after_terminal_phase = state.logical_scroll_top();
@@ -1959,6 +2082,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(10.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -1970,6 +2094,89 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[test]
+    fn only_explicit_precise_events_can_synthesize_list_momentum() {
+        let precise_finger = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let line_wheel = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let native_momentum = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: false,
+            ..Default::default()
+        };
+
+        assert!(super::list_event_synthesizes_momentum(&precise_finger));
+        assert!(!super::list_event_synthesizes_momentum(&line_wheel));
+        assert!(!super::list_event_synthesizes_momentum(&native_momentum));
+    }
+
+    #[gpui::test]
+    fn list_claims_consumed_scroll_but_leaves_edge_scroll_for_its_parent(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(10, crate::ListAlignment::Top, px(200.)).measure_all();
+        let parent_events = Rc::new(Cell::new(0));
+
+        struct TestView {
+            state: ListState,
+            parent_events: Rc<Cell<usize>>,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let parent_events = self.parent_events.clone();
+                div()
+                    .size_full()
+                    .on_scroll_wheel(move |_, _, _| {
+                        parent_events.set(parent_events.get() + 1);
+                    })
+                    .child(
+                        list(self.state.clone(), |_, _, _| {
+                            div().h(px(20.)).w_full().into_any()
+                        })
+                        .size_full(),
+                    )
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                state: state.clone(),
+                parent_events: parent_events.clone(),
+            })
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let finger_scroll = ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-10.))),
+            touch_phase: TouchPhase::Started,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        cx.simulate_event(finger_scroll.clone());
+        assert_eq!(parent_events.get(), 0, "the moving child owns the gesture");
+        assert_eq!(state.logical_scroll_top().offset_in_item, px(10.));
+
+        state.scroll_to_end();
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        cx.simulate_event(finger_scroll);
+        assert_eq!(
+            parent_events.get(),
+            1,
+            "a child at its bound leaves the event available for scroll chaining"
+        );
     }
 
     struct TestListView(ListState);
@@ -2302,6 +2509,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -2370,6 +2578,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-30.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -2594,6 +2803,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(100.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -2845,6 +3055,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(50.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
         assert!(!state.is_following_tail());
@@ -2853,6 +3064,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(-10000.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -2904,6 +3116,7 @@ mod test {
         cx.simulate_event(ScrollWheelEvent {
             position: point(px(50.), px(100.)),
             delta: ScrollDelta::Pixels(point(px(0.), px(200.))),
+            synthesize_momentum: false,
             ..Default::default()
         });
         assert!(!state.is_following_tail());

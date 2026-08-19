@@ -522,6 +522,11 @@ pub struct ScrollWheelEvent {
 
     /// The phase of the touch event.
     pub touch_phase: TouchPhase,
+
+    /// Whether GPUI should synthesize kinetic momentum after this precise
+    /// finger gesture ends. Platforms that already provide momentum must
+    /// leave this false.
+    pub synthesize_momentum: bool,
 }
 
 impl Sealed for ScrollWheelEvent {}
@@ -875,6 +880,7 @@ mod test {
         let event = |delta, touch_phase| ScrollWheelEvent {
             delta,
             touch_phase,
+            synthesize_momentum: false,
             ..Default::default()
         };
 

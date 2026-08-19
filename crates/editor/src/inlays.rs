@@ -20,8 +20,9 @@ pub mod inlay_hints;
 use std::sync::OnceLock;
 
 use gpui::{Context, HighlightStyle, Hsla, Rgba, Task};
+use language::InlayId;
 use multi_buffer::Anchor;
-use project::{InlayHint, InlayId};
+use project::InlayHint;
 use text::Rope;
 
 use crate::{Editor, HighlightKey, hover_links::InlayHighlight};

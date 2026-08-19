@@ -79,7 +79,7 @@ mod rewrap;
 mod selection;
 
 pub(crate) use actions::*;
-pub use clipboard::ClipboardSelection;
+pub use clipboard::{ClipboardPathResolver, ClipboardSelection};
 pub use code_actions::CodeActionProvider;
 use collections::TypeIdHashMap;
 pub use completions::CompletionProvider;
@@ -101,7 +101,6 @@ pub(crate) use edit_prediction::{
 pub(crate) use edit_prediction::{
     EditPredictionKeybindAction, EditPredictionKeybindSurface, edit_prediction_edit_text,
 };
-pub use edit_prediction_types::Direction;
 pub use edit_prediction_types::EditPredictionRequestTrigger;
 pub use editor_settings::{
     CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DiffViewStyle,
@@ -128,6 +127,7 @@ pub use hover_popover::hover_markdown_style;
 pub use inlays::Inlay;
 #[cfg(feature = "workspace-integration")]
 pub use items::MAX_TAB_TITLE_LEN;
+pub use language::Direction;
 pub use linked_editing_ranges::LinkedEdits;
 pub use lsp::CompletionContext;
 pub use lsp_ext::lsp_tasks;
@@ -190,10 +190,11 @@ use itertools::{Either, Itertools};
 use language::{
     AutoindentMode, BlockCommentConfig, BracketMatch, BracketPair, Buffer, BufferRow,
     BufferSnapshot, Capability, CharClassifier, CharKind, CharScopeContext, CodeLabel, CursorShape,
-    DiagnosticEntryRef, DiffOptions, EditPredictionsMode, EditPreview, HighlightedText, IndentKind,
-    IndentSize, Language, LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope,
-    LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
-    TransactionId, TreeSitterOptions, WordsQuery,
+    DiagnosticEntryRef, DiagnosticSeverity, DiffOptions, EditPredictionsMode, EditPreview,
+    GoToDiagnosticSeverityFilter, HighlightedText, IndentKind, IndentSize, InlayId, Language,
+    LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope, LocalFile, OffsetRangeExt,
+    OutlineItem, Point, Selection, SelectionGoal, TextObject, TransactionId, TreeSitterOptions,
+    WordsQuery,
     language_settings::{
         self, AllLanguageSettings, LanguageSettings, LspInsertMode, RewrapBehavior,
         WordsCompletionMode, all_language_settings,
@@ -217,7 +218,7 @@ use parking_lot::Mutex;
 use persistence::EditorDb;
 use project::{
     BreakpointWithPosition, CodeAction, Completion, CompletionDisplayOptions, CompletionIntent,
-    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint, InlayId,
+    CompletionResponse, CompletionSource, DisableAiSettings, DocumentHighlight, InlayHint,
     InvalidationStrategy, Location, LocationLink, LspAction, PrepareRenameResponse, Project,
     ProjectItem, ProjectPath, ProjectTransaction,
     bookmark_store::BookmarkStore,
@@ -233,7 +234,7 @@ use project::{
         BufferSemanticTokens, CacheInlayHints, CompletionDocumentation, FormatTrigger,
         LspFormatTarget, OpenLspBufferHandle,
     },
-    project_settings::{DiagnosticSeverity, GoToDiagnosticSeverityFilter, ProjectSettings},
+    project_settings::ProjectSettings,
 };
 use rand::seq::SliceRandom;
 use regex::Regex;
@@ -1010,6 +1011,7 @@ pub struct Editor {
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     hard_wrap: Option<usize>,
     project: Option<Entity<Project>>,
+    clipboard_path_resolver: Option<Rc<dyn ClipboardPathResolver>>,
     semantics_provider: Option<Rc<dyn SemanticsProvider>>,
     completion_provider: Option<Rc<dyn CompletionProvider>>,
     collaboration_hub: Option<Box<dyn CollaborationHub>>,
@@ -1942,6 +1944,16 @@ impl Editor {
         Self::new(EditorMode::full(), buffer, project, window, cx)
     }
 
+    /// Creates a full editor over a local buffer without requiring a project.
+    pub fn for_local_buffer(
+        buffer: Entity<Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        Self::new_internal(EditorMode::full(), buffer, None, None, window, cx)
+    }
+
     pub fn for_multibuffer(
         buffer: Entity<MultiBuffer>,
         project: Option<Entity<Project>>,
@@ -1949,6 +1961,15 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new(EditorMode::full(), buffer, project, window, cx)
+    }
+
+    /// Creates a full editor over a local multi-buffer without requiring a project.
+    pub fn for_local_multibuffer(
+        buffer: Entity<MultiBuffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_internal(EditorMode::full(), buffer, None, None, window, cx)
     }
 
     pub fn clone(&self, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1981,6 +2002,7 @@ impl Editor {
         clone.needs_initial_data_update = self.enable_lsp_data;
         clone.enable_runnables = self.enable_runnables;
         clone.enable_code_lens = self.enable_code_lens;
+        clone.clipboard_path_resolver = self.clipboard_path_resolver.clone();
         clone
     }
 
@@ -2434,6 +2456,9 @@ impl Editor {
                 .as_ref()
                 .map(|project| Rc::new(project.downgrade()) as _),
             collaboration_hub: project.clone().map(|project| Box::new(project) as _),
+            clipboard_path_resolver: project
+                .clone()
+                .map(|project| Rc::new(project) as Rc<dyn ClipboardPathResolver>),
             project,
             blink_manager: blink_manager.clone(),
             show_local_selections: true,

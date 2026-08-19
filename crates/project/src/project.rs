@@ -153,7 +153,7 @@ pub use worktree::{
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
 pub use fs::*;
-pub use language::Location;
+pub use language::{InlayId, Location};
 #[cfg(any(test, feature = "test-support"))]
 pub use prettier::FORMAT_SUFFIX as TEST_PRETTIER_FORMAT_SUFFIX;
 #[cfg(any(test, feature = "test-support"))]
@@ -482,28 +482,6 @@ pub enum PrepareRenameResponse {
     OnlyUnpreparedRenameSupported,
     #[default]
     InvalidPosition,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum InlayId {
-    EditPrediction(usize),
-    DebuggerValue(usize),
-    // LSP
-    Hint(usize),
-    Color(usize),
-    ReplResult(usize),
-}
-
-impl InlayId {
-    pub fn id(&self) -> usize {
-        match self {
-            Self::EditPrediction(id) => *id,
-            Self::DebuggerValue(id) => *id,
-            Self::Hint(id) => *id,
-            Self::Color(id) => *id,
-            Self::ReplResult(id) => *id,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

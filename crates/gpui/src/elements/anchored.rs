@@ -358,6 +358,7 @@ mod tests {
                 let event = gpui::ScrollWheelEvent {
                     position: point(px(400.), px(300.)),
                     delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1000.))),
+                    synthesize_momentum: false,
                     ..Default::default()
                 };
                 window.dispatch_event(PlatformInput::ScrollWheel(event), cx);

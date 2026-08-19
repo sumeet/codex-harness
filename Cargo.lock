@@ -9875,6 +9875,7 @@ dependencies = [
  "rand 0.9.4",
  "regex",
  "rpc",
+ "schemars 1.0.4",
  "semver",
  "serde",
  "serde_json",

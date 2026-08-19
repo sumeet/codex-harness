@@ -1,8 +1,7 @@
 use core::num;
 
 use gpui::App;
-use language::CursorShape;
-use project::project_settings::DiagnosticSeverity;
+use language::{CursorShape, DiagnosticSeverity};
 pub use settings::{
     CodeLens, CompletionDetailAlignment, CompletionMenuItemKind, CurrentLineHighlight, DelayMs,
     DiffViewStyle, DisplayIn, DocumentColorsRenderMode, DoubleClickInMultibuffer,

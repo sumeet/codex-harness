@@ -5625,6 +5625,7 @@ mod tests {
                         &ScrollWheelEvent {
                             position,
                             delta: ScrollDelta::Lines(GpuiPoint::new(0.0, lines as f32)),
+                            synthesize_momentum: false,
                             ..default()
                         },
                         1.0,

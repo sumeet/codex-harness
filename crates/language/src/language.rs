@@ -10,6 +10,7 @@ mod available_languages;
 mod buffer;
 mod diagnostic;
 mod diagnostic_set;
+mod editor_types;
 mod file_content;
 mod language_registry;
 
@@ -104,6 +105,10 @@ pub use buffer::Operation;
 pub use buffer::*;
 pub use diagnostic::{Diagnostic, DiagnosticSourceKind};
 pub use diagnostic_set::{DiagnosticEntry, DiagnosticEntryRef, DiagnosticGroup};
+pub use editor_types::{
+    DiagnosticSeverity, Direction, GoToDiagnosticSeverity, GoToDiagnosticSeverityFilter, InlayId,
+    TokenType,
+};
 pub use file_content::{ByteContent, FILE_ANALYSIS_BYTES, analyze_byte_content};
 pub use language_registry::{
     BinaryStatus, LanguageNotFound, LanguageQueries, LanguageRegistry, QUERY_FILENAME_PREFIXES,

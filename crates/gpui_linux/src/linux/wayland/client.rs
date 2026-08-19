@@ -158,6 +158,7 @@ struct PointerAxisSequence {
 struct PointerAxisDispatch {
     movement: Option<(ScrollDelta, TouchPhase)>,
     ended: bool,
+    synthesize_momentum: bool,
 }
 
 fn finish_pointer_axis_frame(
@@ -205,8 +206,13 @@ fn finish_pointer_axis_frame(
     let ended = had_finger_sequence
         && !frame.stopped_axes.is_empty()
         && sequence.active_finger_axes.is_empty();
+    let synthesize_momentum = source == AxisSource::Finger || had_finger_sequence;
 
-    PointerAxisDispatch { movement, ended }
+    PointerAxisDispatch {
+        movement,
+        ended,
+        synthesize_momentum,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2447,6 +2453,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         delta,
                         modifiers,
                         touch_phase,
+                        synthesize_momentum: dispatch.synthesize_momentum,
                     }));
                 }
                 if dispatch.ended {
@@ -2455,6 +2462,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
                         modifiers,
                         touch_phase: TouchPhase::Ended,
+                        synthesize_momentum: dispatch.synthesize_momentum,
                     }));
                 }
             }
@@ -2981,6 +2989,7 @@ mod tests {
             (point(px(0.), px(12.)), TouchPhase::Started)
         );
         assert!(!started.ended);
+        assert!(started.synthesize_momentum);
 
         // A compositor may omit the optional source on a continuation frame;
         // an already active finger sequence still supplies the safe context.
@@ -2997,6 +3006,7 @@ mod tests {
             (point(px(0.), px(4.)), TouchPhase::Moved)
         );
         assert!(!moved.ended);
+        assert!(moved.synthesize_momentum);
 
         let ended = finish_pointer_axis_frame(
             PointerAxisFrame {
@@ -3007,6 +3017,7 @@ mod tests {
         );
         assert!(ended.movement.is_none());
         assert!(ended.ended);
+        assert!(ended.synthesize_momentum);
         assert!(sequence.active_finger_axes.is_empty());
 
         let source_less_after_end = finish_pointer_axis_frame(
@@ -3019,6 +3030,7 @@ mod tests {
         );
         assert!(source_less_after_end.movement.is_none());
         assert!(!source_less_after_end.ended);
+        assert!(!source_less_after_end.synthesize_momentum);
 
         let restarted = finish_pointer_axis_frame(
             PointerAxisFrame {
@@ -3097,6 +3109,7 @@ mod tests {
         assert_eq!(delta, point(0., 3.));
         assert_eq!(phase, TouchPhase::Moved);
         assert!(!dispatch.ended);
+        assert!(!dispatch.synthesize_momentum);
         assert!(sequence.active_finger_axes.is_empty());
     }
 

@@ -9,6 +9,7 @@ use futures::{
     future::{Shared, join_all},
 };
 use gpui::{App, AppContext, AsyncApp, Context, Entity, ReadGlobal as _, SharedString, Task};
+pub use language::TokenType;
 use language::{Buffer, LanguageName, language_settings::all_language_settings};
 use lsp::{AdapterServerCapabilities, LanguageServerId};
 use rpc::{TypedEnvelope, proto};
@@ -516,9 +517,6 @@ pub type SemanticTokensTask =
 pub struct BufferSemanticTokens {
     pub tokens: Option<HashMap<LanguageServerId, Arc<[BufferSemanticToken]>>>,
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TokenType(pub u32);
 
 #[derive(Debug, Clone)]
 pub struct BufferSemanticToken {

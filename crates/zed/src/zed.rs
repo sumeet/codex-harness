@@ -4863,6 +4863,7 @@ mod tests {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -4891,6 +4892,7 @@ mod tests {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -4910,6 +4912,7 @@ mod tests {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1.))),
             modifiers: event_modifiers,
+            synthesize_momentum: false,
             ..Default::default()
         });
 
@@ -4941,6 +4944,7 @@ mod tests {
             position: mouse_position,
             delta: gpui::ScrollDelta::Pixels(point(px(0.), px(1.))),
             modifiers: event_modifiers,
+            synthesize_momentum: false,
             ..Default::default()
         });
 

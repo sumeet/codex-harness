@@ -98,7 +98,8 @@ use gpui::{
     WeakEntity,
 };
 use language::{
-    LanguageAwareStyling, Point, Subscription as BufferSubscription,
+    DiagnosticSeverity, InlayId, LanguageAwareStyling, Point, Subscription as BufferSubscription,
+    TokenType,
     language_settings::{AllLanguageSettings, LanguageSettings},
 };
 
@@ -106,8 +107,6 @@ use multi_buffer::{
     Anchor, AnchorRangeExt, MultiBuffer, MultiBufferOffset, MultiBufferOffsetUtf16,
     MultiBufferPoint, MultiBufferRow, MultiBufferSnapshot, RowInfo, ToOffset, ToPoint,
 };
-use project::project_settings::DiagnosticSeverity;
-use project::{InlayId, lsp_store::LspFoldingRange, lsp_store::TokenType};
 use serde::Deserialize;
 use settings::Settings;
 use smallvec::SmallVec;
@@ -133,11 +132,21 @@ use std::{
 use crate::{
     EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
 };
+
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
 use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
 use tab_map::{TabPoint, TabPointCursor, TabSnapshot};
 use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
+
+/// A project-neutral folding range consumed by the display map.
+///
+/// LSP integrations translate their response type at the Editor boundary; the
+/// display map itself only needs stable buffer anchors and optional label text.
+pub(super) struct DocumentFoldingRange {
+    pub range: Range<text::Anchor>,
+    pub collapsed_text: Option<SharedString>,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FoldStatus {
@@ -968,7 +977,7 @@ impl DisplayMap {
     pub(super) fn set_lsp_folding_ranges(
         &mut self,
         buffer_id: BufferId,
-        ranges: Vec<LspFoldingRange>,
+        ranges: Vec<DocumentFoldingRange>,
         cx: &mut Context<Self>,
     ) {
         let snapshot = self.buffer.read(cx).snapshot(cx);

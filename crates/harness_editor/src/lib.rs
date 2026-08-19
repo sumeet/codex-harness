@@ -1109,7 +1109,7 @@ impl TranscriptEditor {
         let editor = cx.new({
             let buffer = buffer.clone();
             |cx| {
-                let mut editor = Editor::for_buffer(buffer, None, window, cx);
+                let mut editor = Editor::for_local_buffer(buffer, window, cx);
                 editor.set_read_only(true);
                 editor.set_use_modal_editing(true);
                 editor.set_current_line_highlight(None);
@@ -2476,6 +2476,38 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_and_vim_clipboard_use_project_free_editor_seams() {
+        let transcript_source = include_str!("lib.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("the source guard must inspect production code only");
+        assert!(transcript_source.contains("Editor::for_local_buffer(buffer, window, cx)"));
+        assert!(!transcript_source.contains("Editor::for_buffer(buffer, None, window, cx)"));
+
+        let yank_source = include_str!("../../vim/src/normal/yank.rs");
+        let yank_method = yank_source
+            .split_once("pub(crate) fn copy_ranges")
+            .and_then(|(_, after)| after.split_once("let highlight_duration"))
+            .map(|(method, _)| method)
+            .expect("copy_ranges must build clipboard metadata before highlighting");
+        assert!(yank_method.contains("editor.clipboard_selection("));
+        assert!(!yank_method.contains("editor.project()"));
+
+        let clipboard_source = include_str!("../../editor/src/clipboard.rs");
+        let legacy_constructor = clipboard_source
+            .split_once("pub fn for_buffer(")
+            .and_then(|(_, after)| after.split_once("pub fn for_buffer_with_path_resolver("))
+            .map(|(constructor, _)| constructor)
+            .expect("project-aware clipboard API must wrap the neutral resolver API");
+        assert!(legacy_constructor.contains("project: Option<&Entity<Project>>"));
+        assert!(legacy_constructor.contains("Self::for_buffer_with_path_resolver("));
+
+        let display_map_source = include_str!("../../editor/src/display_map.rs");
+        assert!(!display_map_source.contains("use project::"));
+        assert!(display_map_source.contains("ranges: Vec<DocumentFoldingRange>"));
+    }
 
     #[test]
     fn native_language_profile_parses_without_a_wasm_store() {

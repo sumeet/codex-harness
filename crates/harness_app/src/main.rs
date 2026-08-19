@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cell::Cell,
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     path::Path,
     rc::Rc,
@@ -118,6 +119,7 @@ const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
 const PROGRESSIVE_WEB_MEDIUM_RESULTS: usize = 10;
 const PROGRESSIVE_WEB_LARGE_RESULTS: usize = 50;
+const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 
@@ -259,16 +261,165 @@ struct SearchContextSnippet {
     match_range: Range<usize>,
 }
 
-fn folded_text_with_source_chars(text: &str) -> (String, Vec<usize>) {
-    let mut folded = String::new();
-    let mut source_chars = Vec::new();
-    for (source_char, character) in text.chars().enumerate() {
-        for lowercase in character.to_lowercase() {
-            folded.push(lowercase);
-            source_chars.push(source_char);
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SearchTextRanges {
+    ranges: Vec<Range<usize>>,
+    active: Option<usize>,
+}
+
+struct RichSearchPaint {
+    query: SharedString,
+    active_item: bool,
+    active_claimed: Cell<bool>,
+    remaining_ranges: Cell<usize>,
+}
+
+impl RichSearchPaint {
+    fn new(query: impl Into<SharedString>, active_item: bool) -> Self {
+        Self {
+            query: query.into(),
+            active_item,
+            active_claimed: Cell::new(false),
+            remaining_ranges: Cell::new(RICH_SEARCH_HIGHLIGHT_LIMIT),
         }
     }
-    (folded, source_chars)
+
+    fn ranges_for(&self, text: &str) -> SearchTextRanges {
+        let ranges = folded_match_byte_ranges(text, &self.query, self.remaining_ranges.get());
+        self.decorate_ranges(ranges)
+    }
+
+    fn decorate_ranges(&self, mut ranges: Vec<Range<usize>>) -> SearchTextRanges {
+        let remaining = self.remaining_ranges.get();
+        ranges.truncate(remaining);
+        self.remaining_ranges
+            .set(remaining.saturating_sub(ranges.len()));
+        let active =
+            (self.active_item && !ranges.is_empty() && !self.active_claimed.get()).then(|| {
+                self.active_claimed.set(true);
+                0
+            });
+        SearchTextRanges { ranges, active }
+    }
+}
+
+fn folded_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
+    let folded_query = query
+        .trim()
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect::<Vec<_>>();
+    if folded_query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+
+    // Stream folded characters through KMP instead of materializing a second
+    // copy of a potentially very large transcript fragment. The short source
+    // window maps folded matches back to valid UTF-8 byte boundaries, including
+    // lowercase expansions such as `İ` -> `i` + dot.
+    let mut prefix = vec![0; folded_query.len()];
+    for index in 1..folded_query.len() {
+        let mut candidate = prefix[index - 1];
+        while candidate > 0 && folded_query[index] != folded_query[candidate] {
+            candidate = prefix[candidate - 1];
+        }
+        if folded_query[index] == folded_query[candidate] {
+            candidate += 1;
+        }
+        prefix[index] = candidate;
+    }
+
+    let mut source_window = VecDeque::with_capacity(folded_query.len());
+    let mut matched = 0;
+    let mut ranges = Vec::with_capacity(limit.min(RICH_SEARCH_HIGHLIGHT_LIMIT));
+    'source: for (source_start, character) in text.char_indices() {
+        let source_range = source_start..source_start + character.len_utf8();
+        for folded_character in character.to_lowercase() {
+            while matched > 0 && folded_query[matched] != folded_character {
+                matched = prefix[matched - 1];
+            }
+            if folded_query[matched] == folded_character {
+                matched += 1;
+            }
+
+            source_window.push_back(source_range.clone());
+            if source_window.len() > folded_query.len() {
+                source_window.pop_front();
+            }
+            if matched == folded_query.len() {
+                if let (Some(first), Some(last)) = (source_window.front(), source_window.back()) {
+                    let range = first.start..last.end;
+                    if ranges.last() != Some(&range) {
+                        ranges.push(range);
+                    }
+                }
+                // Preserve the existing non-overlapping substring behavior.
+                matched = 0;
+                source_window.clear();
+                if ranges.len() == limit {
+                    break 'source;
+                }
+            }
+        }
+    }
+
+    ranges
+}
+
+fn compose_search_highlights(
+    base: Vec<(Range<usize>, gpui::HighlightStyle)>,
+    search: &SearchTextRanges,
+    passive_background: gpui::Hsla,
+    active_background: gpui::Hsla,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    let search_highlights = search.ranges.iter().enumerate().map(|(index, range)| {
+        (
+            range.clone(),
+            gpui::HighlightStyle {
+                background_color: Some(if search.active == Some(index) {
+                    active_background
+                } else {
+                    passive_background
+                }),
+                ..Default::default()
+            },
+        )
+    });
+    gpui::combine_highlights(base, search_highlights).collect()
+}
+
+fn markdown_search_autoscroll(
+    search: &SearchTextRanges,
+    generation: Option<u64>,
+    last_generation: Option<u64>,
+) -> Option<(u64, usize)> {
+    generation
+        .filter(|generation| last_generation != Some(*generation))
+        .and_then(|generation| {
+            search
+                .active
+                .and_then(|active| search.ranges.get(active))
+                .map(|range| (generation, range.start))
+        })
+}
+
+fn searchable_styled_text(
+    text: String,
+    base: Vec<(Range<usize>, gpui::HighlightStyle)>,
+    search: Option<&RichSearchPaint>,
+    cx: &App,
+) -> StyledText {
+    let highlights = if let Some(search) = search {
+        compose_search_highlights(
+            base,
+            &search.ranges_for(&text),
+            cx.theme().colors().search_match_background,
+            cx.theme().colors().search_active_match_background,
+        )
+    } else {
+        base
+    };
+    StyledText::new(text).with_highlights(highlights)
 }
 
 fn search_context_snippet(
@@ -286,51 +437,39 @@ fn search_context_snippet(
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let (folded_line, source_chars) = folded_text_with_source_chars(line);
-        let Some(folded_byte_start) = folded_line.find(&folded_query) else {
+        let Some(source_range) = folded_match_byte_ranges(line, &folded_query, 1).pop() else {
             continue;
         };
-        let folded_char_start = folded_line[..folded_byte_start].chars().count();
-        let folded_char_len = folded_query.chars().count();
-        let Some(source_start) = source_chars.get(folded_char_start).copied() else {
-            continue;
-        };
-        let Some(source_end) = source_chars
-            .get(folded_char_start + folded_char_len - 1)
-            .map(|source_char| source_char.saturating_add(1))
-        else {
-            continue;
-        };
-        let characters = line.chars().collect::<Vec<_>>();
-
-        let mut context_start = source_start.saturating_sub(max_chars / 3);
-        if source_end > context_start + max_chars {
-            context_start = source_end.saturating_sub(max_chars);
-        }
-        let mut context_end = (context_start + max_chars).min(characters.len());
-        context_start = context_start.min(context_end.saturating_sub(max_chars));
-        context_end = (context_start + max_chars).min(characters.len());
+        let matched = &line[source_range.clone()];
+        let match_chars = matched.chars().count();
+        let context_budget = max_chars.saturating_sub(match_chars);
+        let context_before = context_budget / 3;
+        let mut prefix_chars = line[..source_range.start]
+            .chars()
+            .rev()
+            .take(context_before)
+            .collect::<Vec<_>>();
+        prefix_chars.reverse();
+        let prefix_truncated = line[..source_range.start].chars().count() > prefix_chars.len();
+        let prefix = prefix_chars.into_iter().collect::<String>();
+        let context_after = context_budget.saturating_sub(prefix.chars().count());
+        let suffix = line[source_range.end..]
+            .chars()
+            .take(context_after)
+            .collect::<String>();
+        let suffix_truncated = line[source_range.end..].chars().count() > suffix.chars().count();
 
         let mut text = String::new();
-        if context_start > 0 {
+        if prefix_truncated {
             text.push_str("… ");
         }
         let prefix_bytes = text.len();
-        let visible = characters[context_start..context_end]
-            .iter()
-            .collect::<String>();
-        let match_start_bytes = characters[context_start..source_start]
-            .iter()
-            .collect::<String>()
-            .len();
-        let match_bytes = characters[source_start..source_end]
-            .iter()
-            .collect::<String>()
-            .len();
-        text.push_str(&visible);
-        let match_range =
-            prefix_bytes + match_start_bytes..prefix_bytes + match_start_bytes + match_bytes;
-        if context_end < characters.len() {
+        text.push_str(&prefix);
+        let match_start = prefix_bytes + prefix.len();
+        text.push_str(matched);
+        let match_range = match_start..match_start + matched.len();
+        text.push_str(&suffix);
+        if suffix_truncated {
             text.push_str(" …");
         }
         return Some(SearchContextSnippet { text, match_range });
@@ -339,9 +478,67 @@ fn search_context_snippet(
     None
 }
 
+fn item_search_context_snippet(
+    item: &TranscriptItem,
+    query: &str,
+    max_chars: usize,
+) -> Option<SearchContextSnippet> {
+    if item.kind == model::TranscriptKind::Web {
+        let semantic_results = web_search_presentation(&item.raw)
+            .results
+            .into_iter()
+            .flat_map(|result| {
+                [Some(result.title), result.url, result.snippet]
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        search_context_snippet(&semantic_results, query, max_chars)
+            .or_else(|| search_context_snippet(&item.content, query, max_chars))
+    } else {
+        search_context_snippet(&item.content, query, max_chars)
+    }
+}
+
+fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
+    !matches!(
+        (item.kind, item.title.as_str()),
+        (model::TranscriptKind::Agent, "Codex") | (model::TranscriptKind::User, "You")
+    )
+}
+
+fn transcript_item_header_title(item: &TranscriptItem) -> &str {
+    item.pending_request
+        .as_ref()
+        .and_then(|request| request_header_title(&request.method))
+        .unwrap_or(&item.title)
+}
+
 fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
-    item.title.to_lowercase().contains(folded_query)
+    (transcript_item_shows_header(item)
+        && transcript_item_header_title(item)
+            .to_lowercase()
+            .contains(folded_query))
         || item.content.to_lowercase().contains(folded_query)
+        || item
+            .display_status()
+            .is_some_and(|status| status.to_lowercase().contains(folded_query))
+        || (item.kind == model::TranscriptKind::Web
+            && web_search_presentation(&item.raw)
+                .results
+                .iter()
+                .any(|result| {
+                    result.title.to_lowercase().contains(folded_query)
+                        || result
+                            .url
+                            .as_deref()
+                            .is_some_and(|url| url.to_lowercase().contains(folded_query))
+                        || result
+                            .snippet
+                            .as_deref()
+                            .is_some_and(|snippet| snippet.to_lowercase().contains(folded_query))
+                }))
 }
 
 fn reconcile_sorted_search_match(matches: &mut Vec<usize>, index: usize, is_match: bool) {
@@ -1245,8 +1442,7 @@ fn rich_search_match_needs_context(item: &TranscriptItem, expansion: OutputExpan
 }
 
 fn folded_contains(text: &str, query: &str) -> bool {
-    let query = query.trim().to_lowercase();
-    !query.is_empty() && folded_text_with_source_chars(text).0.contains(&query)
+    !folded_match_byte_ranges(text, query, 1).is_empty()
 }
 
 /// Whether the active Rich card already paints the matching text. Search
@@ -1257,7 +1453,8 @@ fn rich_search_query_is_visible(
     expansion: OutputExpansion,
     query: &str,
 ) -> bool {
-    if folded_contains(&item.title, query)
+    if (transcript_item_shows_header(item)
+        && folded_contains(transcript_item_header_title(item), query))
         || item
             .display_status()
             .is_some_and(|status| folded_contains(status, query))
@@ -1265,7 +1462,8 @@ fn rich_search_query_is_visible(
         return true;
     }
     if !item.expanded {
-        return false;
+        return item.kind == model::TranscriptKind::Reasoning
+            && folded_contains(&compact_reasoning_preview(&item.content), query);
     }
 
     match item.kind {
@@ -1309,7 +1507,9 @@ fn rich_search_query_is_visible(
                 if remaining_lines == 0 && !presentation.content.is_empty() {
                     break;
                 }
-                if folded_contains(&presentation.operation, query)
+                let (additions, deletions) = file_change_counts(&presentation);
+                if ((additions == 0 && deletions == 0)
+                    && folded_contains(&presentation.operation, query))
                     || folded_contains(&presentation.path, query)
                 {
                     return true;
@@ -1342,6 +1542,21 @@ fn rich_search_query_is_visible(
                 .join("\n"),
             query,
         ),
+        model::TranscriptKind::Web => web_search_presentation(&item.raw)
+            .results
+            .iter()
+            .take(progressive_web_limit(expansion))
+            .any(|result| {
+                folded_contains(&result.title, query)
+                    || result
+                        .url
+                        .as_deref()
+                        .is_some_and(|url| folded_contains(url, query))
+                    || result
+                        .snippet
+                        .as_deref()
+                        .is_some_and(|snippet| folded_contains(snippet, query))
+            }),
         model::TranscriptKind::Tool
         | model::TranscriptKind::Subagent
         | model::TranscriptKind::Review => activity_output_presentation(&item.content, expansion)
@@ -1615,6 +1830,9 @@ struct RequestChoice {
 struct CachedMarkdown {
     source: String,
     entity: Entity<Markdown>,
+    search_query: Option<String>,
+    search_ranges: Vec<Range<usize>>,
+    last_autoscroll_generation: Option<u64>,
 }
 
 struct LiveRequestSurface {
@@ -1718,6 +1936,7 @@ struct HarnessApp {
     search_query: String,
     search_matches: Vec<usize>,
     active_search_match: usize,
+    search_navigation_generation: u64,
     search_returns_to_buffer: bool,
     buffer_search_backwards: bool,
     request_answers: HashMap<String, HashMap<String, Vec<String>>>,
@@ -1853,6 +2072,7 @@ impl HarnessApp {
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
+            search_navigation_generation: 0,
             search_returns_to_buffer: false,
             buffer_search_backwards: false,
             request_answers: HashMap::default(),
@@ -4476,6 +4696,7 @@ impl HarnessApp {
     fn jump_to_search_match(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.search_matches.get(self.active_search_match).copied() {
             self.selected_item = index;
+            self.search_navigation_generation = self.search_navigation_generation.wrapping_add(1);
             self.list_state.pause_following_tail();
             self.list_state.scroll_to_reveal_item(index);
             cx.notify();
@@ -4621,27 +4842,72 @@ impl HarnessApp {
         &mut self,
         key: &str,
         source: &str,
+        search: Option<&RichSearchPaint>,
+        autoscroll_generation: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
-        if let Some(cached) = self.markdown_cache.get_mut(key) {
-            if cached.source != source {
-                cached.source = source.to_string();
-                cached.entity.update(cx, |markdown, cx| {
-                    markdown.reset(source.to_string().into(), cx)
-                });
-            }
-            return cached.entity.clone();
+        let cached = self
+            .markdown_cache
+            .entry(key.to_string())
+            .or_insert_with(|| {
+                let entity = cx.new(|cx| Markdown::new(source.to_string().into(), None, None, cx));
+                CachedMarkdown {
+                    source: source.to_string(),
+                    entity,
+                    search_query: None,
+                    search_ranges: Vec::new(),
+                    last_autoscroll_generation: None,
+                }
+            });
+        if cached.source != source {
+            cached.source = source.to_string();
+            cached.search_query = None;
+            cached.search_ranges.clear();
+            cached.last_autoscroll_generation = None;
+            cached.entity.update(cx, |markdown, cx| {
+                markdown.reset(source.to_string().into(), cx)
+            });
         }
 
-        let entity = cx.new(|cx| Markdown::new(source.to_string().into(), None, None, cx));
-        self.markdown_cache.insert(
-            key.to_string(),
-            CachedMarkdown {
-                source: source.to_string(),
-                entity: entity.clone(),
-            },
+        let desired = if let Some(search) = search {
+            if cached.search_query.as_deref() != Some(search.query.as_ref()) {
+                cached.search_query = Some(search.query.to_string());
+                cached.search_ranges =
+                    folded_match_byte_ranges(source, &search.query, RICH_SEARCH_HIGHLIGHT_LIMIT);
+            }
+            search.decorate_ranges(cached.search_ranges.clone())
+        } else {
+            cached.search_query = None;
+            cached.search_ranges.clear();
+            SearchTextRanges {
+                ranges: Vec::new(),
+                active: None,
+            }
+        };
+        let changed = {
+            let markdown = cached.entity.read(cx);
+            markdown.search_highlights() != desired.ranges
+                || markdown.active_search_highlight() != desired.active
+        };
+        let autoscroll_source = markdown_search_autoscroll(
+            &desired,
+            autoscroll_generation,
+            cached.last_autoscroll_generation,
         );
-        entity
+        if changed || autoscroll_source.is_some() {
+            cached.entity.update(cx, |markdown, cx| {
+                if changed {
+                    markdown.set_search_highlights(desired.ranges, desired.active, cx);
+                }
+                if let Some((_, source_index)) = autoscroll_source {
+                    markdown.request_autoscroll_to_source_index(source_index, cx);
+                }
+            });
+        }
+        if let Some((generation, _)) = autoscroll_source {
+            cached.last_autoscroll_generation = Some(generation);
+        }
+        cached.entity.clone()
     }
 
     fn render_output_toggle(
@@ -4678,6 +4944,7 @@ impl HarnessApp {
     fn render_diff_lines(
         content: &str,
         visible_line_count: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
@@ -4700,6 +4967,8 @@ impl HarnessApp {
                     &mut new_line,
                     index + 1,
                 );
+                let highlighted_line =
+                    searchable_styled_text(line.to_string(), Vec::new(), search, cx);
                 div()
                     .w_full()
                     .min_h(px(22.))
@@ -4749,7 +5018,7 @@ impl HarnessApp {
                                 ),
                             ),
                     )
-                    .child(div().min_w_0().whitespace_nowrap().child(line.to_string()))
+                    .child(div().min_w_0().whitespace_nowrap().child(highlighted_line))
                     .into_any_element()
             })
             .collect()
@@ -4759,6 +5028,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let line_count = item.content.lines().count();
@@ -4777,7 +5047,7 @@ impl HarnessApp {
             STRUCTURED_OUTPUT_PREVIEW_LINES,
             "diff lines",
         );
-        let lines = Self::render_diff_lines(&item.content, visible_line_count, cx);
+        let lines = Self::render_diff_lines(&item.content, visible_line_count, search, cx);
 
         div()
             .id(("diff-scroll", index))
@@ -4795,6 +5065,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -4820,11 +5091,19 @@ impl HarnessApp {
             let visible_lines = remaining_lines.min(presentation.content.lines().count());
             remaining_lines = remaining_lines.saturating_sub(visible_lines);
             let (additions, deletions) = file_change_counts(&presentation);
+            let highlighted_path =
+                searchable_styled_text(presentation.path.clone(), Vec::new(), search, cx);
             let operation_color = match presentation.operation.as_str() {
                 "Added" => Color::Success,
                 "Deleted" => Color::Error,
                 "Modified" | "Moved" => Color::Accent,
                 _ => Color::Muted,
+            };
+            let operation_text_color = match operation_color {
+                Color::Success => cx.theme().status().success,
+                Color::Error => cx.theme().status().error,
+                Color::Accent => colors.text_accent,
+                _ => colors.text_muted,
             };
             sections.push(
                 div()
@@ -4864,7 +5143,7 @@ impl HarnessApp {
                                     .font_buffer(cx)
                                     .text_ui_sm(cx)
                                     .truncate()
-                                    .child(presentation.path),
+                                    .child(highlighted_path),
                             )
                             .child(
                                 div()
@@ -4888,10 +5167,17 @@ impl HarnessApp {
                                         )
                                     })
                                     .when(additions == 0 && deletions == 0, |this| {
+                                        let operation = searchable_styled_text(
+                                            presentation.operation,
+                                            Vec::new(),
+                                            search,
+                                            cx,
+                                        );
                                         this.child(
-                                            Label::new(presentation.operation)
-                                                .size(LabelSize::XSmall)
-                                                .color(operation_color),
+                                            div()
+                                                .text_ui_xs(cx)
+                                                .text_color(operation_text_color)
+                                                .child(operation),
                                         )
                                     }),
                             ),
@@ -4906,6 +5192,7 @@ impl HarnessApp {
                                 .children(Self::render_diff_lines(
                                     &presentation.content,
                                     visible_lines,
+                                    search,
                                     cx,
                                 )),
                         )
@@ -4933,7 +5220,11 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_reasoning(content: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_reasoning(
+        content: &str,
+        search: Option<&RichSearchPaint>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let steps = content
             .lines()
@@ -4954,6 +5245,7 @@ impl HarnessApp {
             .flex_col()
             .gap_2()
             .children(steps.into_iter().map(|step| {
+                let highlighted_step = searchable_styled_text(step, Vec::new(), search, cx);
                 div()
                     .w_full()
                     .flex()
@@ -4969,7 +5261,7 @@ impl HarnessApp {
                             .rounded_full()
                             .bg(colors.text_accent.opacity(0.7)),
                     )
-                    .child(div().min_w_0().flex_1().child(step))
+                    .child(div().min_w_0().flex_1().child(highlighted_step))
             }))
             .into_any_element()
     }
@@ -4979,6 +5271,7 @@ impl HarnessApp {
         content: String,
         item_key: &str,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -4988,6 +5281,7 @@ impl HarnessApp {
             .copied()
             .unwrap_or_default();
         let preview = structured_output_presentation(&content, "output lines", expansion);
+        let highlighted_content = searchable_styled_text(preview.content, Vec::new(), search, cx);
         div()
             .id(("terminal-scroll", index))
             .w_full()
@@ -5000,7 +5294,7 @@ impl HarnessApp {
             .line_height(relative(1.45))
             .text_color(colors.text)
             .whitespace_normal()
-            .child(preview.content)
+            .child(highlighted_content)
             .when_some(preview.toggle, |this, toggle| {
                 this.child(
                     div()
@@ -5018,6 +5312,7 @@ impl HarnessApp {
         content: String,
         item_key: &str,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expansion = self
@@ -5026,7 +5321,7 @@ impl HarnessApp {
             .copied()
             .unwrap_or_default();
         let Some(presentation) = activity_output_presentation(&content, expansion) else {
-            return self.render_terminal(content, item_key, index, cx);
+            return self.render_terminal(content, item_key, index, search, cx);
         };
 
         let colors = cx.theme().colors().clone();
@@ -5044,10 +5339,16 @@ impl HarnessApp {
                         section.heading.as_deref(),
                         Some("Result" | "Structured result" | "Error")
                     );
-                    let body = section.is_json.then(|| {
-                        StyledText::new(section.body.clone())
-                            .with_highlights(json_highlights(&section.body, cx))
+                    let highlighted_heading = section.heading.as_ref().map(|heading| {
+                        searchable_styled_text(heading.clone(), Vec::new(), search, cx)
                     });
+                    let base = if section.is_json {
+                        json_highlights(&section.body, cx)
+                    } else {
+                        Vec::new()
+                    };
+                    let highlighted_body =
+                        searchable_styled_text(section.body.clone(), base, search, cx);
                     div()
                         .w_full()
                         .min_w_0()
@@ -5060,16 +5361,19 @@ impl HarnessApp {
                                 .border_t_1()
                                 .border_color(colors.border_variant)
                         })
-                        .when_some(section.heading, |this, heading| {
-                            this.child(Label::new(heading).size(LabelSize::XSmall).color(
-                                if error {
-                                    Color::Error
-                                } else if primary {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                },
-                            ))
+                        .when_some(highlighted_heading, |this, heading| {
+                            this.child(
+                                div()
+                                    .text_ui_xs(cx)
+                                    .text_color(if error {
+                                        error_color
+                                    } else if primary {
+                                        colors.text
+                                    } else {
+                                        colors.text_muted
+                                    })
+                                    .child(heading),
+                            )
                         })
                         .when(!section.body.is_empty(), |this| {
                             this.child(
@@ -5081,11 +5385,7 @@ impl HarnessApp {
                                     .line_height(relative(1.45))
                                     .text_color(if error { error_color } else { colors.text })
                                     .whitespace_normal()
-                                    .child(
-                                        body.unwrap_or_else(|| {
-                                            StyledText::new(section.body.clone())
-                                        }),
-                                    ),
+                                    .child(highlighted_body),
                             )
                         })
                 },
@@ -5107,10 +5407,11 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(command) = item.command_transcript() else {
-            return self.render_terminal(item.content.clone(), &item.key, index, cx);
+            return self.render_terminal(item.content.clone(), &item.key, index, search, cx);
         };
         let colors = cx.theme().colors().clone();
         let command_text = command.command.trim_end_matches(['\r', '\n']);
@@ -5145,8 +5446,14 @@ impl HarnessApp {
         )
         .content;
         let toggle = command_output_toggle(&command, expansion);
-        let highlighted_command = StyledText::new(displayed_command.clone())
-            .with_highlights(shell_highlights(&displayed_command, cx));
+        let highlighted_command = searchable_styled_text(
+            displayed_command.clone(),
+            shell_highlights(&displayed_command, cx),
+            search,
+            cx,
+        );
+        let highlighted_output =
+            searchable_styled_text(displayed_output.clone(), Vec::new(), search, cx);
 
         div()
             .id(("command-output", index))
@@ -5180,7 +5487,7 @@ impl HarnessApp {
                         .line_height(relative(1.45))
                         .text_color(colors.text)
                         .whitespace_normal()
-                        .child(displayed_output),
+                        .child(highlighted_output),
                 )
             })
             .when_some(toggle, |this, toggle| {
@@ -5200,6 +5507,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         index: usize,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -5221,6 +5529,8 @@ impl HarnessApp {
             .take(visible_result_count)
             .enumerate()
             .map(|(result_index, result)| {
+                let highlighted_title =
+                    searchable_styled_text(result.title, Vec::new(), search, cx);
                 div()
                     .w_full()
                     .min_w_0()
@@ -5251,10 +5561,12 @@ impl HarnessApp {
                                     .min_w_0()
                                     .text_ui_sm(cx)
                                     .when(!expanded, |this| this.truncate())
-                                    .child(result.title),
+                                    .child(highlighted_title),
                             )
                             .when_some(result.url, |this, url| {
                                 let open_url = url.clone();
+                                let highlighted_url =
+                                    searchable_styled_text(url, Vec::new(), search, cx);
                                 this.child(
                                     div()
                                         .id(format!("web-result-url:{item_key}:{result_index}"))
@@ -5265,17 +5577,19 @@ impl HarnessApp {
                                         .when(!expanded, |this| this.truncate())
                                         .hover(|this| this.underline())
                                         .on_click(move |_, _, cx| cx.open_url(&open_url))
-                                        .child(url),
+                                        .child(highlighted_url),
                                 )
                             })
                             .when_some(result.snippet, |this, snippet| {
+                                let highlighted_snippet =
+                                    searchable_styled_text(snippet, Vec::new(), search, cx);
                                 this.child(
                                     div()
                                         .min_w_0()
                                         .text_ui_xs(cx)
                                         .text_color(colors.text_muted)
                                         .when(!expanded, |this| this.truncate())
-                                        .child(snippet),
+                                        .child(highlighted_snippet),
                                 )
                             }),
                     )
@@ -5314,12 +5628,16 @@ impl HarnessApp {
                 )
             })
             .when(total_results == 0, |this| {
-                this.child(self.render_terminal(item.content.clone(), &item.key, index, cx))
+                this.child(self.render_terminal(item.content.clone(), &item.key, index, search, cx))
             })
             .into_any_element()
     }
 
-    fn render_plain_prose(content: &str, cx: &mut Context<Self>) -> AnyElement {
+    fn render_plain_prose(
+        content: &str,
+        search: Option<&RichSearchPaint>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         div()
             .w_full()
             .min_w_0()
@@ -5335,10 +5653,12 @@ impl HarnessApp {
                     .flex()
                     .flex_col()
                     .children(paragraph.lines().map(|line| {
+                        let highlighted_line =
+                            searchable_styled_text(line.to_string(), Vec::new(), search, cx);
                         div()
                             .min_h(px(20.))
                             .whitespace_normal()
-                            .child(line.to_string())
+                            .child(highlighted_line)
                     }))
             }))
             .into_any_element()
@@ -5347,9 +5667,12 @@ impl HarnessApp {
     fn render_image(
         item: &TranscriptItem,
         surface: Option<Entity<ImageSurface>>,
+        search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let highlighted_caption =
+            searchable_styled_text(item.content.clone(), Vec::new(), search, cx);
         let surface_height = surface
             .as_ref()
             .map(|surface| px(surface.read(cx).rows() as f32 * 20.));
@@ -5374,7 +5697,7 @@ impl HarnessApp {
                         .text_ui(cx)
                         .line_height(relative(1.45))
                         .text_color(colors.text_muted)
-                        .child(item.content.clone()),
+                        .child(highlighted_caption),
                 )
             })
             .into_any_element()
@@ -5934,12 +6257,12 @@ impl HarnessApp {
                 | model::TranscriptKind::Plan
         );
         let streaming = item.status.as_deref() == Some("streaming");
-        let markdown = (narrative
-            && item.kind != model::TranscriptKind::Reasoning
-            && item.expanded
-            && !streaming
-            && !item.content.is_empty())
-        .then(|| self.markdown_for(&item.key, &item.content, cx));
+        let search_item_position = self.search_matches.binary_search(&index).ok();
+        let active_search_item = search_item_position == Some(self.active_search_match);
+        let rich_search = (self.search_visible
+            && !self.search_query.trim().is_empty()
+            && search_item_position.is_some())
+        .then(|| RichSearchPaint::new(self.search_query.clone(), active_search_item));
         let icon = icon_for_kind(item.kind);
         let user_input = (legacy_request_controls && has_user_input)
             .then(|| self.render_user_input_request(index, &item, window, cx));
@@ -5984,28 +6307,22 @@ impl HarnessApp {
             .get(&item.key)
             .copied()
             .unwrap_or_default();
-        let header_title = request_method
-            .and_then(request_header_title)
-            .unwrap_or(&item.title)
-            .to_owned();
+        let header_title = transcript_item_header_title(&item).to_owned();
         let has_collapsible_content = !item.content.trim().is_empty();
-        let show_header = !matches!(
-            (item.kind, item.title.as_str()),
-            (model::TranscriptKind::Agent, "Codex") | (model::TranscriptKind::User, "You")
-        );
+        let show_header = transcript_item_shows_header(&item);
         let disclosure_weak = cx.weak_entity();
         let is_disclosure = has_collapsible_content
             && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
-        let active_search_item = self
-            .search_matches
-            .get(self.active_search_match)
-            .is_some_and(|active| *active == index);
+        let raw_search_visible = raw_visible
+            && self.search_visible
+            && folded_contains(&item.raw.to_string(), &self.search_query);
         let search_context = (self.search_visible
             && active_search_item
             && is_disclosure
             && rich_search_match_needs_context(&item, output_expansion)
+            && !raw_search_visible
             && !rich_search_query_is_visible(&item, output_expansion, &self.search_query))
-        .then(|| search_context_snippet(&item.content, &self.search_query, 180))
+        .then(|| item_search_context_snippet(&item, &self.search_query, 180))
         .flatten()
         .map(|snippet| {
             let styled = StyledText::new(snippet.text).with_highlights(vec![(
@@ -6030,6 +6347,12 @@ impl HarnessApp {
                 .child(styled)
                 .into_any_element()
         });
+        let header_search = show_header.then_some(rich_search.as_ref()).flatten();
+        let highlighted_header_title =
+            searchable_styled_text(header_title, Vec::new(), header_search, cx);
+        let highlighted_status = visible_status
+            .as_ref()
+            .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
 
         let header = div()
             .id(("item-header", index))
@@ -6044,21 +6367,35 @@ impl HarnessApp {
                     .color(transcript_icon_color(item.kind, cursor)),
             )
             .child(
-                div().flex_1().min_w_0().truncate().child(
-                    Label::new(header_title)
-                        .size(LabelSize::Small)
-                        .color(if cursor { Color::Default } else { Color::Muted }),
-                ),
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_ui_sm(cx)
+                    .text_color(if cursor {
+                        colors.text
+                    } else {
+                        colors.text_muted
+                    })
+                    .child(highlighted_header_title),
             )
-            .when_some(visible_status, |this, status| {
-                this.child(
-                    div().flex_none().child(
-                        Label::new(status.clone())
-                            .size(LabelSize::XSmall)
-                            .color(transcript_status_color(&status)),
-                    ),
-                )
-            })
+            .when_some(
+                visible_status.zip(highlighted_status),
+                |this, (status, highlighted)| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_ui_xs(cx)
+                            .text_color(match transcript_status_color(&status) {
+                                Color::Error => cx.theme().status().error,
+                                Color::Warning => cx.theme().status().warning,
+                                Color::Accent => colors.text_accent,
+                                _ => colors.text_muted,
+                            })
+                            .child(highlighted),
+                    )
+                },
+            )
             .when(is_disclosure, |this| {
                 this.cursor_pointer()
                     .on_click(move |_, _, cx| {
@@ -6074,6 +6411,22 @@ impl HarnessApp {
                     })
                     .child(Disclosure::new(("item-disclosure", index), item.expanded))
             });
+
+        let markdown = (narrative
+            && item.kind != model::TranscriptKind::Reasoning
+            && item.expanded
+            && !streaming
+            && !item.content.is_empty())
+        .then(|| {
+            self.markdown_for(
+                &item.key,
+                &item.content,
+                rich_search.as_ref(),
+                (active_search_item && self.search_visible)
+                    .then_some(self.search_navigation_generation),
+                cx,
+            )
+        });
 
         let body = if request_method.is_some() || !item.expanded || item.content.is_empty() {
             None
@@ -6091,27 +6444,53 @@ impl HarnessApp {
             Some(match item.kind {
                 model::TranscriptKind::User
                 | model::TranscriptKind::Agent
-                | model::TranscriptKind::Plan => Self::render_plain_prose(&item.content, cx),
-                model::TranscriptKind::Reasoning => Self::render_reasoning(&item.content, cx),
-                model::TranscriptKind::Command => self.render_command(&item, index, cx),
-                model::TranscriptKind::Web => self.render_web_search(&item, index, cx),
-                model::TranscriptKind::Diff => self.render_diff(&item, index, cx),
-                model::TranscriptKind::FileChange => self.render_file_change(&item, index, cx),
-                model::TranscriptKind::Image => {
-                    Self::render_image(&item, self.image_surfaces.get(&item.key).cloned(), cx)
+                | model::TranscriptKind::Plan => {
+                    Self::render_plain_prose(&item.content, rich_search.as_ref(), cx)
                 }
+                model::TranscriptKind::Reasoning => {
+                    Self::render_reasoning(&item.content, rich_search.as_ref(), cx)
+                }
+                model::TranscriptKind::Command => {
+                    self.render_command(&item, index, rich_search.as_ref(), cx)
+                }
+                model::TranscriptKind::Web => {
+                    self.render_web_search(&item, index, rich_search.as_ref(), cx)
+                }
+                model::TranscriptKind::Diff => {
+                    self.render_diff(&item, index, rich_search.as_ref(), cx)
+                }
+                model::TranscriptKind::FileChange => {
+                    self.render_file_change(&item, index, rich_search.as_ref(), cx)
+                }
+                model::TranscriptKind::Image => Self::render_image(
+                    &item,
+                    self.image_surfaces.get(&item.key).cloned(),
+                    rich_search.as_ref(),
+                    cx,
+                ),
                 model::TranscriptKind::Tool
                 | model::TranscriptKind::Subagent
-                | model::TranscriptKind::Review => {
-                    self.render_activity_sections(item.content.clone(), &item.key, index, cx)
-                }
-                _ => self.render_terminal(item.content.clone(), &item.key, index, cx),
+                | model::TranscriptKind::Review => self.render_activity_sections(
+                    item.content.clone(),
+                    &item.key,
+                    index,
+                    rich_search.as_ref(),
+                    cx,
+                ),
+                _ => self.render_terminal(
+                    item.content.clone(),
+                    &item.key,
+                    index,
+                    rich_search.as_ref(),
+                    cx,
+                ),
             })
         };
 
         let raw = raw_visible.then(|| {
             let content =
                 serde_json::to_string_pretty(&item.raw).unwrap_or_else(|_| item.raw.to_string());
+            let highlighted = searchable_styled_text(content, Vec::new(), rich_search.as_ref(), cx);
             div()
                 .mt_2()
                 .rounded_md()
@@ -6122,7 +6501,7 @@ impl HarnessApp {
                 .font_buffer(cx)
                 .text_ui_xs(cx)
                 .text_color(colors.text_muted)
-                .child(content)
+                .child(highlighted)
                 .into_any_element()
         });
 
@@ -6154,12 +6533,14 @@ impl HarnessApp {
                 )
                 .when(show_header, |this| this.child(header))
                 .when_some(reasoning_preview, |this, preview| {
+                    let highlighted =
+                        searchable_styled_text(preview, Vec::new(), rich_search.as_ref(), cx);
                     this.child(
                         div()
                             .pl_6()
                             .text_sm()
                             .text_color(colors.text_muted)
-                            .child(preview),
+                            .child(highlighted),
                     )
                 })
                 .when_some(search_context, |this, context| this.child(context))
@@ -8358,6 +8739,153 @@ mod tests {
             "first\n\nsecond  "
         );
         assert_eq!(command_output_for_display("\n\r\n"), "");
+    }
+
+    #[test]
+    fn rich_search_ranges_map_lowercase_expansion_to_utf8_source_bytes() {
+        let text = "İSTANBUL · café · İ";
+        let dotted_i = folded_match_byte_ranges(text, "i", 8);
+        assert_eq!(dotted_i.len(), 2);
+        assert_eq!(&text[dotted_i[0].clone()], "İ");
+        assert_eq!(&text[dotted_i[1].clone()], "İ");
+        assert!(dotted_i.iter().all(|range| {
+            text.is_char_boundary(range.start) && text.is_char_boundary(range.end)
+        }));
+
+        let accented = folded_match_byte_ranges(text, "CAFÉ", 8);
+        assert_eq!(accented.len(), 1);
+        assert_eq!(&text[accented[0].clone()], "café");
+
+        let fallback = folded_match_byte_ranges("aaab", "aab", 8);
+        assert_eq!(fallback, vec![1..4]);
+    }
+
+    #[test]
+    fn rich_search_range_budget_is_bounded_across_card_fragments() {
+        let paint = RichSearchPaint::new("needle", true);
+        let first = paint.ranges_for(&"needle ".repeat(100));
+        let second = paint.ranges_for(&"needle ".repeat(100));
+
+        assert_eq!(first.ranges.len(), 100);
+        assert_eq!(first.active, Some(0));
+        assert_eq!(second.ranges.len(), RICH_SEARCH_HIGHLIGHT_LIMIT - 100);
+        assert_eq!(second.active, None);
+        assert!(paint.ranges_for("needle").ranges.is_empty());
+        assert_eq!(
+            folded_match_byte_ranges(&"needle ".repeat(100), "needle", 7).len(),
+            7
+        );
+    }
+
+    #[test]
+    fn search_background_composes_with_existing_syntax_color() {
+        let syntax_color = gpui::red();
+        let passive = gpui::yellow();
+        let active = gpui::blue();
+        let composed = compose_search_highlights(
+            vec![(
+                0..6,
+                gpui::HighlightStyle {
+                    color: Some(syntax_color),
+                    ..Default::default()
+                },
+            )],
+            &SearchTextRanges {
+                ranges: vec![1..4, 4..5],
+                active: Some(0),
+            },
+            passive,
+            active,
+        );
+
+        let active_overlap = composed
+            .iter()
+            .find(|(range, _)| range == &(1..4))
+            .map(|(_, style)| *style)
+            .unwrap();
+        assert_eq!(active_overlap.color, Some(syntax_color));
+        assert_eq!(active_overlap.background_color, Some(active));
+        let passive_overlap = composed
+            .iter()
+            .find(|(range, _)| range == &(4..5))
+            .map(|(_, style)| *style)
+            .unwrap();
+        assert_eq!(passive_overlap.color, Some(syntax_color));
+        assert_eq!(passive_overlap.background_color, Some(passive));
+    }
+
+    #[test]
+    fn markdown_search_autoscroll_is_one_shot_per_navigation_generation() {
+        let search = SearchTextRanges {
+            ranges: vec![120..128, 240..248],
+            active: Some(0),
+        };
+        assert_eq!(
+            markdown_search_autoscroll(&search, Some(7), None),
+            Some((7, 120))
+        );
+        assert_eq!(markdown_search_autoscroll(&search, Some(7), Some(7)), None);
+        assert_eq!(
+            markdown_search_autoscroll(&search, Some(8), Some(7)),
+            Some((8, 120))
+        );
+        assert_eq!(
+            markdown_search_autoscroll(
+                &SearchTextRanges {
+                    ranges: search.ranges,
+                    active: None,
+                },
+                Some(9),
+                Some(8),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rich_search_index_and_context_include_semantic_web_fields_and_status() {
+        let item = TranscriptItem {
+            key: "web-search".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Web,
+            title: "Web search".into(),
+            status: Some("waiting for results".into()),
+            content: "Query\nunrelated".into(),
+            raw: json!({
+                "results": [{
+                    "title": "Semantic Needle",
+                    "url": "https://example.com/semantic-needle",
+                    "snippet": "Only projected from raw protocol data"
+                }]
+            }),
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(item_matches_folded_query(&item, "semantic needle"));
+        assert!(item_matches_folded_query(&item, "waiting for results"));
+        let snippet = item_search_context_snippet(&item, "semantic needle", 72).unwrap();
+        assert_eq!(&snippet.text[snippet.match_range], "Semantic Needle");
+    }
+
+    #[test]
+    fn rich_search_index_excludes_default_hidden_speaker_titles() {
+        let item = TranscriptItem {
+            key: "agent-message".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Agent,
+            title: "Codex".into(),
+            status: None,
+            content: "An unrelated answer".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(!item_matches_folded_query(&item, "codex"));
+        assert!(item_matches_folded_query(&item, "unrelated"));
     }
 
     #[test]

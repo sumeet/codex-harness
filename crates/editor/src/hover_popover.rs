@@ -1293,8 +1293,8 @@ mod tests {
     use futures::stream::StreamExt;
     use gpui::App;
     use indoc::indoc;
+    use language::InlayId;
     use markdown::parser::MarkdownEvent;
-    use project::InlayId;
     use settings::InlayHintSettingsContent;
     use settings::{DelayMs, SettingsStore};
     use std::sync::atomic;

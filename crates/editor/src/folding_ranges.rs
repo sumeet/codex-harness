@@ -4,7 +4,7 @@ use language::language_settings::LanguageSettings;
 use text::BufferId;
 use ui::{Context, Window};
 
-use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT};
+use crate::{Editor, LSP_REQUEST_DEBOUNCE_TIMEOUT, display_map::DocumentFoldingRange};
 
 impl Editor {
     pub(super) fn refresh_folding_ranges(
@@ -70,6 +70,13 @@ impl Editor {
                 .update(cx, |editor, cx| {
                     editor.display_map.update(cx, |display_map, cx| {
                         for (buffer_id, ranges) in results {
+                            let ranges = ranges
+                                .into_iter()
+                                .map(|range| DocumentFoldingRange {
+                                    range: range.range,
+                                    collapsed_text: range.collapsed_text,
+                                })
+                                .collect();
                             display_map.set_lsp_folding_ranges(buffer_id, ranges, cx);
                         }
                     });
