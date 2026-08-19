@@ -256,8 +256,8 @@ pub struct TranscriptEditor {
 /// size and line height remain those of the user's buffer settings.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TranscriptTypographyProfile {
-    #[default]
     Buffer,
+    #[default]
     Reading,
 }
 
@@ -359,6 +359,8 @@ struct UserTranscriptRows;
 struct ReasoningTranscriptRows;
 struct StructuredTranscriptRows;
 struct ErrorTranscriptRows;
+struct ReasoningBodyHighlight;
+struct PlanBodyHighlight;
 struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
@@ -1105,7 +1107,13 @@ fn supplemental_block(placement: Anchor, rows: u32, view: AnyView) -> BlockPrope
 
 impl TranscriptEditor {
     pub fn read_only(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Unlike the composer, this Buffer is a mixed semantic document.
+        // Completed narrative bodies are already projected to readable text,
+        // while command/tool bodies intentionally preserve Markdown-looking
+        // output literally. Applying one Markdown grammar to the entire Buffer
+        // would therefore style terminal output as prose markup.
         let buffer = cx.new(|cx| Buffer::local("", cx));
+        let reading_font = font_for_typography_profile(TranscriptTypographyProfile::Reading, cx);
         let editor = cx.new({
             let buffer = buffer.clone();
             |cx| {
@@ -1118,6 +1126,10 @@ impl TranscriptEditor {
                 editor.set_show_horizontal_scrollbar(false, cx);
                 editor.disable_mouse_wheel_zoom();
                 editor.register_addon(TranscriptKeyContextAddon);
+                editor.set_text_style_refinement(typography_refinement(&reading_font));
+                let mut style = editor.style(cx).clone();
+                apply_typography_font(&mut style.text, &reading_font);
+                editor.set_style(style, window, cx);
                 editor
             }
         });
@@ -1147,7 +1159,7 @@ impl TranscriptEditor {
         Self {
             buffer,
             editor,
-            typography_profile: TranscriptTypographyProfile::Buffer,
+            typography_profile: TranscriptTypographyProfile::Reading,
             segments: Vec::new(),
             segment_header_texts: Vec::new(),
             model_item_count: 0,
@@ -1703,6 +1715,21 @@ impl TranscriptEditor {
             .then(|| self.segments[row_segment_range].to_vec())
             .unwrap_or_default();
         let row_byte_range = desired.byte_range.clone();
+        let body_highlights = rebuild_rows.then(|| {
+            let mut reasoning = Vec::new();
+            let mut plans = Vec::new();
+            for segment in &row_segments {
+                let Some(range) = intersect_ranges(&segment.body_range, &row_byte_range) else {
+                    continue;
+                };
+                match segment.kind {
+                    TranscriptKind::Reasoning => reasoning.push(range),
+                    TranscriptKind::Plan => plans.push(range),
+                    _ => {}
+                }
+            }
+            (reasoning, plans)
+        });
         let diff_highlights = rebuild_diff_highlights.then(|| {
             let body_ranges = visible_diff_body_ranges(&self.segments, &desired.byte_range);
             let buffer = self.buffer.read(cx);
@@ -1809,6 +1836,39 @@ impl TranscriptEditor {
                             cx,
                         ),
                     }
+                }
+
+                if let Some((reasoning, plans)) = body_highlights {
+                    let anchors = |ranges: Vec<Range<usize>>| {
+                        ranges
+                            .into_iter()
+                            .map(|range| clipped_anchor_range(&snapshot, range))
+                            .collect::<Vec<_>>()
+                    };
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            ReasoningBodyHighlight,
+                        >()),
+                        anchors(reasoning),
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_muted),
+                            font_style: Some(gpui::FontStyle::Italic),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            PlanBodyHighlight,
+                        >()),
+                        anchors(plans),
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_accent),
+                            font_weight: Some(FontWeight::BOLD),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
                 }
             }
 
@@ -1970,6 +2030,8 @@ impl TranscriptEditor {
                 editor.clear_row_highlights::<ErrorTranscriptRows>();
                 for key in [
                     NavigationOverlayKey::unique::<TranscriptHeaderHighlight>(),
+                    NavigationOverlayKey::unique::<ReasoningBodyHighlight>(),
+                    NavigationOverlayKey::unique::<PlanBodyHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
                     NavigationOverlayKey::unique::<DiffHunkHighlight>(),
                     NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
@@ -2521,6 +2583,10 @@ mod tests {
 
     #[test]
     fn typography_profile_transition_is_stable_and_idempotent() {
+        assert_eq!(
+            TranscriptTypographyProfile::default(),
+            TranscriptTypographyProfile::Reading
+        );
         assert!(!typography_profile_changed(
             TranscriptTypographyProfile::Buffer,
             TranscriptTypographyProfile::Buffer,
