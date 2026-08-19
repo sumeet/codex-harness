@@ -112,7 +112,7 @@ struct ScrollMomentum {
 
 /// One analytically integrated kinetic-scroll frame.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct KineticScrollStep {
+pub struct KineticScrollStep {
     /// Requested content movement for this frame.
     pub delta: Point<Pixels>,
     /// Whether another frame is required after this one is consumed.
@@ -124,7 +124,7 @@ pub(crate) struct KineticScrollStep {
 /// The state is platform-neutral. Scroll containers opt in only when the
 /// platform event explicitly requests synthesized momentum.
 #[derive(Debug, Default)]
-pub(crate) struct KineticScroll {
+pub struct KineticScroll {
     generation: u64,
     recorder: Option<ScrollVelocityRecorder>,
     momentum: Option<ScrollMomentum>,
@@ -132,26 +132,26 @@ pub(crate) struct KineticScroll {
 
 impl KineticScroll {
     /// Begin a new finger gesture, cancelling any pending momentum callback.
-    pub(crate) fn begin_at(&mut self, now: Instant) {
+    pub fn begin_at(&mut self, now: Instant) {
         self.cancel();
         self.recorder = Some(ScrollVelocityRecorder::new(now));
     }
 
     /// Record content pixels that the scroll container actually consumed.
-    pub(crate) fn record_movement_at(&mut self, delta: Point<Pixels>, now: Instant) {
+    pub fn record_movement_at(&mut self, delta: Point<Pixels>, now: Instant) {
         if let Some(recorder) = self.recorder.as_mut() {
             recorder.record(delta, now);
         }
     }
 
     /// Whether a paired finger gesture is currently recording movement.
-    pub(crate) fn is_recording(&self) -> bool {
+    pub fn is_recording(&self) -> bool {
         self.recorder.is_some()
     }
 
     /// Finish a finger gesture and return the generation to schedule, if its
     /// measured release velocity is sufficient for a fling.
-    pub(crate) fn finish_at(&mut self, now: Instant, tuning: GestureTuning) -> Option<u64> {
+    pub fn finish_at(&mut self, now: Instant, tuning: GestureTuning) -> Option<u64> {
         let recorder = self.recorder.take()?;
         let mut velocity = recorder.release_velocity(now)?;
         let speed = velocity.x.hypot(velocity.y);
@@ -172,7 +172,8 @@ impl KineticScroll {
         Some(self.generation)
     }
 
-    pub(crate) fn frame_at(
+    /// Integrate the next momentum frame for a matching, active generation.
+    pub fn frame_at(
         &mut self,
         generation: u64,
         now: Instant,
@@ -258,11 +259,19 @@ impl KineticScroll {
 }
 
 /// Schedule one kinetic-scroll callback on the next platform frame.
-pub(crate) fn schedule_kinetic_scroll_frame(
+pub fn schedule_kinetic_scroll_frame(
     window: &mut Window,
     callback: impl FnOnce(Instant, &mut Window, &mut App) + 'static,
 ) {
     window.on_next_frame(move |window, cx| callback(cx.background_executor().now(), window, cx));
+}
+
+/// Return the platform's kinetic-scroll tuning, or GPUI's portable defaults.
+pub fn platform_gesture_tuning(cx: &App) -> GestureTuning {
+    cx.platform
+        .gestures()
+        .map(|gestures| gestures.tuning())
+        .unwrap_or_default()
 }
 
 /// Tracks the dominant axis across the events in a scroll gesture.

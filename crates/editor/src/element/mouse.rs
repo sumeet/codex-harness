@@ -7,7 +7,8 @@ use gpui::{
     AnyElement, App, AvailableSpace, ClickEvent, Context, DefiniteLength, DispatchPhase, Element,
     MouseButton, MouseClickEvent, MouseDownEvent, MouseMoveEvent, MousePressureEvent, MouseUpEvent,
     ParentElement, Pixels, PressureStage, ScrollDelta, ScrollWheelEvent, TextStyleRefinement,
-    Window, anchored, deferred, point, px,
+    TouchPhase, WeakEntity, Window, anchored, deferred, platform_gesture_tuning, point, px,
+    schedule_kinetic_scroll_frame,
 };
 use multi_buffer::MultiBufferRow;
 use project::DisableAiSettings;
@@ -25,6 +26,28 @@ use crate::{
     display_map::ToDisplayPoint, editor_settings::DoubleClickInMultibuffer,
     hover_popover::hover_at, mouse_context_menu, scroll::ScrollPixelOffset,
 };
+
+fn editor_event_synthesizes_momentum(event: &ScrollWheelEvent) -> bool {
+    event.synthesize_momentum && matches!(event.delta, ScrollDelta::Pixels(_))
+}
+
+fn schedule_editor_kinetic_scroll(
+    editor: WeakEntity<Editor>,
+    generation: u64,
+    window: &mut Window,
+) {
+    schedule_kinetic_scroll_frame(window, move |now, window, cx| {
+        let tuning = platform_gesture_tuning(cx);
+        let continues = editor
+            .update(cx, |editor, cx| {
+                editor.apply_kinetic_scroll_frame(generation, now, tuning, window, cx)
+            })
+            .unwrap_or(false);
+        if continues {
+            schedule_editor_kinetic_scroll(editor, generation, window);
+        }
+    });
+}
 
 impl EditorElement {
     pub(crate) fn mouse_moved(
@@ -508,15 +531,32 @@ impl EditorElement {
 
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    let synthesize_momentum = editor_event_synthesizes_momentum(event);
+                    let now = cx.background_executor().now();
+                    let tuning = platform_gesture_tuning(cx);
                     if event.is_lifecycle_only() {
-                        if let ScrollDelta::Pixels(mut pixels) = event.delta {
-                            editor.update(cx, |editor, _| {
+                        let generation = editor.update(cx, |editor, _| {
+                            if let ScrollDelta::Pixels(mut pixels) = event.delta {
                                 editor
                                     .scroll_manager
                                     .filter_scroll_delta(&mut pixels, event.touch_phase);
-                            });
+                            }
+                            if event.touch_phase == TouchPhase::Cancelled || !synthesize_momentum {
+                                editor.scroll_manager.cancel_kinetic_scroll();
+                                None
+                            } else if event.touch_phase == TouchPhase::Ended {
+                                editor.scroll_manager.finish_kinetic_scroll(now, tuning)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(generation) = generation {
+                            schedule_editor_kinetic_scroll(editor.downgrade(), generation, window);
                         }
                         return;
+                    }
+                    if event.touch_phase == TouchPhase::Started {
+                        delta = ScrollDelta::default();
                     }
                     delta = delta.coalesce(event.delta);
 
@@ -524,6 +564,9 @@ impl EditorElement {
                         && editor.read(cx).enable_mouse_wheel_zoom
                         && EditorSettings::get_global(cx).mouse_wheel_zoom
                     {
+                        editor.update(cx, |editor, _| {
+                            editor.scroll_manager.cancel_kinetic_scroll();
+                        });
                         let delta_y = match event.delta {
                             ScrollDelta::Pixels(pixels) => pixels.y.into(),
                             ScrollDelta::Lines(lines) => lines.y,
@@ -545,7 +588,28 @@ impl EditorElement {
                             }
                         };
 
-                        editor.update(cx, |editor, cx| {
+                        let generation = editor.update(cx, |editor, cx| {
+                            if event.touch_phase == TouchPhase::Cancelled {
+                                if let ScrollDelta::Pixels(mut pixels) = event.delta {
+                                    editor
+                                        .scroll_manager
+                                        .filter_scroll_delta(&mut pixels, event.touch_phase);
+                                }
+                                editor.scroll_manager.cancel_kinetic_scroll();
+                                return None;
+                            }
+                            if synthesize_momentum {
+                                if event.touch_phase == TouchPhase::Started {
+                                    editor.scroll_manager.begin_kinetic_scroll(now);
+                                } else if event.touch_phase == TouchPhase::Moved
+                                    && !editor.scroll_manager.is_recording_kinetic_scroll()
+                                {
+                                    editor.scroll_manager.cancel_kinetic_scroll();
+                                }
+                            } else {
+                                editor.scroll_manager.cancel_kinetic_scroll();
+                            }
+
                             let line_height = position_map.line_height;
                             let glyph_width = position_map.em_layout_width;
                             let delta = match delta {
@@ -580,11 +644,47 @@ impl EditorElement {
                                 scroll_position.y = current_scroll_position.y;
                             }
 
-                            if scroll_position != current_scroll_position {
-                                editor.scroll(scroll_position, window, cx);
+                            let consumed = if scroll_position != current_scroll_position {
+                                let consumed_scroll_offset = editor
+                                    .set_scroll_position_from_physical_input(
+                                        scroll_position,
+                                        window,
+                                        cx,
+                                    );
+                                point(
+                                    px((consumed_scroll_offset.x
+                                        * ScrollPixelOffset::from(glyph_width))
+                                        as f32),
+                                    px((consumed_scroll_offset.y
+                                        * ScrollPixelOffset::from(line_height))
+                                        as f32),
+                                )
+                            } else {
+                                gpui::Point::default()
+                            };
+                            if consumed != gpui::Point::default() {
                                 cx.stop_propagation();
                             }
+                            if synthesize_momentum {
+                                if consumed == gpui::Point::default() {
+                                    editor.scroll_manager.cancel_kinetic_scroll();
+                                } else {
+                                    editor
+                                        .scroll_manager
+                                        .record_kinetic_scroll_movement(consumed, now);
+                                }
+                                if event.touch_phase == TouchPhase::Ended {
+                                    editor.scroll_manager.finish_kinetic_scroll(now, tuning)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
                         });
+                        if let Some(generation) = generation {
+                            schedule_editor_kinetic_scroll(editor.downgrade(), generation, window);
+                        }
                     }
                 }
             }
@@ -1204,6 +1304,196 @@ mod tests {
         test::editor_test_context::EditorTestContext,
     };
     use gpui::{Modifiers, TestAppContext};
+
+    fn redraw_editor(cx: &mut EditorTestContext) {
+        cx.cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    async fn kinetic_scroll_editor(cx: &mut TestAppContext) -> EditorTestContext {
+        init_test(cx, |_| {});
+        let mut cx = EditorTestContext::new(cx).await;
+        let text = format!(
+            "ˇ{}",
+            (0..300)
+                .map(|row| format!("line {row:03} {}\n", "x".repeat(200)))
+                .collect::<String>()
+        );
+        cx.set_state(&text);
+        redraw_editor(&mut cx);
+        cx
+    }
+
+    fn scroll_hit_position(cx: &mut EditorTestContext) -> gpui::Point<Pixels> {
+        cx.update_editor(|editor, _, _| {
+            editor
+                .last_position_map
+                .as_ref()
+                .expect("editor should have a position map after drawing")
+                .text_hitbox
+                .bounds
+                .center()
+        })
+    }
+
+    fn finger_event(
+        position: gpui::Point<Pixels>,
+        delta_y: f32,
+        touch_phase: TouchPhase,
+    ) -> ScrollWheelEvent {
+        ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta_y))),
+            touch_phase,
+            synthesize_momentum: true,
+            ..Default::default()
+        }
+    }
+
+    fn start_editor_fling(cx: &mut EditorTestContext, position: gpui::Point<Pixels>) {
+        cx.cx
+            .simulate_event(finger_event(position, -10., TouchPhase::Started));
+        cx.cx.executor().advance_clock(Duration::from_millis(10));
+        cx.cx
+            .simulate_event(finger_event(position, -10., TouchPhase::Moved));
+        cx.cx.executor().advance_clock(Duration::from_millis(10));
+        cx.cx
+            .simulate_event(finger_event(position, -10., TouchPhase::Moved));
+        cx.cx
+            .simulate_event(finger_event(position, 0., TouchPhase::Ended));
+    }
+
+    fn advance_editor_frame(cx: &mut EditorTestContext, milliseconds: u64) -> usize {
+        cx.cx
+            .executor()
+            .advance_clock(Duration::from_millis(milliseconds));
+        cx.cx.update(|window, cx| {
+            let _ = window.draw(cx);
+            window.simulate_next_frame(cx)
+        })
+    }
+
+    fn drain_editor_frame_callbacks(cx: &mut EditorTestContext, max_frames: usize) {
+        for _ in 0..max_frames {
+            if advance_editor_frame(cx, 8) == 0 {
+                return;
+            }
+        }
+        panic!("editor frame callbacks did not drain within {max_frames} frames");
+    }
+
+    #[test]
+    fn editor_momentum_requires_an_explicit_precise_source() {
+        let precise_finger = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let line_wheel = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let native_momentum = ScrollWheelEvent {
+            delta: ScrollDelta::Pixels(point(px(0.), px(1.))),
+            synthesize_momentum: false,
+            ..Default::default()
+        };
+
+        assert!(editor_event_synthesizes_momentum(&precise_finger));
+        assert!(!editor_event_synthesizes_momentum(&line_wheel));
+        assert!(!editor_event_synthesizes_momentum(&native_momentum));
+    }
+
+    #[gpui::test]
+    async fn editor_finger_release_continues_on_compositor_frame(cx: &mut TestAppContext) {
+        let mut cx = kinetic_scroll_editor(cx).await;
+        let position = scroll_hit_position(&mut cx);
+        start_editor_fling(&mut cx, position);
+
+        let released_at = cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y);
+        assert!(released_at > 0.);
+        // A full Editor may have cursor or decoration callbacks in the same
+        // global window queue; kinetic scrolling only requires frame demand.
+        assert!(advance_editor_frame(&mut cx, 8) >= 1);
+        let after_frame = cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y);
+        assert!(after_frame > released_at);
+    }
+
+    #[gpui::test]
+    async fn editor_kinetic_scroll_stops_at_bounds_and_drains(cx: &mut TestAppContext) {
+        let mut cx = kinetic_scroll_editor(cx).await;
+        let max_y = cx.update_editor(|editor, _, _| {
+            editor
+                .last_position_map
+                .as_ref()
+                .expect("editor should have a position map")
+                .scroll_max
+                .y
+        });
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(point(0., (max_y - 2.).max(0.)), window, cx);
+        });
+        redraw_editor(&mut cx);
+
+        let position = scroll_hit_position(&mut cx);
+        start_editor_fling(&mut cx, position);
+        let mut frames = 0;
+        while frames < 32 && advance_editor_frame(&mut cx, 8) != 0 {
+            frames += 1;
+        }
+        assert!(frames > 0, "the release should schedule at least one frame");
+        assert!(frames < 32, "momentum should stop promptly at the bound");
+        let final_y = cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y);
+        assert!((final_y - max_y).abs() < 0.001);
+        assert_eq!(advance_editor_frame(&mut cx, 8), 0);
+    }
+
+    #[gpui::test]
+    async fn editor_programmatic_scroll_and_line_wheel_leave_no_recurring_callbacks(
+        cx: &mut TestAppContext,
+    ) {
+        let mut cx = kinetic_scroll_editor(cx).await;
+        let position = scroll_hit_position(&mut cx);
+        start_editor_fling(&mut cx, position);
+
+        cx.update_editor(|editor, window, cx| {
+            editor.set_scroll_position(point(0., 0.), window, cx);
+        });
+        // The cancelled kinetic callback may share the queue with Editor-owned
+        // callbacks. The queue must drain promptly and then remain empty.
+        assert!(advance_editor_frame(&mut cx, 8) >= 1);
+        drain_editor_frame_callbacks(&mut cx, 8);
+        assert_eq!(advance_editor_frame(&mut cx, 8), 0);
+
+        cx.cx.simulate_event(ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            touch_phase: TouchPhase::Moved,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+        assert!(cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y) > 0.);
+        drain_editor_frame_callbacks(&mut cx, 8);
+        assert_eq!(advance_editor_frame(&mut cx, 8), 0);
+    }
+
+    #[gpui::test]
+    async fn editor_forbidden_vertical_scroll_never_arms_momentum(cx: &mut TestAppContext) {
+        let mut cx = kinetic_scroll_editor(cx).await;
+        cx.update_editor(|editor, _, _| editor.set_forbid_vertical_scroll(true));
+        let position = scroll_hit_position(&mut cx);
+        start_editor_fling(&mut cx, position);
+
+        assert_eq!(
+            cx.update_editor(|editor, _, cx| editor.scroll_position(cx).y),
+            0.
+        );
+        drain_editor_frame_callbacks(&mut cx, 8);
+        assert_eq!(advance_editor_frame(&mut cx, 8), 0);
+    }
 
     #[gpui::test]
     async fn test_mouse_drag_preserves_pending_sticky_header_autoscroll(cx: &mut TestAppContext) {

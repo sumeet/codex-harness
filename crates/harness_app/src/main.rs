@@ -2026,23 +2026,53 @@ fn composer_available_width(
     viewport_width - if sidebar_visible { SIDEBAR_WIDTH } else { 0. }
 }
 
-fn composer_height(text: &str, available_width: f32) -> f32 {
-    let columns = (((available_width - 48.).max(0.) / 8.).floor() as usize).max(24);
+fn estimated_composer_columns(line: &str, profile: TranscriptTypographyProfile) -> f32 {
+    line.chars()
+        .map(|character| {
+            if character == '\t' {
+                return 4.;
+            }
+            if !character.is_ascii() {
+                return 2.;
+            }
+            if profile == TranscriptTypographyProfile::Buffer {
+                return 1.;
+            }
+            match character {
+                // A small proportional-width model keeps the fixed-height host
+                // conservative for genuinely wide prose without making lines
+                // full of narrow glyphs grow as early as monospace content.
+                'i' | 'l' | 'I' | '!' | '|' | '.' | ',' | ':' | ';' | '\'' | '`' | ' ' => 0.55,
+                'M' | 'W' | '@' | '#' | '%' | '&' => 1.5,
+                _ => 1.,
+            }
+        })
+        .sum()
+}
+
+fn composer_height(text: &str, available_width: f32, profile: TranscriptTypographyProfile) -> f32 {
+    let columns = ((available_width - 48.).max(0.) / 8.).floor().max(24.);
     let visual_rows = if text.is_empty() {
         1
     } else {
         text.split('\n')
-            .map(|line| line.chars().count().max(1).div_ceil(columns))
+            .map(|line| {
+                ((estimated_composer_columns(line, profile) / columns).ceil() as usize).max(1)
+            })
             .sum::<usize>()
             .clamp(1, 8)
     };
     78. + 20. * visual_rows.saturating_sub(1) as f32
 }
 
-fn composer_render_metrics(text: &str, available_width: f32) -> ComposerRenderMetrics {
+fn composer_render_metrics(
+    text: &str,
+    available_width: f32,
+    profile: TranscriptTypographyProfile,
+) -> ComposerRenderMetrics {
     ComposerRenderMetrics {
         empty: text.trim().is_empty(),
-        height: composer_height(text, available_width),
+        height: composer_height(text, available_width, profile),
     }
 }
 
@@ -2175,6 +2205,7 @@ impl HarnessApp {
         let composer_metrics = composer_render_metrics(
             "",
             composer_available_width(f32::from(window.viewport_size().width), true, false),
+            composer.read(cx).typography_profile(),
         );
         let search_editor =
             cx.new(|cx| LocalEditor::plain_single_line("Search transcript…", window, cx));
@@ -2207,7 +2238,11 @@ impl HarnessApp {
                     this.sidebar_open,
                     this.sidebar_user_override,
                 );
-                let next = composer_render_metrics(&text, available_width);
+                let next = composer_render_metrics(
+                    &text,
+                    available_width,
+                    composer.read(cx).typography_profile(),
+                );
                 if composer_edit_requires_root_invalidation(this.composer_metrics, next) {
                     this.composer_metrics = next;
                     cx.notify();
@@ -4192,6 +4227,9 @@ impl HarnessApp {
     ) {
         self.transcript_editor.update(cx, |editor, cx| {
             editor.set_typography_profile(profile, window, cx);
+        });
+        self.composer.update(cx, |composer, cx| {
+            composer.set_typography_profile(profile, window, cx);
         });
         self.show_text_transcript(window, cx);
     }
@@ -7011,6 +7049,7 @@ impl Render for HarnessApp {
                 self.sidebar_open,
                 self.sidebar_user_override,
             ),
+            self.composer.read(cx).typography_profile(),
         );
         self.composer_metrics = composer_metrics;
         let composer_empty = composer_metrics.empty;
@@ -10135,24 +10174,66 @@ mod tests {
 
     #[test]
     fn composer_height_is_compact_grows_with_content_and_stays_bounded() {
-        assert_eq!(composer_height("", 900.), 78.);
-        assert_eq!(composer_height("one line", 900.), 78.);
-        assert!(composer_height("first\nsecond\nthird", 900.) > 78.);
+        let reading = TranscriptTypographyProfile::Reading;
+        assert_eq!(composer_height("", 900., reading), 78.);
+        assert_eq!(composer_height("one line", 900., reading), 78.);
+        assert!(composer_height("first\nsecond\nthird", 900., reading) > 78.);
         assert!(
-            composer_height(&"wrapped ".repeat(200), 320.)
-                > composer_height(&"wrapped ".repeat(20), 900.),
+            composer_height(&"wrapped ".repeat(200), 320., reading)
+                > composer_height(&"wrapped ".repeat(20), 900., reading),
             "narrow, wrapped prompts should receive more editing room"
         );
-        assert_eq!(composer_height(&"line\n".repeat(100), 320.), 218.);
+        assert_eq!(composer_height(&"line\n".repeat(100), 320., reading), 218.);
+    }
+
+    #[test]
+    fn composer_height_accounts_for_reading_and_monospace_glyph_widths() {
+        let narrow = "i".repeat(40);
+        let wide = "W".repeat(40);
+        let unicode = "界".repeat(40);
+
+        assert!(
+            estimated_composer_columns(&wide, TranscriptTypographyProfile::Reading)
+                > estimated_composer_columns(&narrow, TranscriptTypographyProfile::Reading)
+        );
+        assert_eq!(
+            estimated_composer_columns(&wide, TranscriptTypographyProfile::Buffer),
+            estimated_composer_columns(&narrow, TranscriptTypographyProfile::Buffer)
+        );
+        assert!(
+            composer_height(&wide, 320., TranscriptTypographyProfile::Reading)
+                > composer_height(&narrow, 320., TranscriptTypographyProfile::Reading)
+        );
+        assert!(
+            composer_height(&unicode, 320., TranscriptTypographyProfile::Reading)
+                >= composer_height(&wide, 320., TranscriptTypographyProfile::Reading)
+        );
+    }
+
+    #[test]
+    fn one_typography_control_updates_both_persistent_editor_surfaces() {
+        let source = include_str!("main.rs");
+        let method = source
+            .split_once("fn use_transcript_typography(")
+            .and_then(|(_, after)| after.split_once("fn open_command_palette("))
+            .map(|(method, _)| method)
+            .expect("typography orchestration must remain independently auditable");
+
+        assert!(method.contains("self.transcript_editor.update("));
+        assert!(method.contains("self.composer.update("));
+        assert_eq!(method.matches("set_typography_profile(profile").count(), 2);
+        assert!(!method.contains("LocalEditor::modal_composer"));
+        assert!(!method.contains("TranscriptEditor::read_only"));
     }
 
     #[test]
     fn composer_root_invalidation_only_tracks_empty_and_height_bucket_changes() {
-        let empty = composer_render_metrics("", 320.);
-        let first_character = composer_render_metrics("a", 320.);
-        let same_row_edit = composer_render_metrics("a longer same-row prompt", 320.);
-        let wrapped = composer_render_metrics(&"wrapped ".repeat(200), 320.);
-        let cleared = composer_render_metrics("   ", 320.);
+        let profile = TranscriptTypographyProfile::Reading;
+        let empty = composer_render_metrics("", 320., profile);
+        let first_character = composer_render_metrics("a", 320., profile);
+        let same_row_edit = composer_render_metrics("a longer same-row prompt", 320., profile);
+        let wrapped = composer_render_metrics(&"wrapped ".repeat(200), 320., profile);
+        let cleared = composer_render_metrics("   ", 320., profile);
 
         assert!(composer_edit_requires_root_invalidation(
             empty,
