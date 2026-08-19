@@ -191,13 +191,16 @@ impl Editor {
             s.select_ranges(vec![diagnostic.range.start..diagnostic.range.start])
         });
         self.activate_diagnostics(buffer_id, diagnostic, window, cx);
-        self.refresh_edit_prediction(
-            true,
-            false,
-            EditPredictionRequestTrigger::DiagnosticNavigation,
-            window,
-            cx,
-        );
+        #[cfg(feature = "project-integration")]
+        {
+            self.refresh_edit_prediction(
+                true,
+                false,
+                EditPredictionRequestTrigger::DiagnosticNavigation,
+                window,
+                cx,
+            );
+        }
     }
 
     pub fn go_to_diagnostic_in_direction(
@@ -397,9 +400,12 @@ impl Editor {
                 .diagnostic_group(buffer_id, diagnostic.diagnostic.group_id)
                 .collect::<Vec<_>>();
 
+            #[cfg(feature = "project-integration")]
             let language_registry = self
                 .project()
                 .map(|project| project.read(cx).languages().clone());
+            #[cfg(not(feature = "project-integration"))]
+            let language_registry = None;
 
             let blocks = renderer.render_group(
                 diagnostic_group,
@@ -444,6 +450,7 @@ impl Editor {
         }
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn refresh_inline_diagnostics(
         &mut self,
         debounce: bool,
@@ -531,6 +538,7 @@ impl Editor {
         });
     }
 
+    #[cfg(feature = "project-integration")]
     pub(super) fn pull_diagnostics(
         &mut self,
         buffer_id: BufferId,
@@ -572,6 +580,18 @@ impl Editor {
         });
 
         Some(())
+    }
+
+    #[cfg(not(feature = "project-integration"))]
+    pub(super) fn refresh_inline_diagnostics(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.inline_diagnostics_update = Task::ready(());
+        self.inline_diagnostics.clear();
+        cx.notify();
     }
 
     pub(super) fn update_diagnostics_state(

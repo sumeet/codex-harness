@@ -4,13 +4,14 @@ pub(crate) mod scroll_amount;
 
 use crate::WorkspaceId;
 use crate::editor_settings::ScrollBeyondLastLine;
+#[cfg(feature = "project-integration")]
+use crate::hover_popover::hide_hover;
 #[cfg(feature = "workspace-integration")]
 use crate::persistence::EditorDb;
 use crate::{
     Anchor, DisplayPoint, DisplayRow, Editor, EditorEvent, EditorMode, EditorSettings,
     MultiBufferSnapshot, RowExt, SelectionEffects, SizingBehavior, ToPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
-    hover_popover::hide_hover,
 };
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
@@ -897,9 +898,11 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> WasScrolled {
+        #[cfg(feature = "project-integration")]
         hide_hover(self, cx);
         let workspace_id = self.workspace_database_id();
 
+        #[cfg(feature = "project-integration")]
         self.edit_prediction_preview
             .set_previous_scroll_position(None);
 
@@ -934,6 +937,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "project-integration")]
         hide_hover(self, cx);
         let workspace_id = self.workspace_database_id();
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -960,6 +964,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "project-integration")]
         hide_hover(self, cx);
         let workspace_id = self.workspace_database_id();
         let buffer_snapshot = self.buffer().read(cx).snapshot(cx);

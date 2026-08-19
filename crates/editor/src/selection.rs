@@ -1160,6 +1160,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "project-integration")]
         self.hide_context_menu(window, cx);
 
         match phase {
@@ -1616,67 +1617,71 @@ impl Editor {
         }
 
         if local {
-            if let Some((anchor, _)) = buffer.anchor_to_buffer_anchor(new_cursor_position) {
-                self.register_buffer(anchor.buffer_id, cx);
-            }
-
-            let mut context_menu = self.context_menu.borrow_mut();
-            let completion_menu = match context_menu.as_ref() {
-                Some(CodeContextMenu::Completions(menu)) => Some(menu),
-                Some(CodeContextMenu::CodeActions(_)) => {
-                    *context_menu = None;
-                    None
-                }
-                None => None,
-            };
-            let completion_position = completion_menu.map(|menu| menu.initial_position);
-            drop(context_menu);
-
-            if effects.completions
-                && let Some(completion_position) = completion_position
+            #[cfg(feature = "project-integration")]
             {
-                let start_offset = selection_start.to_offset(buffer);
-                let position_matches = start_offset == completion_position.to_offset(buffer);
-                let continue_showing = if let Some((snap, ..)) =
-                    buffer.point_to_buffer_offset(completion_position)
-                    && !snap.capability.editable()
-                {
-                    false
-                } else if position_matches {
-                    if self.snippet_stack.is_empty() {
-                        buffer.char_kind_before(start_offset, Some(CharScopeContext::Completion))
-                            == Some(CharKind::Word)
-                    } else {
-                        // Snippet choices can be shown even when the cursor is in whitespace.
-                        // Dismissing the menu with actions like backspace is handled by
-                        // invalidation regions.
-                        true
-                    }
-                } else {
-                    false
-                };
+                if let Some((anchor, _)) = buffer.anchor_to_buffer_anchor(new_cursor_position) {
+                    self.register_buffer(anchor.buffer_id, cx);
+                }
 
-                if continue_showing {
-                    self.open_or_update_completions_menu(None, None, false, window, cx);
-                } else {
-                    self.hide_context_menu(window, cx);
+                let mut context_menu = self.context_menu.borrow_mut();
+                let completion_menu = match context_menu.as_ref() {
+                    Some(CodeContextMenu::Completions(menu)) => Some(menu),
+                    Some(CodeContextMenu::CodeActions(_)) => {
+                        *context_menu = None;
+                        None
+                    }
+                    None => None,
+                };
+                let completion_position = completion_menu.map(|menu| menu.initial_position);
+                drop(context_menu);
+
+                if effects.completions
+                    && let Some(completion_position) = completion_position
+                {
+                    let start_offset = selection_start.to_offset(buffer);
+                    let position_matches = start_offset == completion_position.to_offset(buffer);
+                    let continue_showing = if let Some((snap, ..)) =
+                        buffer.point_to_buffer_offset(completion_position)
+                        && !snap.capability.editable()
+                    {
+                        false
+                    } else if position_matches {
+                        if self.snippet_stack.is_empty() {
+                            buffer
+                                .char_kind_before(start_offset, Some(CharScopeContext::Completion))
+                                == Some(CharKind::Word)
+                        } else {
+                            // Snippet choices can be shown even when the cursor is in whitespace.
+                            // Dismissing the menu with actions like backspace is handled by
+                            // invalidation regions.
+                            true
+                        }
+                    } else {
+                        false
+                    };
+
+                    if continue_showing {
+                        self.open_or_update_completions_menu(None, None, false, window, cx);
+                    } else {
+                        self.hide_context_menu(window, cx);
+                    }
+                }
+
+                hide_hover(self, cx);
+
+                self.refresh_code_actions_for_selection(window, cx);
+                self.refresh_document_highlights(cx);
+                refresh_linked_ranges(self, window, cx);
+                self.refresh_outline_symbols_at_cursor(cx);
+                self.update_visible_edit_prediction(window, cx);
+                self.hide_blame_popover(true, cx);
+                if self.git_blame_inline_enabled {
+                    self.start_inline_blame_timer(window, cx);
                 }
             }
-
-            hide_hover(self, cx);
-
-            self.refresh_code_actions_for_selection(window, cx);
-            self.refresh_document_highlights(cx);
-            refresh_linked_ranges(self, window, cx);
 
             self.refresh_selected_text_highlights(&display_map, false, window, cx);
             self.refresh_matching_bracket_highlights(&display_map, cx);
-            self.refresh_outline_symbols_at_cursor(cx);
-            self.update_visible_edit_prediction(window, cx);
-            self.hide_blame_popover(true, cx);
-            if self.git_blame_inline_enabled {
-                self.start_inline_blame_timer(window, cx);
-            }
         }
 
         self.blink_manager.update(cx, BlinkManager::pause_blinking);
@@ -1760,8 +1765,11 @@ impl Editor {
 
             self.selections_did_change(true, old_cursor_position, state.effects, window, cx);
 
-            if self.should_open_signature_help_automatically(old_cursor_position, cx) {
-                self.show_signature_help_auto(window, cx);
+            #[cfg(feature = "project-integration")]
+            {
+                if self.should_open_signature_help_automatically(old_cursor_position, cx) {
+                    self.show_signature_help_auto(window, cx);
+                }
             }
         }
     }

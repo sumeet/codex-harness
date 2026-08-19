@@ -11,6 +11,7 @@ impl Editor {
             return;
         }
 
+        #[cfg(feature = "project-integration")]
         if self.mouse_context_menu.is_some() {
             return;
         }
