@@ -108,6 +108,7 @@ mod tests {
         let scroll_event = ScrollWheelEvent {
             delta: ScrollDelta::Lines(point(0., -1.)),
             touch_phase: TouchPhase::Moved,
+            synthesize_momentum: false,
             ..Default::default()
         };
 
@@ -126,6 +127,7 @@ mod tests {
         let scroll_event = ScrollWheelEvent {
             delta: ScrollDelta::Lines(point(0., 1.)),
             touch_phase: TouchPhase::Moved,
+            synthesize_momentum: false,
             ..Default::default()
         };
 

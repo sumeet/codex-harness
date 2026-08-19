@@ -283,6 +283,7 @@ pub(crate) unsafe fn platform_input_from_native(
                     delta,
                     touch_phase: phase,
                     modifiers: read_modifiers(native_event),
+                    synthesize_momentum: false,
                 })
             }),
             NSEventType::NSLeftMouseDragged
