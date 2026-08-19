@@ -515,12 +515,35 @@ fn transcript_item_header_title(item: &TranscriptItem) -> &str {
         .unwrap_or(&item.title)
 }
 
+fn image_protocol_path(raw: &Value) -> Option<&str> {
+    raw.get("path")
+        .or_else(|| raw.get("savedPath"))
+        .and_then(Value::as_str)
+}
+
+fn image_caption_for_display(item: &TranscriptItem) -> Option<&str> {
+    let caption = item.content.trim();
+    (!caption.is_empty()
+        && image_protocol_path(&item.raw).is_none_or(|path| caption != path.trim()))
+    .then_some(caption)
+}
+
+fn transcript_item_searchable_body(item: &TranscriptItem) -> &str {
+    if item.kind == model::TranscriptKind::Image {
+        image_caption_for_display(item).unwrap_or_default()
+    } else {
+        &item.content
+    }
+}
+
 fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
     (transcript_item_shows_header(item)
         && transcript_item_header_title(item)
             .to_lowercase()
             .contains(folded_query))
-        || item.content.to_lowercase().contains(folded_query)
+        || transcript_item_searchable_body(item)
+            .to_lowercase()
+            .contains(folded_query)
         || item
             .display_status()
             .is_some_and(|status| status.to_lowercase().contains(folded_query))
@@ -981,31 +1004,6 @@ fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> u
     }
 }
 
-fn next_line_expansion(
-    current: OutputExpansion,
-    total_lines: usize,
-    preview_limit: usize,
-) -> OutputExpansion {
-    next_useful_output_expansion(current, |candidate| {
-        total_lines <= progressive_line_limit(candidate, preview_limit)
-    })
-}
-
-fn progressive_line_toggle(
-    current: OutputExpansion,
-    total_lines: usize,
-    preview_limit: usize,
-    noun: &str,
-) -> Option<ProgressiveOutputToggle> {
-    (total_lines > preview_limit).then(|| {
-        let next = next_line_expansion(current, total_lines, preview_limit);
-        ProgressiveOutputToggle {
-            label: progressive_output_label(noun, total_lines, 0, preview_limit, usize::MAX, next),
-            next,
-        }
-    })
-}
-
 fn progressive_web_limit(expansion: OutputExpansion) -> usize {
     match expansion {
         OutputExpansion::Preview => WEB_RESULT_PREVIEW_COUNT,
@@ -1047,6 +1045,149 @@ struct FileChangePresentation {
     operation: String,
     path: String,
     content: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DiffFilePresentation {
+    path: String,
+    content: String,
+}
+
+fn normalized_diff_path(path: &str) -> Option<String> {
+    let path = path
+        .trim()
+        .trim_matches('"')
+        .split_once('\t')
+        .map_or(path.trim().trim_matches('"'), |(path, _)| path)
+        .trim_matches('"');
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_string(),
+    )
+}
+
+fn diff_header_path(line: &str) -> Option<String> {
+    let header = line.strip_prefix("diff --git ")?;
+    header
+        .rsplit_once(" b/")
+        .map(|(_, path)| path)
+        .or_else(|| header.rsplit_once(" \"b/").map(|(_, path)| path))
+        .and_then(normalized_diff_path)
+}
+
+fn push_diff_file_presentation(
+    sections: &mut Vec<DiffFilePresentation>,
+    path: Option<String>,
+    lines: &mut Vec<&str>,
+) {
+    if lines.is_empty() && path.is_none() {
+        return;
+    }
+    let inferred_path = lines
+        .iter()
+        .find_map(|line| line.strip_prefix("+++ ").and_then(normalized_diff_path))
+        .or_else(|| {
+            lines
+                .iter()
+                .find_map(|line| line.strip_prefix("--- ").and_then(normalized_diff_path))
+        });
+    sections.push(DiffFilePresentation {
+        path: path.or(inferred_path).unwrap_or_else(|| "Diff".into()),
+        content: lines.join("\n").trim_end().to_string(),
+    });
+    lines.clear();
+}
+
+fn diff_file_presentations(content: &str) -> Vec<DiffFilePresentation> {
+    let mut sections = Vec::new();
+    let mut path = None;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        if line.starts_with("diff --git ") {
+            push_diff_file_presentation(&mut sections, path.take(), &mut lines);
+            path = diff_header_path(line);
+        } else {
+            lines.push(line);
+        }
+    }
+    push_diff_file_presentation(&mut sections, path, &mut lines);
+
+    if sections.is_empty() && !content.trim().is_empty() {
+        sections.push(DiffFilePresentation {
+            path: "Diff".into(),
+            content: content.trim_end().into(),
+        });
+    }
+    sections
+}
+
+fn diff_content_counts(content: &str) -> (usize, usize) {
+    let mut in_hunk = false;
+    content
+        .lines()
+        .map(|line| diff_line_tone(line, &mut in_hunk))
+        .fold((0, 0), |(additions, deletions), tone| match tone {
+            DiffLineTone::Addition => (additions + 1, deletions),
+            DiffLineTone::Deletion => (additions, deletions + 1),
+            _ => (additions, deletions),
+        })
+}
+
+fn aggregate_diff_counts<'a>(contents: impl IntoIterator<Item = &'a str>) -> (usize, usize) {
+    contents.into_iter().map(diff_content_counts).fold(
+        (0, 0),
+        |(total_additions, total_deletions), (additions, deletions)| {
+            (total_additions + additions, total_deletions + deletions)
+        },
+    )
+}
+
+fn fair_line_allocations(line_counts: &[usize], budget: usize) -> Vec<usize> {
+    if budget == usize::MAX {
+        return line_counts.to_vec();
+    }
+    if line_counts.is_empty() || budget == 0 {
+        return vec![0; line_counts.len()];
+    }
+    let mut allocations = vec![0; line_counts.len()];
+    let mut remaining_budget = budget;
+    let share = (budget / line_counts.len()).max(1);
+    for (index, line_count) in line_counts.iter().copied().enumerate() {
+        if remaining_budget == 0 {
+            break;
+        }
+        let added = line_count.min(share).min(remaining_budget);
+        allocations[index] = added;
+        remaining_budget -= added;
+    }
+
+    // Extra detail can safely go to the final visible file: its header is
+    // already ahead of those lines, so this never pushes a later filename out
+    // of the preview the way refilling an earlier huge patch would.
+    if let (Some(allocation), Some(line_count)) =
+        (allocations.last_mut(), line_counts.last().copied())
+    {
+        let added = (line_count - *allocation).min(remaining_budget);
+        *allocation += added;
+    }
+    allocations
+}
+
+fn progressive_file_line_allocations(
+    line_counts: &[usize],
+    expansion: OutputExpansion,
+) -> Vec<usize> {
+    let limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
+    fair_line_allocations(
+        &line_counts.iter().copied().take(limit).collect::<Vec<_>>(),
+        limit,
+    )
 }
 
 fn file_change_summary(line: &str) -> Option<(&str, &str)> {
@@ -1142,6 +1283,47 @@ fn progressive_file_change_toggle(
     Some(ProgressiveOutputToggle { label, next })
 }
 
+fn diff_counts_for_limits(item: &TranscriptItem) -> (usize, usize) {
+    let presentations = diff_file_presentations(&item.content);
+    let detail_lines = presentations
+        .iter()
+        .map(|presentation| presentation.content.lines().count())
+        .sum();
+    (presentations.len(), detail_lines)
+}
+
+fn diff_fits_output_expansion(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
+    let (files, detail_lines) = diff_counts_for_limits(item);
+    let limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
+    files <= limit && detail_lines <= limit
+}
+
+fn next_diff_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
+    next_useful_output_expansion(current, |candidate| {
+        diff_fits_output_expansion(item, candidate)
+    })
+}
+
+fn progressive_diff_toggle(
+    item: &TranscriptItem,
+    current: OutputExpansion,
+) -> Option<ProgressiveOutputToggle> {
+    let (files, detail_lines) = diff_counts_for_limits(item);
+    if files <= STRUCTURED_OUTPUT_PREVIEW_LINES && detail_lines <= STRUCTURED_OUTPUT_PREVIEW_LINES {
+        return None;
+    }
+    let next = next_diff_expansion(item, current);
+    let label = match next {
+        OutputExpansion::Preview => "Collapse to preview".into(),
+        OutputExpansion::Medium | OutputExpansion::Large => format!(
+            "Show up to {} files / diff lines",
+            progressive_line_limit(next, STRUCTURED_OUTPUT_PREVIEW_LINES)
+        ),
+        OutputExpansion::All => format!("Show all {files} files and {detail_lines} diff lines"),
+    };
+    Some(ProgressiveOutputToggle { label, next })
+}
+
 fn file_change_counts(presentation: &FileChangePresentation) -> (usize, usize) {
     let unified = presentation
         .content
@@ -1156,16 +1338,7 @@ fn file_change_counts(presentation: &FileChangePresentation) -> (usize, usize) {
         };
     }
 
-    let mut in_hunk = false;
-    presentation
-        .content
-        .lines()
-        .map(|line| diff_line_tone(line, &mut in_hunk))
-        .fold((0, 0), |(additions, deletions), tone| match tone {
-            DiffLineTone::Addition => (additions + 1, deletions),
-            DiffLineTone::Deletion => (additions, deletions + 1),
-            _ => (additions, deletions),
-        })
+    diff_content_counts(&presentation.content)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1277,9 +1450,7 @@ fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
         model::TranscriptKind::Web => {
             web_search_has_hidden_content(&web_search_presentation(&item.raw))
         }
-        model::TranscriptKind::Diff => {
-            item.content.lines().count() > STRUCTURED_OUTPUT_PREVIEW_LINES
-        }
+        model::TranscriptKind::Diff => !diff_fits_output_expansion(item, OutputExpansion::Preview),
         model::TranscriptKind::FileChange => {
             !file_change_fits_output_expansion(item, OutputExpansion::Preview)
         }
@@ -1357,10 +1528,7 @@ fn output_expansion_reveals_all(item: &TranscriptItem, expansion: OutputExpansio
             expansion != OutputExpansion::Preview
                 && presentation.results.len() <= progressive_web_limit(expansion)
         }
-        model::TranscriptKind::Diff => {
-            item.content.lines().count()
-                <= progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES)
-        }
+        model::TranscriptKind::Diff => diff_fits_output_expansion(item, expansion),
         model::TranscriptKind::FileChange => file_change_fits_output_expansion(item, expansion),
         model::TranscriptKind::Image | model::TranscriptKind::Approval => true,
         model::TranscriptKind::Tool
@@ -1398,11 +1566,7 @@ fn next_item_output_expansion(item: &TranscriptItem, current: OutputExpansion) -
             let presentation = web_search_presentation(&item.raw);
             next_web_expansion(current, presentation.results.len())
         }
-        model::TranscriptKind::Diff => next_line_expansion(
-            current,
-            item.content.lines().count(),
-            STRUCTURED_OUTPUT_PREVIEW_LINES,
-        ),
+        model::TranscriptKind::Diff => next_diff_expansion(item, current),
         model::TranscriptKind::FileChange => next_file_change_expansion(item, current),
         model::TranscriptKind::Image | model::TranscriptKind::Approval => OutputExpansion::Preview,
         model::TranscriptKind::Tool
@@ -1443,6 +1607,13 @@ fn rich_search_match_needs_context(item: &TranscriptItem, expansion: OutputExpan
 
 fn folded_contains(text: &str, query: &str) -> bool {
     !folded_match_byte_ranges(text, query, 1).is_empty()
+}
+
+fn visible_line_prefix_contains(content: &str, visible_lines: usize, query: &str) -> bool {
+    content
+        .lines()
+        .take(visible_lines)
+        .any(|line| folded_contains(line, query))
 }
 
 /// Whether the active Rich card already paints the matching text. Search
@@ -1494,19 +1665,15 @@ fn rich_search_query_is_visible(
             folded_contains(command, query) || folded_contains(output, query)
         }),
         model::TranscriptKind::FileChange => {
-            let mut remaining_lines =
-                progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
-            for presentation in
-                file_change_presentations(&item.content)
-                    .into_iter()
-                    .take(progressive_line_limit(
-                        expansion,
-                        STRUCTURED_OUTPUT_PREVIEW_LINES,
-                    ))
-            {
-                if remaining_lines == 0 && !presentation.content.is_empty() {
-                    break;
-                }
+            let presentations = file_change_presentations(&item.content);
+            let allocations = progressive_file_line_allocations(
+                &presentations
+                    .iter()
+                    .map(|presentation| presentation.content.lines().count())
+                    .collect::<Vec<_>>(),
+                expansion,
+            );
+            for (presentation, visible_lines) in presentations.into_iter().zip(allocations) {
                 let (additions, deletions) = file_change_counts(&presentation);
                 if ((additions == 0 && deletions == 0)
                     && folded_contains(&presentation.operation, query))
@@ -1514,34 +1681,29 @@ fn rich_search_query_is_visible(
                 {
                     return true;
                 }
-                let visible_lines = remaining_lines.min(presentation.content.lines().count());
-                if folded_contains(
-                    &presentation
-                        .content
-                        .lines()
-                        .take(visible_lines)
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    query,
-                ) {
+                if visible_line_prefix_contains(&presentation.content, visible_lines, query) {
                     return true;
                 }
-                remaining_lines = remaining_lines.saturating_sub(visible_lines);
             }
             false
         }
-        model::TranscriptKind::Diff => folded_contains(
-            &item
-                .content
-                .lines()
-                .take(progressive_line_limit(
-                    expansion,
-                    STRUCTURED_OUTPUT_PREVIEW_LINES,
-                ))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            query,
-        ),
+        model::TranscriptKind::Diff => {
+            let presentations = diff_file_presentations(&item.content);
+            let allocations = progressive_file_line_allocations(
+                &presentations
+                    .iter()
+                    .map(|presentation| presentation.content.lines().count())
+                    .collect::<Vec<_>>(),
+                expansion,
+            );
+            presentations
+                .into_iter()
+                .zip(allocations)
+                .any(|(presentation, visible_lines)| {
+                    folded_contains(&presentation.path, query)
+                        || visible_line_prefix_contains(&presentation.content, visible_lines, query)
+                })
+        }
         model::TranscriptKind::Web => web_search_presentation(&item.raw)
             .results
             .iter()
@@ -1577,7 +1739,7 @@ fn rich_search_query_is_visible(
             let visible = structured_output_presentation(&item.content, "output", expansion);
             folded_contains(&visible.content, query)
         }
-        _ => folded_contains(&item.content, query),
+        _ => folded_contains(transcript_item_searchable_body(item), query),
     }
 }
 
@@ -1848,6 +2010,22 @@ fn legacy_request_controls_active(
     request_is_live && !uses_shared_surface && request_is_pending
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ComposerRenderMetrics {
+    empty: bool,
+    height: f32,
+}
+
+fn composer_available_width(
+    viewport_width: f32,
+    sidebar_open: bool,
+    sidebar_user_override: bool,
+) -> f32 {
+    let compact = viewport_width < COMPACT_SIDEBAR_THRESHOLD;
+    let sidebar_visible = sidebar_open && (!compact || sidebar_user_override);
+    viewport_width - if sidebar_visible { SIDEBAR_WIDTH } else { 0. }
+}
+
 fn composer_height(text: &str, available_width: f32) -> f32 {
     let columns = (((available_width - 48.).max(0.) / 8.).floor() as usize).max(24);
     let visual_rows = if text.is_empty() {
@@ -1859,6 +2037,20 @@ fn composer_height(text: &str, available_width: f32) -> f32 {
             .clamp(1, 8)
     };
     78. + 20. * visual_rows.saturating_sub(1) as f32
+}
+
+fn composer_render_metrics(text: &str, available_width: f32) -> ComposerRenderMetrics {
+    ComposerRenderMetrics {
+        empty: text.trim().is_empty(),
+        height: composer_height(text, available_width),
+    }
+}
+
+fn composer_edit_requires_root_invalidation(
+    previous: ComposerRenderMetrics,
+    next: ComposerRenderMetrics,
+) -> bool {
+    previous != next
 }
 
 fn composer_send_blocked(
@@ -1920,6 +2112,7 @@ struct HarnessApp {
     error: Option<SharedString>,
     model: TranscriptModel,
     composer: Entity<LocalEditor>,
+    composer_metrics: ComposerRenderMetrics,
     search_editor: Entity<LocalEditor>,
     transcript_editor: Entity<TranscriptEditor>,
     mode_indicator: Entity<ModeIndicator>,
@@ -1979,6 +2172,10 @@ impl HarnessApp {
     ) -> Self {
         let mode_indicator = cx.new(|cx| ModeIndicator::new(window, cx));
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
+        let composer_metrics = composer_render_metrics(
+            "",
+            composer_available_width(f32::from(window.viewport_size().width), true, false),
+        );
         let search_editor =
             cx.new(|cx| LocalEditor::plain_single_line("Search transcript…", window, cx));
         let transcript_editor = cx.new(|cx| TranscriptEditor::read_only(window, cx));
@@ -2000,8 +2197,24 @@ impl HarnessApp {
             }
         })
         .detach();
-        cx.subscribe(&composer, |_, _, _: &LocalEditorChanged, cx| cx.notify())
-            .detach();
+        cx.subscribe_in(
+            &composer,
+            window,
+            |this, composer, _: &LocalEditorChanged, window, cx| {
+                let text = composer.read(cx).text(cx);
+                let available_width = composer_available_width(
+                    f32::from(window.viewport_size().width),
+                    this.sidebar_open,
+                    this.sidebar_user_override,
+                );
+                let next = composer_render_metrics(&text, available_width);
+                if composer_edit_requires_root_invalidation(this.composer_metrics, next) {
+                    this.composer_metrics = next;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
@@ -2051,6 +2264,7 @@ impl HarnessApp {
             selected_item: model.items.len().saturating_sub(1),
             model,
             composer,
+            composer_metrics,
             search_editor,
             transcript_editor,
             mode_indicator,
@@ -5031,32 +5245,155 @@ impl HarnessApp {
         search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let line_count = item.content.lines().count();
+        let colors = cx.theme().colors().clone();
+        let presentations = diff_file_presentations(&item.content);
+        let file_count = presentations.len();
+        let (total_additions, total_deletions) = aggregate_diff_counts(
+            presentations
+                .iter()
+                .map(|presentation| presentation.content.as_str()),
+        );
         let expansion = self
             .output_expansion
             .get(&item.key)
             .copied()
             .unwrap_or_default();
-        let visible_line_count = line_count.min(progressive_line_limit(
+        let allocations = progressive_file_line_allocations(
+            &presentations
+                .iter()
+                .map(|presentation| presentation.content.lines().count())
+                .collect::<Vec<_>>(),
             expansion,
-            STRUCTURED_OUTPUT_PREVIEW_LINES,
-        ));
-        let toggle = progressive_line_toggle(
-            expansion,
-            line_count,
-            STRUCTURED_OUTPUT_PREVIEW_LINES,
-            "diff lines",
         );
-        let lines = Self::render_diff_lines(&item.content, visible_line_count, search, cx);
+        let toggle = progressive_diff_toggle(item, expansion);
+        let mut sections = Vec::new();
+
+        for (section_index, (presentation, visible_lines)) in
+            presentations.into_iter().zip(allocations).enumerate()
+        {
+            let (additions, deletions) = diff_content_counts(&presentation.content);
+            let highlighted_path =
+                searchable_styled_text(presentation.path, Vec::new(), search, cx);
+            sections.push(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(section_index > 0, |this| {
+                        this.mt_1()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(colors.border_variant)
+                    })
+                    .child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_subheader_background.opacity(0.72))
+                            .child(
+                                Icon::new(IconName::File)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .font_buffer(cx)
+                                    .text_ui_sm(cx)
+                                    .truncate()
+                                    .child(highlighted_path),
+                            )
+                            .when(additions > 0 || deletions > 0, |this| {
+                                this.child(
+                                    DiffStat::new(
+                                        format!("diff-file-stat:{index}:{section_index}"),
+                                        additions,
+                                        deletions,
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(format!(
+                                        "{additions} lines added, {deletions} lines removed"
+                                    )),
+                                )
+                            }),
+                    )
+                    .when(
+                        !presentation.content.is_empty() && visible_lines > 0,
+                        |this| {
+                            this.child(
+                                div()
+                                    .id(format!("diff-file-lines:{index}:{section_index}"))
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_x_scroll()
+                                    .children(Self::render_diff_lines(
+                                        &presentation.content,
+                                        visible_lines,
+                                        search,
+                                        cx,
+                                    )),
+                            )
+                        },
+                    ),
+            );
+        }
 
         div()
-            .id(("diff-scroll", index))
+            .id(("diff-output", index))
             .w_full()
             .min_w_0()
-            .overflow_x_scroll()
-            .children(lines)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .when(file_count > 1, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .child(
+                            Label::new(format!("{file_count} files"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when(total_additions > 0 || total_deletions > 0, |this| {
+                            this.child(
+                                DiffStat::new(
+                                    format!("diff-total-stat:{index}"),
+                                    total_additions,
+                                    total_deletions,
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(format!(
+                                    "{total_additions} total lines added, {total_deletions} total lines removed"
+                                )),
+                            )
+                        }),
+                )
+            })
+            .children(sections)
             .when_some(toggle, |this, toggle| {
-                this.child(Self::render_output_toggle(&item.key, index, toggle, cx))
+                this.child(
+                    div()
+                        .pt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
+                )
             })
             .into_any_element()
     }
@@ -5070,26 +5407,31 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let presentations = file_change_presentations(&item.content);
+        let file_count = presentations.len();
+        let (total_additions, total_deletions) = presentations.iter().map(file_change_counts).fold(
+            (0, 0),
+            |(total_additions, total_deletions), (additions, deletions)| {
+                (total_additions + additions, total_deletions + deletions)
+            },
+        );
         let expansion = self
             .output_expansion
             .get(&item.key)
             .copied()
             .unwrap_or_default();
-        let progressive_limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
-        let mut remaining_lines = progressive_limit;
+        let allocations = progressive_file_line_allocations(
+            &presentations
+                .iter()
+                .map(|presentation| presentation.content.lines().count())
+                .collect::<Vec<_>>(),
+            expansion,
+        );
         let toggle = progressive_file_change_toggle(item, expansion);
         let mut sections = Vec::new();
 
-        for (section_index, presentation) in presentations
-            .into_iter()
-            .take(progressive_limit)
-            .enumerate()
+        for (section_index, (presentation, visible_lines)) in
+            presentations.into_iter().zip(allocations).enumerate()
         {
-            if remaining_lines == 0 && !presentation.content.is_empty() {
-                break;
-            }
-            let visible_lines = remaining_lines.min(presentation.content.lines().count());
-            remaining_lines = remaining_lines.saturating_sub(visible_lines);
             let (additions, deletions) = file_change_counts(&presentation);
             let highlighted_path =
                 searchable_styled_text(presentation.path.clone(), Vec::new(), search, cx);
@@ -5207,6 +5549,37 @@ impl HarnessApp {
             .flex()
             .flex_col()
             .gap_1()
+            .when(file_count > 1, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .child(
+                            Label::new(format!("{file_count} files"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when(total_additions > 0 || total_deletions > 0, |this| {
+                            this.child(
+                                DiffStat::new(
+                                    format!("file-change-total-stat:{index}"),
+                                    total_additions,
+                                    total_deletions,
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(format!(
+                                    "{total_additions} total lines added, {total_deletions} total lines removed"
+                                )),
+                            )
+                        }),
+                )
+            })
             .children(sections)
             .when_some(toggle, |this, toggle| {
                 this.child(
@@ -5671,8 +6044,10 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let highlighted_caption =
-            searchable_styled_text(item.content.clone(), Vec::new(), search, cx);
+        let caption = image_caption_for_display(item).map(ToOwned::to_owned);
+        let highlighted_caption = caption
+            .as_ref()
+            .map(|caption| searchable_styled_text(caption.clone(), Vec::new(), search, cx));
         let surface_height = surface
             .as_ref()
             .map(|surface| px(surface.read(cx).rows() as f32 * 20.));
@@ -5691,7 +6066,7 @@ impl HarnessApp {
                         .child(surface),
                 )
             })
-            .when(!item.content.is_empty(), |this| {
+            .when_some(highlighted_caption, |this, highlighted_caption| {
                 this.child(
                     div()
                         .text_ui(cx)
@@ -6627,17 +7002,25 @@ impl Render for HarnessApp {
         let colors = cx.theme().colors().clone();
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
+        let viewport_width = f32::from(window.viewport_size().width);
         let composer_text = self.composer.read(cx).text(cx);
-        let composer_empty = composer_text.trim().is_empty();
+        let composer_metrics = composer_render_metrics(
+            &composer_text,
+            composer_available_width(
+                viewport_width,
+                self.sidebar_open,
+                self.sidebar_user_override,
+            ),
+        );
+        self.composer_metrics = composer_metrics;
+        let composer_empty = composer_metrics.empty;
         let send_blocked = composer_send_blocked(
             composer_empty,
             self.loading_thread,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         );
-        let available_composer_width = f32::from(window.viewport_size().width)
-            - if sidebar_visible { SIDEBAR_WIDTH } else { 0. };
-        let composer_height = composer_height(&composer_text, available_composer_width);
+        let composer_height = composer_metrics.height;
         let turn_active = self.model.current_turn_id.is_some();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
@@ -8529,6 +8912,171 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_diff_parser_recovers_files_and_per_file_stats() {
+        let presentations = diff_file_presentations(
+            "diff --git a/src/first.rs b/src/first.rs\n\
+             index 111..222 100644\n\
+             --- a/src/first.rs\n\
+             +++ b/src/first.rs\n\
+             @@ -1,2 +1,3 @@\n\
+              context\n\
+             -old\n\
+             +new\n\
+             +another\n\
+             diff --git \"a/docs/name with spaces.md\" \"b/docs/name with spaces.md\"\n\
+             --- \"a/docs/name with spaces.md\"\n\
+             +++ \"b/docs/name with spaces.md\"\n\
+             @@ -4 +4 @@\n\
+             -before\n\
+             +after",
+        );
+
+        assert_eq!(presentations.len(), 2);
+        assert_eq!(presentations[0].path, "src/first.rs");
+        assert_eq!(presentations[1].path, "docs/name with spaces.md");
+        assert_eq!(diff_content_counts(&presentations[0].content), (2, 1));
+        assert_eq!(diff_content_counts(&presentations[1].content), (1, 1));
+        assert_eq!(
+            aggregate_diff_counts(
+                presentations
+                    .iter()
+                    .map(|presentation| presentation.content.as_str())
+            ),
+            (3, 2)
+        );
+    }
+
+    #[test]
+    fn progressive_file_lines_cannot_let_first_huge_patch_starve_later_headers() {
+        let allocations = fair_line_allocations(&[10_000, 2, 10_000], 18);
+        assert_eq!(allocations, vec![6, 2, 10]);
+        assert!(allocations.iter().sum::<usize>() <= 18);
+
+        let metadata_after_huge_patch = fair_line_allocations(&[10_000, 0, 0], 18);
+        assert_eq!(metadata_after_huge_patch, vec![6, 0, 0]);
+        assert_eq!(
+            fair_line_allocations(&[10_000, 2, 10_000], usize::MAX),
+            vec![10_000, 2, 10_000]
+        );
+    }
+
+    #[test]
+    fn aggregate_diff_search_tracks_fairly_visible_file_sections() {
+        let first_lines = std::iter::once("@@ -1 +1 @@".to_string())
+            .chain((0..40).map(|index| format!(" context {index}")))
+            .chain(std::iter::once("+hidden-tail-needle".into()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let content = format!(
+            "diff --git a/src/first.rs b/src/first.rs\n{first_lines}\n\
+             diff --git a/src/later.rs b/src/later.rs\n\
+             @@ -1 +1 @@\n\
+             +visible-later-needle"
+        );
+        let item = TranscriptItem {
+            key: "aggregate-diff".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Diff,
+            title: "Working tree diff".into(),
+            status: None,
+            content,
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "later.rs"
+        ));
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "visible-later-needle"
+        ));
+        assert!(!rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "hidden-tail-needle"
+        ));
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::All,
+            "hidden-tail-needle"
+        ));
+    }
+
+    #[test]
+    fn multi_file_change_search_keeps_later_metadata_and_details_visible() {
+        let first_lines = std::iter::once("@@ -1 +1 @@".to_string())
+            .chain((0..40).map(|index| format!(" context {index}")))
+            .chain(std::iter::once("+hidden-first-tail".into()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = TranscriptItem {
+            key: "multi-file-change".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::FileChange,
+            title: "File changes · 2 files".into(),
+            status: None,
+            content: format!(
+                "Modified · /tmp/first.rs\n{first_lines}\n\n\
+                 Modified · /tmp/later.rs\n\
+                 @@ -1 +1 @@\n\
+                 +visible-later-change"
+            ),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "later.rs"
+        ));
+        assert!(rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "visible-later-change"
+        ));
+        assert!(!rich_search_query_is_visible(
+            &item,
+            OutputExpansion::Preview,
+            "hidden-first-tail"
+        ));
+    }
+
+    #[test]
+    fn exact_image_path_body_is_suppressed_without_hiding_real_caption_text() {
+        let mut item = TranscriptItem {
+            key: "image".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Image,
+            title: "Viewed image · preview.png".into(),
+            status: None,
+            content: "/tmp/preview.png".into(),
+            raw: json!({"path": "/tmp/preview.png"}),
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert_eq!(image_caption_for_display(&item), None);
+        assert!(!item_matches_folded_query(&item, "/tmp/preview.png"));
+
+        item.content = "/tmp/preview.png\n\nRevised prompt\nA detailed scene".into();
+        assert_eq!(
+            image_caption_for_display(&item),
+            Some("/tmp/preview.png\n\nRevised prompt\nA detailed scene")
+        );
+        assert!(item_matches_folded_query(&item, "detailed scene"));
+    }
+
+    #[test]
     fn rich_search_exposes_matches_hidden_by_output_previews() {
         let mut item = TranscriptItem {
             key: "tool-1".into(),
@@ -9509,6 +10057,33 @@ mod tests {
             "narrow, wrapped prompts should receive more editing room"
         );
         assert_eq!(composer_height(&"line\n".repeat(100), 320.), 218.);
+    }
+
+    #[test]
+    fn composer_root_invalidation_only_tracks_empty_and_height_bucket_changes() {
+        let empty = composer_render_metrics("", 320.);
+        let first_character = composer_render_metrics("a", 320.);
+        let same_row_edit = composer_render_metrics("a longer same-row prompt", 320.);
+        let wrapped = composer_render_metrics(&"wrapped ".repeat(200), 320.);
+        let cleared = composer_render_metrics("   ", 320.);
+
+        assert!(composer_edit_requires_root_invalidation(
+            empty,
+            first_character
+        ));
+        assert!(!composer_edit_requires_root_invalidation(
+            first_character,
+            same_row_edit
+        ));
+        assert!(composer_edit_requires_root_invalidation(
+            same_row_edit,
+            wrapped
+        ));
+        assert!(composer_edit_requires_root_invalidation(
+            first_character,
+            cleared
+        ));
+        assert!(!composer_edit_requires_root_invalidation(empty, cleared));
     }
 
     #[test]
