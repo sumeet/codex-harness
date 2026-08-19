@@ -450,7 +450,7 @@ impl Editor {
     }
 
     pub fn request_autoscroll(&mut self, autoscroll: Autoscroll, cx: &mut Context<Self>) {
-        self.scroll_manager.autoscroll_request = Some((autoscroll, true));
+        self.scroll_manager.request_autoscroll(autoscroll, true);
         cx.notify();
     }
 
@@ -459,7 +459,7 @@ impl Editor {
         autoscroll: Autoscroll,
         cx: &mut Context<Self>,
     ) {
-        self.scroll_manager.autoscroll_request = Some((autoscroll, false));
+        self.scroll_manager.request_autoscroll(autoscroll, false);
         cx.notify();
     }
 }

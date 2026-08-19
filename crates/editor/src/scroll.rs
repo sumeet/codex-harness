@@ -15,14 +15,17 @@ use crate::{
 pub use autoscroll::{Autoscroll, AutoscrollStrategy};
 use core::fmt::Debug;
 use gpui::{
-    Along, App, AppContext as _, Axis, Context, Entity, EntityId, OngoingScroll, Pixels, Task,
-    TouchPhase, Window, point,
+    Along, App, AppContext as _, Axis, Context, Entity, EntityId, GestureTuning, KineticScroll,
+    KineticScrollStep, OngoingScroll, Pixels, Task, TouchPhase, Window, point, px,
 };
 use language::language_settings::{AllLanguageSettings, SoftWrap};
 use language::{Bias, Point};
 pub use scroll_amount::ScrollAmount;
 use settings::Settings;
-use std::{cmp::Ordering, time::Duration};
+use std::{
+    cmp::Ordering,
+    time::{Duration, Instant},
+};
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
 #[cfg(feature = "workspace-integration")]
@@ -31,6 +34,13 @@ use workspace::ItemId;
 const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct WasScrolled(pub(crate) bool);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollUpdateOrigin {
+    Programmatic,
+    Physical,
+    Kinetic,
+}
 
 pub type ScrollOffset = f64;
 pub type ScrollPixelOffset = f64;
@@ -149,6 +159,7 @@ pub struct ScrollManager {
     /// Each side separately clamps the x component using its own scroll_max_x when reading from the SharedScrollAnchor.
     scroll_max_x: Option<f64>,
     ongoing: OngoingScroll,
+    kinetic_scroll: KineticScroll,
     /// The second element indicates whether the autoscroll request is local
     /// (true) or remote (false). Local requests are initiated by user actions,
     /// while remote requests come from external sources.
@@ -180,6 +191,7 @@ impl ScrollManager {
             anchor,
             scroll_max_x: None,
             ongoing: OngoingScroll::default(),
+            kinetic_scroll: KineticScroll::default(),
             autoscroll_request: None,
             show_scrollbars: true,
             hide_scrollbar_task: None,
@@ -218,6 +230,7 @@ impl ScrollManager {
             this.display_map_id = Some(my_snapshot.display_map_id);
         });
         self.ongoing = other.ongoing;
+        self.kinetic_scroll.cancel();
     }
 
     pub fn offset(&self, cx: &App) -> gpui::Point<f64> {
@@ -286,10 +299,12 @@ impl ScrollManager {
     }
 
     pub fn set_shared_scroll_anchor(&mut self, entity: Entity<SharedScrollAnchor>) {
+        self.kinetic_scroll.cancel();
         self.anchor = entity;
     }
 
     pub fn unshare_scroll_anchor(&mut self, snapshot: &DisplaySnapshot, cx: &mut Context<Editor>) {
+        self.kinetic_scroll.cancel();
         let scroll_anchor = self.native_anchor(snapshot, cx);
         self.anchor = cx.new(|_| SharedScrollAnchor {
             scroll_anchor,
@@ -303,6 +318,52 @@ impl ScrollManager {
         touch_phase: TouchPhase,
     ) {
         self.ongoing.filter(delta, touch_phase);
+    }
+
+    pub(crate) fn begin_kinetic_scroll(&mut self, now: Instant) {
+        self.kinetic_scroll.begin_at(now);
+    }
+
+    pub(crate) fn cancel_kinetic_scroll(&mut self) {
+        self.kinetic_scroll.cancel();
+    }
+
+    pub(crate) fn is_recording_kinetic_scroll(&self) -> bool {
+        self.kinetic_scroll.is_recording()
+    }
+
+    pub(crate) fn record_kinetic_scroll_movement(
+        &mut self,
+        delta: gpui::Point<Pixels>,
+        now: Instant,
+    ) {
+        self.kinetic_scroll.record_movement_at(delta, now);
+    }
+
+    pub(crate) fn finish_kinetic_scroll(
+        &mut self,
+        now: Instant,
+        tuning: GestureTuning,
+    ) -> Option<u64> {
+        self.kinetic_scroll.finish_at(now, tuning)
+    }
+
+    pub(crate) fn kinetic_scroll_frame(
+        &mut self,
+        generation: u64,
+        now: Instant,
+        tuning: GestureTuning,
+    ) -> Option<KineticScrollStep> {
+        self.kinetic_scroll.frame_at(generation, now, tuning)
+    }
+
+    pub(crate) fn consume_kinetic_scroll_frame(
+        &mut self,
+        generation: u64,
+        requested: gpui::Point<Pixels>,
+        consumed: gpui::Point<Pixels>,
+    ) -> bool {
+        self.kinetic_scroll.consume(generation, requested, consumed)
     }
 
     pub fn scroll_position(
@@ -324,6 +385,7 @@ impl ScrollManager {
         scroll_beyond_last_line: ScrollBeyondLastLine,
         local: bool,
         autoscroll: bool,
+        origin: ScrollUpdateOrigin,
         workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Editor>,
@@ -371,6 +433,7 @@ impl ScrollManager {
             scroll_top_buffer_point.row,
             local,
             autoscroll,
+            origin,
             workspace_id,
             window,
             cx,
@@ -384,10 +447,14 @@ impl ScrollManager {
         top_row: u32,
         local: bool,
         autoscroll: bool,
+        origin: ScrollUpdateOrigin,
         workspace_id: Option<WorkspaceId>,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> WasScrolled {
+        if origin == ScrollUpdateOrigin::Programmatic {
+            self.kinetic_scroll.cancel();
+        }
         let adjusted_anchor = if self.forbid_vertical_scroll {
             let current = self.anchor.read(cx);
             ScrollAnchor {
@@ -470,6 +537,11 @@ impl ScrollManager {
         self.autoscroll_request.is_some()
     }
 
+    pub(crate) fn request_autoscroll(&mut self, request: Autoscroll, local: bool) {
+        self.kinetic_scroll.cancel();
+        self.autoscroll_request = Some((request, local));
+    }
+
     pub fn take_autoscroll_request(&mut self) -> Option<(Autoscroll, bool)> {
         self.autoscroll_request.take()
     }
@@ -502,6 +574,7 @@ impl ScrollManager {
     }
 
     pub fn set_dragged_scroll_thumb_axis(&mut self, axis: Axis, cx: &mut Context<Editor>) {
+        self.kinetic_scroll.cancel();
         self.update_active_scrollbar_state(
             Some(ActiveScrollbarState::new(
                 axis,
@@ -538,6 +611,7 @@ impl ScrollManager {
     }
 
     pub fn set_is_dragging_minimap(&mut self, cx: &mut Context<Editor>) {
+        self.kinetic_scroll.cancel();
         self.update_minimap_thumb_state(Some(ScrollbarThumbState::Dragging), cx);
     }
 
@@ -572,6 +646,7 @@ impl ScrollManager {
     }
 
     pub fn set_forbid_vertical_scroll(&mut self, forbid: bool) {
+        self.kinetic_scroll.cancel();
         self.forbid_vertical_scroll = forbid;
     }
 
@@ -658,7 +733,100 @@ impl Editor {
         }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
         let position = self.scroll_manager.scroll_position(&display_map, cx) + delta.map(f64::from);
-        self.set_scroll_position_taking_display_map(position, true, false, display_map, window, cx);
+        self.set_scroll_position_taking_display_map(
+            position,
+            true,
+            false,
+            ScrollUpdateOrigin::Programmatic,
+            &display_map,
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn set_scroll_position_from_physical_input(
+        &mut self,
+        scroll_position: gpui::Point<ScrollOffset>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Point<ScrollOffset> {
+        let map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let before = self.scroll_manager.scroll_position(&map, cx);
+        self.set_scroll_position_taking_display_map(
+            scroll_position,
+            true,
+            false,
+            ScrollUpdateOrigin::Physical,
+            &map,
+            window,
+            cx,
+        );
+        self.scroll_manager.scroll_position(&map, cx) - before
+    }
+
+    pub(crate) fn apply_kinetic_scroll_frame(
+        &mut self,
+        generation: u64,
+        now: Instant,
+        tuning: GestureTuning,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(step) = self
+            .scroll_manager
+            .kinetic_scroll_frame(generation, now, tuning)
+        else {
+            return false;
+        };
+        let Some(position_map) = self.last_position_map.clone() else {
+            self.scroll_manager.cancel_kinetic_scroll();
+            return false;
+        };
+        let glyph_width = position_map.em_layout_width;
+        let line_height = position_map.line_height;
+        if glyph_width == Pixels::ZERO || line_height == Pixels::ZERO {
+            self.scroll_manager.cancel_kinetic_scroll();
+            return false;
+        }
+
+        let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
+        let current_position = self.scroll_manager.scroll_position(&display_map, cx);
+        let mut requested_position = point(
+            current_position.x
+                + ScrollPixelOffset::from(step.delta.x) / ScrollPixelOffset::from(glyph_width),
+            current_position.y
+                + ScrollPixelOffset::from(step.delta.y) / ScrollPixelOffset::from(line_height),
+        )
+        .clamp(&point(0., 0.), &position_map.scroll_max);
+        if self.scroll_manager.forbid_vertical_scroll() {
+            requested_position.y = current_position.y;
+        }
+
+        self.set_scroll_position_taking_display_map(
+            requested_position,
+            true,
+            false,
+            ScrollUpdateOrigin::Kinetic,
+            &display_map,
+            window,
+            cx,
+        );
+        let actual_position = self.scroll_manager.scroll_position(&display_map, cx);
+        let consumed = point(
+            px(
+                ((actual_position.x - current_position.x) * ScrollPixelOffset::from(glyph_width))
+                    as f32,
+            ),
+            px(
+                ((actual_position.y - current_position.y) * ScrollPixelOffset::from(line_height))
+                    as f32,
+            ),
+        );
+
+        step.continues
+            && self
+                .scroll_manager
+                .consume_kinetic_scroll_frame(generation, step.delta, consumed)
     }
 
     pub fn set_scroll_position(
@@ -710,7 +878,8 @@ impl Editor {
             scroll_position,
             local,
             autoscroll,
-            map,
+            ScrollUpdateOrigin::Programmatic,
+            &map,
             window,
             cx,
         );
@@ -723,7 +892,8 @@ impl Editor {
         scroll_position: gpui::Point<ScrollOffset>,
         local: bool,
         autoscroll: bool,
-        display_map: DisplaySnapshot,
+        origin: ScrollUpdateOrigin,
+        display_map: &DisplaySnapshot,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> WasScrolled {
@@ -734,7 +904,7 @@ impl Editor {
             .set_previous_scroll_position(None);
 
         let adjusted_position = if self.scroll_manager.forbid_vertical_scroll {
-            let current_position = self.scroll_manager.scroll_position(&display_map, cx);
+            let current_position = self.scroll_manager.scroll_position(display_map, cx);
             gpui::Point::new(scroll_position.x, current_position.y)
         } else {
             scroll_position
@@ -742,10 +912,11 @@ impl Editor {
         let scroll_beyond_last_line = self.scroll_beyond_last_line(cx);
         self.scroll_manager.set_scroll_position(
             adjusted_position,
-            &display_map,
+            display_map,
             scroll_beyond_last_line,
             local,
             autoscroll,
+            origin,
             workspace_id,
             window,
             cx,
@@ -776,6 +947,7 @@ impl Editor {
             top_row,
             true,
             false,
+            ScrollUpdateOrigin::Programmatic,
             workspace_id,
             window,
             cx,
@@ -803,6 +975,7 @@ impl Editor {
             top_row,
             false,
             false,
+            ScrollUpdateOrigin::Programmatic,
             workspace_id,
             window,
             cx,
