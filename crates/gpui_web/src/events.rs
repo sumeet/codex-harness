@@ -329,6 +329,7 @@ impl WebWindowInner {
 
             this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                 position,
+                event_time: None,
                 delta,
                 modifiers,
                 touch_phase: TouchPhase::Moved,

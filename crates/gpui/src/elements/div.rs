@@ -3327,7 +3327,9 @@ impl Interactivity {
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let synthesize_momentum = div_event_synthesizes_momentum(event);
-                    let now = cx.background_executor().now();
+                    let now = event
+                        .event_time
+                        .unwrap_or_else(|| cx.background_executor().now());
                     let tuning = div_scroll_tuning(cx);
 
                     if event.touch_phase == TouchPhase::Cancelled {

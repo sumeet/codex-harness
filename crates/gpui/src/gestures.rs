@@ -20,10 +20,9 @@ use crate::{App, Axis, IsZero, Pixels, Point, TouchPhase, Window, point, px};
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 
-const VELOCITY_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
-const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(50);
+const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(200);
 const VELOCITY_MIN_SAMPLE_SPAN: Duration = Duration::from_millis(8);
-const VELOCITY_MAX_SAMPLES: usize = 32;
+const VELOCITY_MAX_SAMPLES: usize = 3;
 const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 const MOMENTUM_MAX_VELOCITY: f32 = 8_000.;
 const MOMENTUM_MAX_DURATION: Duration = Duration::from_secs(3);
@@ -42,8 +41,8 @@ fn kinetic_scroll_diagnostics_enabled() -> bool {
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollMotionSample {
-    at: Instant,
-    position: Point<f32>,
+    interval: Duration,
+    delta: Point<f32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,18 +56,15 @@ struct ScrollRelease {
 #[derive(Debug)]
 struct ScrollVelocityRecorder {
     samples: VecDeque<ScrollMotionSample>,
-    position: Point<f32>,
+    last_sample_at: Instant,
     last_movement_at: Option<Instant>,
 }
 
 impl ScrollVelocityRecorder {
     fn new(started_at: Instant) -> Self {
         Self {
-            samples: VecDeque::from([ScrollMotionSample {
-                at: started_at,
-                position: Point::default(),
-            }]),
-            position: Point::default(),
+            samples: VecDeque::with_capacity(VELOCITY_MAX_SAMPLES),
+            last_sample_at: started_at,
             last_movement_at: None,
         }
     }
@@ -77,49 +73,71 @@ impl ScrollVelocityRecorder {
         if delta.is_zero() {
             return;
         }
-        self.position.x += delta.x.as_f32();
-        self.position.y += delta.y.as_f32();
+        let interval = now.saturating_duration_since(self.last_sample_at);
+        self.last_sample_at = now;
         self.last_movement_at = Some(now);
         if self.samples.len() == VELOCITY_MAX_SAMPLES {
             self.samples.pop_front();
         }
         self.samples.push_back(ScrollMotionSample {
-            at: now,
-            position: self.position,
+            interval,
+            delta: point(delta.x.as_f32(), delta.y.as_f32()),
         });
-        while self.samples.len() > 2
-            && self
-                .samples
-                .front()
-                .is_some_and(|sample| now.duration_since(sample.at) > VELOCITY_SAMPLE_WINDOW)
-        {
-            self.samples.pop_front();
-        }
     }
 
     fn release_velocity(&self, now: Instant) -> Option<ScrollRelease> {
         let last_movement_at = self.last_movement_at?;
-        let release_age = now.duration_since(last_movement_at);
+        let release_age = now.saturating_duration_since(last_movement_at);
         if release_age > VELOCITY_RELEASE_MAX_AGE {
             return None;
         }
-        let last = self.samples.back()?;
-        let first = self
+        let sample_span = self
             .samples
             .iter()
-            .find(|sample| last.at.duration_since(sample.at) <= VELOCITY_SAMPLE_WINDOW)?;
-        let span = last.at.duration_since(first.at);
-        if span < VELOCITY_MIN_SAMPLE_SPAN {
+            .fold(Duration::ZERO, |span, sample| span + sample.interval);
+        if self.samples.len() < 2 || sample_span < VELOCITY_MIN_SAMPLE_SPAN {
             return None;
         }
-        let seconds = span.as_secs_f32();
+
+        // This is the same latest-three-frame linear regression Chromium's
+        // Wayland backend uses (and in turn matches libgestures). Iterating
+        // newest-to-oldest makes each accumulated delta a position at an
+        // increasing time before release; translating every time by the lift
+        // gap does not change the fitted slope. Each interval precedes its
+        // frame, so advance it only after observing that frame. In particular,
+        // the first Started frame may legitimately have a zero interval.
+        let mut time = release_age.as_secs_f32();
+        let mut position = Point::<f32>::default();
+        let mut time_sum = 0.;
+        let mut time_squared_sum = 0.;
+        let mut x_sum = 0.;
+        let mut y_sum = 0.;
+        let mut time_x_sum = 0.;
+        let mut time_y_sum = 0.;
+        for sample in self.samples.iter().rev() {
+            position.x += sample.delta.x;
+            position.y += sample.delta.y;
+            time_sum += time;
+            time_squared_sum += time * time;
+            x_sum += position.x;
+            y_sum += position.y;
+            time_x_sum += time * position.x;
+            time_y_sum += time * position.y;
+            time += sample.interval.as_secs_f32();
+        }
+        let count = self.samples.len() as f32;
+        let determinant = count * time_squared_sum - time_sum * time_sum;
+        if determinant.abs() <= f32::EPSILON {
+            return None;
+        }
+        let inverse_determinant = determinant.recip();
         Some(ScrollRelease {
             velocity: point(
-                (last.position.x - first.position.x) / seconds,
-                (last.position.y - first.position.y) / seconds,
+                (count * time_x_sum - time_sum * x_sum) * inverse_determinant,
+                (count * time_y_sum - time_sum * y_sum) * inverse_determinant,
             ),
             sample_count: self.samples.len(),
-            sample_span: span,
+            sample_span,
             release_age,
         })
     }
@@ -694,7 +712,7 @@ mod tests {
             )
             .expect("fling should produce a frame");
 
-        assert!(step.delta.y > px(10.));
+        assert!(step.delta.y > px(9.) && step.delta.y < px(10.));
         assert!(step.continues);
     }
 
@@ -728,6 +746,94 @@ mod tests {
                 .len(),
             VELOCITY_MAX_SAMPLES
         );
+    }
+
+    #[test]
+    fn release_velocity_uses_only_the_latest_three_source_timed_frames() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        recorder.record(point(px(0.), px(100.)), start);
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(10));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(20));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(30));
+
+        let release = recorder
+            .release_velocity(start + Duration::from_millis(30))
+            .expect("three regularly spaced frames should fit a release velocity");
+        assert_eq!(release.sample_count, 3);
+        assert!((release.velocity.y - 1_000.).abs() < 0.1);
+    }
+
+    #[test]
+    fn release_velocity_does_not_bias_a_short_started_frame() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        recorder.record(point(px(0.), px(10.)), start);
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(10));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(20));
+
+        let release = recorder
+            .release_velocity(start + Duration::from_millis(20))
+            .expect("three source-timed frames should fit a release velocity");
+        assert!((release.velocity.y - 1_000.).abs() < 0.1);
+    }
+
+    #[test]
+    fn source_timestamps_preserve_velocity_when_dispatch_is_batched() {
+        let source_start = Instant::now();
+        let mut kinetic = KineticScroll::default();
+        kinetic.begin_at(source_start);
+        for frame in 0..4 {
+            // These calls intentionally happen without waiting between them,
+            // as when the platform drains several queued axis events at once.
+            kinetic.record_movement_at(
+                point(px(0.), px(12.)),
+                source_start + Duration::from_millis(frame * 8),
+            );
+        }
+
+        assert!(
+            kinetic
+                .finish_at(
+                    source_start + Duration::from_millis(32),
+                    GestureTuning::default(),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn release_gap_is_allowed_through_chromiums_wayland_boundary() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        for frame in 0..4 {
+            recorder.record(
+                point(px(0.), px(10.)),
+                start + Duration::from_millis(frame * 10),
+            );
+        }
+
+        assert!(
+            recorder
+                .release_velocity(start + Duration::from_millis(230))
+                .is_some()
+        );
+        assert!(
+            recorder
+                .release_velocity(start + Duration::from_millis(231))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn degenerate_source_timestamps_do_not_manufacture_velocity() {
+        let now = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(now);
+        for _ in 0..4 {
+            recorder.record(point(px(0.), px(10.)), now);
+        }
+
+        assert!(recorder.release_velocity(now).is_none());
     }
 
     #[test]

@@ -514,6 +514,13 @@ pub struct ScrollWheelEvent {
     /// The position of the mouse on the window.
     pub position: Point<Pixels>,
 
+    /// The source event's monotonic timestamp, when the platform provides it.
+    ///
+    /// Consumers should fall back to their dispatch-time clock when this is
+    /// absent. Keeping the source time lets gesture recognizers retain motion
+    /// cadence when several platform events are delivered in one batch.
+    pub event_time: Option<std::time::Instant>,
+
     /// The change in scroll wheel position for this event.
     pub delta: ScrollDelta,
 

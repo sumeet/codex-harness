@@ -6375,6 +6375,7 @@ mod tests {
 
         cx.simulate_event(ScrollWheelEvent {
             position: event_position,
+            event_time: None,
             delta: ScrollDelta::Pixels(point(px(-100.), px(0.))),
             modifiers: Modifiers::default(),
             touch_phase: TouchPhase::Moved,
