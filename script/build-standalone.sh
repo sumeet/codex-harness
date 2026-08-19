@@ -5,7 +5,6 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 profile=${HARNESS_PROFILE:-dev}
 jobs=${HARNESS_BUILD_JOBS:-1}
-bundled_cmake="$project_dir/.tools/cmake-4.3.4/bin"
 
 case "$profile" in
     dev)
@@ -28,18 +27,11 @@ if [ "${available_kib:-0}" -lt "$minimum_kib" ]; then
     exit 1
 fi
 
-if [ -x "$bundled_cmake/cmake" ]; then
-    PATH="$bundled_cmake:$PATH"
-elif ! command -v cmake >/dev/null 2>&1; then
-    echo "CMake is required. Install it or place CMake 4.3.4 under .tools/." >&2
-    exit 1
-fi
-
 # A failed build is preferable to the kernel choosing an interactive app as an
 # OOM victim. Codegen stays serialized unless the caller explicitly opts in.
 ulimit -v $((8 * 1024 * 1024))
 CARGO_BUILD_JOBS="$jobs"
-export PATH CARGO_BUILD_JOBS
+export CARGO_BUILD_JOBS
 
 cd "$project_dir"
 # shellcheck disable=SC2086
