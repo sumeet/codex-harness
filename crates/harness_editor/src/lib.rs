@@ -419,6 +419,9 @@ struct MarkdownStrongHighlight;
 struct MarkdownEmphasisHighlight;
 struct MarkdownInlineCodeHighlight;
 struct MarkdownLinkHighlight;
+struct MarkdownCodeBlockHighlight;
+struct MarkdownBlockQuoteHighlight;
+struct MarkdownStrikethroughHighlight;
 struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
@@ -625,6 +628,9 @@ struct SemanticHighlightRanges {
     emphasis: Vec<Range<usize>>,
     inline_code: Vec<Range<usize>>,
     links: Vec<Range<usize>>,
+    code_blocks: Vec<Range<usize>>,
+    block_quotes: Vec<Range<usize>>,
+    strikethrough: Vec<Range<usize>>,
     scanned_spans: usize,
 }
 
@@ -659,6 +665,9 @@ fn visible_semantic_highlight_ranges(
                 TranscriptSemanticStyle::Emphasis => highlights.emphasis.push(range),
                 TranscriptSemanticStyle::InlineCode => highlights.inline_code.push(range),
                 TranscriptSemanticStyle::Link => highlights.links.push(range),
+                TranscriptSemanticStyle::CodeBlock => highlights.code_blocks.push(range),
+                TranscriptSemanticStyle::BlockQuote => highlights.block_quotes.push(range),
+                TranscriptSemanticStyle::Strikethrough => highlights.strikethrough.push(range),
             }
         }
     }
@@ -2108,6 +2117,9 @@ impl TranscriptEditor {
                     emphasis,
                     inline_code,
                     links,
+                    code_blocks,
+                    block_quotes,
+                    strikethrough,
                     scanned_spans: _,
                 } = semantic_highlights;
                 let anchors = |ranges: Vec<Range<usize>>| {
@@ -2116,6 +2128,40 @@ impl TranscriptEditor {
                         .map(|range| clipped_anchor_range(&snapshot, range))
                         .collect::<Vec<_>>()
                 };
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownCodeBlockHighlight,
+                    >()),
+                    anchors(code_blocks),
+                    HighlightStyle {
+                        background_color: Some(
+                            cx.theme()
+                                .colors()
+                                .editor_subheader_background
+                                .opacity(0.72),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownBlockQuoteHighlight,
+                    >()),
+                    anchors(block_quotes),
+                    HighlightStyle {
+                        color: Some(cx.theme().colors().text_muted),
+                        font_style: Some(gpui::FontStyle::Italic),
+                        background_color: Some(
+                            cx.theme()
+                                .colors()
+                                .editor_subheader_background
+                                .opacity(0.28),
+                        ),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
                 editor.highlight_text(
                     HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
                         MarkdownHeadingHighlight,
@@ -2179,6 +2225,22 @@ impl TranscriptEditor {
                             thickness: px(1.),
                             color: Some(link_color),
                             wavy: false,
+                        }),
+                        ..HighlightStyle::default()
+                    },
+                    cx,
+                );
+                let strikethrough_color = cx.theme().colors().text_muted;
+                editor.highlight_text(
+                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                        MarkdownStrikethroughHighlight,
+                    >()),
+                    anchors(strikethrough),
+                    HighlightStyle {
+                        color: Some(strikethrough_color),
+                        strikethrough: Some(gpui::StrikethroughStyle {
+                            thickness: px(1.),
+                            color: Some(strikethrough_color),
                         }),
                         ..HighlightStyle::default()
                     },
@@ -2275,6 +2337,9 @@ impl TranscriptEditor {
                     NavigationOverlayKey::unique::<MarkdownEmphasisHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownInlineCodeHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownLinkHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownCodeBlockHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownBlockQuoteHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownStrikethroughHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
                     NavigationOverlayKey::unique::<DiffHunkHighlight>(),
                     NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
@@ -3763,6 +3828,14 @@ mod tests {
                 style: TranscriptSemanticStyle::Heading,
             },
             TranscriptSemanticSpan {
+                range: 14..58,
+                style: TranscriptSemanticStyle::CodeBlock,
+            },
+            TranscriptSemanticSpan {
+                range: 16..56,
+                style: TranscriptSemanticStyle::BlockQuote,
+            },
+            TranscriptSemanticSpan {
                 range: 20..42,
                 style: TranscriptSemanticStyle::Strong,
             },
@@ -3778,6 +3851,10 @@ mod tests {
                 range: 30..50,
                 style: TranscriptSemanticStyle::Link,
             },
+            TranscriptSemanticSpan {
+                range: 32..48,
+                style: TranscriptSemanticStyle::Strikethrough,
+            },
         ];
 
         let highlights = visible_semantic_highlight_ranges(&[segment], &(32..34));
@@ -3786,7 +3863,10 @@ mod tests {
         assert_eq!(highlights.emphasis, [32..34]);
         assert_eq!(highlights.inline_code, [32..34]);
         assert_eq!(highlights.links, [32..34]);
-        assert_eq!(highlights.scanned_spans, 5);
+        assert_eq!(highlights.code_blocks, [32..34]);
+        assert_eq!(highlights.block_quotes, [32..34]);
+        assert_eq!(highlights.strikethrough, [32..34]);
+        assert_eq!(highlights.scanned_spans, 8);
     }
 
     #[test]
