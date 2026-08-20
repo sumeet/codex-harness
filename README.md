@@ -71,6 +71,14 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 ./script/run-standalone.sh --replay 10000
 ```
 
+The current selectable-rich experiment keeps command bodies as real Text-mode
+Buffer characters while retaining card chrome, shell syntax colors, mixed-font
+wrapping, search, and characterwise Vim selection:
+
+```sh
+HARNESS_SELECTABLE_RICH_COMMAND=1 ./script/run-standalone.sh --replay 8 --text
+```
+
 ## Controls worth knowing
 
 - `Ctrl-W H/J/K/L` moves between the thread rail, composer, and transcript where
@@ -96,9 +104,9 @@ The composer is a real plaintext Zed Editor with Markdown and fenced-language
 syntax highlighting. Markdown punctuation remains visible and editable, and
 Vim operations always address the exact source text; it is not a WYSIWYG field.
 Colors, emphasis, and common Bash/Rust/JSON fence injections are enabled today.
-Mixed proportional-prose and monospace-code font families require a deeper
-Editor layout extension so wrapping, cursor geometry, clicks, and Vim selection
-all agree, and are deliberately not simulated with unselectable UI fragments.
+The transcript Editor also supports proportional prose mixed with monospace
+code and structured output. Those alternate font advances participate in its
+real wrapping and hit-testing geometry; they are not unselectable UI fragments.
 
 ## Current architecture
 

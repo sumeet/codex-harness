@@ -318,6 +318,8 @@ pub enum TranscriptSemanticStyle {
     CodeBlock,
     BlockQuote,
     Strikethrough,
+    CommandInvocation,
+    CommandOutput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -662,14 +664,38 @@ fn selectable_transcript_body(
         } else {
             selectable_markdown_text(normalized_content)
         }
+    } else if item.kind == TranscriptKind::Command {
+        let text = normalized_content
+            .strip_prefix("$ ")
+            .unwrap_or(normalized_content)
+            .trim()
+            .to_owned();
+        let mut semantic_spans = Vec::new();
+        if let Some(command) = item.command_transcript() {
+            let command = normalize_buffer_line_endings(command.command)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            if !command.is_empty() && text.starts_with(&command) {
+                semantic_spans.push(TranscriptSemanticSpan {
+                    range: 0..command.len(),
+                    style: TranscriptSemanticStyle::CommandInvocation,
+                });
+                let output_start = text[command.len()..]
+                    .find(|character: char| !character.is_whitespace())
+                    .map(|offset| command.len() + offset);
+                if let Some(output_start) = output_start.filter(|start| *start < text.len()) {
+                    semantic_spans.push(TranscriptSemanticSpan {
+                        range: output_start..text.len(),
+                        style: TranscriptSemanticStyle::CommandOutput,
+                    });
+                }
+            }
+        }
+        SelectableBodyProjection {
+            text,
+            semantic_spans,
+        }
     } else {
-        let normalized_content = if item.kind == TranscriptKind::Command {
-            normalized_content
-                .strip_prefix("$ ")
-                .unwrap_or(normalized_content)
-        } else {
-            normalized_content
-        };
         SelectableBodyProjection {
             text: normalized_content.trim().to_owned(),
             semantic_spans: Vec::new(),
@@ -4393,9 +4419,21 @@ mod tests {
                 output: "hello".into(),
             })
         );
+        let projection = model.item_projection(0).unwrap();
+        assert_eq!(projection.body_text(), "printf '%s' \"hello\"\n\nhello");
+        let body_start = projection.segment.body_range.start;
         assert_eq!(
-            model.item_projection(0).unwrap().body_text(),
-            "printf '%s' \"hello\"\n\nhello"
+            projection.segment.semantic_spans,
+            [
+                TranscriptSemanticSpan {
+                    range: body_start..body_start + 19,
+                    style: TranscriptSemanticStyle::CommandInvocation,
+                },
+                TranscriptSemanticSpan {
+                    range: body_start + 21..body_start + 26,
+                    style: TranscriptSemanticStyle::CommandOutput,
+                },
+            ]
         );
     }
 

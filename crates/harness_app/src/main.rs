@@ -20,14 +20,14 @@ use gpui_platform::application;
 use harness_editor::{
     LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptReplacement,
     TranscriptSelectionChanged, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
-    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious,
+    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious, shell_capture_priority,
+    shell_capture_ranges,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
 use serde_json::{Value, json};
 use settings::SettingsStore;
-use tree_sitter::{Query, StreamingIterator as _};
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
@@ -1827,59 +1827,6 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
     }
 }
 
-fn shell_capture_priority(capture_name: &str) -> u8 {
-    match capture_name {
-        "function" => 60,
-        "variable" | "variable.special" => 55,
-        "keyword" | "keyword.control" | "keyword.operator" => 50,
-        "operator" => 45,
-        "constant" | "number" => 40,
-        "comment" | "keyword.directive" => 35,
-        "embedded" | "punctuation.special" => 30,
-        "punctuation.delimiter" | "punctuation.bracket" => 20,
-        _ => 10,
-    }
-}
-
-fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
-    static QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
-        Query::new(
-            &tree_sitter_bash::LANGUAGE.into(),
-            include_str!("../../grammars/src/bash/highlights.scm"),
-        )
-        .ok()
-    });
-    let Some(query) = QUERY.as_ref() else {
-        return Vec::new();
-    };
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(command, None) else {
-        return Vec::new();
-    };
-    let capture_names = query.capture_names();
-    let mut cursor = tree_sitter::QueryCursor::new();
-    let mut matches = cursor.matches(query, tree.root_node(), command.as_bytes());
-    let mut captures = Vec::new();
-    while let Some(query_match) = matches.next() {
-        for capture in query_match.captures {
-            let range = capture.node.byte_range();
-            if !range.is_empty()
-                && range.end <= command.len()
-                && let Some(name) = capture_names.get(capture.index as usize)
-            {
-                captures.push((range, (*name).to_string()));
-            }
-        }
-    }
-    captures
-}
-
 fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
     let mut byte_styles = vec![(0_u8, None); command.len()];
     for (range, capture_name) in shell_capture_ranges(command) {
@@ -2135,7 +2082,19 @@ fn hybrid_replacement_key(item_key: &str) -> String {
     format!("{HYBRID_REPLACEMENT_PREFIX}{item_key}")
 }
 
+fn selectable_rich_command_experiment() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("HARNESS_SELECTABLE_RICH_COMMAND")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    });
+    *ENABLED
+}
+
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
+    if selectable_rich_command_experiment() && item.kind == model::TranscriptKind::Command {
+        return false;
+    }
     match item.kind {
         model::TranscriptKind::Diff => true,
         model::TranscriptKind::Command => item.command_transcript().is_some(),

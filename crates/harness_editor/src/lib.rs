@@ -6,7 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Range, RangeInclusive},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use editor::{
@@ -31,6 +31,7 @@ use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
 use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
+use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
     Color, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
     prelude::{ActiveTheme, LabelCommon as _},
@@ -464,6 +465,15 @@ struct MarkdownCodeBlockHighlight;
 struct MarkdownMonospaceGeometryHighlight;
 struct MarkdownBlockQuoteHighlight;
 struct MarkdownStrikethroughHighlight;
+struct ShellFunctionHighlight;
+struct ShellVariableHighlight;
+struct ShellKeywordHighlight;
+struct ShellOperatorHighlight;
+struct ShellConstantHighlight;
+struct ShellStringHighlight;
+struct ShellCommentHighlight;
+struct ShellEmbeddedHighlight;
+struct ShellPunctuationHighlight;
 struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
@@ -673,6 +683,8 @@ struct SemanticHighlightRanges {
     code_blocks: Vec<Range<usize>>,
     block_quotes: Vec<Range<usize>>,
     strikethrough: Vec<Range<usize>>,
+    command_invocations: Vec<Range<usize>>,
+    command_outputs: Vec<Range<usize>>,
     scanned_spans: usize,
 }
 
@@ -710,6 +722,10 @@ fn visible_semantic_highlight_ranges(
                 TranscriptSemanticStyle::CodeBlock => highlights.code_blocks.push(range),
                 TranscriptSemanticStyle::BlockQuote => highlights.block_quotes.push(range),
                 TranscriptSemanticStyle::Strikethrough => highlights.strikethrough.push(range),
+                TranscriptSemanticStyle::CommandInvocation => {
+                    highlights.command_invocations.push(range)
+                }
+                TranscriptSemanticStyle::CommandOutput => highlights.command_outputs.push(range),
             }
         }
     }
@@ -723,7 +739,10 @@ fn semantic_monospace_ranges(segments: &[TranscriptDocumentSegment]) -> Vec<Rang
         .filter(|span| {
             matches!(
                 span.style,
-                TranscriptSemanticStyle::InlineCode | TranscriptSemanticStyle::CodeBlock
+                TranscriptSemanticStyle::InlineCode
+                    | TranscriptSemanticStyle::CodeBlock
+                    | TranscriptSemanticStyle::CommandInvocation
+                    | TranscriptSemanticStyle::CommandOutput
             )
         })
         .map(|span| span.range.clone())
@@ -740,6 +759,179 @@ fn semantic_monospace_ranges(segments: &[TranscriptDocumentSegment]) -> Vec<Rang
         }
     }
     merged
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellSemanticKind {
+    Function,
+    Variable,
+    Keyword,
+    Operator,
+    Constant,
+    String,
+    Comment,
+    Embedded,
+    Punctuation,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ShellSemanticHighlightRanges {
+    functions: Vec<Range<usize>>,
+    variables: Vec<Range<usize>>,
+    keywords: Vec<Range<usize>>,
+    operators: Vec<Range<usize>>,
+    constants: Vec<Range<usize>>,
+    strings: Vec<Range<usize>>,
+    comments: Vec<Range<usize>>,
+    embedded: Vec<Range<usize>>,
+    punctuation: Vec<Range<usize>>,
+}
+
+impl ShellSemanticHighlightRanges {
+    fn push(&mut self, kind: ShellSemanticKind, range: Range<usize>) {
+        match kind {
+            ShellSemanticKind::Function => self.functions.push(range),
+            ShellSemanticKind::Variable => self.variables.push(range),
+            ShellSemanticKind::Keyword => self.keywords.push(range),
+            ShellSemanticKind::Operator => self.operators.push(range),
+            ShellSemanticKind::Constant => self.constants.push(range),
+            ShellSemanticKind::String => self.strings.push(range),
+            ShellSemanticKind::Comment => self.comments.push(range),
+            ShellSemanticKind::Embedded => self.embedded.push(range),
+            ShellSemanticKind::Punctuation => self.punctuation.push(range),
+        }
+    }
+}
+
+pub fn shell_capture_priority(capture_name: &str) -> u8 {
+    match capture_name {
+        "function" => 60,
+        "variable" | "variable.special" => 55,
+        "keyword" | "keyword.control" | "keyword.operator" => 50,
+        "operator" => 45,
+        "constant" | "number" => 40,
+        "comment" | "keyword.directive" => 35,
+        "embedded" | "punctuation.special" => 30,
+        "punctuation.delimiter" | "punctuation.bracket" => 20,
+        _ => 10,
+    }
+}
+
+/// Parse shell syntax once for both transcript surfaces. Keeping capture ranges
+/// in the Editor-side crate prevents the rich card and selectable buffer from
+/// quietly developing different shell grammars or precedence rules.
+pub fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
+    static QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
+        Query::new(
+            &tree_sitter_bash::LANGUAGE.into(),
+            include_str!("../../grammars/src/bash/highlights.scm"),
+        )
+        .ok()
+    });
+    let Some(query) = QUERY.as_ref() else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(command, None) else {
+        return Vec::new();
+    };
+
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), command.as_bytes());
+    let mut captures = Vec::new();
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            let range = capture.node.byte_range();
+            if !range.is_empty()
+                && range.end <= command.len()
+                && let Some(name) = capture_names.get(capture.index as usize)
+            {
+                captures.push((range, (*name).to_string()));
+            }
+        }
+    }
+    captures
+}
+
+fn shell_capture_kind(capture_name: &str) -> ShellSemanticKind {
+    match capture_name {
+        "function" => ShellSemanticKind::Function,
+        "variable" | "variable.special" => ShellSemanticKind::Variable,
+        "keyword" | "keyword.control" | "keyword.operator" => ShellSemanticKind::Keyword,
+        "operator" => ShellSemanticKind::Operator,
+        "constant" | "number" => ShellSemanticKind::Constant,
+        "comment" | "keyword.directive" => ShellSemanticKind::Comment,
+        "embedded" => ShellSemanticKind::Embedded,
+        "string" | "string.escape" | "string.regex" | "character" => ShellSemanticKind::String,
+        _ => ShellSemanticKind::Punctuation,
+    }
+}
+
+fn shell_semantic_highlights(command: &str, base: usize) -> ShellSemanticHighlightRanges {
+    let mut byte_styles = vec![(0_u8, None); command.len()];
+    for (range, capture_name) in shell_capture_ranges(command) {
+        let priority = shell_capture_priority(&capture_name);
+        let kind = shell_capture_kind(&capture_name);
+        for byte_style in &mut byte_styles[range] {
+            if priority >= byte_style.0 {
+                *byte_style = (priority, Some(kind));
+            }
+        }
+    }
+
+    let mut highlights = ShellSemanticHighlightRanges::default();
+    let mut active_kind = None;
+    let mut active_start = 0;
+    for offset in command
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(command.len()))
+    {
+        let kind = byte_styles
+            .get(offset)
+            .and_then(|(_, kind)| kind.as_ref())
+            .copied();
+        if kind != active_kind {
+            if let Some(kind) = active_kind {
+                highlights.push(kind, base + active_start..base + offset);
+            }
+            active_kind = kind;
+            active_start = offset;
+        }
+    }
+    highlights
+}
+
+fn visible_shell_semantic_highlights(
+    text: &str,
+    text_base: usize,
+    invocations: &[Range<usize>],
+) -> ShellSemanticHighlightRanges {
+    let mut highlights = ShellSemanticHighlightRanges::default();
+    for range in invocations {
+        let relative = range.start.saturating_sub(text_base)..range.end.saturating_sub(text_base);
+        let Some(command) = text.get(relative) else {
+            continue;
+        };
+        let parsed = shell_semantic_highlights(command, range.start);
+        highlights.functions.extend(parsed.functions);
+        highlights.variables.extend(parsed.variables);
+        highlights.keywords.extend(parsed.keywords);
+        highlights.operators.extend(parsed.operators);
+        highlights.constants.extend(parsed.constants);
+        highlights.strings.extend(parsed.strings);
+        highlights.comments.extend(parsed.comments);
+        highlights.embedded.extend(parsed.embedded);
+        highlights.punctuation.extend(parsed.punctuation);
+    }
+    highlights
 }
 
 /// Return overlapping default search matches in one already bounded window.
@@ -2390,6 +2582,17 @@ impl TranscriptEditor {
         });
         let semantic_highlights = rebuild_semantic_highlights
             .then(|| visible_semantic_highlight_ranges(&self.segments, &desired.byte_range));
+        let shell_semantic_highlights = semantic_highlights.as_ref().map(|semantic| {
+            let buffer = self.buffer.read(cx);
+            let text = buffer
+                .text_for_range(desired.byte_range.clone())
+                .collect::<String>();
+            visible_shell_semantic_highlights(
+                &text,
+                desired.byte_range.start,
+                &semantic.command_invocations,
+            )
+        });
         let search_case_sensitive = self.search.case_sensitive;
         let search_whole_word = self.search.whole_word;
         let search_highlights = rebuild_search_highlights.then(|| {
@@ -2618,6 +2821,8 @@ impl TranscriptEditor {
                     code_blocks,
                     block_quotes,
                     strikethrough,
+                    command_invocations: _,
+                    command_outputs: _,
                     scanned_spans: _,
                 } = semantic_highlights;
                 let anchors = |ranges: Vec<Range<usize>>| {
@@ -2746,6 +2951,82 @@ impl TranscriptEditor {
                 );
             }
 
+            if let Some(shell_highlights) = shell_semantic_highlights {
+                let anchors = |ranges: Vec<Range<usize>>| {
+                    ranges
+                        .into_iter()
+                        .map(|range| clipped_anchor_range(&snapshot, range))
+                        .collect::<Vec<_>>()
+                };
+                let fallback = HighlightStyle {
+                    color: Some(cx.theme().colors().text_accent),
+                    ..HighlightStyle::default()
+                };
+                let syntax = cx.theme().syntax();
+                let function_style = syntax.style_for_name("function").unwrap_or(fallback);
+                let variable_style = syntax.style_for_name("variable").unwrap_or(fallback);
+                let keyword_style = syntax.style_for_name("keyword").unwrap_or(fallback);
+                let operator_style = syntax.style_for_name("operator").unwrap_or(fallback);
+                let constant_style = syntax.style_for_name("constant").unwrap_or(fallback);
+                let string_style = syntax.style_for_name("string").unwrap_or(fallback);
+                let comment_style = syntax.style_for_name("comment").unwrap_or(fallback);
+                let embedded_style = syntax.style_for_name("embedded").unwrap_or(fallback);
+                let punctuation_style = syntax.style_for_name("punctuation").unwrap_or(fallback);
+                macro_rules! paint_shell {
+                    ($marker:ty, $ranges:expr, $style:expr) => {
+                        editor.highlight_text(
+                            HighlightKey::NavigationOverlay(
+                                NavigationOverlayKey::unique::<$marker>(),
+                            ),
+                            anchors($ranges),
+                            $style,
+                            cx,
+                        );
+                    };
+                }
+                paint_shell!(
+                    ShellFunctionHighlight,
+                    shell_highlights.functions,
+                    function_style
+                );
+                paint_shell!(
+                    ShellVariableHighlight,
+                    shell_highlights.variables,
+                    variable_style
+                );
+                paint_shell!(
+                    ShellKeywordHighlight,
+                    shell_highlights.keywords,
+                    keyword_style
+                );
+                paint_shell!(
+                    ShellOperatorHighlight,
+                    shell_highlights.operators,
+                    operator_style
+                );
+                paint_shell!(
+                    ShellConstantHighlight,
+                    shell_highlights.constants,
+                    constant_style
+                );
+                paint_shell!(ShellStringHighlight, shell_highlights.strings, string_style);
+                paint_shell!(
+                    ShellCommentHighlight,
+                    shell_highlights.comments,
+                    comment_style
+                );
+                paint_shell!(
+                    ShellEmbeddedHighlight,
+                    shell_highlights.embedded,
+                    embedded_style
+                );
+                paint_shell!(
+                    ShellPunctuationHighlight,
+                    shell_highlights.punctuation,
+                    punctuation_style
+                );
+            }
+
             if let Some(search_highlights) = search_highlights {
                 if let Some(search_highlights) = search_highlights {
                     let active_search_match = active_search_match.map(|range| {
@@ -2863,6 +3144,15 @@ impl TranscriptEditor {
                     NavigationOverlayKey::unique::<MarkdownMonospaceGeometryHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownBlockQuoteHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownStrikethroughHighlight>(),
+                    NavigationOverlayKey::unique::<ShellFunctionHighlight>(),
+                    NavigationOverlayKey::unique::<ShellVariableHighlight>(),
+                    NavigationOverlayKey::unique::<ShellKeywordHighlight>(),
+                    NavigationOverlayKey::unique::<ShellOperatorHighlight>(),
+                    NavigationOverlayKey::unique::<ShellConstantHighlight>(),
+                    NavigationOverlayKey::unique::<ShellStringHighlight>(),
+                    NavigationOverlayKey::unique::<ShellCommentHighlight>(),
+                    NavigationOverlayKey::unique::<ShellEmbeddedHighlight>(),
+                    NavigationOverlayKey::unique::<ShellPunctuationHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
                     NavigationOverlayKey::unique::<DiffHunkHighlight>(),
                     NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
@@ -4433,7 +4723,7 @@ mod tests {
     }
 
     #[test]
-    fn code_semantics_form_stable_full_document_font_ranges() {
+    fn monospace_semantics_form_stable_full_document_font_ranges() {
         let mut first = segment(0, 0..80, 0..10, 10..80);
         first.semantic_spans = vec![
             TranscriptSemanticSpan {
@@ -4450,14 +4740,55 @@ mod tests {
             },
         ];
         let mut second = segment(1, 80..140, 80..90, 90..140);
-        second.semantic_spans = vec![TranscriptSemanticSpan {
-            range: 100..120,
-            style: TranscriptSemanticStyle::CodeBlock,
-        }];
+        second.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 100..120,
+                style: TranscriptSemanticStyle::CodeBlock,
+            },
+            TranscriptSemanticSpan {
+                range: 122..130,
+                style: TranscriptSemanticStyle::CommandInvocation,
+            },
+            TranscriptSemanticSpan {
+                range: 132..140,
+                style: TranscriptSemanticStyle::CommandOutput,
+            },
+        ];
 
         assert_eq!(
             semantic_monospace_ranges(&[first, second]),
-            [20..50, 100..120]
+            [20..50, 100..120, 122..130, 132..140]
+        );
+    }
+
+    #[test]
+    fn shell_semantics_keep_exact_utf8_offsets_for_selectable_commands() {
+        let command = "printf '%s' \"héllo\" | rg -i hello";
+        let highlights = shell_semantic_highlights(command, 100);
+        let all_ranges = highlights
+            .functions
+            .iter()
+            .chain(&highlights.variables)
+            .chain(&highlights.keywords)
+            .chain(&highlights.operators)
+            .chain(&highlights.constants)
+            .chain(&highlights.strings)
+            .chain(&highlights.comments)
+            .chain(&highlights.embedded)
+            .chain(&highlights.punctuation)
+            .collect::<Vec<_>>();
+
+        assert!(!all_ranges.is_empty());
+        assert!(all_ranges.iter().all(|range| {
+            range.start >= 100
+                && range.end <= 100 + command.len()
+                && command.is_char_boundary(range.start - 100)
+                && command.is_char_boundary(range.end - 100)
+        }));
+        assert!(
+            all_ranges
+                .iter()
+                .any(|range| &command[range.start - 100..range.end - 100] == "printf")
         );
     }
 
