@@ -12,16 +12,16 @@ use std::{
 use editor::{
     Addon, Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
     display_map::{
-        BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
-        NavigationOverlayKey, RenderBlock,
+        BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
+        FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
     },
     scroll::Autoscroll,
 };
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
     FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
-    KeyContext, Render, SharedString, TextStyle, TextStyleRefinement, Window, div, point,
-    prelude::*, px,
+    KeyContext, Pixels, Render, SharedString, TextStyle, TextStyleRefinement, WeakEntity, Window,
+    div, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -32,7 +32,7 @@ use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _
 use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
 use ui::{
-    Color, Icon, IconName, IconSize, Label, LabelSize,
+    Color, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
     prelude::{ActiveTheme, LabelCommon as _},
 };
 
@@ -275,6 +275,7 @@ pub struct TranscriptEditor {
     // append-only growth. Keeping the ids keyed by position lets viewport
     // shifts retain blocks in the overlap instead of recreating every header.
     header_blocks: BTreeMap<usize, CustomBlockId>,
+    collapsed_items: BTreeSet<String>,
     supplements: BTreeMap<String, MountedTranscriptSupplement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
@@ -889,6 +890,41 @@ fn error_transcript_background(cx: &App) -> Hsla {
     cx.theme().status().error.opacity(0.1)
 }
 
+fn transcript_card_border(cx: &App) -> Hsla {
+    cx.theme().colors().border_variant.opacity(0.72)
+}
+
+fn error_transcript_card_border(cx: &App) -> Hsla {
+    cx.theme().status().error.opacity(0.46)
+}
+
+fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
+    let card = matches!(
+        kind,
+        TranscriptKind::User
+            | TranscriptKind::Command
+            | TranscriptKind::FileChange
+            | TranscriptKind::Tool
+            | TranscriptKind::Diff
+            | TranscriptKind::Image
+            | TranscriptKind::Subagent
+            | TranscriptKind::Web
+            | TranscriptKind::Review
+            | TranscriptKind::Error
+            | TranscriptKind::Approval
+    );
+    RowHighlightOptions {
+        include_gutter: false,
+        border: card.then_some(if kind == TranscriptKind::Error {
+            error_transcript_card_border
+        } else {
+            transcript_card_border
+        }),
+        corner_radius: if card { px(6.) } else { Pixels::ZERO },
+        ..RowHighlightOptions::default()
+    }
+}
+
 fn transcript_icon(kind: TranscriptKind) -> IconName {
     match kind {
         TranscriptKind::User => IconName::Person,
@@ -1162,8 +1198,11 @@ fn apply_projected_segment_shape(
 
 fn native_header_block(
     placement: std::ops::RangeInclusive<Anchor>,
+    item_key: String,
     kind: TranscriptKind,
     label: SharedString,
+    foldable: bool,
+    transcript: WeakEntity<TranscriptEditor>,
 ) -> BlockProperties<Anchor> {
     let show_label = native_header_shows_label(kind, &label);
     BlockProperties {
@@ -1173,6 +1212,9 @@ fn native_header_block(
         // editor gutter, which makes the header read as part of the transcript.
         style: BlockStyle::Spacer,
         render: Arc::new(move |cx: &mut BlockContext| {
+            let collapsed = transcript.upgrade().is_some_and(|transcript| {
+                transcript.read(cx.app).collapsed_items.contains(&item_key)
+            });
             let icon_color = transcript_icon_color(kind, cx.selected);
             let colors = cx.theme().colors();
             let background = if cx.selected {
@@ -1188,7 +1230,7 @@ fn native_header_block(
                 colors.border_variant.opacity(0.78)
             };
 
-            div()
+            let header = div()
                 .id(cx.block_id)
                 .h(cx.line_height)
                 .w_full()
@@ -1218,11 +1260,44 @@ fn native_header_block(
                             })
                             .truncate(),
                     )
-                })
-                .into_any_element()
+                });
+
+            if foldable {
+                let item_key = item_key.clone();
+                let disclosure_id = format!("transcript-fold:{item_key}");
+                let transcript = transcript.clone();
+                header
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        transcript
+                            .update(cx, |transcript, cx| {
+                                transcript.toggle_item_collapsed(&item_key, window, cx);
+                            })
+                            .ok();
+                    })
+                    .child(Disclosure::new(disclosure_id, !collapsed))
+                    .into_any_element()
+            } else {
+                header.into_any_element()
+            }
         }),
         priority: 0,
     }
+}
+
+fn transcript_item_is_foldable(segment: &TranscriptDocumentSegment) -> bool {
+    !segment.body_range.is_empty()
+        && matches!(
+            segment.kind,
+            TranscriptKind::Reasoning
+                | TranscriptKind::Command
+                | TranscriptKind::FileChange
+                | TranscriptKind::Tool
+                | TranscriptKind::Diff
+                | TranscriptKind::Subagent
+                | TranscriptKind::Web
+                | TranscriptKind::Review
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1351,6 +1426,7 @@ impl TranscriptEditor {
             segment_header_texts: Vec::new(),
             model_item_count: 0,
             header_blocks: BTreeMap::new(),
+            collapsed_items: BTreeSet::new(),
             supplements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
@@ -1703,6 +1779,77 @@ impl TranscriptEditor {
         self.pending_tail_intent = None;
     }
 
+    /// Toggle one structured item's body using the Editor's native fold map.
+    ///
+    /// The selectable bytes remain in the Buffer. Native Vim unfold motions,
+    /// search navigation, and mouse interaction with the fold placeholder can
+    /// therefore reveal the exact same text without a second scroll surface.
+    fn toggle_item_collapsed(
+        &mut self,
+        item_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.item_key == item_key && transcript_item_is_foldable(segment))
+        else {
+            return false;
+        };
+        let body_range = segment.body_range.clone();
+        let line_count = self
+            .buffer
+            .read(cx)
+            .text_for_range(body_range.clone())
+            .collect::<String>()
+            .lines()
+            .count()
+            .max(1);
+        let item_key = item_key.to_owned();
+        let collapsed = self.editor.update(cx, |editor, cx| {
+            let currently_folded = editor
+                .display_snapshot(cx)
+                .folds_in_range(
+                    MultiBufferOffset(body_range.start)..MultiBufferOffset(body_range.end),
+                )
+                .next()
+                .is_some();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors = clipped_anchor_range(&snapshot, body_range);
+            if currently_folded {
+                editor.unfold_ranges(&[anchors], true, false, cx);
+                false
+            } else {
+                let mut placeholder: FoldPlaceholder = editor.default_fold_placeholder(cx);
+                placeholder.constrain_width = false;
+                placeholder.merge_adjacent = false;
+                placeholder.collapsed_text = Some(
+                    format!(
+                        "  … {line_count} {} hidden  ",
+                        if line_count == 1 { "line" } else { "lines" }
+                    )
+                    .into(),
+                );
+                editor.fold_creases(
+                    vec![Crease::simple(anchors, placeholder)],
+                    false,
+                    window,
+                    cx,
+                );
+                true
+            }
+        });
+        if collapsed {
+            self.collapsed_items.insert(item_key);
+        } else {
+            self.collapsed_items.remove(&item_key);
+        }
+        self.pause_tail_follow();
+        cx.notify();
+        true
+    }
+
     /// Align a Buffer row to the top of the viewport without changing the Vim
     /// cursor or selection. The request is anchor-based so soft wrapping and
     /// supplemental display-map blocks are accounted for during layout.
@@ -1957,6 +2104,7 @@ impl TranscriptEditor {
             .filter_map(|position| self.header_blocks.remove(position))
             .collect::<Vec<_>>();
 
+        let transcript = cx.weak_entity();
         let inserted_header_blocks = self.editor.update(cx, |editor, cx| {
             if !header_blocks_to_remove.is_empty() {
                 editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
@@ -1970,8 +2118,11 @@ impl TranscriptEditor {
                     let (start, end) = clipped_anchor_pair(&snapshot, segment.header_range.clone());
                     native_header_block(
                         start..=end,
+                        segment.item_key.clone(),
                         segment.kind,
                         native_header_text(&header_text).into(),
+                        transcript_item_is_foldable(segment),
+                        transcript.clone(),
                     )
                 })
                 .collect();
@@ -1986,16 +2137,13 @@ impl TranscriptEditor {
                 editor.clear_row_highlights::<ReasoningTranscriptRows>();
                 editor.clear_row_highlights::<StructuredTranscriptRows>();
                 editor.clear_row_highlights::<ErrorTranscriptRows>();
-                let options = RowHighlightOptions {
-                    include_gutter: false,
-                    ..RowHighlightOptions::default()
-                };
                 for segment in row_segments {
                     let Some(range) = intersect_ranges(&segment.whole_range, &row_byte_range)
                     else {
                         continue;
                     };
                     let anchors = clipped_anchor_range(&snapshot, range);
+                    let options = transcript_row_options(segment.kind);
                     match segment.kind {
                         TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
                             anchors,
@@ -2364,6 +2512,7 @@ impl TranscriptEditor {
             self.unmount_all_supplements(cx);
             self.segments.clear();
             self.segment_header_texts.clear();
+            self.collapsed_items.clear();
             self.model_item_count = document.item_rows.len();
             let previous_header_blocks = std::mem::take(&mut self.header_blocks);
             self.viewport_decorations = None;
@@ -2408,6 +2557,12 @@ impl TranscriptEditor {
         // against the new per-item body ranges below.
         self.unmount_all_supplements(cx);
         self.segments.clone_from(&document.segments);
+        self.collapsed_items.retain(|item_key| {
+            document
+                .segments
+                .iter()
+                .any(|segment| &segment.item_key == item_key)
+        });
         self.segment_header_texts = document
             .segments
             .iter()
@@ -3951,6 +4106,24 @@ mod tests {
             semantic_monospace_ranges(&[first, second]),
             [20..50, 100..120]
         );
+    }
+
+    #[test]
+    fn transcript_cards_and_folds_are_semantic_not_global() {
+        let user = transcript_row_options(TranscriptKind::User);
+        assert!(user.border.is_some());
+        assert_eq!(user.corner_radius, px(6.));
+
+        let agent = transcript_row_options(TranscriptKind::Agent);
+        assert!(agent.border.is_none());
+        assert_eq!(agent.corner_radius, Pixels::ZERO);
+
+        let command = segment_with_kind(0, TranscriptKind::Command, 0..80, 0..10, 10..78);
+        let narrative = segment_with_kind(1, TranscriptKind::Agent, 80..160, 80..90, 90..158);
+        let empty_tool = segment_with_kind(2, TranscriptKind::Tool, 160..180, 160..170, 170..170);
+        assert!(transcript_item_is_foldable(&command));
+        assert!(!transcript_item_is_foldable(&narrative));
+        assert!(!transcript_item_is_foldable(&empty_tool));
     }
 
     #[test]

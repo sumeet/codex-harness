@@ -5135,9 +5135,16 @@ impl EditorElement {
                             * highlight_row_end.next_row().minus(highlight_row_start) as f32,
                     );
                     let mut quad = fill(Bounds { origin, size }, highlight.background);
+                    if highlight.corner_radius > Pixels::ZERO {
+                        quad = quad.corner_radii(Corners::all(highlight.corner_radius));
+                    }
                     if let Some(border_color) = highlight.border {
                         quad.border_color = border_color;
-                        quad.border_widths = edges
+                        quad.border_widths = if highlight.corner_radius > Pixels::ZERO {
+                            Edges::all(px(1.))
+                        } else {
+                            edges
+                        }
                     }
                     window.paint_quad(quad);
                 };
@@ -8454,6 +8461,7 @@ impl Element for EditorElement {
                             let hollow_highlight = LineHighlight {
                                 background: diff_hunk_colors.hollow_background.into(),
                                 border: Some(diff_hunk_colors.hollow_border),
+                                corner_radius: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
                             };
@@ -8461,6 +8469,7 @@ impl Element for EditorElement {
                             let filled_highlight = LineHighlight {
                                 background: solid_background(diff_hunk_colors.filled_background),
                                 border: None,
+                                corner_radius: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
                             };
@@ -8487,6 +8496,7 @@ impl Element for EditorElement {
                             let drag_highlight = LineHighlight {
                                 background: solid_background(drag_highlight_color),
                                 border: Some(drag_border_color),
+                                corner_radius: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
                             };

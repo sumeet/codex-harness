@@ -1670,6 +1670,10 @@ impl SelectionHistory {
 pub struct RowHighlightOptions {
     pub autoscroll: bool,
     pub include_gutter: bool,
+    /// Optional outline for a contiguous highlighted range.
+    pub border: Option<fn(&App) -> Hsla>,
+    /// Corner radius applied to the contiguous highlighted range.
+    pub corner_radius: Pixels,
 }
 
 impl Default for RowHighlightOptions {
@@ -1677,6 +1681,8 @@ impl Default for RowHighlightOptions {
         Self {
             autoscroll: Default::default(),
             include_gutter: true,
+            border: None,
+            corner_radius: Pixels::ZERO,
         }
     }
 }
@@ -9873,7 +9879,8 @@ impl Editor {
                                 DisplayRow(row),
                                 LineHighlight {
                                     include_gutter: highlight.options.include_gutter,
-                                    border: None,
+                                    border: highlight.options.border.map(|border| border(cx)),
+                                    corner_radius: highlight.options.corner_radius,
                                     background: (highlight.color)(cx).into(),
                                     type_id: Some(highlight.type_id),
                                 },
@@ -13495,6 +13502,7 @@ impl Focusable for PromptEditor {
 pub struct LineHighlight {
     pub background: Background,
     pub border: Option<gpui::Hsla>,
+    pub corner_radius: Pixels,
     pub include_gutter: bool,
     pub type_id: Option<TypeId>,
 }
