@@ -7061,7 +7061,6 @@ impl Render for HarnessApp {
         );
         let composer_height = composer_metrics.height;
         let turn_active = self.model.current_turn_id.is_some();
-        let transcript_typography = self.transcript_editor.read(cx).typography_profile();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
@@ -7479,92 +7478,6 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
-                    .child(
-                        deferred(
-                            div()
-                                .absolute()
-                                .top(if self.search_visible { px(48.) } else { px(6.) })
-                                .right(px(8.))
-                                .h(px(24.))
-                                .px_0p5()
-                                .flex()
-                                .items_center()
-                                .gap_0p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .bg(colors.panel_background.opacity(0.94))
-                                .occlude()
-                                .child(
-                                    Button::new("rich-transcript-surface", "Rich")
-                                        .size(ButtonSize::Compact)
-                                        .style(ButtonStyle::Subtle)
-                                        .toggle_state(!self.buffer_view)
-                                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                        .aria_label("Show rich transcript")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.show_rich_transcript(window, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("text-transcript-surface", "Text")
-                                        .size(ButtonSize::Compact)
-                                        .style(ButtonStyle::Subtle)
-                                        .toggle_state(self.buffer_view)
-                                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                        .aria_label("Show selectable Vim transcript")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.show_text_transcript(window, cx)
-                                        })),
-                                )
-                                .when(self.buffer_view, |this| {
-                                    this.child(
-                                        div()
-                                            .h(px(14.))
-                                            .mx_0p5()
-                                            .border_l_1()
-                                            .border_color(colors.border_variant),
-                                    )
-                                    .child(
-                                        Button::new("reading-transcript-typography", "Reading")
-                                            .size(ButtonSize::Compact)
-                                            .style(ButtonStyle::Subtle)
-                                            .toggle_state(
-                                                transcript_typography
-                                                    == TranscriptTypographyProfile::Reading,
-                                            )
-                                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                            .aria_label("Use proportional reading typography")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.use_transcript_typography(
-                                                    TranscriptTypographyProfile::Reading,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("mono-transcript-typography", "Mono")
-                                            .size(ButtonSize::Compact)
-                                            .style(ButtonStyle::Subtle)
-                                            .toggle_state(
-                                                transcript_typography
-                                                    == TranscriptTypographyProfile::Buffer,
-                                            )
-                                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                                            .aria_label("Use monospace buffer typography")
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.use_transcript_typography(
-                                                    TranscriptTypographyProfile::Buffer,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })),
-                                    )
-                                }),
-                        )
-                        .with_priority(1),
-                    )
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
