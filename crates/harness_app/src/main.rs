@@ -2196,6 +2196,9 @@ impl Render for HybridDiffSurface {
                             .find(|item| item.key == item_key)
                         {
                             item.expanded = !item.expanded;
+                            app.transcript_editor.update(cx, |editor, _| {
+                                editor.pause_tail_follow();
+                            });
                             cx.notify();
                         }
                     })
