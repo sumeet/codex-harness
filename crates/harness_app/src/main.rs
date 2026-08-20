@@ -18,8 +18,8 @@ use gpui::{
 };
 use gpui_platform::application;
 use harness_editor::{
-    LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged,
-    TranscriptReplacement, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
+    LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptReplacement,
+    TranscriptSelectionChanged, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
     VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious,
 };
 use harness_protocol as model;
@@ -2129,15 +2129,27 @@ fn mark_unbacked_requests_inactive(
     }
 }
 
-const HYBRID_DIFF_REPLACEMENT_KEY: &str = "hybrid-rich-diff";
+const HYBRID_REPLACEMENT_PREFIX: &str = "hybrid-rich:";
 
-struct HybridDiffSurface {
+fn hybrid_replacement_key(item_key: &str) -> String {
+    format!("{HYBRID_REPLACEMENT_PREFIX}{item_key}")
+}
+
+fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
+    match item.kind {
+        model::TranscriptKind::Diff => true,
+        model::TranscriptKind::Command => item.command_transcript().is_some(),
+        _ => false,
+    }
+}
+
+struct HybridStructuredSurface {
     item: TranscriptItem,
     item_index: usize,
     owner: WeakEntity<HarnessApp>,
 }
 
-impl HybridDiffSurface {
+impl HybridStructuredSurface {
     fn new(item: TranscriptItem, item_index: usize, owner: WeakEntity<HarnessApp>) -> Self {
         Self {
             item,
@@ -2163,23 +2175,36 @@ impl HybridDiffSurface {
     }
 }
 
-impl Render for HybridDiffSurface {
+impl Render for HybridStructuredSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let body = self.item.expanded.then(|| {
-            HarnessApp::render_diff_content(
-                &self.item,
-                self.item_index,
-                None,
-                OutputExpansion::Preview,
-                None,
-                cx,
-            )
-        });
+        let body = self
+            .item
+            .expanded
+            .then(|| match self.item.kind {
+                model::TranscriptKind::Diff => Some(HarnessApp::render_diff_content(
+                    &self.item,
+                    self.item_index,
+                    None,
+                    OutputExpansion::Preview,
+                    None,
+                    cx,
+                )),
+                model::TranscriptKind::Command => HarnessApp::render_command_content(
+                    &self.item,
+                    self.item_index,
+                    None,
+                    OutputExpansion::Preview,
+                    None,
+                    cx,
+                ),
+                _ => None,
+            })
+            .flatten();
         let item_key = self.item.key.clone();
         let owner = self.owner.clone();
         let header = div()
-            .id(format!("hybrid-diff-header:{}", self.item.key))
+            .id(format!("hybrid-structured-header:{}", self.item.key))
             .w_full()
             .min_w_0()
             .flex()
@@ -2189,11 +2214,8 @@ impl Render for HybridDiffSurface {
             .on_click(move |_, _, cx| {
                 owner
                     .update(cx, |app, cx| {
-                        if let Some(item) = app
-                            .model
-                            .items
-                            .iter_mut()
-                            .find(|item| item.key == item_key)
+                        if let Some(item) =
+                            app.model.items.iter_mut().find(|item| item.key == item_key)
                         {
                             item.expanded = !item.expanded;
                             app.transcript_editor.update(cx, |editor, _| {
@@ -2219,50 +2241,82 @@ impl Render for HybridDiffSurface {
                     .child(transcript_item_header_title(&self.item).to_owned()),
             )
             .child(Disclosure::new(
-                format!("hybrid-diff-disclosure:{}", self.item.key),
+                format!("hybrid-structured-disclosure:{}", self.item.key),
                 self.item.expanded,
             ));
 
-        div()
-            .size_full()
-            .min_w_0()
-            .py_1()
-            .child(
-                div()
-                    .size_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .px_2()
-                    .py_1()
-                    .child(header)
-                    .when_some(body, |this, body| this.child(body)),
-            )
+        div().size_full().min_w_0().py_1().child(
+            div()
+                .size_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(colors.border_variant)
+                .px_2()
+                .py_1()
+                .child(header)
+                .when_some(body, |this, body| this.child(body)),
+        )
     }
 }
 
-fn hybrid_diff_rows(item: &TranscriptItem) -> u32 {
+fn hybrid_structured_rows(item: &TranscriptItem) -> u32 {
     if !item.expanded {
         return 2;
     }
-    let presentations = diff_file_presentations(&item.content);
-    let visible_lines = progressive_file_line_allocations(
-        &presentations
-            .iter()
-            .map(|presentation| presentation.content.lines().count())
-            .collect::<Vec<_>>(),
-        OutputExpansion::Preview,
-    )
-    .into_iter()
-    .sum::<usize>();
-    let structural_rows = presentations.len() + usize::from(presentations.len() > 1) + 3;
-    u32::try_from(visible_lines + structural_rows)
-        .unwrap_or(18)
-        .clamp(6, 18)
+    let rows = match item.kind {
+        model::TranscriptKind::Diff => {
+            let presentations = diff_file_presentations(&item.content);
+            let visible_lines = progressive_file_line_allocations(
+                &presentations
+                    .iter()
+                    .map(|presentation| presentation.content.lines().count())
+                    .collect::<Vec<_>>(),
+                OutputExpansion::Preview,
+            )
+            .into_iter()
+            .sum::<usize>();
+            let structural_rows = presentations.len() + usize::from(presentations.len() > 1) + 3;
+            visible_lines + structural_rows
+        }
+        model::TranscriptKind::Command => item.command_transcript().map_or(4, |command| {
+            let command_limits = output_limits(
+                OutputExpansion::Preview,
+                COMMAND_PREVIEW_LINES,
+                COMMAND_PREVIEW_BYTES,
+            );
+            let output_limits = output_limits(
+                OutputExpansion::Preview,
+                STRUCTURED_OUTPUT_PREVIEW_LINES,
+                STRUCTURED_OUTPUT_PREVIEW_BYTES,
+            );
+            let command_lines = structured_output_preview_with_limits(
+                command.command.trim_end_matches(['\r', '\n']),
+                "command",
+                command_limits.lines,
+                command_limits.bytes,
+            )
+            .content
+            .lines()
+            .count()
+            .max(1);
+            let output_lines = structured_output_preview_with_limits(
+                command_output_for_display(&command.output),
+                "output",
+                output_limits.lines,
+                output_limits.bytes,
+            )
+            .content
+            .lines()
+            .count();
+            command_lines + output_lines + usize::from(output_lines > 0) * 2 + 3
+        }),
+        _ => 2,
+    };
+    u32::try_from(rows).unwrap_or(18).clamp(4, 18)
 }
 
 struct HarnessApp {
@@ -2316,7 +2370,7 @@ struct HarnessApp {
     performance_status_generation: u64,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
-    hybrid_diff_surface: Option<Entity<HybridDiffSurface>>,
+    hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
     list_state: ListState,
     task_list_state: ListState,
     sidebar_open: bool,
@@ -2479,7 +2533,7 @@ impl HarnessApp {
             performance_status_generation: 0,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
-            hybrid_diff_surface: None,
+            hybrid_surfaces: HashMap::default(),
             sidebar_open: true,
             sidebar_user_override: false,
             server_task: Task::ready(()),
@@ -2873,44 +2927,56 @@ impl HarnessApp {
         }
     }
 
-    fn sync_hybrid_diff_surface(&mut self, cx: &mut Context<Self>) {
-        let candidate = self
+    fn sync_hybrid_surfaces(&mut self, cx: &mut Context<Self>) {
+        let candidates = self
             .model
             .items
             .iter()
             .enumerate()
-            .find(|(_, item)| item.kind == model::TranscriptKind::Diff)
-            .map(|(index, item)| (index, item.clone()));
-        let Some((index, item)) = candidate else {
-            if self.hybrid_diff_surface.take().is_some() {
-                self.transcript_editor.update(cx, |editor, cx| {
-                    editor.remove_replacement(HYBRID_DIFF_REPLACEMENT_KEY, cx);
-                });
-            }
-            return;
-        };
+            .filter(|(_, item)| item_uses_hybrid_surface(item))
+            .map(|(index, item)| (index, item.clone()))
+            .collect::<Vec<_>>();
+        let desired_keys = candidates
+            .iter()
+            .map(|(_, item)| item.key.clone())
+            .collect::<HashSet<_>>();
+        let stale_keys = self
+            .hybrid_surfaces
+            .keys()
+            .filter(|key| !desired_keys.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for item_key in stale_keys {
+            self.hybrid_surfaces.remove(&item_key);
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.remove_replacement(&hybrid_replacement_key(&item_key), cx);
+            });
+        }
 
-        let surface = if let Some(surface) = &self.hybrid_diff_surface {
-            surface.update(cx, |surface, cx| surface.update(item.clone(), index, cx));
-            surface.clone()
-        } else {
-            let owner = cx.weak_entity();
-            let surface = cx.new(|_| HybridDiffSurface::new(item.clone(), index, owner));
-            self.hybrid_diff_surface = Some(surface.clone());
-            surface
-        };
-        let rows = hybrid_diff_rows(&item);
-        self.transcript_editor.update(cx, |editor, cx| {
-            editor.upsert_replacement(
-                TranscriptReplacement::new(
-                    HYBRID_DIFF_REPLACEMENT_KEY,
-                    item.key,
-                    rows,
-                    surface.into(),
-                ),
-                cx,
-            );
-        });
+        for (index, item) in candidates {
+            let surface = if let Some(surface) = self.hybrid_surfaces.get(&item.key) {
+                surface.update(cx, |surface, cx| surface.update(item.clone(), index, cx));
+                surface.clone()
+            } else {
+                let owner = cx.weak_entity();
+                let surface = cx.new(|_| HybridStructuredSurface::new(item.clone(), index, owner));
+                self.hybrid_surfaces
+                    .insert(item.key.clone(), surface.clone());
+                surface
+            };
+            let rows = hybrid_structured_rows(&item);
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.upsert_replacement(
+                    TranscriptReplacement::new(
+                        hybrid_replacement_key(&item.key),
+                        item.key,
+                        rows,
+                        surface.into(),
+                    ),
+                    cx,
+                );
+            });
+        }
     }
 
     fn sync_request_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6011,17 +6077,33 @@ impl HarnessApp {
         search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(command) = item.command_transcript() else {
+        if item.command_transcript().is_none() {
             return self.render_terminal(item.content.clone(), &item.key, index, search, cx);
-        };
-        let colors = cx.theme().colors().clone();
-        let command_text = command.command.trim_end_matches(['\r', '\n']);
-        let output = command_output_for_display(&command.output).to_string();
+        }
         let expansion = self
             .output_expansion
             .get(&item.key)
             .copied()
             .unwrap_or_default();
+        let command = item.command_transcript().expect("command parsed above");
+        let toggle = command_output_toggle(&command, expansion)
+            .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
+        Self::render_command_content(item, index, search, expansion, toggle, cx)
+            .expect("command parsed above")
+    }
+
+    fn render_command_content(
+        item: &TranscriptItem,
+        index: usize,
+        search: Option<&RichSearchPaint>,
+        expansion: OutputExpansion,
+        toggle: Option<AnyElement>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let command = item.command_transcript()?;
+        let colors = cx.theme().colors().clone();
+        let command_text = command.command.trim_end_matches(['\r', '\n']);
+        let output = command_output_for_display(&command.output).to_string();
         let command_limits = output_limits(expansion, COMMAND_PREVIEW_LINES, COMMAND_PREVIEW_BYTES);
         let output_limits = output_limits(
             expansion,
@@ -6046,7 +6128,6 @@ impl HarnessApp {
             output_limits.bytes,
         )
         .content;
-        let toggle = command_output_toggle(&command, expansion);
         let highlighted_command = searchable_styled_text(
             displayed_command.clone(),
             shell_highlights(&displayed_command, cx),
@@ -6056,52 +6137,54 @@ impl HarnessApp {
         let highlighted_output =
             searchable_styled_text(displayed_output.clone(), Vec::new(), search, cx);
 
-        div()
-            .id(("command-output", index))
-            .w_full()
-            .min_w_0()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .font_buffer(cx)
-                    .text_ui_sm(cx)
-                    .line_height(relative(1.45))
-                    .whitespace_normal()
-                    .child(highlighted_command),
-            )
-            .when(!displayed_output.is_empty(), |this| {
-                this.child(
+        Some(
+            div()
+                .id(("command-output", index))
+                .w_full()
+                .min_w_0()
+                .child(
                     div()
-                        .id(("command-output-scroll", index))
                         .w_full()
                         .min_w_0()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .mt_2()
-                        .pt_2()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
                         .line_height(relative(1.45))
-                        .text_color(colors.text)
                         .whitespace_normal()
-                        .child(highlighted_output),
+                        .child(highlighted_command),
                 )
-            })
-            .when_some(toggle, |this, toggle| {
-                this.child(
-                    div()
-                        .mt_1()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
-                )
-            })
-            .into_any_element()
+                .when(!displayed_output.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .id(("command-output-scroll", index))
+                            .w_full()
+                            .min_w_0()
+                            .border_t_1()
+                            .border_color(colors.border_variant)
+                            .mt_2()
+                            .pt_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .line_height(relative(1.45))
+                            .text_color(colors.text)
+                            .whitespace_normal()
+                            .child(highlighted_output),
+                    )
+                })
+                .when_some(toggle, |this, toggle| {
+                    this.child(
+                        div()
+                            .mt_1()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(colors.border_variant)
+                            .child(toggle),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_web_search(
@@ -7225,7 +7308,7 @@ impl HarnessApp {
 
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_hybrid_diff_surface(cx);
+        self.sync_hybrid_surfaces(cx);
         self.sync_image_surfaces(window, cx);
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
@@ -9256,9 +9339,32 @@ mod tests {
             pending_request: None,
         };
 
-        assert!(hybrid_diff_rows(&item) >= 6);
+        assert!(hybrid_structured_rows(&item) >= 6);
         item.expanded = false;
-        assert_eq!(hybrid_diff_rows(&item), 2);
+        assert_eq!(hybrid_structured_rows(&item), 2);
+    }
+
+    #[test]
+    fn hybrid_command_requires_a_parseable_command_and_has_bounded_rows() {
+        let mut item = TranscriptItem {
+            key: "hybrid-command".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Command,
+            title: "Command".into(),
+            status: None,
+            content: "$ cargo check -p harness_app\n\nFinished successfully".into(),
+            raw: json!({"command":"cargo check -p harness_app"}),
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(item_uses_hybrid_surface(&item));
+        assert!((4..=18).contains(&hybrid_structured_rows(&item)));
+
+        item.content = "unstructured output".into();
+        item.raw = Value::Null;
+        assert!(!item_uses_hybrid_surface(&item));
     }
 
     #[test]

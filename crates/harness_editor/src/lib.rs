@@ -1429,6 +1429,14 @@ fn replacement_anchor_range(
         .map(|segment| segment.whole_range.clone())
 }
 
+/// Translate a half-open document item range into the inclusive byte offsets
+/// expected by an Editor replacement block. Using the exclusive end directly
+/// makes adjacent items share a display row, so BlockMap coalesces their two
+/// replacement renderers and only one remains visible.
+fn replacement_anchor_offsets(range: Range<usize>) -> Option<(usize, usize)> {
+    (!range.is_empty()).then(|| (range.start, range.end - 1))
+}
+
 fn replacement_renderer(view: AnyView) -> RenderBlock {
     Arc::new(move |cx: &mut BlockContext| {
         div()
@@ -1768,14 +1776,15 @@ impl TranscriptEditor {
         let key = replacement.key;
         let was_present = self.replacements.contains_key(&key);
         let rows = replacement.rows.max(1);
-        let mut mounted = self.replacements.remove(&key).unwrap_or_else(|| {
-            MountedTranscriptReplacement {
-                item_key: replacement.item_key.clone(),
-                rows,
-                view: replacement.view.clone(),
-                block_id: None,
-            }
-        });
+        let mut mounted =
+            self.replacements
+                .remove(&key)
+                .unwrap_or_else(|| MountedTranscriptReplacement {
+                    item_key: replacement.item_key.clone(),
+                    rows,
+                    view: replacement.view.clone(),
+                    block_id: None,
+                });
         let update = supplement_update(
             mounted.item_key != replacement.item_key,
             mounted.rows != rows,
@@ -1984,7 +1993,12 @@ impl TranscriptEditor {
             }
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let blocks = pending.iter().map(|(_, range, rows, view)| {
-                let (start, end) = clipped_anchor_pair(&snapshot, range.clone());
+                let (start_offset, end_offset) =
+                    replacement_anchor_offsets(range.clone()).unwrap_or((range.start, range.start));
+                let start = snapshot.clip_offset(MultiBufferOffset(start_offset), Bias::Left);
+                let end = snapshot.clip_offset(MultiBufferOffset(end_offset), Bias::Left);
+                let start = snapshot.anchor_before(start);
+                let end = snapshot.anchor_before(end);
                 replacement_block(start..=end, *rows, view.clone())
             });
             editor.insert_blocks(blocks, None, cx)
@@ -4090,6 +4104,17 @@ mod tests {
         assert_eq!(replacement_anchor_range("item-1", &before), Some(30..60));
         assert_eq!(replacement_anchor_range("item-1", &after), Some(75..105));
         assert_eq!(replacement_anchor_range("missing", &after), None);
+    }
+
+    #[test]
+    fn adjacent_replacement_offsets_do_not_share_the_exclusive_boundary() {
+        assert_eq!(replacement_anchor_offsets(0..23), Some((0, 22)));
+        assert_eq!(replacement_anchor_offsets(23..43), Some((23, 42)));
+        assert_eq!(replacement_anchor_offsets(9..9), None);
+
+        let (_, first_end) = replacement_anchor_offsets(0..23).unwrap();
+        let (second_start, _) = replacement_anchor_offsets(23..43).unwrap();
+        assert!(first_end < second_start);
     }
 
     #[test]
