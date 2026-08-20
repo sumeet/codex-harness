@@ -509,6 +509,9 @@ impl TextStyle {
     /// Create a new text style with the given highlighting applied.
     pub fn highlight(mut self, style: impl Into<HighlightStyle>) -> Self {
         let style = style.into();
+        if let Some(FontFamilyVariant::Monospace) = style.font_family {
+            self.font_family = SharedString::new_static(".ZedMono");
+        }
         if let Some(weight) = style.font_weight {
             self.font_weight = weight;
         }
@@ -574,12 +577,25 @@ impl TextStyle {
     }
 }
 
-/// A highlight style to apply, similar to a `TextStyle` except
-/// for a single font, uniformly sized and spaced text.
+/// A geometry-safe font-family choice that can be applied to a highlighted
+/// range. The concrete family is resolved by GPUI so this remains compact and
+/// copyable inside syntax/highlight runs.
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FontFamilyVariant {
+    /// GPUI's bundled/configured fixed-width editor face.
+    Monospace,
+}
+
+/// A highlight style to apply, similar to a `TextStyle`. Font size remains
+/// uniform, while `font_family` may opt a range into a geometry-aware family
+/// such as monospace when the owning surface supports styled wrapping.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct HighlightStyle {
     /// The color of the text
     pub color: Option<Hsla>,
+
+    /// An alternate font family whose advances must participate in layout.
+    pub font_family: Option<FontFamilyVariant>,
 
     /// The font weight, e.g. bold
     pub font_weight: Option<FontWeight>,
@@ -605,6 +621,7 @@ impl Eq for HighlightStyle {}
 impl Hash for HighlightStyle {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.color.hash(state);
+        self.font_family.hash(state);
         self.font_weight.hash(state);
         self.font_style.hash(state);
         self.background_color.hash(state);
@@ -900,6 +917,7 @@ impl From<&TextStyle> for HighlightStyle {
     fn from(other: &TextStyle) -> Self {
         Self {
             color: Some(other.color),
+            font_family: None,
             font_weight: Some(other.font_weight),
             font_style: Some(other.font_style),
             background_color: other.background_color,
@@ -933,6 +951,7 @@ impl HighlightStyle {
                     }
                 })
                 .or(self.color),
+            font_family: other.font_family.or(self.font_family),
             font_weight: other.font_weight.or(self.font_weight),
             font_style: other.font_style.or(self.font_style),
             background_color: other.background_color.or(self.background_color),
@@ -1349,6 +1368,7 @@ mod tests {
 
         let mut style_b = HighlightStyle {
             color: Some(red()),
+            font_family: Some(FontFamilyVariant::Monospace),
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(2.),
                 color: Some(blue()),
@@ -1381,6 +1401,7 @@ mod tests {
 
         let style_d = HighlightStyle {
             color: Some(blue().alpha(0.7)),
+            font_family: None,
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(4.),
                 color: Some(crate::red()),
@@ -1398,6 +1419,7 @@ mod tests {
 
         let expected_style = HighlightStyle {
             color: Some(red().blend(blue().alpha(0.7))),
+            font_family: Some(FontFamilyVariant::Monospace),
             strikethrough: Some(StrikethroughStyle {
                 thickness: px(4.),
                 color: Some(red()),

@@ -20,6 +20,7 @@ pub struct LineWrapper {
     pub(crate) font_size: Pixels,
     cached_ascii_char_widths: [Option<Pixels>; 128],
     cached_other_char_widths: HashMap<char, Pixels>,
+    alternate_char_widths: HashMap<(FontId, char), Pixels>,
 }
 
 impl LineWrapper {
@@ -33,6 +34,7 @@ impl LineWrapper {
             font_size,
             cached_ascii_char_widths: [None; 128],
             cached_other_char_widths: HashMap::default(),
+            alternate_char_widths: HashMap::default(),
         }
     }
 
@@ -60,7 +62,10 @@ impl LineWrapper {
                 index += candidate.len_utf8();
                 let mut new_prev_c = prev_c;
                 let item_width = match candidate {
-                    WrapBoundaryCandidate::Char { character: c } => {
+                    WrapBoundaryCandidate::Char {
+                        character: c,
+                        font_id,
+                    } => {
                         if c == '\n' {
                             continue;
                         }
@@ -84,7 +89,7 @@ impl LineWrapper {
 
                         new_prev_c = c;
 
-                        self.width_for_char(c)
+                        self.width_for_char_in_font(c, font_id)
                     }
                     WrapBoundaryCandidate::Element {
                         width: element_width,
@@ -505,6 +510,17 @@ impl LineWrapper {
             width
         }
     }
+
+    #[inline(always)]
+    fn width_for_char_in_font(&mut self, c: char, font_id: Option<FontId>) -> Pixels {
+        let Some(font_id) = font_id.filter(|font_id| *font_id != self.font_id) else {
+            return self.width_for_char(c);
+        };
+        *self
+            .alternate_char_widths
+            .entry((font_id, c))
+            .or_insert_with(|| self.text_system.layout_width(font_id, self.font_size, c))
+    }
 }
 
 fn update_runs_after_truncation(
@@ -610,6 +626,9 @@ pub enum LineFragment<'a> {
     Text {
         /// The text content of the fragment.
         text: &'a str,
+        /// An alternate font used to measure this fragment. `None` uses the
+        /// wrapper's base font.
+        font_id: Option<FontId>,
     },
     /// A non-text element with a fixed width.
     Element {
@@ -623,7 +642,18 @@ pub enum LineFragment<'a> {
 impl<'a> LineFragment<'a> {
     /// Creates a new text fragment from the given text.
     pub fn text(text: &'a str) -> Self {
-        LineFragment::Text { text }
+        LineFragment::Text {
+            text,
+            font_id: None,
+        }
+    }
+
+    /// Creates a text fragment measured with a specific font.
+    pub fn text_with_font(text: &'a str, font_id: FontId) -> Self {
+        LineFragment::Text {
+            text,
+            font_id: Some(font_id),
+        }
     }
 
     /// Creates a new non-text element with the given width and UTF-8 encoded length.
@@ -633,7 +663,7 @@ impl<'a> LineFragment<'a> {
 
     fn wrap_boundary_candidates(&self) -> impl Iterator<Item = WrapBoundaryCandidate> {
         let text = match self {
-            LineFragment::Text { text } => text,
+            LineFragment::Text { text, .. } => text,
             LineFragment::Element { .. } => "\0",
         };
         text.chars().map(move |character| {
@@ -643,21 +673,33 @@ impl<'a> LineFragment<'a> {
                     len_utf8: *len_utf8,
                 }
             } else {
-                WrapBoundaryCandidate::Char { character }
+                WrapBoundaryCandidate::Char {
+                    character,
+                    font_id: match self {
+                        LineFragment::Text { font_id, .. } => *font_id,
+                        LineFragment::Element { .. } => None,
+                    },
+                }
             }
         })
     }
 }
 
 enum WrapBoundaryCandidate {
-    Char { character: char },
-    Element { width: Pixels, len_utf8: usize },
+    Char {
+        character: char,
+        font_id: Option<FontId>,
+    },
+    Element {
+        width: Pixels,
+        len_utf8: usize,
+    },
 }
 
 impl WrapBoundaryCandidate {
     pub fn len_utf8(&self) -> usize {
         match self {
-            WrapBoundaryCandidate::Char { character } => character.len_utf8(),
+            WrapBoundaryCandidate::Char { character, .. } => character.len_utf8(),
             WrapBoundaryCandidate::Element { len_utf8: len, .. } => *len,
         }
     }
@@ -690,6 +732,37 @@ mod tests {
         let cx = TestAppContext::build(dispatcher, None);
         let id = cx.text_system().resolve_font(&font(".ZedMono"));
         LineWrapper::new(id, px(16.), cx.text_system().clone())
+    }
+
+    #[test]
+    fn mixed_font_fragments_wrap_using_their_actual_advances() {
+        let mut base_wrapper = build_wrapper();
+        let base_id = base_wrapper.font_id;
+        let alternate_id = FontId(base_id.0 + 1);
+        let base_width = base_wrapper.width_for_char('i');
+        base_wrapper
+            .alternate_char_widths
+            .insert((alternate_id, 'i'), base_width * 2.);
+        let text = "i".repeat(64);
+        let wrap_width = base_width * 16.;
+        let base_boundary = base_wrapper
+            .wrap_line(&[LineFragment::text(&text)], wrap_width)
+            .next()
+            .expect("the long base-font run must wrap")
+            .ix;
+        let alternate_boundary = base_wrapper
+            .wrap_line(
+                &[LineFragment::text_with_font(&text, alternate_id)],
+                wrap_width,
+            )
+            .next()
+            .expect("the long alternate-font run must wrap")
+            .ix;
+
+        assert_ne!(
+            base_boundary, alternate_boundary,
+            "wrapping must follow the selected range font rather than the surface base font"
+        );
     }
 
     fn generate_test_runs(input_run_len: &[usize]) -> Vec<TextRun> {

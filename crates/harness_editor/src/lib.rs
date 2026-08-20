@@ -19,8 +19,9 @@ use editor::{
 };
 use gpui::{
     AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render,
-    SharedString, TextStyle, TextStyleRefinement, Window, div, point, prelude::*, px,
+    FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
+    KeyContext, Render, SharedString, TextStyle, TextStyleRefinement, Window, div, point,
+    prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -420,6 +421,7 @@ struct MarkdownEmphasisHighlight;
 struct MarkdownInlineCodeHighlight;
 struct MarkdownLinkHighlight;
 struct MarkdownCodeBlockHighlight;
+struct MarkdownMonospaceGeometryHighlight;
 struct MarkdownBlockQuoteHighlight;
 struct MarkdownStrikethroughHighlight;
 struct DiffFileHeaderHighlight;
@@ -672,6 +674,32 @@ fn visible_semantic_highlight_ranges(
         }
     }
     highlights
+}
+
+fn semantic_monospace_ranges(segments: &[TranscriptDocumentSegment]) -> Vec<Range<usize>> {
+    let mut ranges = segments
+        .iter()
+        .flat_map(|segment| segment.semantic_spans.iter())
+        .filter(|span| {
+            matches!(
+                span.style,
+                TranscriptSemanticStyle::InlineCode | TranscriptSemanticStyle::CodeBlock
+            )
+        })
+        .map(|span| span.range.clone())
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else if range.start < range.end {
+            merged.push(range);
+        }
+    }
+    merged
 }
 
 /// Return overlapping default search matches in one already bounded window.
@@ -2305,6 +2333,28 @@ impl TranscriptEditor {
     /// Zed treats a cursor that enters a replacement block as selecting that
     /// whole underlying row, so headers intentionally do not have character-level
     /// visual selection; every body on either side still does.
+    fn refresh_semantic_font_geometry(&mut self, cx: &mut Context<Self>) {
+        let ranges = semantic_monospace_ranges(&self.segments);
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors = ranges
+                .into_iter()
+                .map(|range| clipped_anchor_range(&snapshot, range))
+                .collect();
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    MarkdownMonospaceGeometryHighlight,
+                >()),
+                anchors,
+                HighlightStyle {
+                    font_family: Some(FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+        });
+    }
+
     pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) -> bool {
         if !document_has_valid_segment_ranges(document) {
             // Keep the raw Buffer readable/selectable, but discard every
@@ -2338,6 +2388,7 @@ impl TranscriptEditor {
                     NavigationOverlayKey::unique::<MarkdownInlineCodeHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownLinkHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownCodeBlockHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownMonospaceGeometryHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownBlockQuoteHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownStrikethroughHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
@@ -2397,6 +2448,7 @@ impl TranscriptEditor {
                 cx,
             );
         });
+        self.refresh_semantic_font_geometry(cx);
         self.mount_unmounted_supplements(cx);
         self.refresh_viewport_decorations(cx);
         true
@@ -2581,6 +2633,9 @@ impl TranscriptEditor {
         self.search.highlights_dirty |= search_text_changed;
         if self.segments.len() > appended_segment_start {
             self.decorate_appended_segments(appended_segment_start, cx);
+        }
+        if semantic_bodies_changed {
+            self.refresh_semantic_font_geometry(cx);
         }
         self.mount_unmounted_supplements(cx);
         self.refresh_viewport_decorations(cx);
@@ -3867,6 +3922,35 @@ mod tests {
         assert_eq!(highlights.block_quotes, [32..34]);
         assert_eq!(highlights.strikethrough, [32..34]);
         assert_eq!(highlights.scanned_spans, 8);
+    }
+
+    #[test]
+    fn code_semantics_form_stable_full_document_font_ranges() {
+        let mut first = segment(0, 0..80, 0..10, 10..80);
+        first.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 20..30,
+                style: TranscriptSemanticStyle::InlineCode,
+            },
+            TranscriptSemanticSpan {
+                range: 30..50,
+                style: TranscriptSemanticStyle::CodeBlock,
+            },
+            TranscriptSemanticSpan {
+                range: 22..26,
+                style: TranscriptSemanticStyle::Strong,
+            },
+        ];
+        let mut second = segment(1, 80..140, 80..90, 90..140);
+        second.semantic_spans = vec![TranscriptSemanticSpan {
+            range: 100..120,
+            style: TranscriptSemanticStyle::CodeBlock,
+        }];
+
+        assert_eq!(
+            semantic_monospace_ranges(&[first, second]),
+            [20..50, 100..120]
+        );
     }
 
     #[test]

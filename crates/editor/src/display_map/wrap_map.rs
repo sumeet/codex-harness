@@ -9,7 +9,8 @@ use super::{
 use collections::HashMap;
 use futures_lite::future::yield_now;
 use gpui::{
-    App, AppContext as _, Context, Entity, Font, FontId, LineWrapper, Pixels, Task, TextSystem,
+    App, AppContext as _, Context, Entity, Font, FontFamilyVariant, FontId, LineWrapper, Pixels,
+    Task, TextSystem,
 };
 use language::{LanguageAwareStyling, Point};
 use multi_buffer::RowInfo;
@@ -49,6 +50,14 @@ pub struct WrapMap {
     wrap_width: Option<Pixels>,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
+    font_variant_ranges: Arc<[FontVariantRange]>,
+}
+
+/// A geometry-affecting font choice in the tab-expanded coordinate space.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FontVariantRange {
+    pub range: Range<TabPoint>,
+    pub variant: FontFamilyVariant,
 }
 
 #[derive(Clone)]
@@ -90,22 +99,105 @@ pub struct WrapPoint(pub Point);
 struct LineFragmentBuilder {
     text_system: Arc<TextSystem>,
     font_id: FontId,
+    monospace_font_id: FontId,
     font_size: Pixels,
+    font_variant_ranges: Arc<[FontVariantRange]>,
     cached_replacement_widths: HashMap<char, Pixels>,
 }
 
 impl LineFragmentBuilder {
+    #[cfg(test)]
     fn new(text_system: Arc<TextSystem>, font: &Font, font_size: Pixels) -> Self {
+        Self::with_font_variant_ranges(text_system, font, font_size, Arc::default())
+    }
+
+    fn with_font_variant_ranges(
+        text_system: Arc<TextSystem>,
+        font: &Font,
+        font_size: Pixels,
+        font_variant_ranges: Arc<[FontVariantRange]>,
+    ) -> Self {
         let font_id = text_system.resolve_font(font);
+        let monospace_font_id = text_system.resolve_font(&gpui::font(".ZedMono"));
         Self {
             text_system,
             font_id,
+            monospace_font_id,
             font_size,
+            font_variant_ranges,
             cached_replacement_widths: HashMap::default(),
         }
     }
 
     fn push_fragments<'a>(&mut self, fragments: &mut Vec<gpui::LineFragment<'a>>, text: &'a str) {
+        self.push_fragments_with_font(fragments, text, None);
+    }
+
+    fn push_fragments_at<'a>(
+        &mut self,
+        fragments: &mut Vec<gpui::LineFragment<'a>>,
+        text: &'a str,
+        start: TabPoint,
+    ) {
+        if self.font_variant_ranges.is_empty() || text.is_empty() {
+            self.push_fragments(fragments, text);
+            return;
+        }
+
+        let row = start.row();
+        let chunk_start = start.column() as usize;
+        let chunk_end = chunk_start.saturating_add(text.len());
+        let mut emitted = 0usize;
+        let ranges = self.font_variant_ranges.clone();
+        for font_range in ranges.iter() {
+            if font_range.range.end.row() < row
+                || (font_range.range.end.row() == row
+                    && font_range.range.end.column() as usize <= chunk_start)
+            {
+                continue;
+            }
+            if font_range.range.start.row() > row
+                || (font_range.range.start.row() == row
+                    && font_range.range.start.column() as usize >= chunk_end)
+            {
+                break;
+            }
+
+            let range_start = if font_range.range.start.row() < row {
+                chunk_start
+            } else {
+                (font_range.range.start.column() as usize).max(chunk_start)
+            };
+            let range_end = if font_range.range.end.row() > row {
+                chunk_end
+            } else {
+                (font_range.range.end.column() as usize).min(chunk_end)
+            };
+            if range_start >= range_end {
+                continue;
+            }
+            let local_start = range_start - chunk_start;
+            let local_end = range_end - chunk_start;
+            if emitted < local_start {
+                self.push_fragments_with_font(fragments, &text[emitted..local_start], None);
+            }
+            let font_id = match font_range.variant {
+                FontFamilyVariant::Monospace => self.monospace_font_id,
+            };
+            self.push_fragments_with_font(fragments, &text[local_start..local_end], Some(font_id));
+            emitted = local_end;
+        }
+        if emitted < text.len() {
+            self.push_fragments_with_font(fragments, &text[emitted..], None);
+        }
+    }
+
+    fn push_fragments_with_font<'a>(
+        &mut self,
+        fragments: &mut Vec<gpui::LineFragment<'a>>,
+        text: &'a str,
+        font_id: Option<FontId>,
+    ) {
         let mut prefix_start = 0;
         for (offset, ch) in text.char_indices() {
             if !is_invisible(ch) {
@@ -119,14 +211,25 @@ impl LineFragmentBuilder {
                 continue;
             };
             if prefix_start < offset {
-                fragments.push(gpui::LineFragment::text(&text[prefix_start..offset]));
+                Self::push_text_fragment(fragments, &text[prefix_start..offset], font_id);
             }
             fragments.push(gpui::LineFragment::element(width, ch_end - offset));
             prefix_start = ch_end;
         }
         if prefix_start < text.len() || text.is_empty() {
-            fragments.push(gpui::LineFragment::text(&text[prefix_start..]));
+            Self::push_text_fragment(fragments, &text[prefix_start..], font_id);
         }
+    }
+
+    fn push_text_fragment<'a>(
+        fragments: &mut Vec<gpui::LineFragment<'a>>,
+        text: &'a str,
+        font_id: Option<FontId>,
+    ) {
+        fragments.push(match font_id {
+            Some(font_id) => gpui::LineFragment::text_with_font(text, font_id),
+            None => gpui::LineFragment::text(text),
+        });
     }
 
     fn replacement_width(&mut self, ch: char) -> Option<Pixels> {
@@ -198,6 +301,7 @@ impl WrapMap {
         let handle = cx.new(|cx| {
             let mut this = Self {
                 font_with_size: (font, font_size),
+                font_variant_ranges: Arc::default(),
                 wrap_width: None,
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
@@ -238,6 +342,19 @@ impl WrapMap {
         (self.snapshot.clone(), mem::take(&mut self.edits_since_sync))
     }
 
+    pub fn sync_with_font_variant_ranges(
+        &mut self,
+        tab_snapshot: TabSnapshot,
+        edits: Vec<TabEdit>,
+        ranges: Vec<FontVariantRange>,
+        cx: &mut Context<Self>,
+    ) -> (WrapSnapshot, WrapPatch) {
+        let (_, edits) = self.sync(tab_snapshot, edits, cx);
+        self.set_font_variant_ranges(ranges, cx);
+        let font_edits = mem::take(&mut self.edits_since_sync);
+        (self.snapshot.clone(), edits.compose(&font_edits))
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn set_font_with_size(
         &mut self,
@@ -251,6 +368,21 @@ impl WrapMap {
             false
         } else {
             self.font_with_size = font_with_size;
+            self.rewrap(cx);
+            true
+        }
+    }
+
+    pub fn set_font_variant_ranges(
+        &mut self,
+        ranges: Vec<FontVariantRange>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let ranges: Arc<[FontVariantRange]> = ranges.into();
+        if ranges == self.font_variant_ranges {
+            false
+        } else {
+            self.font_variant_ranges = ranges;
             self.rewrap(cx);
             true
         }
@@ -278,8 +410,12 @@ impl WrapMap {
 
             let text_system = cx.text_system();
             let (font, font_size) = self.font_with_size.clone();
-            let mut fragment_builder =
-                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
+            let mut fragment_builder = LineFragmentBuilder::with_font_variant_ranges(
+                text_system.clone(),
+                &font,
+                font_size,
+                self.font_variant_ranges.clone(),
+            );
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
             let tab_snapshot = new_snapshot.tab_snapshot.clone();
             let total_rows = tab_snapshot.max_point().row() as usize + 1;
@@ -382,8 +518,12 @@ impl WrapMap {
             let mut snapshot = self.snapshot.clone();
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
-            let mut fragment_builder =
-                LineFragmentBuilder::new(text_system.clone(), &font, font_size);
+            let mut fragment_builder = LineFragmentBuilder::with_font_variant_ranges(
+                text_system.clone(),
+                &font,
+                font_size,
+                self.font_variant_ranges.clone(),
+            );
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
 
             if pending_edits.len() == 1
@@ -624,10 +764,15 @@ impl WrapSnapshot {
                 );
                 let mut edit_transforms = Vec::<Transform>::new();
                 for (i, _) in (edit.new_rows.start..edit.new_rows.end).enumerate() {
+                    let row = edit.new_rows.start + i as u32;
                     while let Some(chunk) = remaining.take().or_else(|| chunks.next()) {
                         if let Some(ix) = chunk.text.find('\n') {
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
-                            fragment_builder.push_fragments(&mut line_fragments, prefix);
+                            fragment_builder.push_fragments_at(
+                                &mut line_fragments,
+                                prefix,
+                                TabPoint::new(row, line.len() as u32),
+                            );
                             line.push_str(prefix);
                             remaining = Some(Chunk {
                                 text: suffix,
@@ -641,7 +786,11 @@ impl WrapSnapshot {
                                 line_fragments
                                     .push(gpui::LineFragment::element(width, chunk.text.len()));
                             } else {
-                                fragment_builder.push_fragments(&mut line_fragments, chunk.text);
+                                fragment_builder.push_fragments_at(
+                                    &mut line_fragments,
+                                    chunk.text,
+                                    TabPoint::new(row, line.len() as u32),
+                                );
                             }
                             line.push_str(chunk.text);
                         }
@@ -1552,7 +1701,7 @@ mod tests {
         let shapes = fragments
             .iter()
             .map(|fragment| match fragment {
-                LineFragment::Text { text } => (false, text.len()),
+                LineFragment::Text { text, .. } => (false, text.len()),
                 LineFragment::Element { len_utf8, width } => {
                     assert!(
                         *width > px(0.),
@@ -1587,7 +1736,7 @@ mod tests {
         );
         assert_eq!(
             plain_fragments.first().map(|fragment| match fragment {
-                LineFragment::Text { text } => text.len(),
+                LineFragment::Text { text, .. } => text.len(),
                 LineFragment::Element { len_utf8, .. } => *len_utf8,
             }),
             Some(10),
