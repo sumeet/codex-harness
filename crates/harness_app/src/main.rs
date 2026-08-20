@@ -7096,6 +7096,9 @@ impl Render for HarnessApp {
             div()
                 .flex_1()
                 .min_h_0()
+                // Give buffer-native cards a real outer gutter. This also
+                // narrows soft wrapping without inserting transcript bytes.
+                .px_4()
                 .overflow_hidden()
                 .bg(colors.editor_background)
                 .child(self.transcript_editor.clone())

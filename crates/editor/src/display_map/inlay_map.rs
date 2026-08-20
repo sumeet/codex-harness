@@ -335,6 +335,7 @@ impl<'a> Iterator for InlayChunks<'a> {
 
                 let mut renderer = None;
                 let mut highlight_style = match inlay.id {
+                    InlayId::Custom(_) => None,
                     InlayId::EditPrediction(_) => self.highlight_styles.edit_prediction.map(|s| {
                         if inlay.text().chars().all(|c| c.is_whitespace()) {
                             s.whitespace

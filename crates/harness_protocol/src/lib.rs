@@ -699,7 +699,10 @@ fn project_transcript_item(
     }
     text.push_str(" ━━━━");
     let header_end = text.len();
-    text.push_str("\n\n");
+    // Layout owns the visual separation between transcript items. Keep only
+    // the newline that separates the real header and body rows so Vim never
+    // lands on decorative blank lines.
+    text.push('\n');
 
     let body_start = text.len();
     let normalized_content = normalize_buffer_line_endings(item.content.clone());
@@ -709,7 +712,6 @@ fn project_transcript_item(
         text.push('\n');
     }
     let body_end = body_start + body.text.len();
-    text.push('\n');
 
     let whole_end = text.len();
     Some(TranscriptItemProjection {
@@ -4581,7 +4583,7 @@ mod tests {
         );
         assert_eq!(
             &document.text[segment.whole_range.clone()],
-            "━━━━ Café 🦀 · prêt ━━━━\n\nα first\nβ second\n\n"
+            "━━━━ Café 🦀 · prêt ━━━━\nα first\nβ second\n"
         );
         for offset in [
             segment.whole_range.start,

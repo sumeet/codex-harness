@@ -10,7 +10,7 @@ use std::{
 };
 
 use editor::{
-    Addon, Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
+    Addon, Bias, Editor, EditorEvent, Inlay, RowExt as _, RowHighlightOptions, SelectionEffects,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
         FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
@@ -27,7 +27,7 @@ use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
     TranscriptSemanticSpan, TranscriptSemanticStyle, minimal_text_edit,
 };
-use language::{Buffer, Language, LanguageRegistry, Point};
+use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
 use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
@@ -276,6 +276,8 @@ pub struct TranscriptEditor {
     // shifts retain blocks in the overlap instead of recreating every header.
     header_blocks: BTreeMap<usize, CustomBlockId>,
     collapsed_items: BTreeSet<String>,
+    padding_inlays: Vec<InlayId>,
+    next_padding_inlay_id: usize,
     supplements: BTreeMap<String, MountedTranscriptSupplement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
@@ -898,8 +900,8 @@ fn error_transcript_card_border(cx: &App) -> Hsla {
     cx.theme().status().error.opacity(0.46)
 }
 
-fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
-    let card = matches!(
+fn transcript_kind_is_card(kind: TranscriptKind) -> bool {
+    matches!(
         kind,
         TranscriptKind::User
             | TranscriptKind::Command
@@ -912,7 +914,11 @@ fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
             | TranscriptKind::Review
             | TranscriptKind::Error
             | TranscriptKind::Approval
-    );
+    )
+}
+
+fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
+    let card = transcript_kind_is_card(kind);
     RowHighlightOptions {
         include_gutter: false,
         border: card.then_some(if kind == TranscriptKind::Error {
@@ -1217,7 +1223,10 @@ fn native_header_block(
             });
             let icon_color = transcript_icon_color(kind, cx.selected);
             let colors = cx.theme().colors();
-            let background = if cx.selected {
+            let card = transcript_kind_is_card(kind);
+            let background = if card {
+                Hsla::transparent_black()
+            } else if cx.selected {
                 colors.editor_highlighted_line_background
             } else {
                 colors.editor_subheader_background.opacity(0.56)
@@ -1241,9 +1250,12 @@ fn native_header_block(
                 .items_center()
                 .gap_2()
                 .overflow_hidden()
-                .border_l_2()
-                .border_color(rail)
                 .bg(background)
+                .when(card, |this| {
+                    this.border_b_1()
+                        .border_color(colors.border_variant.opacity(0.62))
+                })
+                .when(!card, |this| this.border_l_2().border_color(rail))
                 .child(
                     Icon::new(transcript_icon(kind))
                         .size(IconSize::XSmall)
@@ -1427,6 +1439,8 @@ impl TranscriptEditor {
             model_item_count: 0,
             header_blocks: BTreeMap::new(),
             collapsed_items: BTreeSet::new(),
+            padding_inlays: Vec::new(),
+            next_padding_inlay_id: 0,
             supplements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
@@ -2048,6 +2062,46 @@ impl TranscriptEditor {
             .then(|| self.segments[row_segment_range].to_vec())
             .unwrap_or_default();
         let row_byte_range = desired.byte_range.clone();
+        let padding_offsets = rebuild_rows
+            .then(|| {
+                let buffer = self.buffer.read(cx);
+                let mut offsets = Vec::new();
+                for segment in &row_segments {
+                    if !transcript_kind_is_card(segment.kind) {
+                        continue;
+                    }
+                    let Some(range) = intersect_ranges(&segment.body_range, &row_byte_range) else {
+                        continue;
+                    };
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let text = buffer.text_for_range(range.clone()).collect::<String>();
+                    // The body start and every real hard-line start receive
+                    // display-only padding. Soft wraps inherit the same indent
+                    // from GPUI's line wrapper, while yanks remain byte-exact.
+                    offsets.push(range.start);
+                    offsets.extend(
+                        text.match_indices('\n')
+                            .map(|(offset, _)| range.start + offset + 1)
+                            .filter(|offset| *offset < range.end),
+                    );
+                }
+                offsets
+            })
+            .unwrap_or_default();
+        let padding_inlays_to_remove = rebuild_rows
+            .then(|| std::mem::take(&mut self.padding_inlays))
+            .unwrap_or_default();
+        let padding_inlays_to_insert = padding_offsets
+            .into_iter()
+            .map(|offset| {
+                let id = self.next_padding_inlay_id;
+                self.next_padding_inlay_id = self.next_padding_inlay_id.wrapping_add(1);
+                self.padding_inlays.push(InlayId::Custom(id));
+                (id, offset)
+            })
+            .collect::<Vec<_>>();
         let body_highlights = rebuild_rows.then(|| {
             let mut reasoning = Vec::new();
             let mut plans = Vec::new();
@@ -2111,6 +2165,15 @@ impl TranscriptEditor {
             }
 
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            if rebuild_rows {
+                let inlays = padding_inlays_to_insert
+                    .into_iter()
+                    .map(|(id, offset)| {
+                        Inlay::custom(id, clipped_anchor_after(&snapshot, offset), "   ")
+                    })
+                    .collect();
+                editor.splice_inlays(&padding_inlays_to_remove, inlays, cx);
+            }
             let native_headers: Vec<_> = header_segments
                 .iter()
                 .zip(header_texts)

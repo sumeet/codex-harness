@@ -19,6 +19,8 @@ pub enum Direction {
 pub enum InlayId {
     EditPrediction(usize),
     DebuggerValue(usize),
+    /// Host-owned display text that is not part of the underlying buffer.
+    Custom(usize),
     // LSP
     Hint(usize),
     Color(usize),
@@ -30,6 +32,7 @@ impl InlayId {
         match self {
             Self::EditPrediction(id)
             | Self::DebuggerValue(id)
+            | Self::Custom(id)
             | Self::Hint(id)
             | Self::Color(id)
             | Self::ReplResult(id) => *id,

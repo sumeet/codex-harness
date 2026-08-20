@@ -4,7 +4,10 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 profile=${HARNESS_PROFILE:-dev}
-jobs=${HARNESS_BUILD_JOBS:-1}
+# The standalone dependency cut keeps the graph small enough to compile in
+# parallel again. Four workers balance this 20-thread CPU against the laptop's
+# 16 GiB RAM; callers can still override the value for a colder/roomier box.
+jobs=${HARNESS_BUILD_JOBS:-4}
 
 case "$profile" in
     dev)
@@ -30,7 +33,8 @@ if [ "${available_kib:-0}" -lt "$minimum_kib" ]; then
 fi
 
 # A failed build is preferable to the kernel choosing an interactive app as an
-# OOM victim. Codegen stays serialized unless the caller explicitly opts in.
+# OOM victim. Keep a per-process ceiling even though the bounded worker pool is
+# parallel by default.
 ulimit -v $((8 * 1024 * 1024))
 CARGO_BUILD_JOBS="$jobs"
 export CARGO_BUILD_JOBS
