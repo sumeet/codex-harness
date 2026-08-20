@@ -663,6 +663,13 @@ fn selectable_transcript_body(
             selectable_markdown_text(normalized_content)
         }
     } else {
+        let normalized_content = if item.kind == TranscriptKind::Command {
+            normalized_content
+                .strip_prefix("$ ")
+                .unwrap_or(normalized_content)
+        } else {
+            normalized_content
+        };
         SelectableBodyProjection {
             text: normalized_content.trim().to_owned(),
             semantic_spans: Vec::new(),
@@ -691,18 +698,25 @@ fn project_transcript_item(
 
     let mut text = String::new();
     let header_start = text.len();
-    text.push_str("━━━━ ");
-    text.push_str(&normalize_buffer_line_endings(item.title.clone()));
-    if let Some(status) = item.display_status() {
-        text.push_str(" · ");
-        text.push_str(&normalize_buffer_line_endings(status.to_owned()));
+    let show_header = !matches!(
+        (item.kind, item.title.as_str()),
+        (TranscriptKind::Agent, "Codex") | (TranscriptKind::User, "You")
+    );
+    if show_header {
+        text.push_str("━━━━ ");
+        text.push_str(&normalize_buffer_line_endings(item.title.clone()));
+        if let Some(status) = item.display_status() {
+            text.push_str(" · ");
+            text.push_str(&normalize_buffer_line_endings(status.to_owned()));
+        }
+        text.push_str(" ━━━━");
     }
-    text.push_str(" ━━━━");
     let header_end = text.len();
-    // Layout owns the visual separation between transcript items. Keep only
-    // the newline that separates the real header and body rows so Vim never
-    // lands on decorative blank lines.
-    text.push('\n');
+    // Match the Rich transcript's attribution policy: ordinary user and agent
+    // messages are self-evident and do not consume a decorative header row.
+    if show_header {
+        text.push('\n');
+    }
 
     let body_start = text.len();
     let normalized_content = normalize_buffer_line_endings(item.content.clone());
@@ -4379,6 +4393,10 @@ mod tests {
                 output: "hello".into(),
             })
         );
+        assert_eq!(
+            model.item_projection(0).unwrap().body_text(),
+            "printf '%s' \"hello\"\n\nhello"
+        );
     }
 
     #[test]
@@ -4609,6 +4627,9 @@ mod tests {
         ));
 
         let document = model.full_document();
+        let segment = &document.segments[0];
+        assert!(segment.header_range.is_empty());
+        assert_eq!(segment.whole_range.start, segment.body_range.start);
         let body = &document.text[document.segments[0].body_range.clone()];
 
         assert!(body.contains("Result"));
@@ -4617,6 +4638,31 @@ mod tests {
         assert!(!body.contains("**"));
         assert!(!body.contains("# Result"));
         assert!(!body.contains("`motions`"));
+        assert!(!document.text.contains("Codex"));
+    }
+
+    #[test]
+    fn default_user_messages_are_compact_bodies_without_attribution_rows() {
+        let mut model = TranscriptModel::default();
+        model.push_without_splice(replay_item(
+            0,
+            TranscriptKind::User,
+            "You",
+            "A compact message",
+            json!(null),
+        ));
+
+        let document = model.full_document();
+        let segment = &document.segments[0];
+        assert!(segment.header_range.is_empty());
+        assert_eq!(
+            &document.text[segment.body_range.clone()],
+            "A compact message"
+        );
+        assert_eq!(
+            &document.text[segment.whole_range.clone()],
+            "A compact message\n"
+        );
     }
 
     #[test]

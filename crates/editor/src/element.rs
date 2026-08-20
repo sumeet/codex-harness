@@ -5121,7 +5121,7 @@ impl EditorElement {
                         width -= layout.gutter_hitbox.size.width;
                     }
 
-                    let origin = point(
+                    let mut origin = point(
                         origin_x,
                         layout.hitbox.origin.y
                             + Pixels::from(
@@ -5129,22 +5129,29 @@ impl EditorElement {
                                     * ScrollPixelOffset::from(layout.position_map.line_height),
                             ),
                     );
-                    let size = size(
+                    let mut size = size(
                         width,
                         layout.position_map.line_height
                             * highlight_row_end.next_row().minus(highlight_row_start) as f32,
                     );
+                    let vertical_margin = highlight
+                        .vertical_margin
+                        .min((size.height - px(1.)).max(Pixels::ZERO) / 2.);
+                    origin.y += vertical_margin;
+                    size.height = (size.height - vertical_margin * 2.).max(px(1.));
                     let mut quad = fill(Bounds { origin, size }, highlight.background);
                     if highlight.corner_radius > Pixels::ZERO {
                         quad = quad.corner_radii(Corners::all(highlight.corner_radius));
                     }
                     if let Some(border_color) = highlight.border {
                         quad.border_color = border_color;
-                        quad.border_widths = if highlight.corner_radius > Pixels::ZERO {
-                            Edges::all(px(1.))
-                        } else {
-                            edges
-                        }
+                        quad.border_widths = highlight.border_widths.unwrap_or_else(|| {
+                            if highlight.corner_radius > Pixels::ZERO {
+                                Edges::all(px(1.))
+                            } else {
+                                edges
+                            }
+                        });
                     }
                     window.paint_quad(quad);
                 };
@@ -8461,17 +8468,23 @@ impl Element for EditorElement {
                             let hollow_highlight = LineHighlight {
                                 background: diff_hunk_colors.hollow_background.into(),
                                 border: Some(diff_hunk_colors.hollow_border),
+                                border_widths: None,
                                 corner_radius: Pixels::ZERO,
+                                vertical_margin: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
+                                group_id: None,
                             };
 
                             let filled_highlight = LineHighlight {
                                 background: solid_background(diff_hunk_colors.filled_background),
                                 border: None,
+                                border_widths: None,
                                 corner_radius: Pixels::ZERO,
+                                vertical_margin: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
+                                group_id: None,
                             };
 
                             let background = if self.diff_hunk_hollow(diff_status, cx) {
@@ -8496,9 +8509,12 @@ impl Element for EditorElement {
                             let drag_highlight = LineHighlight {
                                 background: solid_background(drag_highlight_color),
                                 border: Some(drag_border_color),
+                                border_widths: None,
                                 corner_radius: Pixels::ZERO,
+                                vertical_margin: Pixels::ZERO,
                                 include_gutter: true,
                                 type_id: None,
+                                group_id: None,
                             };
                             for row_num in start_row..=end_row {
                                 highlighted_rows

@@ -18,8 +18,8 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
+    AnyView, App, AppContext as _, Context, Edges, Entity, EventEmitter, FocusHandle, Focusable,
+    Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
     KeyContext, Pixels, Render, SharedString, TextStyle, TextStyleRefinement, WeakEntity, Window,
     div, point, prelude::*, px,
 };
@@ -874,18 +874,19 @@ fn should_request_tail_autoscroll(follow_tail: bool, content_changed: bool) -> b
 }
 
 fn user_transcript_background(cx: &App) -> Hsla {
-    cx.theme().colors().element_background.opacity(0.56)
+    cx.theme().colors().element_background
 }
 
 fn reasoning_transcript_background(cx: &App) -> Hsla {
-    cx.theme()
-        .colors()
-        .editor_highlighted_line_background
-        .opacity(0.46)
+    let _ = cx;
+    Hsla::transparent_black()
 }
 
 fn structured_transcript_background(cx: &App) -> Hsla {
-    cx.theme().colors().editor_subheader_background.opacity(0.5)
+    cx.theme()
+        .colors()
+        .editor_subheader_background
+        .opacity(0.28)
 }
 
 fn error_transcript_background(cx: &App) -> Hsla {
@@ -894,6 +895,10 @@ fn error_transcript_background(cx: &App) -> Hsla {
 
 fn transcript_card_border(cx: &App) -> Hsla {
     cx.theme().colors().border_variant.opacity(0.72)
+}
+
+fn transcript_section_rail(cx: &App) -> Hsla {
+    cx.theme().colors().text_accent.opacity(0.55)
 }
 
 fn error_transcript_card_border(cx: &App) -> Hsla {
@@ -919,14 +924,26 @@ fn transcript_kind_is_card(kind: TranscriptKind) -> bool {
 
 fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
     let card = transcript_kind_is_card(kind);
+    let section = matches!(kind, TranscriptKind::Reasoning | TranscriptKind::Plan);
+    let border: Option<fn(&App) -> Hsla> = if section {
+        Some(transcript_section_rail)
+    } else if kind == TranscriptKind::Error {
+        Some(error_transcript_card_border)
+    } else if card {
+        Some(transcript_card_border)
+    } else {
+        None
+    };
     RowHighlightOptions {
         include_gutter: false,
-        border: card.then_some(if kind == TranscriptKind::Error {
-            error_transcript_card_border
-        } else {
-            transcript_card_border
+        border,
+        border_widths: section.then_some(Edges {
+            left: px(2.),
+            ..Edges::default()
         }),
         corner_radius: if card { px(6.) } else { Pixels::ZERO },
+        vertical_margin: if card { px(3.) } else { Pixels::ZERO },
+        merge_adjacent: !card,
         ..RowHighlightOptions::default()
     }
 }
@@ -1224,19 +1241,10 @@ fn native_header_block(
             let icon_color = transcript_icon_color(kind, cx.selected);
             let colors = cx.theme().colors();
             let card = transcript_kind_is_card(kind);
-            let background = if card {
+            let background = if card || !cx.selected {
                 Hsla::transparent_black()
-            } else if cx.selected {
+            } else {
                 colors.editor_highlighted_line_background
-            } else {
-                colors.editor_subheader_background.opacity(0.56)
-            };
-            let rail = if kind == TranscriptKind::Error {
-                cx.theme().status().error.opacity(0.72)
-            } else if cx.selected {
-                colors.text_accent.opacity(0.82)
-            } else {
-                colors.border_variant.opacity(0.78)
             };
 
             let header = div()
@@ -1251,11 +1259,6 @@ fn native_header_block(
                 .gap_2()
                 .overflow_hidden()
                 .bg(background)
-                .when(card, |this| {
-                    this.border_b_1()
-                        .border_color(colors.border_variant.opacity(0.62))
-                })
-                .when(!card, |this| this.border_l_2().border_color(rail))
                 .child(
                     Icon::new(transcript_icon(kind))
                         .size(IconSize::XSmall)
@@ -1397,6 +1400,8 @@ impl TranscriptEditor {
                 editor.set_current_line_highlight(None);
                 editor.set_soft_wrap();
                 editor.set_show_gutter(false, cx);
+                editor.set_show_indent_guides(false, cx);
+                editor.set_show_wrap_guides(false, cx);
                 editor.set_show_horizontal_scrollbar(false, cx);
                 editor.disable_mouse_wheel_zoom();
                 editor.register_addon(TranscriptKeyContextAddon);
@@ -4176,10 +4181,14 @@ mod tests {
         let user = transcript_row_options(TranscriptKind::User);
         assert!(user.border.is_some());
         assert_eq!(user.corner_radius, px(6.));
+        assert_eq!(user.vertical_margin, px(3.));
+        assert!(!user.merge_adjacent);
 
         let agent = transcript_row_options(TranscriptKind::Agent);
         assert!(agent.border.is_none());
         assert_eq!(agent.corner_radius, Pixels::ZERO);
+        assert_eq!(agent.vertical_margin, Pixels::ZERO);
+        assert!(agent.merge_adjacent);
 
         let command = segment_with_kind(0, TranscriptKind::Command, 0..80, 0..10, 10..78);
         let narrative = segment_with_kind(1, TranscriptKind::Agent, 80..160, 80..90, 90..158);
