@@ -49,8 +49,14 @@ Builds and launches are deliberately separate; launching never invokes Cargo:
 ```
 
 The build wrapper serializes Rust compilation, refuses to build when less than
-4 GiB of memory is available, and caps an individual compiler process. For an
-optimized non-LTO test build:
+4 GiB of memory is available, and caps an individual compiler process. Its
+default `dev` selection uses the `harness-dev` Cargo profile: only Harness's
+frame, input, Editor, text-layout, and Linux GPU-submission crates are optimized.
+Debug assertions, overflow checks, limited line information, backtraces, and
+incremental compilation remain enabled. The first build therefore costs more
+than an unoptimized `cargo build`, while subsequent Harness-only edits remain
+incremental and avoid release LTO. For a more broadly optimized non-LTO test
+build:
 
 ```sh
 HARNESS_PROFILE=release-fast ./script/build-standalone.sh

@@ -280,6 +280,7 @@ pub(crate) unsafe fn platform_input_from_native(
                         px(native_event.locationInWindow().x as f32),
                         window_height - px(native_event.locationInWindow().y as f32),
                     ),
+                    event_time: None,
                     delta,
                     touch_phase: phase,
                     modifiers: read_modifiers(native_event),

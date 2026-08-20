@@ -2495,6 +2495,7 @@ fn make_scroll_wheel_event(
     };
     gpui::ScrollWheelEvent {
         position,
+        event_time: None,
         delta: ScrollDelta::Lines(delta),
         modifiers,
         touch_phase: TouchPhase::default(),

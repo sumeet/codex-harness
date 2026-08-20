@@ -315,6 +315,9 @@ pub enum TranscriptSemanticStyle {
     Emphasis,
     InlineCode,
     Link,
+    CodeBlock,
+    BlockQuote,
+    Strikethrough,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -354,16 +357,37 @@ fn close_semantic_span(
     style: TranscriptSemanticStyle,
     output: &str,
 ) {
+    close_semantic_span_at(open, spans, style, output.len());
+}
+
+fn close_semantic_span_at(
+    open: &mut Vec<OpenSemanticSpan>,
+    spans: &mut Vec<TranscriptSemanticSpan>,
+    style: TranscriptSemanticStyle,
+    end: usize,
+) {
     let Some(position) = open.iter().rposition(|candidate| candidate.style == style) else {
         return;
     };
     let open = open.remove(position);
-    if open.start < output.len() && spans.len() < MAX_SEMANTIC_SPANS_PER_ITEM {
+    if open.start < end && spans.len() < MAX_SEMANTIC_SPANS_PER_ITEM {
         spans.push(TranscriptSemanticSpan {
-            range: open.start..output.len(),
+            range: open.start..end,
             style,
         });
     }
+}
+
+fn close_block_semantic_span(
+    open: &mut Vec<OpenSemanticSpan>,
+    spans: &mut Vec<TranscriptSemanticSpan>,
+    style: TranscriptSemanticStyle,
+    output: &str,
+) {
+    // Pulldown includes the block's terminating line break in Text/Paragraph
+    // events. It remains in the selectable projection as layout, but is not
+    // part of the semantic content painted by the block decoration.
+    close_semantic_span_at(open, spans, style, output.trim_end_matches('\n').len());
 }
 
 fn push_inline_semantic_text(
@@ -445,6 +469,11 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
                 TranscriptSemanticStyle::Emphasis,
                 &output,
             ),
+            MarkdownEvent::Start(Tag::Strikethrough) => open_semantic_span(
+                &mut open_semantic_spans,
+                TranscriptSemanticStyle::Strikethrough,
+                &output,
+            ),
             MarkdownEvent::Start(Tag::List(start)) => {
                 ensure_line_break(&mut output);
                 lists.push(start);
@@ -461,8 +490,21 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
                     }
                 }
             }
-            MarkdownEvent::Start(Tag::CodeBlock(_)) | MarkdownEvent::Start(Tag::BlockQuote(_)) => {
-                ensure_line_break(&mut output)
+            MarkdownEvent::Start(Tag::CodeBlock(_)) => {
+                ensure_line_break(&mut output);
+                open_semantic_span(
+                    &mut open_semantic_spans,
+                    TranscriptSemanticStyle::CodeBlock,
+                    &output,
+                );
+            }
+            MarkdownEvent::Start(Tag::BlockQuote(_)) => {
+                ensure_line_break(&mut output);
+                open_semantic_span(
+                    &mut open_semantic_spans,
+                    TranscriptSemanticStyle::BlockQuote,
+                    &output,
+                );
             }
             MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
                 open_semantic_span(
@@ -517,6 +559,12 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
                 TranscriptSemanticStyle::Emphasis,
                 &output,
             ),
+            MarkdownEvent::End(TagEnd::Strikethrough) => close_semantic_span(
+                &mut open_semantic_spans,
+                &mut semantic_spans,
+                TranscriptSemanticStyle::Strikethrough,
+                &output,
+            ),
             MarkdownEvent::End(TagEnd::Heading(_)) => {
                 close_semantic_span(
                     &mut open_semantic_spans,
@@ -526,13 +574,27 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
                 );
                 ensure_line_break(&mut output);
             }
-            MarkdownEvent::End(
-                TagEnd::Paragraph
-                | TagEnd::BlockQuote(_)
-                | TagEnd::CodeBlock
-                | TagEnd::Item
-                | TagEnd::TableRow,
-            ) => ensure_line_break(&mut output),
+            MarkdownEvent::End(TagEnd::CodeBlock) => {
+                close_block_semantic_span(
+                    &mut open_semantic_spans,
+                    &mut semantic_spans,
+                    TranscriptSemanticStyle::CodeBlock,
+                    &output,
+                );
+                ensure_line_break(&mut output);
+            }
+            MarkdownEvent::End(TagEnd::BlockQuote(_)) => {
+                close_block_semantic_span(
+                    &mut open_semantic_spans,
+                    &mut semantic_spans,
+                    TranscriptSemanticStyle::BlockQuote,
+                    &output,
+                );
+                ensure_line_break(&mut output);
+            }
+            MarkdownEvent::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow) => {
+                ensure_line_break(&mut output)
+            }
             MarkdownEvent::End(TagEnd::TableCell) => output.push('\t'),
             MarkdownEvent::Code(text) => push_inline_semantic_text(
                 &mut output,
@@ -4868,6 +4930,62 @@ mod tests {
     }
 
     #[test]
+    fn completed_block_markdown_styles_exact_selectable_output_ranges() {
+        let source =
+            "> Quote ~~retiré~~ and **kept**.\n>\n> δεύτερο\n\n```rust\nlet café = 1;\n```";
+        let mut model = TranscriptModel::default();
+        let mut item = replay_item(0, TranscriptKind::Agent, "Codex", source, json!(null));
+        item.status = Some("streaming".into());
+        model.push_without_splice(item);
+
+        let streaming = model.item_projection(0).unwrap();
+        assert_eq!(streaming.body_text(), source);
+        assert!(streaming.segment.semantic_spans.is_empty());
+
+        model.items[0].status = Some("completed".into());
+        let completed = model.item_projection(0).unwrap();
+        assert_eq!(
+            completed.body_text(),
+            "Quote retiré and kept.\nδεύτερο\nlet café = 1;"
+        );
+        assert!(completed.segment.semantic_spans.iter().all(|span| {
+            completed.text.is_char_boundary(span.range.start)
+                && completed.text.is_char_boundary(span.range.end)
+                && completed.segment.body_range.start <= span.range.start
+                && span.range.end <= completed.segment.body_range.end
+        }));
+
+        let semantic_text = |style| {
+            completed
+                .segment
+                .semantic_spans
+                .iter()
+                .filter(|span| span.style == style)
+                .map(|span| &completed.text[span.range.clone()])
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::BlockQuote),
+            ["Quote retiré and kept.\nδεύτερο"]
+        );
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::Strikethrough),
+            ["retiré"]
+        );
+        assert_eq!(semantic_text(TranscriptSemanticStyle::Strong), ["kept"]);
+        assert_eq!(
+            semantic_text(TranscriptSemanticStyle::CodeBlock),
+            ["let café = 1;"]
+        );
+        assert!(
+            !completed
+                .body_text()
+                .chars()
+                .any(|character| ['>', '~', '`'].contains(&character))
+        );
+    }
+
+    #[test]
     fn completed_markdown_semantic_metadata_has_a_per_item_cap() {
         let source = (0..MAX_SEMANTIC_SPANS_PER_ITEM + 500)
             .map(|index| format!("**value-{index}** "))
@@ -4917,14 +5035,17 @@ mod tests {
             0,
             TranscriptKind::Command,
             "Command",
-            "  # literal output\n**not emphasis**  ",
+            "  # literal output\n> still literal\n```sh\nprintf ok\n```\n~~not strikethrough~~  ",
             json!(null),
         ));
 
         let document = model.full_document();
         let body = &document.text[document.segments[0].body_range.clone()];
 
-        assert_eq!(body, "# literal output\n**not emphasis**");
+        assert_eq!(
+            body,
+            "# literal output\n> still literal\n```sh\nprintf ok\n```\n~~not strikethrough~~"
+        );
         assert!(document.segments[0].semantic_spans.is_empty());
     }
 

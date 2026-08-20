@@ -548,7 +548,9 @@ impl EditorElement {
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let synthesize_momentum = editor_event_synthesizes_momentum(event);
-                    let now = cx.background_executor().now();
+                    let now = event
+                        .event_time
+                        .unwrap_or_else(|| cx.background_executor().now());
                     let tuning = platform_gesture_tuning(cx);
                     if event.is_lifecycle_only() {
                         let generation = editor.update(cx, |editor, _| {

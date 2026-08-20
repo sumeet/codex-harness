@@ -143,6 +143,7 @@ impl PointerAxes {
 #[derive(Debug, Default)]
 struct PointerAxisFrame {
     source: Option<AxisSource>,
+    event_time_millis: Option<u32>,
     continuous_delta: Option<Point<Pixels>>,
     discrete_delta: Option<Point<f32>>,
     moved_axes: PointerAxes,
@@ -152,6 +153,53 @@ struct PointerAxisFrame {
 #[derive(Debug, Default)]
 struct PointerAxisSequence {
     active_finger_axes: PointerAxes,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PointerAxisTimebase {
+    protocol_start_millis: u32,
+    instant_start: Instant,
+    last_resolved: Instant,
+}
+
+#[derive(Debug, Default)]
+struct PointerAxisEventClock(Option<PointerAxisTimebase>);
+
+impl PointerAxisEventClock {
+    fn resolve(&mut self, protocol_millis: u32, received_at: Instant) -> Instant {
+        let Some(timebase) = self.0.as_mut() else {
+            self.0 = Some(PointerAxisTimebase {
+                protocol_start_millis: protocol_millis,
+                instant_start: received_at,
+                last_resolved: received_at,
+            });
+            return received_at;
+        };
+
+        let elapsed_millis = protocol_millis.wrapping_sub(timebase.protocol_start_millis);
+        // A forward interval shorter than half the u32 domain is unambiguous,
+        // including the normal wrap at roughly 49.7 days. A larger interval
+        // means the compositor clock moved backwards or the sequence is stale;
+        // re-anchor rather than manufacturing an event weeks in the future.
+        if elapsed_millis > i32::MAX as u32 {
+            *timebase = PointerAxisTimebase {
+                protocol_start_millis: protocol_millis,
+                instant_start: received_at,
+                last_resolved: received_at,
+            };
+            return received_at;
+        }
+
+        let resolved = (timebase.instant_start + Duration::from_millis(elapsed_millis.into()))
+            .min(received_at)
+            .max(timebase.last_resolved);
+        timebase.last_resolved = resolved;
+        resolved
+    }
+
+    fn reset(&mut self) {
+        self.0 = None;
+    }
 }
 
 #[derive(Debug)]
@@ -440,6 +488,7 @@ pub(crate) struct WaylandClientState {
     pub mouse_location: Option<Point<Pixels>>,
     pointer_axis_frame: PointerAxisFrame,
     pointer_axis_sequence: PointerAxisSequence,
+    pointer_axis_event_clock: PointerAxisEventClock,
     vertical_modifier: f32,
     horizontal_modifier: f32,
     enter_token: Option<()>,
@@ -992,6 +1041,7 @@ impl WaylandClient {
             mouse_location: None,
             pointer_axis_frame: PointerAxisFrame::default(),
             pointer_axis_sequence: PointerAxisSequence::default(),
+            pointer_axis_event_clock: PointerAxisEventClock::default(),
             vertical_modifier: -1.0,
             horizontal_modifier: -1.0,
             button_pressed: None,
@@ -1775,6 +1825,9 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                     wl_pointer.release();
                 }
 
+                state.pointer_axis_frame = PointerAxisFrame::default();
+                state.pointer_axis_sequence = PointerAxisSequence::default();
+                state.pointer_axis_event_clock.reset();
                 state.wl_pointer = Some(pointer);
             }
         }
@@ -2180,6 +2233,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     state.mouse_location = None;
                     state.button_pressed = None;
                     state.cursor_hidden_window = None;
+                    state.pointer_axis_frame = PointerAxisFrame::default();
+                    state.pointer_axis_sequence = PointerAxisSequence::default();
+                    state.pointer_axis_event_clock.reset();
 
                     drop(state);
                     focused_window.handle_input(input);
@@ -2334,10 +2390,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 state.pointer_axis_frame.source = Some(axis_source);
             }
             wl_pointer::Event::Axis {
+                time,
                 axis: WEnum::Value(axis),
                 value,
-                ..
             } => {
+                state.pointer_axis_frame.event_time_millis = Some(time);
                 let protocol_axis = axis;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
@@ -2429,16 +2486,37 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 state.pointer_axis_frame.moved_axes.insert(protocol_axis);
             }
             wl_pointer::Event::AxisStop {
+                time,
                 axis: WEnum::Value(axis),
-                ..
             } => {
+                state.pointer_axis_frame.event_time_millis = Some(time);
                 state.pointer_axis_frame.stopped_axes.insert(axis);
             }
             wl_pointer::Event::Frame => {
                 let frame = std::mem::take(&mut state.pointer_axis_frame);
+                let event_time_millis = frame.event_time_millis;
                 let dispatch = finish_pointer_axis_frame(frame, &mut state.pointer_axis_sequence);
                 if dispatch.movement.is_none() && !dispatch.ended {
                     return;
+                }
+                if dispatch
+                    .movement
+                    .is_some_and(|(_, phase)| phase == TouchPhase::Started)
+                {
+                    state.pointer_axis_event_clock.reset();
+                }
+                let event_time = dispatch
+                    .synthesize_momentum
+                    .then(|| {
+                        event_time_millis.map(|millis| {
+                            state
+                                .pointer_axis_event_clock
+                                .resolve(millis, Instant::now())
+                        })
+                    })
+                    .flatten();
+                if dispatch.ended {
+                    state.pointer_axis_event_clock.reset();
                 }
                 let Some(window) = state.mouse_focused_window.clone() else {
                     return;
@@ -2450,6 +2528,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if let Some((delta, touch_phase)) = dispatch.movement {
                     window.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
+                        event_time,
                         delta,
                         modifiers,
                         touch_phase,
@@ -2459,6 +2538,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 if dispatch.ended {
                     window.handle_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
+                        event_time,
                         delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
                         modifiers,
                         touch_phase: TouchPhase::Ended,
@@ -2971,6 +3051,42 @@ mod tests {
     }
 
     #[test]
+    fn pointer_axis_clock_preserves_protocol_cadence_across_batched_receipt() {
+        let received_at = Instant::now();
+        let mut clock = PointerAxisEventClock::default();
+
+        let first = clock.resolve(1_000, received_at);
+        let second = clock.resolve(1_008, received_at + Duration::from_millis(40));
+        let third = clock.resolve(1_019, received_at + Duration::from_millis(40));
+
+        assert_eq!(first, received_at);
+        assert_eq!(second.duration_since(first), Duration::from_millis(8));
+        assert_eq!(third.duration_since(second), Duration::from_millis(11));
+    }
+
+    #[test]
+    fn pointer_axis_clock_unwraps_the_u32_millisecond_boundary() {
+        let received_at = Instant::now();
+        let mut clock = PointerAxisEventClock::default();
+
+        let first = clock.resolve(u32::MAX - 4, received_at);
+        let after_wrap = clock.resolve(3, received_at + Duration::from_millis(8));
+
+        assert_eq!(after_wrap.duration_since(first), Duration::from_millis(8));
+    }
+
+    #[test]
+    fn pointer_axis_clock_reanchors_a_backwards_protocol_timestamp() {
+        let received_at = Instant::now();
+        let mut clock = PointerAxisEventClock::default();
+        clock.resolve(1_000, received_at);
+
+        let reanchored = clock.resolve(999, received_at + Duration::from_millis(20));
+
+        assert_eq!(reanchored, received_at + Duration::from_millis(20));
+    }
+
+    #[test]
     fn finger_axis_frames_emit_started_moved_and_a_separate_end() {
         let mut sequence = PointerAxisSequence::default();
         let vertical = pointer_axes([wl_pointer::Axis::VerticalScroll]);
@@ -3099,6 +3215,7 @@ mod tests {
                 discrete_delta: Some(point(0., 3.)),
                 moved_axes: vertical,
                 stopped_axes: vertical,
+                event_time_millis: None,
             },
             &mut sequence,
         );

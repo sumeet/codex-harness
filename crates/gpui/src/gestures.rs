@@ -12,6 +12,7 @@
 
 use std::{
     collections::VecDeque,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -19,10 +20,9 @@ use crate::{App, Axis, IsZero, Pixels, Point, TouchPhase, Window, point, px};
 
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 
-const VELOCITY_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
-const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(50);
+const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(200);
 const VELOCITY_MIN_SAMPLE_SPAN: Duration = Duration::from_millis(8);
-const VELOCITY_MAX_SAMPLES: usize = 32;
+const VELOCITY_MAX_SAMPLES: usize = 3;
 const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 const MOMENTUM_MAX_VELOCITY: f32 = 8_000.;
 const MOMENTUM_MAX_DURATION: Duration = Duration::from_secs(3);
@@ -31,27 +31,40 @@ const MOMENTUM_MAX_FRAME_INTERVAL: Duration = Duration::from_millis(50);
 const MOMENTUM_RESUME_TIMEOUT: Duration = Duration::from_millis(250);
 const MOMENTUM_CONSUMPTION_EPSILON: f32 = 0.25;
 
+fn kinetic_scroll_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    })
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ScrollMotionSample {
-    at: Instant,
-    position: Point<f32>,
+    interval: Duration,
+    delta: Point<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScrollRelease {
+    velocity: Point<f32>,
+    sample_count: usize,
+    sample_span: Duration,
+    release_age: Duration,
 }
 
 #[derive(Debug)]
 struct ScrollVelocityRecorder {
     samples: VecDeque<ScrollMotionSample>,
-    position: Point<f32>,
+    last_sample_at: Instant,
     last_movement_at: Option<Instant>,
 }
 
 impl ScrollVelocityRecorder {
     fn new(started_at: Instant) -> Self {
         Self {
-            samples: VecDeque::from([ScrollMotionSample {
-                at: started_at,
-                position: Point::default(),
-            }]),
-            position: Point::default(),
+            samples: VecDeque::with_capacity(VELOCITY_MAX_SAMPLES),
+            last_sample_at: started_at,
             last_movement_at: None,
         }
     }
@@ -60,54 +73,104 @@ impl ScrollVelocityRecorder {
         if delta.is_zero() {
             return;
         }
-        self.position.x += delta.x.as_f32();
-        self.position.y += delta.y.as_f32();
+        let interval = now.saturating_duration_since(self.last_sample_at);
+        self.last_sample_at = now;
         self.last_movement_at = Some(now);
         if self.samples.len() == VELOCITY_MAX_SAMPLES {
             self.samples.pop_front();
         }
         self.samples.push_back(ScrollMotionSample {
-            at: now,
-            position: self.position,
+            interval,
+            delta: point(delta.x.as_f32(), delta.y.as_f32()),
         });
-        while self.samples.len() > 2
-            && self
-                .samples
-                .front()
-                .is_some_and(|sample| now.duration_since(sample.at) > VELOCITY_SAMPLE_WINDOW)
-        {
-            self.samples.pop_front();
-        }
     }
 
-    fn release_velocity(&self, now: Instant) -> Option<Point<f32>> {
+    fn release_velocity(&self, now: Instant) -> Option<ScrollRelease> {
         let last_movement_at = self.last_movement_at?;
-        if now.duration_since(last_movement_at) > VELOCITY_RELEASE_MAX_AGE {
+        let release_age = now.saturating_duration_since(last_movement_at);
+        if release_age > VELOCITY_RELEASE_MAX_AGE {
             return None;
         }
-        let last = self.samples.back()?;
-        let first = self
+        let sample_span = self
             .samples
             .iter()
-            .find(|sample| last.at.duration_since(sample.at) <= VELOCITY_SAMPLE_WINDOW)?;
-        let span = last.at.duration_since(first.at);
-        if span < VELOCITY_MIN_SAMPLE_SPAN {
+            .fold(Duration::ZERO, |span, sample| span + sample.interval);
+        if self.samples.len() < 2 || sample_span < VELOCITY_MIN_SAMPLE_SPAN {
             return None;
         }
-        let seconds = span.as_secs_f32();
-        Some(point(
-            (last.position.x - first.position.x) / seconds,
-            (last.position.y - first.position.y) / seconds,
-        ))
+
+        // This is the same latest-three-frame linear regression Chromium's
+        // Wayland backend uses (and in turn matches libgestures). Iterating
+        // newest-to-oldest makes each accumulated delta a position at an
+        // increasing time before release; translating every time by the lift
+        // gap does not change the fitted slope. Each interval precedes its
+        // frame, so advance it only after observing that frame. In particular,
+        // the first Started frame may legitimately have a zero interval.
+        let mut time = release_age.as_secs_f32();
+        let mut position = Point::<f32>::default();
+        let mut time_sum = 0.;
+        let mut time_squared_sum = 0.;
+        let mut x_sum = 0.;
+        let mut y_sum = 0.;
+        let mut time_x_sum = 0.;
+        let mut time_y_sum = 0.;
+        for sample in self.samples.iter().rev() {
+            position.x += sample.delta.x;
+            position.y += sample.delta.y;
+            time_sum += time;
+            time_squared_sum += time * time;
+            x_sum += position.x;
+            y_sum += position.y;
+            time_x_sum += time * position.x;
+            time_y_sum += time * position.y;
+            time += sample.interval.as_secs_f32();
+        }
+        let count = self.samples.len() as f32;
+        let determinant = count * time_squared_sum - time_sum * time_sum;
+        if determinant.abs() <= f32::EPSILON {
+            return None;
+        }
+        let inverse_determinant = determinant.recip();
+        Some(ScrollRelease {
+            velocity: point(
+                (count * time_x_sum - time_sum * x_sum) * inverse_determinant,
+                (count * time_y_sum - time_sum * y_sum) * inverse_determinant,
+            ),
+            sample_count: self.samples.len(),
+            sample_span,
+            release_age,
+        })
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ScrollMomentum {
     velocity: Point<f32>,
+    initial_velocity: Point<f32>,
     last_frame_at: Instant,
     elapsed: Duration,
     frames: u16,
+    requested: Point<f32>,
+    consumed: Point<f32>,
+}
+
+fn log_kinetic_scroll_end(id: usize, generation: u64, reason: &str, momentum: &ScrollMomentum) {
+    if !kinetic_scroll_diagnostics_enabled() {
+        return;
+    }
+    log::info!(
+        "gpui kinetic end id={id:x} generation={generation} reason={reason} frames={} elapsed_ms={:.2} initial_velocity=({:.1},{:.1}) final_velocity=({:.1},{:.1}) requested=({:.1},{:.1}) consumed=({:.1},{:.1})",
+        momentum.frames,
+        momentum.elapsed.as_secs_f64() * 1_000.,
+        momentum.initial_velocity.x,
+        momentum.initial_velocity.y,
+        momentum.velocity.x,
+        momentum.velocity.y,
+        momentum.requested.x,
+        momentum.requested.y,
+        momentum.consumed.x,
+        momentum.consumed.y,
+    );
 }
 
 /// One analytically integrated kinetic-scroll frame.
@@ -153,7 +216,9 @@ impl KineticScroll {
     /// measured release velocity is sufficient for a fling.
     pub fn finish_at(&mut self, now: Instant, tuning: GestureTuning) -> Option<u64> {
         let recorder = self.recorder.take()?;
-        let mut velocity = recorder.release_velocity(now)?;
+        let release = recorder.release_velocity(now)?;
+        let raw_velocity = release.velocity;
+        let mut velocity = raw_velocity;
         let speed = velocity.x.hypot(velocity.y);
         if speed < tuning.min_fling_velocity {
             return None;
@@ -163,11 +228,29 @@ impl KineticScroll {
             velocity.x *= scale;
             velocity.y *= scale;
         }
+        let id = self as *const Self as usize;
+        if kinetic_scroll_diagnostics_enabled() {
+            log::info!(
+                "gpui kinetic release id={id:x} generation={} samples={} span_ms={:.2} release_age_ms={:.2} raw_velocity=({:.1},{:.1}) velocity=({:.1},{:.1}) decay_per_ms={:.6}",
+                self.generation,
+                release.sample_count,
+                release.sample_span.as_secs_f64() * 1_000.,
+                release.release_age.as_secs_f64() * 1_000.,
+                raw_velocity.x,
+                raw_velocity.y,
+                velocity.x,
+                velocity.y,
+                tuning.momentum_decay_per_ms,
+            );
+        }
         self.momentum = Some(ScrollMomentum {
             velocity,
+            initial_velocity: velocity,
             last_frame_at: now,
             elapsed: Duration::ZERO,
             frames: 0,
+            requested: Point::default(),
+            consumed: Point::default(),
         });
         Some(self.generation)
     }
@@ -182,9 +265,11 @@ impl KineticScroll {
         if generation != self.generation {
             return None;
         }
+        let id = self as *const Self as usize;
         let momentum = self.momentum.as_mut()?;
         let actual_elapsed = now.saturating_duration_since(momentum.last_frame_at);
         if actual_elapsed > MOMENTUM_RESUME_TIMEOUT {
+            log_kinetic_scroll_end(id, generation, "frame-timeout", momentum);
             self.momentum = None;
             return None;
         }
@@ -205,13 +290,25 @@ impl KineticScroll {
             px(momentum.velocity.x * distance_scale),
             px(momentum.velocity.y * distance_scale),
         );
+        momentum.requested.x += delta.x.as_f32();
+        momentum.requested.y += delta.y.as_f32();
         momentum.velocity.x *= decay;
         momentum.velocity.y *= decay;
 
-        let continues = momentum.velocity.x.hypot(momentum.velocity.y) >= MOMENTUM_STOP_VELOCITY
-            && momentum.elapsed < MOMENTUM_MAX_DURATION
-            && momentum.frames < MOMENTUM_MAX_FRAMES;
+        let speed_continues =
+            momentum.velocity.x.hypot(momentum.velocity.y) >= MOMENTUM_STOP_VELOCITY;
+        let duration_continues = momentum.elapsed < MOMENTUM_MAX_DURATION;
+        let frame_count_continues = momentum.frames < MOMENTUM_MAX_FRAMES;
+        let continues = speed_continues && duration_continues && frame_count_continues;
         if !continues {
+            let reason = if !speed_continues {
+                "velocity"
+            } else if !duration_continues {
+                "duration"
+            } else {
+                "frame-limit"
+            };
+            log_kinetic_scroll_end(id, generation, reason, momentum);
             self.momentum = None;
         }
         Some(KineticScrollStep { delta, continues })
@@ -229,9 +326,31 @@ impl KineticScroll {
         if generation != self.generation {
             return false;
         }
+        let id = self as *const Self as usize;
         let Some(momentum) = self.momentum.as_mut() else {
             return false;
         };
+        momentum.consumed.x += consumed.x.as_f32();
+        momentum.consumed.y += consumed.y.as_f32();
+        if kinetic_scroll_diagnostics_enabled()
+            && (momentum.frames <= 16 || momentum.frames % 30 == 0)
+        {
+            log::info!(
+                "gpui kinetic frame id={id:x} generation={generation} frame={} elapsed_ms={:.2} requested=({:.2},{:.2}) consumed=({:.2},{:.2}) velocity=({:.1},{:.1}) total_requested=({:.1},{:.1}) total_consumed=({:.1},{:.1})",
+                momentum.frames,
+                momentum.elapsed.as_secs_f64() * 1_000.,
+                requested.x.as_f32(),
+                requested.y.as_f32(),
+                consumed.x.as_f32(),
+                consumed.y.as_f32(),
+                momentum.velocity.x,
+                momentum.velocity.y,
+                momentum.requested.x,
+                momentum.requested.y,
+                momentum.consumed.x,
+                momentum.consumed.y,
+            );
+        }
         if (requested.x - consumed.x).abs().as_f32() > MOMENTUM_CONSUMPTION_EPSILON {
             momentum.velocity.x = 0.;
         }
@@ -239,6 +358,7 @@ impl KineticScroll {
             momentum.velocity.y = 0.;
         }
         if momentum.velocity.x.hypot(momentum.velocity.y) < MOMENTUM_STOP_VELOCITY {
+            log_kinetic_scroll_end(id, generation, "clipped-at-bound", momentum);
             self.momentum = None;
         }
         self.momentum.is_some()
@@ -247,6 +367,10 @@ impl KineticScroll {
     /// Cancel recording and momentum. A queued callback becomes stale and
     /// drains without scheduling a successor.
     pub fn cancel(&mut self) {
+        let id = self as *const Self as usize;
+        if let Some(momentum) = self.momentum.as_ref() {
+            log_kinetic_scroll_end(id, self.generation, "cancelled", momentum);
+        }
         self.generation = self.generation.wrapping_add(1);
         self.recorder = None;
         self.momentum = None;
@@ -588,7 +712,7 @@ mod tests {
             )
             .expect("fling should produce a frame");
 
-        assert!(step.delta.y > px(10.));
+        assert!(step.delta.y > px(9.) && step.delta.y < px(10.));
         assert!(step.continues);
     }
 
@@ -622,6 +746,94 @@ mod tests {
                 .len(),
             VELOCITY_MAX_SAMPLES
         );
+    }
+
+    #[test]
+    fn release_velocity_uses_only_the_latest_three_source_timed_frames() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        recorder.record(point(px(0.), px(100.)), start);
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(10));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(20));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(30));
+
+        let release = recorder
+            .release_velocity(start + Duration::from_millis(30))
+            .expect("three regularly spaced frames should fit a release velocity");
+        assert_eq!(release.sample_count, 3);
+        assert!((release.velocity.y - 1_000.).abs() < 0.1);
+    }
+
+    #[test]
+    fn release_velocity_does_not_bias_a_short_started_frame() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        recorder.record(point(px(0.), px(10.)), start);
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(10));
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(20));
+
+        let release = recorder
+            .release_velocity(start + Duration::from_millis(20))
+            .expect("three source-timed frames should fit a release velocity");
+        assert!((release.velocity.y - 1_000.).abs() < 0.1);
+    }
+
+    #[test]
+    fn source_timestamps_preserve_velocity_when_dispatch_is_batched() {
+        let source_start = Instant::now();
+        let mut kinetic = KineticScroll::default();
+        kinetic.begin_at(source_start);
+        for frame in 0..4 {
+            // These calls intentionally happen without waiting between them,
+            // as when the platform drains several queued axis events at once.
+            kinetic.record_movement_at(
+                point(px(0.), px(12.)),
+                source_start + Duration::from_millis(frame * 8),
+            );
+        }
+
+        assert!(
+            kinetic
+                .finish_at(
+                    source_start + Duration::from_millis(32),
+                    GestureTuning::default(),
+                )
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn release_gap_is_allowed_through_chromiums_wayland_boundary() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        for frame in 0..4 {
+            recorder.record(
+                point(px(0.), px(10.)),
+                start + Duration::from_millis(frame * 10),
+            );
+        }
+
+        assert!(
+            recorder
+                .release_velocity(start + Duration::from_millis(230))
+                .is_some()
+        );
+        assert!(
+            recorder
+                .release_velocity(start + Duration::from_millis(231))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn degenerate_source_timestamps_do_not_manufacture_velocity() {
+        let now = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(now);
+        for _ in 0..4 {
+            recorder.record(point(px(0.), px(10.)), now);
+        }
+
+        assert!(recorder.release_velocity(now).is_none());
     }
 
     #[test]
@@ -756,9 +968,12 @@ mod tests {
             recorder: None,
             momentum: Some(ScrollMomentum {
                 velocity,
+                initial_velocity: velocity,
                 last_frame_at: start,
                 elapsed: Duration::ZERO,
                 frames: 0,
+                requested: Point::default(),
+                consumed: Point::default(),
             }),
         }
     }

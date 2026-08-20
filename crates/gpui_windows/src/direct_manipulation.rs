@@ -172,6 +172,7 @@ impl DirectManipulationEventHandler {
                     .borrow_mut()
                     .push(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
+                        event_time: None,
                         delta: ScrollDelta::Pixels(point(px(0.0), px(0.0))),
                         modifiers,
                         touch_phase: TouchPhase::Ended,
@@ -327,6 +328,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                     .borrow_mut()
                     .push(PlatformInput::ScrollWheel(ScrollWheelEvent {
                         position,
+                        event_time: None,
                         delta: ScrollDelta::Pixels(point(px(dx), px(dy))),
                         modifiers,
                         touch_phase,
