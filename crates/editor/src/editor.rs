@@ -1670,6 +1670,19 @@ impl SelectionHistory {
 pub struct RowHighlightOptions {
     pub autoscroll: bool,
     pub include_gutter: bool,
+    /// Optional outline for a contiguous highlighted range.
+    pub border: Option<fn(&App) -> Hsla>,
+    /// Explicit border widths. When omitted, rounded highlights use a one-pixel
+    /// outline and ordinary row highlights retain their existing edge policy.
+    pub border_widths: Option<Edges<Pixels>>,
+    /// Corner radius applied to the contiguous highlighted range.
+    pub corner_radius: Pixels,
+    /// Display-only space inset from the top and bottom of the highlighted range.
+    pub vertical_margin: Pixels,
+    /// Whether a range that touches the next range of the same type becomes one
+    /// continuous highlight. Card-like decorations disable this so adjacent
+    /// items retain independent borders and corners.
+    pub merge_adjacent: bool,
 }
 
 impl Default for RowHighlightOptions {
@@ -1677,6 +1690,11 @@ impl Default for RowHighlightOptions {
         Self {
             autoscroll: Default::default(),
             include_gutter: true,
+            border: None,
+            border_widths: None,
+            corner_radius: Pixels::ZERO,
+            vertical_margin: Pixels::ZERO,
+            merge_adjacent: true,
         }
     }
 }
@@ -9737,11 +9755,11 @@ impl Editor {
             let mut merged = false;
             if ix > 0 {
                 let prev_highlight = &mut row_highlights[ix - 1];
-                if prev_highlight
-                    .range
-                    .end
-                    .cmp(&range.start, &snapshot)
-                    .is_ge()
+                let relation = prev_highlight.range.end.cmp(&range.start, &snapshot);
+                if relation.is_gt()
+                    || (relation.is_eq()
+                        && prev_highlight.options.merge_adjacent
+                        && options.merge_adjacent)
                 {
                     ix -= 1;
                     if prev_highlight.range.end.cmp(&range.end, &snapshot).is_lt() {
@@ -9770,11 +9788,14 @@ impl Editor {
             // If any of the following highlights intersect with this one, merge them.
             while let Some(next_highlight) = row_highlights.get(ix + 1) {
                 let highlight = &row_highlights[ix];
-                if next_highlight
+                let relation = next_highlight
                     .range
                     .start
-                    .cmp(&highlight.range.end, &snapshot)
-                    .is_le()
+                    .cmp(&highlight.range.end, &snapshot);
+                if relation.is_lt()
+                    || (relation.is_eq()
+                        && highlight.options.merge_adjacent
+                        && next_highlight.options.merge_adjacent)
                 {
                     if next_highlight
                         .range
@@ -9873,9 +9894,13 @@ impl Editor {
                                 DisplayRow(row),
                                 LineHighlight {
                                     include_gutter: highlight.options.include_gutter,
-                                    border: None,
+                                    border: highlight.options.border.map(|border| border(cx)),
+                                    border_widths: highlight.options.border_widths,
+                                    corner_radius: highlight.options.corner_radius,
+                                    vertical_margin: highlight.options.vertical_margin,
                                     background: (highlight.color)(cx).into(),
                                     type_id: Some(highlight.type_id),
+                                    group_id: Some(highlight.index),
                                 },
                             );
                         }
@@ -13495,8 +13520,12 @@ impl Focusable for PromptEditor {
 pub struct LineHighlight {
     pub background: Background,
     pub border: Option<gpui::Hsla>,
+    pub border_widths: Option<Edges<Pixels>>,
+    pub corner_radius: Pixels,
+    pub vertical_margin: Pixels,
     pub include_gutter: bool,
     pub type_id: Option<TypeId>,
+    pub group_id: Option<usize>,
 }
 
 struct LineManipulationResult {

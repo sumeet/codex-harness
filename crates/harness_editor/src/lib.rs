@@ -5,33 +5,35 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
-    sync::Arc,
+    ops::{Range, RangeInclusive},
+    sync::{Arc, LazyLock},
 };
 
 use editor::{
-    Addon, Bias, Editor, EditorEvent, RowExt as _, RowHighlightOptions, SelectionEffects,
+    Addon, Bias, Editor, EditorEvent, Inlay, RowExt as _, RowHighlightOptions, SelectionEffects,
     display_map::{
-        BlockContext, BlockPlacement, BlockProperties, BlockStyle, CustomBlockId, HighlightKey,
-        NavigationOverlayKey, RenderBlock,
+        BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
+        FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
     },
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding, KeyContext, Render,
-    SharedString, TextStyle, TextStyleRefinement, Window, div, point, prelude::*, px,
+    AnyView, App, AppContext as _, Context, Edges, Entity, EventEmitter, FocusHandle, Focusable,
+    Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
+    KeyContext, Pixels, Render, SharedString, TextStyle, TextStyleRefinement, WeakEntity, Window,
+    div, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
     TranscriptSemanticSpan, TranscriptSemanticStyle, minimal_text_edit,
 };
-use language::{Buffer, Language, LanguageRegistry, Point};
+use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
 use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
+use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
-    Color, Icon, IconName, IconSize, Label, LabelSize,
+    Color, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
     prelude::{ActiveTheme, LabelCommon as _},
 };
 
@@ -274,7 +276,11 @@ pub struct TranscriptEditor {
     // append-only growth. Keeping the ids keyed by position lets viewport
     // shifts retain blocks in the overlap instead of recreating every header.
     header_blocks: BTreeMap<usize, CustomBlockId>,
+    collapsed_items: BTreeSet<String>,
+    padding_inlays: Vec<InlayId>,
+    next_padding_inlay_id: usize,
     supplements: BTreeMap<String, MountedTranscriptSupplement>,
+    replacements: BTreeMap<String, MountedTranscriptReplacement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
     refresh_when_rendered: bool,
@@ -403,6 +409,42 @@ struct MountedTranscriptSupplement {
     block_id: Option<CustomBlockId>,
 }
 
+/// A host-owned rich view that replaces one semantic transcript item.
+///
+/// The item's bytes remain in the Buffer, so search, yank, and raw inspection
+/// still operate on the canonical transcript. The display map treats the rich
+/// surface as one atomic Vim object while it is mounted.
+#[derive(Clone)]
+pub struct TranscriptReplacement {
+    pub key: String,
+    pub item_key: String,
+    pub rows: u32,
+    pub view: AnyView,
+}
+
+impl TranscriptReplacement {
+    pub fn new(
+        key: impl Into<String>,
+        item_key: impl Into<String>,
+        rows: u32,
+        view: AnyView,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            item_key: item_key.into(),
+            rows: rows.max(1),
+            view,
+        }
+    }
+}
+
+struct MountedTranscriptReplacement {
+    item_key: String,
+    rows: u32,
+    view: AnyView,
+    block_id: Option<CustomBlockId>,
+}
+
 pub struct TranscriptSelectionChanged;
 
 impl EventEmitter<TranscriptSelectionChanged> for TranscriptEditor {}
@@ -420,8 +462,18 @@ struct MarkdownEmphasisHighlight;
 struct MarkdownInlineCodeHighlight;
 struct MarkdownLinkHighlight;
 struct MarkdownCodeBlockHighlight;
+struct MarkdownMonospaceGeometryHighlight;
 struct MarkdownBlockQuoteHighlight;
 struct MarkdownStrikethroughHighlight;
+struct ShellFunctionHighlight;
+struct ShellVariableHighlight;
+struct ShellKeywordHighlight;
+struct ShellOperatorHighlight;
+struct ShellConstantHighlight;
+struct ShellStringHighlight;
+struct ShellCommentHighlight;
+struct ShellEmbeddedHighlight;
+struct ShellPunctuationHighlight;
 struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
@@ -631,6 +683,8 @@ struct SemanticHighlightRanges {
     code_blocks: Vec<Range<usize>>,
     block_quotes: Vec<Range<usize>>,
     strikethrough: Vec<Range<usize>>,
+    command_invocations: Vec<Range<usize>>,
+    command_outputs: Vec<Range<usize>>,
     scanned_spans: usize,
 }
 
@@ -668,8 +722,214 @@ fn visible_semantic_highlight_ranges(
                 TranscriptSemanticStyle::CodeBlock => highlights.code_blocks.push(range),
                 TranscriptSemanticStyle::BlockQuote => highlights.block_quotes.push(range),
                 TranscriptSemanticStyle::Strikethrough => highlights.strikethrough.push(range),
+                TranscriptSemanticStyle::CommandInvocation => {
+                    highlights.command_invocations.push(range)
+                }
+                TranscriptSemanticStyle::CommandOutput => highlights.command_outputs.push(range),
             }
         }
+    }
+    highlights
+}
+
+fn semantic_monospace_ranges(segments: &[TranscriptDocumentSegment]) -> Vec<Range<usize>> {
+    let mut ranges = segments
+        .iter()
+        .flat_map(|segment| segment.semantic_spans.iter())
+        .filter(|span| {
+            matches!(
+                span.style,
+                TranscriptSemanticStyle::InlineCode
+                    | TranscriptSemanticStyle::CodeBlock
+                    | TranscriptSemanticStyle::CommandInvocation
+                    | TranscriptSemanticStyle::CommandOutput
+            )
+        })
+        .map(|span| span.range.clone())
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else if range.start < range.end {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellSemanticKind {
+    Function,
+    Variable,
+    Keyword,
+    Operator,
+    Constant,
+    String,
+    Comment,
+    Embedded,
+    Punctuation,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+struct ShellSemanticHighlightRanges {
+    functions: Vec<Range<usize>>,
+    variables: Vec<Range<usize>>,
+    keywords: Vec<Range<usize>>,
+    operators: Vec<Range<usize>>,
+    constants: Vec<Range<usize>>,
+    strings: Vec<Range<usize>>,
+    comments: Vec<Range<usize>>,
+    embedded: Vec<Range<usize>>,
+    punctuation: Vec<Range<usize>>,
+}
+
+impl ShellSemanticHighlightRanges {
+    fn push(&mut self, kind: ShellSemanticKind, range: Range<usize>) {
+        match kind {
+            ShellSemanticKind::Function => self.functions.push(range),
+            ShellSemanticKind::Variable => self.variables.push(range),
+            ShellSemanticKind::Keyword => self.keywords.push(range),
+            ShellSemanticKind::Operator => self.operators.push(range),
+            ShellSemanticKind::Constant => self.constants.push(range),
+            ShellSemanticKind::String => self.strings.push(range),
+            ShellSemanticKind::Comment => self.comments.push(range),
+            ShellSemanticKind::Embedded => self.embedded.push(range),
+            ShellSemanticKind::Punctuation => self.punctuation.push(range),
+        }
+    }
+}
+
+pub fn shell_capture_priority(capture_name: &str) -> u8 {
+    match capture_name {
+        "function" => 60,
+        "variable" | "variable.special" => 55,
+        "keyword" | "keyword.control" | "keyword.operator" => 50,
+        "operator" => 45,
+        "constant" | "number" => 40,
+        "comment" | "keyword.directive" => 35,
+        "embedded" | "punctuation.special" => 30,
+        "punctuation.delimiter" | "punctuation.bracket" => 20,
+        _ => 10,
+    }
+}
+
+/// Parse shell syntax once for both transcript surfaces. Keeping capture ranges
+/// in the Editor-side crate prevents the rich card and selectable buffer from
+/// quietly developing different shell grammars or precedence rules.
+pub fn shell_capture_ranges(command: &str) -> Vec<(Range<usize>, String)> {
+    static QUERY: LazyLock<Option<Query>> = LazyLock::new(|| {
+        Query::new(
+            &tree_sitter_bash::LANGUAGE.into(),
+            include_str!("../../grammars/src/bash/highlights.scm"),
+        )
+        .ok()
+    });
+    let Some(query) = QUERY.as_ref() else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(command, None) else {
+        return Vec::new();
+    };
+
+    let capture_names = query.capture_names();
+    let mut cursor = tree_sitter::QueryCursor::new();
+    let mut matches = cursor.matches(query, tree.root_node(), command.as_bytes());
+    let mut captures = Vec::new();
+    while let Some(query_match) = matches.next() {
+        for capture in query_match.captures {
+            let range = capture.node.byte_range();
+            if !range.is_empty()
+                && range.end <= command.len()
+                && let Some(name) = capture_names.get(capture.index as usize)
+            {
+                captures.push((range, (*name).to_string()));
+            }
+        }
+    }
+    captures
+}
+
+fn shell_capture_kind(capture_name: &str) -> ShellSemanticKind {
+    match capture_name {
+        "function" => ShellSemanticKind::Function,
+        "variable" | "variable.special" => ShellSemanticKind::Variable,
+        "keyword" | "keyword.control" | "keyword.operator" => ShellSemanticKind::Keyword,
+        "operator" => ShellSemanticKind::Operator,
+        "constant" | "number" => ShellSemanticKind::Constant,
+        "comment" | "keyword.directive" => ShellSemanticKind::Comment,
+        "embedded" => ShellSemanticKind::Embedded,
+        "string" | "string.escape" | "string.regex" | "character" => ShellSemanticKind::String,
+        _ => ShellSemanticKind::Punctuation,
+    }
+}
+
+fn shell_semantic_highlights(command: &str, base: usize) -> ShellSemanticHighlightRanges {
+    let mut byte_styles = vec![(0_u8, None); command.len()];
+    for (range, capture_name) in shell_capture_ranges(command) {
+        let priority = shell_capture_priority(&capture_name);
+        let kind = shell_capture_kind(&capture_name);
+        for byte_style in &mut byte_styles[range] {
+            if priority >= byte_style.0 {
+                *byte_style = (priority, Some(kind));
+            }
+        }
+    }
+
+    let mut highlights = ShellSemanticHighlightRanges::default();
+    let mut active_kind = None;
+    let mut active_start = 0;
+    for offset in command
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(command.len()))
+    {
+        let kind = byte_styles
+            .get(offset)
+            .and_then(|(_, kind)| kind.as_ref())
+            .copied();
+        if kind != active_kind {
+            if let Some(kind) = active_kind {
+                highlights.push(kind, base + active_start..base + offset);
+            }
+            active_kind = kind;
+            active_start = offset;
+        }
+    }
+    highlights
+}
+
+fn visible_shell_semantic_highlights(
+    text: &str,
+    text_base: usize,
+    invocations: &[Range<usize>],
+) -> ShellSemanticHighlightRanges {
+    let mut highlights = ShellSemanticHighlightRanges::default();
+    for range in invocations {
+        let relative = range.start.saturating_sub(text_base)..range.end.saturating_sub(text_base);
+        let Some(command) = text.get(relative) else {
+            continue;
+        };
+        let parsed = shell_semantic_highlights(command, range.start);
+        highlights.functions.extend(parsed.functions);
+        highlights.variables.extend(parsed.variables);
+        highlights.keywords.extend(parsed.keywords);
+        highlights.operators.extend(parsed.operators);
+        highlights.constants.extend(parsed.constants);
+        highlights.strings.extend(parsed.strings);
+        highlights.comments.extend(parsed.comments);
+        highlights.embedded.extend(parsed.embedded);
+        highlights.punctuation.extend(parsed.punctuation);
     }
     highlights
 }
@@ -843,22 +1103,78 @@ fn should_request_tail_autoscroll(follow_tail: bool, content_changed: bool) -> b
 }
 
 fn user_transcript_background(cx: &App) -> Hsla {
-    cx.theme().colors().element_background.opacity(0.56)
+    cx.theme().colors().element_background
 }
 
 fn reasoning_transcript_background(cx: &App) -> Hsla {
-    cx.theme()
-        .colors()
-        .editor_highlighted_line_background
-        .opacity(0.46)
+    let _ = cx;
+    Hsla::transparent_black()
 }
 
 fn structured_transcript_background(cx: &App) -> Hsla {
-    cx.theme().colors().editor_subheader_background.opacity(0.5)
+    cx.theme()
+        .colors()
+        .editor_subheader_background
+        .opacity(0.28)
 }
 
 fn error_transcript_background(cx: &App) -> Hsla {
     cx.theme().status().error.opacity(0.1)
+}
+
+fn transcript_card_border(cx: &App) -> Hsla {
+    cx.theme().colors().border_variant.opacity(0.72)
+}
+
+fn transcript_section_rail(cx: &App) -> Hsla {
+    cx.theme().colors().text_accent.opacity(0.55)
+}
+
+fn error_transcript_card_border(cx: &App) -> Hsla {
+    cx.theme().status().error.opacity(0.46)
+}
+
+fn transcript_kind_is_card(kind: TranscriptKind) -> bool {
+    matches!(
+        kind,
+        TranscriptKind::User
+            | TranscriptKind::Command
+            | TranscriptKind::FileChange
+            | TranscriptKind::Tool
+            | TranscriptKind::Diff
+            | TranscriptKind::Image
+            | TranscriptKind::Subagent
+            | TranscriptKind::Web
+            | TranscriptKind::Review
+            | TranscriptKind::Error
+            | TranscriptKind::Approval
+    )
+}
+
+fn transcript_row_options(kind: TranscriptKind) -> RowHighlightOptions {
+    let card = transcript_kind_is_card(kind);
+    let section = matches!(kind, TranscriptKind::Reasoning | TranscriptKind::Plan);
+    let border: Option<fn(&App) -> Hsla> = if section {
+        Some(transcript_section_rail)
+    } else if kind == TranscriptKind::Error {
+        Some(error_transcript_card_border)
+    } else if card {
+        Some(transcript_card_border)
+    } else {
+        None
+    };
+    RowHighlightOptions {
+        include_gutter: false,
+        border,
+        border_widths: section.then_some(Edges {
+            left: px(2.),
+            ..Edges::default()
+        }),
+        corner_radius: if card { px(6.) } else { Pixels::ZERO },
+        vertical_margin: if card { px(3.) } else { Pixels::ZERO },
+        merge_adjacent: !card,
+        ..RowHighlightOptions::default()
+    }
 }
 
 fn transcript_icon(kind: TranscriptKind) -> IconName {
@@ -1134,8 +1450,11 @@ fn apply_projected_segment_shape(
 
 fn native_header_block(
     placement: std::ops::RangeInclusive<Anchor>,
+    item_key: String,
     kind: TranscriptKind,
     label: SharedString,
+    foldable: bool,
+    transcript: WeakEntity<TranscriptEditor>,
 ) -> BlockProperties<Anchor> {
     let show_label = native_header_shows_label(kind, &label);
     BlockProperties {
@@ -1145,22 +1464,19 @@ fn native_header_block(
         // editor gutter, which makes the header read as part of the transcript.
         style: BlockStyle::Spacer,
         render: Arc::new(move |cx: &mut BlockContext| {
+            let collapsed = transcript.upgrade().is_some_and(|transcript| {
+                transcript.read(cx.app).collapsed_items.contains(&item_key)
+            });
             let icon_color = transcript_icon_color(kind, cx.selected);
             let colors = cx.theme().colors();
-            let background = if cx.selected {
+            let card = transcript_kind_is_card(kind);
+            let background = if card || !cx.selected {
+                Hsla::transparent_black()
+            } else {
                 colors.editor_highlighted_line_background
-            } else {
-                colors.editor_subheader_background.opacity(0.56)
-            };
-            let rail = if kind == TranscriptKind::Error {
-                cx.theme().status().error.opacity(0.72)
-            } else if cx.selected {
-                colors.text_accent.opacity(0.82)
-            } else {
-                colors.border_variant.opacity(0.78)
             };
 
-            div()
+            let header = div()
                 .id(cx.block_id)
                 .h(cx.line_height)
                 .w_full()
@@ -1171,8 +1487,6 @@ fn native_header_block(
                 .items_center()
                 .gap_2()
                 .overflow_hidden()
-                .border_l_2()
-                .border_color(rail)
                 .bg(background)
                 .child(
                     Icon::new(transcript_icon(kind))
@@ -1190,11 +1504,44 @@ fn native_header_block(
                             })
                             .truncate(),
                     )
-                })
-                .into_any_element()
+                });
+
+            if foldable {
+                let item_key = item_key.clone();
+                let disclosure_id = format!("transcript-fold:{item_key}");
+                let transcript = transcript.clone();
+                header
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        transcript
+                            .update(cx, |transcript, cx| {
+                                transcript.toggle_item_collapsed(&item_key, window, cx);
+                            })
+                            .ok();
+                    })
+                    .child(Disclosure::new(disclosure_id, !collapsed))
+                    .into_any_element()
+            } else {
+                header.into_any_element()
+            }
         }),
         priority: 0,
     }
+}
+
+fn transcript_item_is_foldable(segment: &TranscriptDocumentSegment) -> bool {
+    !segment.body_range.is_empty()
+        && matches!(
+            segment.kind,
+            TranscriptKind::Reasoning
+                | TranscriptKind::Command
+                | TranscriptKind::FileChange
+                | TranscriptKind::Tool
+                | TranscriptKind::Diff
+                | TranscriptKind::Subagent
+                | TranscriptKind::Web
+                | TranscriptKind::Review
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1264,6 +1611,51 @@ fn supplemental_block(placement: Anchor, rows: u32, view: AnyView) -> BlockPrope
     }
 }
 
+fn replacement_anchor_range(
+    item_key: &str,
+    segments: &[TranscriptDocumentSegment],
+) -> Option<Range<usize>> {
+    segments
+        .iter()
+        .find(|segment| segment.item_key == item_key)
+        .map(|segment| segment.whole_range.clone())
+}
+
+/// Translate a half-open document item range into the inclusive byte offsets
+/// expected by an Editor replacement block. Using the exclusive end directly
+/// makes adjacent items share a display row, so BlockMap coalesces their two
+/// replacement renderers and only one remains visible.
+fn replacement_anchor_offsets(range: Range<usize>) -> Option<(usize, usize)> {
+    (!range.is_empty()).then(|| (range.start, range.end - 1))
+}
+
+fn replacement_renderer(view: AnyView) -> RenderBlock {
+    Arc::new(move |cx: &mut BlockContext| {
+        div()
+            .id(cx.block_id)
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .block_mouse_except_scroll()
+            .child(view.clone())
+            .into_any_element()
+    })
+}
+
+fn replacement_block(
+    placement: RangeInclusive<Anchor>,
+    rows: u32,
+    view: AnyView,
+) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Replace(placement),
+        height: Some(rows.max(1)),
+        style: BlockStyle::Spacer,
+        render: replacement_renderer(view),
+        priority: 1,
+    }
+}
+
 impl TranscriptEditor {
     pub fn read_only(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Unlike the composer, this Buffer is a mixed semantic document.
@@ -1282,6 +1674,8 @@ impl TranscriptEditor {
                 editor.set_current_line_highlight(None);
                 editor.set_soft_wrap();
                 editor.set_show_gutter(false, cx);
+                editor.set_show_indent_guides(false, cx);
+                editor.set_show_wrap_guides(false, cx);
                 editor.set_show_horizontal_scrollbar(false, cx);
                 editor.disable_mouse_wheel_zoom();
                 editor.register_addon(TranscriptKeyContextAddon);
@@ -1323,7 +1717,11 @@ impl TranscriptEditor {
             segment_header_texts: Vec::new(),
             model_item_count: 0,
             header_blocks: BTreeMap::new(),
+            collapsed_items: BTreeSet::new(),
+            padding_inlays: Vec::new(),
+            next_padding_inlay_id: 0,
             supplements: BTreeMap::new(),
+            replacements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
             refresh_when_rendered: false,
@@ -1557,6 +1955,93 @@ impl TranscriptEditor {
         }
     }
 
+    /// Replace one projected item with a host-rendered semantic component.
+    ///
+    /// This is the hybrid transcript seam: the Buffer remains authoritative,
+    /// while the Editor display map presents a richer atomic view for item
+    /// types whose layout cannot be expressed by row and text highlights.
+    pub fn upsert_replacement(
+        &mut self,
+        replacement: TranscriptReplacement,
+        cx: &mut Context<Self>,
+    ) {
+        let key = replacement.key;
+        let was_present = self.replacements.contains_key(&key);
+        let rows = replacement.rows.max(1);
+        let mut mounted =
+            self.replacements
+                .remove(&key)
+                .unwrap_or_else(|| MountedTranscriptReplacement {
+                    item_key: replacement.item_key.clone(),
+                    rows,
+                    view: replacement.view.clone(),
+                    block_id: None,
+                });
+        let update = supplement_update(
+            mounted.item_key != replacement.item_key,
+            mounted.rows != rows,
+            mounted.view != replacement.view,
+        );
+        let display_changed = !was_present || update != SupplementUpdate::Unchanged;
+        mounted.item_key = replacement.item_key;
+        mounted.rows = rows;
+        mounted.view = replacement.view;
+
+        if let Some(block_id) = mounted.block_id {
+            match update {
+                SupplementUpdate::Unchanged => {}
+                SupplementUpdate::Resize => self.editor.update(cx, |editor, cx| {
+                    editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx)
+                }),
+                SupplementUpdate::ReplaceRenderer => {
+                    let renderer = replacement_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        )
+                    });
+                }
+                SupplementUpdate::ResizeAndReplaceRenderer => {
+                    let renderer = replacement_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx);
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        );
+                    });
+                }
+                SupplementUpdate::Reanchor => {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.remove_blocks([block_id].into_iter().collect(), None, cx)
+                    });
+                    mounted.block_id = None;
+                }
+            }
+        }
+        self.replacements.insert(key, mounted);
+        self.mount_unmounted_replacements(cx);
+        if should_request_tail_autoscroll(self.follow_tail, display_changed) {
+            self.request_tail_autoscroll(cx);
+        }
+    }
+
+    pub fn remove_replacement(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(replacement) = self.replacements.remove(key) else {
+            return false;
+        };
+        if let Some(block_id) = replacement.block_id {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks([block_id].into_iter().collect(), None, cx)
+            });
+        }
+        self.viewport_decorations = None;
+        true
+    }
+
     /// Reveal an already-mounted supplement without changing the transcript
     /// cursor or selection. Tall blocks align to the top; shorter blocks move
     /// only enough to fit inside the current Editor viewport.
@@ -1611,6 +2096,19 @@ impl TranscriptEditor {
         }
     }
 
+    fn unmount_all_replacements(&mut self, cx: &mut Context<Self>) {
+        let block_ids = self
+            .replacements
+            .values_mut()
+            .filter_map(|replacement| replacement.block_id.take())
+            .collect::<Vec<_>>();
+        if !block_ids.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
+            });
+        }
+    }
+
     fn mount_unmounted_supplements(&mut self, cx: &mut Context<Self>) {
         let pending = self
             .supplements
@@ -1647,6 +2145,65 @@ impl TranscriptEditor {
         }
     }
 
+    fn mount_unmounted_replacements(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .replacements
+            .iter()
+            .filter(|(_, replacement)| replacement.block_id.is_none())
+            .filter_map(|(key, replacement)| {
+                Some((
+                    key.clone(),
+                    replacement_anchor_range(&replacement.item_key, &self.segments)?,
+                    replacement.rows,
+                    replacement.view.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        let replaced_item_keys = pending
+            .iter()
+            .filter_map(|(key, _, _, _)| {
+                self.replacements
+                    .get(key)
+                    .map(|replacement| replacement.item_key.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let header_blocks_to_remove = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| replaced_item_keys.contains(&segment.item_key))
+            .filter_map(|(position, _)| self.header_blocks.remove(&position))
+            .collect::<Vec<_>>();
+
+        let block_ids = self.editor.update(cx, |editor, cx| {
+            if !header_blocks_to_remove.is_empty() {
+                editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
+            }
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let blocks = pending.iter().map(|(_, range, rows, view)| {
+                let (start_offset, end_offset) =
+                    replacement_anchor_offsets(range.clone()).unwrap_or((range.start, range.start));
+                let start = snapshot.clip_offset(MultiBufferOffset(start_offset), Bias::Left);
+                let end = snapshot.clip_offset(MultiBufferOffset(end_offset), Bias::Left);
+                let start = snapshot.anchor_before(start);
+                let end = snapshot.anchor_before(end);
+                replacement_block(start..=end, *rows, view.clone())
+            });
+            editor.insert_blocks(blocks, None, cx)
+        });
+        debug_assert_eq!(pending.len(), block_ids.len());
+        for ((key, _, _, _), block_id) in pending.into_iter().zip(block_ids) {
+            if let Some(replacement) = self.replacements.get_mut(&key) {
+                replacement.block_id = Some(block_id);
+            }
+        }
+        self.viewport_decorations = None;
+    }
+
     /// Explicitly opt into streaming tail-follow for an initial/full thread
     /// open. This scrolls by an Editor display-map anchor and leaves Vim's
     /// cursor, visual selection, and registers untouched.
@@ -1673,6 +2230,77 @@ impl TranscriptEditor {
     pub fn pause_tail_follow(&mut self) {
         self.follow_tail = false;
         self.pending_tail_intent = None;
+    }
+
+    /// Toggle one structured item's body using the Editor's native fold map.
+    ///
+    /// The selectable bytes remain in the Buffer. Native Vim unfold motions,
+    /// search navigation, and mouse interaction with the fold placeholder can
+    /// therefore reveal the exact same text without a second scroll surface.
+    fn toggle_item_collapsed(
+        &mut self,
+        item_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.item_key == item_key && transcript_item_is_foldable(segment))
+        else {
+            return false;
+        };
+        let body_range = segment.body_range.clone();
+        let line_count = self
+            .buffer
+            .read(cx)
+            .text_for_range(body_range.clone())
+            .collect::<String>()
+            .lines()
+            .count()
+            .max(1);
+        let item_key = item_key.to_owned();
+        let collapsed = self.editor.update(cx, |editor, cx| {
+            let currently_folded = editor
+                .display_snapshot(cx)
+                .folds_in_range(
+                    MultiBufferOffset(body_range.start)..MultiBufferOffset(body_range.end),
+                )
+                .next()
+                .is_some();
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors = clipped_anchor_range(&snapshot, body_range);
+            if currently_folded {
+                editor.unfold_ranges(&[anchors], true, false, cx);
+                false
+            } else {
+                let mut placeholder: FoldPlaceholder = editor.default_fold_placeholder(cx);
+                placeholder.constrain_width = false;
+                placeholder.merge_adjacent = false;
+                placeholder.collapsed_text = Some(
+                    format!(
+                        "  … {line_count} {} hidden  ",
+                        if line_count == 1 { "line" } else { "lines" }
+                    )
+                    .into(),
+                );
+                editor.fold_creases(
+                    vec![Crease::simple(anchors, placeholder)],
+                    false,
+                    window,
+                    cx,
+                );
+                true
+            }
+        });
+        if collapsed {
+            self.collapsed_items.insert(item_key);
+        } else {
+            self.collapsed_items.remove(&item_key);
+        }
+        self.pause_tail_follow();
+        cx.notify();
+        true
     }
 
     /// Align a Buffer row to the top of the viewport without changing the Vim
@@ -1860,6 +2488,18 @@ impl TranscriptEditor {
         } else {
             (Vec::new(), Vec::new())
         };
+        let replacement_item_keys = self
+            .replacements
+            .values()
+            .filter(|replacement| replacement.block_id.is_some())
+            .map(|replacement| replacement.item_key.as_str())
+            .collect::<BTreeSet<_>>();
+        let header_positions_to_insert = header_positions_to_insert
+            .into_iter()
+            .filter(|position| {
+                !replacement_item_keys.contains(self.segments[*position].item_key.as_str())
+            })
+            .collect::<Vec<_>>();
         let header_segments = header_positions_to_insert
             .iter()
             .map(|position| self.segments[*position].clone())
@@ -1873,6 +2513,46 @@ impl TranscriptEditor {
             .then(|| self.segments[row_segment_range].to_vec())
             .unwrap_or_default();
         let row_byte_range = desired.byte_range.clone();
+        let padding_offsets = rebuild_rows
+            .then(|| {
+                let buffer = self.buffer.read(cx);
+                let mut offsets = Vec::new();
+                for segment in &row_segments {
+                    if !transcript_kind_is_card(segment.kind) {
+                        continue;
+                    }
+                    let Some(range) = intersect_ranges(&segment.body_range, &row_byte_range) else {
+                        continue;
+                    };
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let text = buffer.text_for_range(range.clone()).collect::<String>();
+                    // The body start and every real hard-line start receive
+                    // display-only padding. Soft wraps inherit the same indent
+                    // from GPUI's line wrapper, while yanks remain byte-exact.
+                    offsets.push(range.start);
+                    offsets.extend(
+                        text.match_indices('\n')
+                            .map(|(offset, _)| range.start + offset + 1)
+                            .filter(|offset| *offset < range.end),
+                    );
+                }
+                offsets
+            })
+            .unwrap_or_default();
+        let padding_inlays_to_remove = rebuild_rows
+            .then(|| std::mem::take(&mut self.padding_inlays))
+            .unwrap_or_default();
+        let padding_inlays_to_insert = padding_offsets
+            .into_iter()
+            .map(|offset| {
+                let id = self.next_padding_inlay_id;
+                self.next_padding_inlay_id = self.next_padding_inlay_id.wrapping_add(1);
+                self.padding_inlays.push(InlayId::Custom(id));
+                (id, offset)
+            })
+            .collect::<Vec<_>>();
         let body_highlights = rebuild_rows.then(|| {
             let mut reasoning = Vec::new();
             let mut plans = Vec::new();
@@ -1902,6 +2582,17 @@ impl TranscriptEditor {
         });
         let semantic_highlights = rebuild_semantic_highlights
             .then(|| visible_semantic_highlight_ranges(&self.segments, &desired.byte_range));
+        let shell_semantic_highlights = semantic_highlights.as_ref().map(|semantic| {
+            let buffer = self.buffer.read(cx);
+            let text = buffer
+                .text_for_range(desired.byte_range.clone())
+                .collect::<String>();
+            visible_shell_semantic_highlights(
+                &text,
+                desired.byte_range.start,
+                &semantic.command_invocations,
+            )
+        });
         let search_case_sensitive = self.search.case_sensitive;
         let search_whole_word = self.search.whole_word;
         let search_highlights = rebuild_search_highlights.then(|| {
@@ -1929,12 +2620,22 @@ impl TranscriptEditor {
             .filter_map(|position| self.header_blocks.remove(position))
             .collect::<Vec<_>>();
 
+        let transcript = cx.weak_entity();
         let inserted_header_blocks = self.editor.update(cx, |editor, cx| {
             if !header_blocks_to_remove.is_empty() {
                 editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
             }
 
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            if rebuild_rows {
+                let inlays = padding_inlays_to_insert
+                    .into_iter()
+                    .map(|(id, offset)| {
+                        Inlay::custom(id, clipped_anchor_after(&snapshot, offset), "   ")
+                    })
+                    .collect();
+                editor.splice_inlays(&padding_inlays_to_remove, inlays, cx);
+            }
             let native_headers: Vec<_> = header_segments
                 .iter()
                 .zip(header_texts)
@@ -1942,8 +2643,11 @@ impl TranscriptEditor {
                     let (start, end) = clipped_anchor_pair(&snapshot, segment.header_range.clone());
                     native_header_block(
                         start..=end,
+                        segment.item_key.clone(),
                         segment.kind,
                         native_header_text(&header_text).into(),
+                        transcript_item_is_foldable(segment),
+                        transcript.clone(),
                     )
                 })
                 .collect();
@@ -1958,16 +2662,13 @@ impl TranscriptEditor {
                 editor.clear_row_highlights::<ReasoningTranscriptRows>();
                 editor.clear_row_highlights::<StructuredTranscriptRows>();
                 editor.clear_row_highlights::<ErrorTranscriptRows>();
-                let options = RowHighlightOptions {
-                    include_gutter: false,
-                    ..RowHighlightOptions::default()
-                };
                 for segment in row_segments {
                     let Some(range) = intersect_ranges(&segment.whole_range, &row_byte_range)
                     else {
                         continue;
                     };
                     let anchors = clipped_anchor_range(&snapshot, range);
+                    let options = transcript_row_options(segment.kind);
                     match segment.kind {
                         TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
                             anchors,
@@ -2120,6 +2821,8 @@ impl TranscriptEditor {
                     code_blocks,
                     block_quotes,
                     strikethrough,
+                    command_invocations: _,
+                    command_outputs: _,
                     scanned_spans: _,
                 } = semantic_highlights;
                 let anchors = |ranges: Vec<Range<usize>>| {
@@ -2248,6 +2951,82 @@ impl TranscriptEditor {
                 );
             }
 
+            if let Some(shell_highlights) = shell_semantic_highlights {
+                let anchors = |ranges: Vec<Range<usize>>| {
+                    ranges
+                        .into_iter()
+                        .map(|range| clipped_anchor_range(&snapshot, range))
+                        .collect::<Vec<_>>()
+                };
+                let fallback = HighlightStyle {
+                    color: Some(cx.theme().colors().text_accent),
+                    ..HighlightStyle::default()
+                };
+                let syntax = cx.theme().syntax();
+                let function_style = syntax.style_for_name("function").unwrap_or(fallback);
+                let variable_style = syntax.style_for_name("variable").unwrap_or(fallback);
+                let keyword_style = syntax.style_for_name("keyword").unwrap_or(fallback);
+                let operator_style = syntax.style_for_name("operator").unwrap_or(fallback);
+                let constant_style = syntax.style_for_name("constant").unwrap_or(fallback);
+                let string_style = syntax.style_for_name("string").unwrap_or(fallback);
+                let comment_style = syntax.style_for_name("comment").unwrap_or(fallback);
+                let embedded_style = syntax.style_for_name("embedded").unwrap_or(fallback);
+                let punctuation_style = syntax.style_for_name("punctuation").unwrap_or(fallback);
+                macro_rules! paint_shell {
+                    ($marker:ty, $ranges:expr, $style:expr) => {
+                        editor.highlight_text(
+                            HighlightKey::NavigationOverlay(
+                                NavigationOverlayKey::unique::<$marker>(),
+                            ),
+                            anchors($ranges),
+                            $style,
+                            cx,
+                        );
+                    };
+                }
+                paint_shell!(
+                    ShellFunctionHighlight,
+                    shell_highlights.functions,
+                    function_style
+                );
+                paint_shell!(
+                    ShellVariableHighlight,
+                    shell_highlights.variables,
+                    variable_style
+                );
+                paint_shell!(
+                    ShellKeywordHighlight,
+                    shell_highlights.keywords,
+                    keyword_style
+                );
+                paint_shell!(
+                    ShellOperatorHighlight,
+                    shell_highlights.operators,
+                    operator_style
+                );
+                paint_shell!(
+                    ShellConstantHighlight,
+                    shell_highlights.constants,
+                    constant_style
+                );
+                paint_shell!(ShellStringHighlight, shell_highlights.strings, string_style);
+                paint_shell!(
+                    ShellCommentHighlight,
+                    shell_highlights.comments,
+                    comment_style
+                );
+                paint_shell!(
+                    ShellEmbeddedHighlight,
+                    shell_highlights.embedded,
+                    embedded_style
+                );
+                paint_shell!(
+                    ShellPunctuationHighlight,
+                    shell_highlights.punctuation,
+                    punctuation_style
+                );
+            }
+
             if let Some(search_highlights) = search_highlights {
                 if let Some(search_highlights) = search_highlights {
                     let active_search_match = active_search_match.map(|range| {
@@ -2305,6 +3084,28 @@ impl TranscriptEditor {
     /// Zed treats a cursor that enters a replacement block as selecting that
     /// whole underlying row, so headers intentionally do not have character-level
     /// visual selection; every body on either side still does.
+    fn refresh_semantic_font_geometry(&mut self, cx: &mut Context<Self>) {
+        let ranges = semantic_monospace_ranges(&self.segments);
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors = ranges
+                .into_iter()
+                .map(|range| clipped_anchor_range(&snapshot, range))
+                .collect();
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    MarkdownMonospaceGeometryHighlight,
+                >()),
+                anchors,
+                HighlightStyle {
+                    font_family: Some(FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+        });
+    }
+
     pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) -> bool {
         if !document_has_valid_segment_ranges(document) {
             // Keep the raw Buffer readable/selectable, but discard every
@@ -2312,8 +3113,10 @@ impl TranscriptEditor {
             // A later valid full sync remounts the retained logical supplement
             // specs against fresh ranges.
             self.unmount_all_supplements(cx);
+            self.unmount_all_replacements(cx);
             self.segments.clear();
             self.segment_header_texts.clear();
+            self.collapsed_items.clear();
             self.model_item_count = document.item_rows.len();
             let previous_header_blocks = std::mem::take(&mut self.header_blocks);
             self.viewport_decorations = None;
@@ -2338,8 +3141,18 @@ impl TranscriptEditor {
                     NavigationOverlayKey::unique::<MarkdownInlineCodeHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownLinkHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownCodeBlockHighlight>(),
+                    NavigationOverlayKey::unique::<MarkdownMonospaceGeometryHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownBlockQuoteHighlight>(),
                     NavigationOverlayKey::unique::<MarkdownStrikethroughHighlight>(),
+                    NavigationOverlayKey::unique::<ShellFunctionHighlight>(),
+                    NavigationOverlayKey::unique::<ShellVariableHighlight>(),
+                    NavigationOverlayKey::unique::<ShellKeywordHighlight>(),
+                    NavigationOverlayKey::unique::<ShellOperatorHighlight>(),
+                    NavigationOverlayKey::unique::<ShellConstantHighlight>(),
+                    NavigationOverlayKey::unique::<ShellStringHighlight>(),
+                    NavigationOverlayKey::unique::<ShellCommentHighlight>(),
+                    NavigationOverlayKey::unique::<ShellEmbeddedHighlight>(),
+                    NavigationOverlayKey::unique::<ShellPunctuationHighlight>(),
                     NavigationOverlayKey::unique::<DiffFileHeaderHighlight>(),
                     NavigationOverlayKey::unique::<DiffHunkHighlight>(),
                     NavigationOverlayKey::unique::<DiffAdditionHighlight>(),
@@ -2356,7 +3169,14 @@ impl TranscriptEditor {
         // Keep the logical specs and host views, but remount their Editor blocks
         // against the new per-item body ranges below.
         self.unmount_all_supplements(cx);
+        self.unmount_all_replacements(cx);
         self.segments.clone_from(&document.segments);
+        self.collapsed_items.retain(|item_key| {
+            document
+                .segments
+                .iter()
+                .any(|segment| &segment.item_key == item_key)
+        });
         self.segment_header_texts = document
             .segments
             .iter()
@@ -2397,7 +3217,9 @@ impl TranscriptEditor {
                 cx,
             );
         });
+        self.refresh_semantic_font_geometry(cx);
         self.mount_unmounted_supplements(cx);
+        self.mount_unmounted_replacements(cx);
         self.refresh_viewport_decorations(cx);
         true
     }
@@ -2582,7 +3404,11 @@ impl TranscriptEditor {
         if self.segments.len() > appended_segment_start {
             self.decorate_appended_segments(appended_segment_start, cx);
         }
+        if semantic_bodies_changed {
+            self.refresh_semantic_font_geometry(cx);
+        }
         self.mount_unmounted_supplements(cx);
+        self.mount_unmounted_replacements(cx);
         self.refresh_viewport_decorations(cx);
         if should_request_tail_autoscroll(self.follow_tail, search_text_changed) {
             self.request_tail_autoscroll(cx);
@@ -3555,6 +4381,33 @@ mod tests {
     }
 
     #[test]
+    fn replacement_covers_the_whole_semantic_item_across_rebuilds() {
+        let before = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+        let after = [
+            segment(0, 0..75, 0..8, 10..73),
+            segment(1, 75..105, 75..83, 85..103),
+        ];
+
+        assert_eq!(replacement_anchor_range("item-1", &before), Some(30..60));
+        assert_eq!(replacement_anchor_range("item-1", &after), Some(75..105));
+        assert_eq!(replacement_anchor_range("missing", &after), None);
+    }
+
+    #[test]
+    fn adjacent_replacement_offsets_do_not_share_the_exclusive_boundary() {
+        assert_eq!(replacement_anchor_offsets(0..23), Some((0, 22)));
+        assert_eq!(replacement_anchor_offsets(23..43), Some((23, 42)));
+        assert_eq!(replacement_anchor_offsets(9..9), None);
+
+        let (_, first_end) = replacement_anchor_offsets(0..23).unwrap();
+        let (second_start, _) = replacement_anchor_offsets(23..43).unwrap();
+        assert!(first_end < second_start);
+    }
+
+    #[test]
     fn removing_supplement_above_paused_viewport_preserves_visible_rows() {
         assert_eq!(scroll_top_after_supplement_removal(10., 4, 30.), Some(26.));
         assert_eq!(scroll_top_after_supplement_removal(10., 4, 14.), Some(10.));
@@ -3867,6 +4720,98 @@ mod tests {
         assert_eq!(highlights.block_quotes, [32..34]);
         assert_eq!(highlights.strikethrough, [32..34]);
         assert_eq!(highlights.scanned_spans, 8);
+    }
+
+    #[test]
+    fn monospace_semantics_form_stable_full_document_font_ranges() {
+        let mut first = segment(0, 0..80, 0..10, 10..80);
+        first.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 20..30,
+                style: TranscriptSemanticStyle::InlineCode,
+            },
+            TranscriptSemanticSpan {
+                range: 30..50,
+                style: TranscriptSemanticStyle::CodeBlock,
+            },
+            TranscriptSemanticSpan {
+                range: 22..26,
+                style: TranscriptSemanticStyle::Strong,
+            },
+        ];
+        let mut second = segment(1, 80..140, 80..90, 90..140);
+        second.semantic_spans = vec![
+            TranscriptSemanticSpan {
+                range: 100..120,
+                style: TranscriptSemanticStyle::CodeBlock,
+            },
+            TranscriptSemanticSpan {
+                range: 122..130,
+                style: TranscriptSemanticStyle::CommandInvocation,
+            },
+            TranscriptSemanticSpan {
+                range: 132..140,
+                style: TranscriptSemanticStyle::CommandOutput,
+            },
+        ];
+
+        assert_eq!(
+            semantic_monospace_ranges(&[first, second]),
+            [20..50, 100..120, 122..130, 132..140]
+        );
+    }
+
+    #[test]
+    fn shell_semantics_keep_exact_utf8_offsets_for_selectable_commands() {
+        let command = "printf '%s' \"héllo\" | rg -i hello";
+        let highlights = shell_semantic_highlights(command, 100);
+        let all_ranges = highlights
+            .functions
+            .iter()
+            .chain(&highlights.variables)
+            .chain(&highlights.keywords)
+            .chain(&highlights.operators)
+            .chain(&highlights.constants)
+            .chain(&highlights.strings)
+            .chain(&highlights.comments)
+            .chain(&highlights.embedded)
+            .chain(&highlights.punctuation)
+            .collect::<Vec<_>>();
+
+        assert!(!all_ranges.is_empty());
+        assert!(all_ranges.iter().all(|range| {
+            range.start >= 100
+                && range.end <= 100 + command.len()
+                && command.is_char_boundary(range.start - 100)
+                && command.is_char_boundary(range.end - 100)
+        }));
+        assert!(
+            all_ranges
+                .iter()
+                .any(|range| &command[range.start - 100..range.end - 100] == "printf")
+        );
+    }
+
+    #[test]
+    fn transcript_cards_and_folds_are_semantic_not_global() {
+        let user = transcript_row_options(TranscriptKind::User);
+        assert!(user.border.is_some());
+        assert_eq!(user.corner_radius, px(6.));
+        assert_eq!(user.vertical_margin, px(3.));
+        assert!(!user.merge_adjacent);
+
+        let agent = transcript_row_options(TranscriptKind::Agent);
+        assert!(agent.border.is_none());
+        assert_eq!(agent.corner_radius, Pixels::ZERO);
+        assert_eq!(agent.vertical_margin, Pixels::ZERO);
+        assert!(agent.merge_adjacent);
+
+        let command = segment_with_kind(0, TranscriptKind::Command, 0..80, 0..10, 10..78);
+        let narrative = segment_with_kind(1, TranscriptKind::Agent, 80..160, 80..90, 90..158);
+        let empty_tool = segment_with_kind(2, TranscriptKind::Tool, 160..180, 160..170, 170..170);
+        assert!(transcript_item_is_foldable(&command));
+        assert!(!transcript_item_is_foldable(&narrative));
+        assert!(!transcript_item_is_foldable(&empty_tool));
     }
 
     #[test]

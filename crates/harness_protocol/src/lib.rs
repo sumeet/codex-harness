@@ -318,6 +318,8 @@ pub enum TranscriptSemanticStyle {
     CodeBlock,
     BlockQuote,
     Strikethrough,
+    CommandInvocation,
+    CommandOutput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -662,6 +664,37 @@ fn selectable_transcript_body(
         } else {
             selectable_markdown_text(normalized_content)
         }
+    } else if item.kind == TranscriptKind::Command {
+        let text = normalized_content
+            .strip_prefix("$ ")
+            .unwrap_or(normalized_content)
+            .trim()
+            .to_owned();
+        let mut semantic_spans = Vec::new();
+        if let Some(command) = item.command_transcript() {
+            let command = normalize_buffer_line_endings(command.command)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            if !command.is_empty() && text.starts_with(&command) {
+                semantic_spans.push(TranscriptSemanticSpan {
+                    range: 0..command.len(),
+                    style: TranscriptSemanticStyle::CommandInvocation,
+                });
+                let output_start = text[command.len()..]
+                    .find(|character: char| !character.is_whitespace())
+                    .map(|offset| command.len() + offset);
+                if let Some(output_start) = output_start.filter(|start| *start < text.len()) {
+                    semantic_spans.push(TranscriptSemanticSpan {
+                        range: output_start..text.len(),
+                        style: TranscriptSemanticStyle::CommandOutput,
+                    });
+                }
+            }
+        }
+        SelectableBodyProjection {
+            text,
+            semantic_spans,
+        }
     } else {
         SelectableBodyProjection {
             text: normalized_content.trim().to_owned(),
@@ -691,15 +724,25 @@ fn project_transcript_item(
 
     let mut text = String::new();
     let header_start = text.len();
-    text.push_str("━━━━ ");
-    text.push_str(&normalize_buffer_line_endings(item.title.clone()));
-    if let Some(status) = item.display_status() {
-        text.push_str(" · ");
-        text.push_str(&normalize_buffer_line_endings(status.to_owned()));
+    let show_header = !matches!(
+        (item.kind, item.title.as_str()),
+        (TranscriptKind::Agent, "Codex") | (TranscriptKind::User, "You")
+    );
+    if show_header {
+        text.push_str("━━━━ ");
+        text.push_str(&normalize_buffer_line_endings(item.title.clone()));
+        if let Some(status) = item.display_status() {
+            text.push_str(" · ");
+            text.push_str(&normalize_buffer_line_endings(status.to_owned()));
+        }
+        text.push_str(" ━━━━");
     }
-    text.push_str(" ━━━━");
     let header_end = text.len();
-    text.push_str("\n\n");
+    // Match the Rich transcript's attribution policy: ordinary user and agent
+    // messages are self-evident and do not consume a decorative header row.
+    if show_header {
+        text.push('\n');
+    }
 
     let body_start = text.len();
     let normalized_content = normalize_buffer_line_endings(item.content.clone());
@@ -709,7 +752,6 @@ fn project_transcript_item(
         text.push('\n');
     }
     let body_end = body_start + body.text.len();
-    text.push('\n');
 
     let whole_end = text.len();
     Some(TranscriptItemProjection {
@@ -4377,6 +4419,22 @@ mod tests {
                 output: "hello".into(),
             })
         );
+        let projection = model.item_projection(0).unwrap();
+        assert_eq!(projection.body_text(), "printf '%s' \"hello\"\n\nhello");
+        let body_start = projection.segment.body_range.start;
+        assert_eq!(
+            projection.segment.semantic_spans,
+            [
+                TranscriptSemanticSpan {
+                    range: body_start..body_start + 19,
+                    style: TranscriptSemanticStyle::CommandInvocation,
+                },
+                TranscriptSemanticSpan {
+                    range: body_start + 21..body_start + 26,
+                    style: TranscriptSemanticStyle::CommandOutput,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -4581,7 +4639,7 @@ mod tests {
         );
         assert_eq!(
             &document.text[segment.whole_range.clone()],
-            "━━━━ Café 🦀 · prêt ━━━━\n\nα first\nβ second\n\n"
+            "━━━━ Café 🦀 · prêt ━━━━\nα first\nβ second\n"
         );
         for offset in [
             segment.whole_range.start,
@@ -4607,6 +4665,9 @@ mod tests {
         ));
 
         let document = model.full_document();
+        let segment = &document.segments[0];
+        assert!(segment.header_range.is_empty());
+        assert_eq!(segment.whole_range.start, segment.body_range.start);
         let body = &document.text[document.segments[0].body_range.clone()];
 
         assert!(body.contains("Result"));
@@ -4615,6 +4676,31 @@ mod tests {
         assert!(!body.contains("**"));
         assert!(!body.contains("# Result"));
         assert!(!body.contains("`motions`"));
+        assert!(!document.text.contains("Codex"));
+    }
+
+    #[test]
+    fn default_user_messages_are_compact_bodies_without_attribution_rows() {
+        let mut model = TranscriptModel::default();
+        model.push_without_splice(replay_item(
+            0,
+            TranscriptKind::User,
+            "You",
+            "A compact message",
+            json!(null),
+        ));
+
+        let document = model.full_document();
+        let segment = &document.segments[0];
+        assert!(segment.header_range.is_empty());
+        assert_eq!(
+            &document.text[segment.body_range.clone()],
+            "A compact message"
+        );
+        assert_eq!(
+            &document.text[segment.whole_range.clone()],
+            "A compact message\n"
+        );
     }
 
     #[test]

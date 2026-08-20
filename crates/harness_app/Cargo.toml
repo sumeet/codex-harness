@@ -29,8 +29,6 @@ serde_json.workspace = true
 settings.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
-tree-sitter.workspace = true
-tree-sitter-bash.workspace = true
 ui.workspace = true
 zed_actions.workspace = true
 

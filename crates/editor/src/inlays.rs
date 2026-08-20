@@ -67,6 +67,15 @@ pub enum InlayContent {
 }
 
 impl Inlay {
+    /// Construct host-owned display text without adding bytes to the Buffer.
+    pub fn custom<T: Into<Rope>>(id: usize, position: Anchor, text: T) -> Self {
+        Self {
+            id: InlayId::Custom(id),
+            position,
+            content: InlayContent::Text(text.into()),
+        }
+    }
+
     #[cfg(feature = "project-integration")]
     pub fn hint(id: InlayId, position: Anchor, hint: &InlayHint) -> Self {
         let mut text = hint.text();

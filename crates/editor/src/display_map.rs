@@ -139,7 +139,7 @@ use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
 use inlay_map::{BufferOffsetToInlayPointCursor, InlaySnapshot};
 use tab_map::{TabPoint, TabPointCursor, TabSnapshot};
-use wrap_map::{WrapMap, WrapPatch, WrapPointCursor};
+use wrap_map::{FontVariantRange, WrapMap, WrapPatch, WrapPointCursor};
 
 /// A project-neutral folding range consumed by the display map.
 ///
@@ -585,13 +585,63 @@ impl DisplayMap {
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
         let tab_size = Self::tab_size(&self.buffer, cx);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let font_variant_point_ranges = self
+            .text_highlights
+            .values()
+            .filter_map(|highlight| {
+                highlight
+                    .0
+                    .font_family
+                    .map(|variant| (variant, highlight.1.as_slice()))
+            })
+            .flat_map(|(variant, ranges)| {
+                ranges.iter().filter_map({
+                    let buffer_snapshot = &buffer_snapshot;
+                    move |range| {
+                        let range = range.to_point(buffer_snapshot);
+                        (range.start < range.end).then_some((range, variant))
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
         let edits = self.buffer_subscription.consume().into_inner();
 
         let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        self.wrap_map
-            .update(cx, |map, cx| map.sync(snapshot, edits, cx))
+        let mut font_variant_ranges = font_variant_point_ranges
+            .into_iter()
+            .filter_map(|(range, variant)| {
+                let start = snapshot.point_to_tab_point(range.start, Bias::Left);
+                let end = snapshot.point_to_tab_point(range.end, Bias::Right);
+                (start < end).then_some(FontVariantRange {
+                    range: start..end,
+                    variant,
+                })
+            })
+            .collect::<Vec<_>>();
+        font_variant_ranges.sort_by(|left, right| {
+            left.range
+                .start
+                .cmp(&right.range.start)
+                .then_with(|| left.range.end.cmp(&right.range.end))
+                .then_with(|| left.variant.cmp(&right.variant))
+        });
+        let mut merged_font_variant_ranges: Vec<FontVariantRange> =
+            Vec::with_capacity(font_variant_ranges.len());
+        for range in font_variant_ranges {
+            if let Some(previous) = merged_font_variant_ranges.last_mut()
+                && previous.variant == range.variant
+                && range.range.start <= previous.range.end
+            {
+                previous.range.end = previous.range.end.max(range.range.end);
+            } else {
+                merged_font_variant_ranges.push(range);
+            }
+        }
+        self.wrap_map.update(cx, |map, cx| {
+            map.sync_with_font_variant_ranges(snapshot, edits, merged_font_variant_ranges, cx)
+        })
     }
 
     fn with_synced_companion_mut<R>(
