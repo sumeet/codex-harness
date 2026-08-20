@@ -13,14 +13,14 @@ use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
     IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListState, Render, SharedString,
-    StyledText, Task, UpdateGlobal, Window, WindowBounds, WindowOptions, actions, deferred, div,
-    list, prelude::*, px, relative, size,
+    StyledText, Task, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions,
+    deferred, div, list, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
     LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged,
-    TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch,
-    VimWordNext, VimWordPrevious,
+    TranscriptReplacement, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
+    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -2129,6 +2129,139 @@ fn mark_unbacked_requests_inactive(
     }
 }
 
+const HYBRID_DIFF_REPLACEMENT_KEY: &str = "hybrid-rich-diff";
+
+struct HybridDiffSurface {
+    item: TranscriptItem,
+    item_index: usize,
+    owner: WeakEntity<HarnessApp>,
+}
+
+impl HybridDiffSurface {
+    fn new(item: TranscriptItem, item_index: usize, owner: WeakEntity<HarnessApp>) -> Self {
+        Self {
+            item,
+            item_index,
+            owner,
+        }
+    }
+
+    fn update(&mut self, item: TranscriptItem, item_index: usize, cx: &mut Context<Self>) {
+        if self.item.key == item.key
+            && self.item.event_count == item.event_count
+            && self.item.expanded == item.expanded
+            && self.item.content == item.content
+            && self.item.title == item.title
+            && self.item.status == item.status
+            && self.item_index == item_index
+        {
+            return;
+        }
+        self.item = item;
+        self.item_index = item_index;
+        cx.notify();
+    }
+}
+
+impl Render for HybridDiffSurface {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let body = self.item.expanded.then(|| {
+            HarnessApp::render_diff_content(
+                &self.item,
+                self.item_index,
+                None,
+                OutputExpansion::Preview,
+                None,
+                cx,
+            )
+        });
+        let item_key = self.item.key.clone();
+        let owner = self.owner.clone();
+        let header = div()
+            .id(format!("hybrid-diff-header:{}", self.item.key))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .on_click(move |_, _, cx| {
+                owner
+                    .update(cx, |app, cx| {
+                        if let Some(item) = app
+                            .model
+                            .items
+                            .iter_mut()
+                            .find(|item| item.key == item_key)
+                        {
+                            item.expanded = !item.expanded;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+            })
+            .child(
+                Icon::new(icon_for_kind(self.item.kind))
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .text_ui_sm(cx)
+                    .text_color(colors.text_muted)
+                    .child(transcript_item_header_title(&self.item).to_owned()),
+            )
+            .child(Disclosure::new(
+                format!("hybrid-diff-disclosure:{}", self.item.key),
+                self.item.expanded,
+            ));
+
+        div()
+            .size_full()
+            .min_w_0()
+            .py_1()
+            .child(
+                div()
+                    .size_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .px_2()
+                    .py_1()
+                    .child(header)
+                    .when_some(body, |this, body| this.child(body)),
+            )
+    }
+}
+
+fn hybrid_diff_rows(item: &TranscriptItem) -> u32 {
+    if !item.expanded {
+        return 2;
+    }
+    let presentations = diff_file_presentations(&item.content);
+    let visible_lines = progressive_file_line_allocations(
+        &presentations
+            .iter()
+            .map(|presentation| presentation.content.lines().count())
+            .collect::<Vec<_>>(),
+        OutputExpansion::Preview,
+    )
+    .into_iter()
+    .sum::<usize>();
+    let structural_rows = presentations.len() + usize::from(presentations.len() > 1) + 3;
+    u32::try_from(visible_lines + structural_rows)
+        .unwrap_or(18)
+        .clamp(6, 18)
+}
+
 struct HarnessApp {
     cwd: String,
     replay_count: Option<usize>,
@@ -2180,6 +2313,7 @@ struct HarnessApp {
     performance_status_generation: u64,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
+    hybrid_diff_surface: Option<Entity<HybridDiffSurface>>,
     list_state: ListState,
     task_list_state: ListState,
     sidebar_open: bool,
@@ -2342,6 +2476,7 @@ impl HarnessApp {
             performance_status_generation: 0,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
+            hybrid_diff_surface: None,
             sidebar_open: true,
             sidebar_user_override: false,
             server_task: Task::ready(()),
@@ -2733,6 +2868,46 @@ impl HarnessApp {
                 }
             }
         }
+    }
+
+    fn sync_hybrid_diff_surface(&mut self, cx: &mut Context<Self>) {
+        let candidate = self
+            .model
+            .items
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.kind == model::TranscriptKind::Diff)
+            .map(|(index, item)| (index, item.clone()));
+        let Some((index, item)) = candidate else {
+            if self.hybrid_diff_surface.take().is_some() {
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.remove_replacement(HYBRID_DIFF_REPLACEMENT_KEY, cx);
+                });
+            }
+            return;
+        };
+
+        let surface = if let Some(surface) = &self.hybrid_diff_surface {
+            surface.update(cx, |surface, cx| surface.update(item.clone(), index, cx));
+            surface.clone()
+        } else {
+            let owner = cx.weak_entity();
+            let surface = cx.new(|_| HybridDiffSurface::new(item.clone(), index, owner));
+            self.hybrid_diff_surface = Some(surface.clone());
+            surface
+        };
+        let rows = hybrid_diff_rows(&item);
+        self.transcript_editor.update(cx, |editor, cx| {
+            editor.upsert_replacement(
+                TranscriptReplacement::new(
+                    HYBRID_DIFF_REPLACEMENT_KEY,
+                    item.key,
+                    rows,
+                    surface.into(),
+                ),
+                cx,
+            );
+        });
     }
 
     fn sync_request_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5197,7 +5372,7 @@ impl HarnessApp {
         content: &str,
         visible_line_count: usize,
         search: Option<&RichSearchPaint>,
-        cx: &mut Context<Self>,
+        cx: &App,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let unified = content.lines().any(|line| line.starts_with("@@"));
@@ -5283,6 +5458,24 @@ impl HarnessApp {
         search: Option<&RichSearchPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let expansion = self
+            .output_expansion
+            .get(&item.key)
+            .copied()
+            .unwrap_or_default();
+        let toggle = progressive_diff_toggle(item, expansion)
+            .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
+        Self::render_diff_content(item, index, search, expansion, toggle, cx)
+    }
+
+    fn render_diff_content(
+        item: &TranscriptItem,
+        index: usize,
+        search: Option<&RichSearchPaint>,
+        expansion: OutputExpansion,
+        toggle: Option<AnyElement>,
+        cx: &App,
+    ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let presentations = diff_file_presentations(&item.content);
         let file_count = presentations.len();
@@ -5291,11 +5484,6 @@ impl HarnessApp {
                 .iter()
                 .map(|presentation| presentation.content.as_str()),
         );
-        let expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
         let allocations = progressive_file_line_allocations(
             &presentations
                 .iter()
@@ -5303,7 +5491,6 @@ impl HarnessApp {
                 .collect::<Vec<_>>(),
             expansion,
         );
-        let toggle = progressive_diff_toggle(item, expansion);
         let mut sections = Vec::new();
 
         for (section_index, (presentation, visible_lines)) in
@@ -5430,7 +5617,7 @@ impl HarnessApp {
                         .pt_1()
                         .border_t_1()
                         .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
+                        .child(toggle),
                 )
             })
             .into_any_element()
@@ -7035,6 +7222,7 @@ impl HarnessApp {
 
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_hybrid_diff_surface(cx);
         self.sync_image_surfaces(window, cx);
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
@@ -9048,6 +9236,26 @@ mod tests {
             OutputExpansion::All,
             "hidden-tail-needle"
         ));
+    }
+
+    #[test]
+    fn hybrid_diff_block_resizes_to_a_compact_collapsed_header() {
+        let mut item = TranscriptItem {
+            key: "hybrid-diff".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Diff,
+            title: "Working tree diff".into(),
+            status: None,
+            content: "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\n-old\n+new".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert!(hybrid_diff_rows(&item) >= 6);
+        item.expanded = false;
+        assert_eq!(hybrid_diff_rows(&item), 2);
     }
 
     #[test]

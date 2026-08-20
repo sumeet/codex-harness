@@ -5,7 +5,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
+    ops::{Range, RangeInclusive},
     sync::Arc,
 };
 
@@ -279,6 +279,7 @@ pub struct TranscriptEditor {
     padding_inlays: Vec<InlayId>,
     next_padding_inlay_id: usize,
     supplements: BTreeMap<String, MountedTranscriptSupplement>,
+    replacements: BTreeMap<String, MountedTranscriptReplacement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
     refresh_when_rendered: bool,
@@ -401,6 +402,42 @@ impl TranscriptSupplement {
 }
 
 struct MountedTranscriptSupplement {
+    item_key: String,
+    rows: u32,
+    view: AnyView,
+    block_id: Option<CustomBlockId>,
+}
+
+/// A host-owned rich view that replaces one semantic transcript item.
+///
+/// The item's bytes remain in the Buffer, so search, yank, and raw inspection
+/// still operate on the canonical transcript. The display map treats the rich
+/// surface as one atomic Vim object while it is mounted.
+#[derive(Clone)]
+pub struct TranscriptReplacement {
+    pub key: String,
+    pub item_key: String,
+    pub rows: u32,
+    pub view: AnyView,
+}
+
+impl TranscriptReplacement {
+    pub fn new(
+        key: impl Into<String>,
+        item_key: impl Into<String>,
+        rows: u32,
+        view: AnyView,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            item_key: item_key.into(),
+            rows: rows.max(1),
+            view,
+        }
+    }
+}
+
+struct MountedTranscriptReplacement {
     item_key: String,
     rows: u32,
     view: AnyView,
@@ -1382,6 +1419,43 @@ fn supplemental_block(placement: Anchor, rows: u32, view: AnyView) -> BlockPrope
     }
 }
 
+fn replacement_anchor_range(
+    item_key: &str,
+    segments: &[TranscriptDocumentSegment],
+) -> Option<Range<usize>> {
+    segments
+        .iter()
+        .find(|segment| segment.item_key == item_key)
+        .map(|segment| segment.whole_range.clone())
+}
+
+fn replacement_renderer(view: AnyView) -> RenderBlock {
+    Arc::new(move |cx: &mut BlockContext| {
+        div()
+            .id(cx.block_id)
+            .size_full()
+            .min_w_0()
+            .overflow_hidden()
+            .block_mouse_except_scroll()
+            .child(view.clone())
+            .into_any_element()
+    })
+}
+
+fn replacement_block(
+    placement: RangeInclusive<Anchor>,
+    rows: u32,
+    view: AnyView,
+) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Replace(placement),
+        height: Some(rows.max(1)),
+        style: BlockStyle::Spacer,
+        render: replacement_renderer(view),
+        priority: 1,
+    }
+}
+
 impl TranscriptEditor {
     pub fn read_only(window: &mut Window, cx: &mut Context<Self>) -> Self {
         // Unlike the composer, this Buffer is a mixed semantic document.
@@ -1447,6 +1521,7 @@ impl TranscriptEditor {
             padding_inlays: Vec::new(),
             next_padding_inlay_id: 0,
             supplements: BTreeMap::new(),
+            replacements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
             refresh_when_rendered: false,
@@ -1680,6 +1755,92 @@ impl TranscriptEditor {
         }
     }
 
+    /// Replace one projected item with a host-rendered semantic component.
+    ///
+    /// This is the hybrid transcript seam: the Buffer remains authoritative,
+    /// while the Editor display map presents a richer atomic view for item
+    /// types whose layout cannot be expressed by row and text highlights.
+    pub fn upsert_replacement(
+        &mut self,
+        replacement: TranscriptReplacement,
+        cx: &mut Context<Self>,
+    ) {
+        let key = replacement.key;
+        let was_present = self.replacements.contains_key(&key);
+        let rows = replacement.rows.max(1);
+        let mut mounted = self.replacements.remove(&key).unwrap_or_else(|| {
+            MountedTranscriptReplacement {
+                item_key: replacement.item_key.clone(),
+                rows,
+                view: replacement.view.clone(),
+                block_id: None,
+            }
+        });
+        let update = supplement_update(
+            mounted.item_key != replacement.item_key,
+            mounted.rows != rows,
+            mounted.view != replacement.view,
+        );
+        let display_changed = !was_present || update != SupplementUpdate::Unchanged;
+        mounted.item_key = replacement.item_key;
+        mounted.rows = rows;
+        mounted.view = replacement.view;
+
+        if let Some(block_id) = mounted.block_id {
+            match update {
+                SupplementUpdate::Unchanged => {}
+                SupplementUpdate::Resize => self.editor.update(cx, |editor, cx| {
+                    editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx)
+                }),
+                SupplementUpdate::ReplaceRenderer => {
+                    let renderer = replacement_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        )
+                    });
+                }
+                SupplementUpdate::ResizeAndReplaceRenderer => {
+                    let renderer = replacement_renderer(mounted.view.clone());
+                    self.editor.update(cx, |editor, cx| {
+                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx);
+                        editor.replace_blocks(
+                            [(block_id, renderer)].into_iter().collect(),
+                            None,
+                            cx,
+                        );
+                    });
+                }
+                SupplementUpdate::Reanchor => {
+                    self.editor.update(cx, |editor, cx| {
+                        editor.remove_blocks([block_id].into_iter().collect(), None, cx)
+                    });
+                    mounted.block_id = None;
+                }
+            }
+        }
+        self.replacements.insert(key, mounted);
+        self.mount_unmounted_replacements(cx);
+        if should_request_tail_autoscroll(self.follow_tail, display_changed) {
+            self.request_tail_autoscroll(cx);
+        }
+    }
+
+    pub fn remove_replacement(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(replacement) = self.replacements.remove(key) else {
+            return false;
+        };
+        if let Some(block_id) = replacement.block_id {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks([block_id].into_iter().collect(), None, cx)
+            });
+        }
+        self.viewport_decorations = None;
+        true
+    }
+
     /// Reveal an already-mounted supplement without changing the transcript
     /// cursor or selection. Tall blocks align to the top; shorter blocks move
     /// only enough to fit inside the current Editor viewport.
@@ -1734,6 +1895,19 @@ impl TranscriptEditor {
         }
     }
 
+    fn unmount_all_replacements(&mut self, cx: &mut Context<Self>) {
+        let block_ids = self
+            .replacements
+            .values_mut()
+            .filter_map(|replacement| replacement.block_id.take())
+            .collect::<Vec<_>>();
+        if !block_ids.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
+            });
+        }
+    }
+
     fn mount_unmounted_supplements(&mut self, cx: &mut Context<Self>) {
         let pending = self
             .supplements
@@ -1768,6 +1942,60 @@ impl TranscriptEditor {
                 supplement.block_id = Some(block_id);
             }
         }
+    }
+
+    fn mount_unmounted_replacements(&mut self, cx: &mut Context<Self>) {
+        let pending = self
+            .replacements
+            .iter()
+            .filter(|(_, replacement)| replacement.block_id.is_none())
+            .filter_map(|(key, replacement)| {
+                Some((
+                    key.clone(),
+                    replacement_anchor_range(&replacement.item_key, &self.segments)?,
+                    replacement.rows,
+                    replacement.view.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+
+        let replaced_item_keys = pending
+            .iter()
+            .filter_map(|(key, _, _, _)| {
+                self.replacements
+                    .get(key)
+                    .map(|replacement| replacement.item_key.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let header_blocks_to_remove = self
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, segment)| replaced_item_keys.contains(&segment.item_key))
+            .filter_map(|(position, _)| self.header_blocks.remove(&position))
+            .collect::<Vec<_>>();
+
+        let block_ids = self.editor.update(cx, |editor, cx| {
+            if !header_blocks_to_remove.is_empty() {
+                editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
+            }
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let blocks = pending.iter().map(|(_, range, rows, view)| {
+                let (start, end) = clipped_anchor_pair(&snapshot, range.clone());
+                replacement_block(start..=end, *rows, view.clone())
+            });
+            editor.insert_blocks(blocks, None, cx)
+        });
+        debug_assert_eq!(pending.len(), block_ids.len());
+        for ((key, _, _, _), block_id) in pending.into_iter().zip(block_ids) {
+            if let Some(replacement) = self.replacements.get_mut(&key) {
+                replacement.block_id = Some(block_id);
+            }
+        }
+        self.viewport_decorations = None;
     }
 
     /// Explicitly opt into streaming tail-follow for an initial/full thread
@@ -2054,6 +2282,18 @@ impl TranscriptEditor {
         } else {
             (Vec::new(), Vec::new())
         };
+        let replacement_item_keys = self
+            .replacements
+            .values()
+            .filter(|replacement| replacement.block_id.is_some())
+            .map(|replacement| replacement.item_key.as_str())
+            .collect::<BTreeSet<_>>();
+        let header_positions_to_insert = header_positions_to_insert
+            .into_iter()
+            .filter(|position| {
+                !replacement_item_keys.contains(self.segments[*position].item_key.as_str())
+            })
+            .collect::<Vec<_>>();
         let header_segments = header_positions_to_insert
             .iter()
             .map(|position| self.segments[*position].clone())
@@ -2578,6 +2818,7 @@ impl TranscriptEditor {
             // A later valid full sync remounts the retained logical supplement
             // specs against fresh ranges.
             self.unmount_all_supplements(cx);
+            self.unmount_all_replacements(cx);
             self.segments.clear();
             self.segment_header_texts.clear();
             self.collapsed_items.clear();
@@ -2624,6 +2865,7 @@ impl TranscriptEditor {
         // Keep the logical specs and host views, but remount their Editor blocks
         // against the new per-item body ranges below.
         self.unmount_all_supplements(cx);
+        self.unmount_all_replacements(cx);
         self.segments.clone_from(&document.segments);
         self.collapsed_items.retain(|item_key| {
             document
@@ -2673,6 +2915,7 @@ impl TranscriptEditor {
         });
         self.refresh_semantic_font_geometry(cx);
         self.mount_unmounted_supplements(cx);
+        self.mount_unmounted_replacements(cx);
         self.refresh_viewport_decorations(cx);
         true
     }
@@ -2861,6 +3104,7 @@ impl TranscriptEditor {
             self.refresh_semantic_font_geometry(cx);
         }
         self.mount_unmounted_supplements(cx);
+        self.mount_unmounted_replacements(cx);
         self.refresh_viewport_decorations(cx);
         if should_request_tail_autoscroll(self.follow_tail, search_text_changed) {
             self.request_tail_autoscroll(cx);
@@ -3830,6 +4074,22 @@ mod tests {
         assert_eq!(supplement_anchor_offset("item-1", &before), Some(58));
         assert_eq!(supplement_anchor_offset("item-1", &after), Some(103));
         assert_eq!(supplement_anchor_offset("missing", &after), None);
+    }
+
+    #[test]
+    fn replacement_covers_the_whole_semantic_item_across_rebuilds() {
+        let before = [
+            segment(0, 0..30, 0..8, 10..28),
+            segment(1, 30..60, 30..38, 40..58),
+        ];
+        let after = [
+            segment(0, 0..75, 0..8, 10..73),
+            segment(1, 75..105, 75..83, 85..103),
+        ];
+
+        assert_eq!(replacement_anchor_range("item-1", &before), Some(30..60));
+        assert_eq!(replacement_anchor_range("item-1", &after), Some(75..105));
+        assert_eq!(replacement_anchor_range("missing", &after), None);
     }
 
     #[test]
