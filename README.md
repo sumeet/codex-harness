@@ -5,17 +5,19 @@ Codex Harness is a standalone, keyboard-first native client for
 theme tokens, and icon system without booting Zed's workspace, project UI,
 tabs, login shell, or IDE chrome.
 
-The product has two coordinated, full-width projections of one transcript:
+The default transcript is a hybrid of Zed's reading and editing surfaces:
 
-- **Rich** is the default reading surface: proportional Markdown, Zed-native
-  cards and icons, diff styling, images, tool activity, and interactive request
-  controls.
-- **Text** is a real Zed `Editor`/`Buffer` driven by Zed's Vim engine: character
-  motions, text objects, visual selection, registers, yank, search, and fast
-  keyboard navigation over the complete selectable history.
+- **Rich paint** supplies proportional Markdown, Zed-native cards and icons,
+  diff styling, images, tool activity, and interactive request controls.
+- A persistent, input-only **Zed `Editor`/`Buffer`** is the transcript's source
+  of truth for Vim state: character and line motions, Visual/Visual Line/Visual
+  Block selection, registers, yank, search, and keyboard navigation. Its cursor
+  and selections are projected onto the rich surface.
 
-Both retain the same semantic item, use one history scrollbar at a time, and
-keep a real modal composer below the history. Product acceptance is defined in
+The code-icon view switch exposes the same Editor as a raw diagnostic view; it
+is no longer required to obtain real Vim behavior. Both projections retain the
+same semantic position, use one history scrollbar at a time, and keep a real
+modal composer below the history. Product acceptance is defined in
 [`docs/quality-gates.md`](docs/quality-gates.md); a compiling slice is not by
 itself considered finished.
 
@@ -48,20 +50,29 @@ Builds and launches are deliberately separate; launching never invokes Cargo:
 ./script/run-standalone.sh
 ```
 
-The build wrapper serializes Rust compilation, refuses to build when less than
-4 GiB of memory is available, and caps an individual compiler process. Its
-default `dev` selection uses the `harness-dev` Cargo profile: only Harness's
-frame, input, Editor, text-layout, and Linux GPU-submission crates are optimized.
-Debug assertions, overflow checks, limited line information, backtraces, and
-incremental compilation remain enabled. The first build therefore costs more
-than an unoptimized `cargo build`, while subsequent Harness-only edits remain
-incremental and avoid release LTO. For a more broadly optimized non-LTO test
-build:
+The build wrapper refuses to build when less than 4 GiB of memory is available,
+caps an individual compiler process, and uses four Cargo workers by default.
+Its default `release-fast` profile is broadly optimized without release LTO, so
+the ordinary run command exercises the interactive build rather than debug
+rendering performance:
 
 ```sh
-HARNESS_PROFILE=release-fast ./script/build-standalone.sh
-HARNESS_PROFILE=release-fast ./script/run-standalone.sh
+./script/build-standalone.sh
+./script/run-standalone.sh
 ```
+
+For assertion-heavy development, opt into `harness-dev`. Only Harness's frame,
+input, Editor, text-layout, and Linux GPU-submission path is optimized in that
+profile; assertions, overflow checks, limited line information, backtraces, and
+incremental compilation remain enabled:
+
+```sh
+HARNESS_PROFILE=dev ./script/build-standalone.sh
+HARNESS_PROFILE=dev ./script/run-standalone.sh
+```
+
+Set `HARNESS_BUILD_JOBS` to override the default worker count on a machine with
+more or less available memory.
 
 Replay fixtures do not require a live App Server and are useful for UI QA:
 
@@ -71,32 +82,23 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 ./script/run-standalone.sh --replay 10000
 ```
 
-The current selectable-rich experiment keeps command bodies as real Text-mode
-Buffer characters while retaining card chrome, shell syntax colors, mixed-font
-wrapping, search, and characterwise Vim selection:
-
-```sh
-HARNESS_SELECTABLE_RICH_COMMAND=1 ./script/run-standalone.sh --replay 8 --text
-```
-
 ## Controls worth knowing
 
 - `Ctrl-W H/J/K/L` moves between the thread rail, composer, and transcript where
   the current focus makes that direction meaningful; `Ctrl-B` toggles the rail.
 - `Ctrl-N` starts a fresh task. `Ctrl-Enter` sends from the composer.
-- Rich uses `j`/`k`, `gg`/`G`, `/`, disclosures, and blockwise selection/yank.
-  `Shift-V` enters Text at the same semantic item.
-- Text is Zed's modal Editor. Its normal/visual motions, registers, yank,
-  `/ ? n N`, jumplist, and `:` palette operate on real Buffer text. `:rich`,
-  `:text`, `:reading`, `:mono`, `:compose`, `:tasks`, `:new`, `:stop`, and
-  `:perf` are Harness aliases. `:perf` copies a delta performance report that
-  distinguishes input arrival, input dispatch, input-to-present latency, and
-  input-present cadence rather than adding permanent profiler chrome. The
+- The rich transcript uses Zed's modal Editor for `j`/`k`, `gg`/`G`, motions,
+  Visual (`v`), Visual Line (`V`), Visual Block (`Ctrl-V`), registers, yank,
+  `/ ? n N`, and jumplist behavior. `z a` toggles the selected disclosure.
+- `:rich`, `:text`, `:reading`, `:mono`, `:compose`, `:tasks`, `:new`, `:stop`,
+  and `:perf` are Harness aliases. `:perf` copies a delta performance report
+  that distinguishes input arrival, input dispatch, input-to-present latency,
+  and input-present cadence rather than adding permanent profiler chrome. The
   developer alias `:perf-j` runs 240 real Vim `j` inputs paced one per presented
-  frame in Text, then copies that run's report. `--text` starts directly in Text
-  for repeatable QA; the code icon in the thread-rail toolbar switches modes
-  with the mouse. Standalone `* # g* g# gn gN` search semantics are still active
-  work rather than being silently claimed here.
+  frame, then copies that run's report. `--text` starts directly in the raw
+  Editor projection for repeatable QA; the code icon in the thread-rail toolbar
+  switches projections with the mouse. Standalone `* # g* g# gn gN` search
+  semantics are still active work rather than being silently claimed here.
 - `Enter` on an interactive request in Text focuses its shared form/approval
   surface; `Escape` returns to the transcript.
 
@@ -122,20 +124,22 @@ real wrapping and hit-testing geometry; they are not unselectable UI fragments.
 - `crates/command_palette_core`: host-neutral Zed palette matching, history,
   interceptor merge, and confirmation behavior.
 
-Normal Text-mode streaming updates edit only dirty transcript items. Rich
-headers, diff styling, and search highlights are viewport-bounded; underlying
-message text remains real selectable Buffer text. Approvals, permissions,
+Streaming updates edit only dirty transcript items in the persistent Editor.
+Rich headers, diff styling, selection paint, and search highlights are
+viewport-bounded; underlying message text remains real selectable Buffer text.
+Approvals, permissions,
 request-user-input forms, MCP forms, and image previews are stable shared GPUI
-entities: Rich renders them inline, while Text anchors the same entities as
-supplemental Editor blocks. Neither projection introduces a nested vertical
-history scrollbar.
+entities: Rich renders them inline, while the raw Editor projection anchors the
+same entities as supplemental blocks. Neither projection introduces a nested
+vertical history scrollbar.
 
 ## Honest status
 
-Rich and Text are intentional product modes, not old/new implementations.
-Current work is validating mode-to-mode semantic position and tail-follow
-transfer, consolidating every interactive surface across both projections,
-and polishing long diffs, tools, reasoning, images, and the always-visible
+Rich paint backed by native Editor/Vim state is the primary product direction;
+the raw Editor projection remains a diagnostic and accessibility escape hatch.
+Current work is closing selection and hit-testing parity across every rich
+renderer, consolidating every interactive surface across both projections, and
+polishing long diffs, tools, reasoning, images, scrolling, and the always-visible
 composer in real windows. Full Ex command semantics, settings controls,
 live-turn/request endurance testing, and longer exploratory use across real
 histories remain active work.
