@@ -578,18 +578,31 @@ fn navigation_highlights_for_fragment(
     if start >= end {
         return Vec::new();
     }
-    let player = cx.theme().players().read_only();
     vec![(
         start - fragment.start..end - fragment.start,
         gpui::HighlightStyle {
-            background_color: Some(if navigation.visual {
-                player.selection
-            } else {
-                player.cursor.opacity(0.62)
-            }),
+            background_color: Some(rich_navigation_highlight_background(navigation, cx)),
             ..Default::default()
         },
     )]
+}
+
+/// Markdown paints its external selection after its glyphs, while StyledText
+/// paints highlight backgrounds below them. Keep one translucent color for
+/// both paths so a Visual selection never obscures the Rich text it selects.
+fn rich_navigation_selection_background(cx: &App) -> gpui::Hsla {
+    cx.theme().players().read_only().selection.alpha(0.28)
+}
+
+fn rich_navigation_highlight_background(
+    navigation: &RichNavigationPaint,
+    cx: &App,
+) -> gpui::Hsla {
+    if navigation.visual {
+        rich_navigation_selection_background(cx)
+    } else {
+        cx.theme().players().read_only().cursor.opacity(0.62)
+    }
 }
 
 fn navigation_searchable_styled_text(
@@ -7758,8 +7771,9 @@ impl HarnessApp {
         } else if let Some(markdown) = markdown {
             let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             style.code_block_overflow_x_scroll = true;
-            if rich_vim_experiment() {
-                style.selection_background_color = cx.theme().players().read_only().selection;
+            if let Some(navigation) = rich_navigation.as_ref() {
+                style.selection_background_color =
+                    rich_navigation_highlight_background(navigation, cx);
             }
             let mut element = MarkdownElement::new(markdown, style);
             if rich_vim_experiment() {
