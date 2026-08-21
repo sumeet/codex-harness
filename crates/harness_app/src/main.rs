@@ -6159,17 +6159,25 @@ impl HarnessApp {
         for (section_index, (presentation, visible_lines)) in
             presentations.into_iter().zip(allocations).enumerate()
         {
-            let logical_body_start = navigation
-                .and_then(|navigation| {
-                    navigation.body_text[logical_search_start.min(navigation.body_text.len())..]
-                        .find(&presentation.content)
-                        .map(|offset| logical_search_start + offset)
-                })
-                .unwrap_or(logical_search_start);
-            logical_search_start = logical_body_start + presentation.content.len();
+            let path_range = rich_navigation_fragment_range(
+                navigation,
+                &presentation.path,
+                &mut logical_search_start,
+            );
+            let content_range = rich_navigation_fragment_range(
+                navigation,
+                &presentation.content,
+                &mut logical_search_start,
+            );
             let (additions, deletions) = diff_content_counts(&presentation.content);
-            let highlighted_path =
-                searchable_styled_text(presentation.path, Vec::new(), search, cx);
+            let highlighted_path = navigation_searchable_styled_text(
+                presentation.path,
+                Vec::new(),
+                search,
+                navigation,
+                path_range,
+                cx,
+            );
             sections.push(
                 div()
                     .w_full()
@@ -6236,7 +6244,7 @@ impl HarnessApp {
                                         visible_lines,
                                         search,
                                         navigation,
-                                        logical_body_start,
+                                        content_range.start,
                                         cx,
                                     )),
                             )
@@ -9967,6 +9975,50 @@ mod tests {
             OutputExpansion::Preview,
             Some(&navigation),
         ));
+    }
+
+    #[test]
+    fn rich_diff_maps_hidden_git_header_onto_visible_file_path() {
+        let body = "diff --git a/src/main.rs b/src/main.rs\n@@ -1 +1 @@\n-old\n+new";
+        let presentation = diff_file_presentations(body).pop().unwrap();
+
+        let normal = RichNavigationPaint {
+            body_text: body.into(),
+            ranges: Vec::new(),
+            head: Some(0),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        let mut logical_cursor = 0;
+        let path_range =
+            rich_navigation_fragment_range(Some(&normal), &presentation.path, &mut logical_cursor);
+        let content_range = rich_navigation_fragment_range(
+            Some(&normal),
+            &presentation.content,
+            &mut logical_cursor,
+        );
+        assert_eq!(&body[path_range.clone()], "src/main.rs");
+        assert_eq!(
+            navigation_ranges_for_fragment(&normal, path_range.clone()),
+            [0..1]
+        );
+        assert!(navigation_ranges_for_fragment(&normal, content_range.clone()).is_empty());
+
+        let visual = RichNavigationPaint {
+            body_text: body.into(),
+            ranges: vec![0..content_range.start + 2],
+            head: Some(content_range.start + 1),
+            visual: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            navigation_ranges_for_fragment(&visual, path_range.clone()),
+            [0..path_range.len()]
+        );
+        assert_eq!(
+            navigation_ranges_for_fragment(&visual, content_range),
+            [0..2]
+        );
     }
 
     #[test]

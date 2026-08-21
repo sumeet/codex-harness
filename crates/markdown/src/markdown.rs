@@ -2800,21 +2800,23 @@ impl Element for MarkdownElement {
                                     )
                                     .fill();
 
-                                    if let Some(on_toggle) = self.on_checkbox_toggle.clone() {
-                                        let task_source_range = task_range.clone();
-                                        checkbox
-                                            .on_click(move |_state, window, cx| {
-                                                on_toggle(
-                                                    task_source_range.clone(),
-                                                    !checked,
-                                                    window,
-                                                    cx,
-                                                );
-                                            })
-                                            .into_any_element()
-                                    } else {
-                                        checkbox.visualization_only(true).into_any_element()
-                                    }
+                                    let checkbox =
+                                        if let Some(on_toggle) = self.on_checkbox_toggle.clone() {
+                                            let task_source_range = task_range.clone();
+                                            checkbox
+                                                .on_click(move |_state, window, cx| {
+                                                    on_toggle(
+                                                        task_source_range.clone(),
+                                                        !checked,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })
+                                                .into_any_element()
+                                        } else {
+                                            checkbox.visualization_only(true).into_any_element()
+                                        };
+                                    builder.wrap_source_replacement(task_range.clone(), checkbox)
                                 } else if let Some(bullet_index) = builder.next_bullet_index() {
                                     div().child(format!("{}.", bullet_index)).into_any_element()
                                 } else {
@@ -3574,6 +3576,7 @@ struct MarkdownElementBuilder {
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
     rendered_image_links: Vec<RenderedImageLink>,
+    rendered_source_replacements: Vec<RenderedSourceReplacement>,
     rendered_footnote_refs: Vec<RenderedFootnoteRef>,
     current_source_index: usize,
     html_comment: bool,
@@ -3634,6 +3637,7 @@ impl MarkdownElementBuilder {
             pending_line: PendingLine::default(),
             rendered_links: Vec::new(),
             rendered_image_links: Vec::new(),
+            rendered_source_replacements: Vec::new(),
             rendered_footnote_refs: Vec::new(),
             current_source_index: 0,
             html_comment: false,
@@ -3835,6 +3839,37 @@ impl MarkdownElementBuilder {
         });
     }
 
+    /// Record the screen geometry of an element that visually replaces source
+    /// bytes (for example a task-list checkbox replacing `[x]`). Rich Vim
+    /// navigation still moves through the source, so those bytes must own
+    /// real geometry for cursors, selections, and mouse placement.
+    fn wrap_source_replacement(
+        &mut self,
+        source_range: Range<usize>,
+        element: AnyElement,
+    ) -> AnyElement {
+        let bounds = Rc::new(Cell::new(None));
+        self.rendered_source_replacements
+            .push(RenderedSourceReplacement {
+                source_range,
+                bounds: bounds.clone(),
+            });
+        div()
+            .relative()
+            .child(element)
+            .child(
+                canvas(
+                    move |replacement_bounds, _window, _cx| bounds.set(Some(replacement_bounds)),
+                    |_, _, _, _| {},
+                )
+                .size_full()
+                .absolute()
+                .top_0()
+                .left_0(),
+            )
+            .into_any_element()
+    }
+
     fn push_footnote_ref(&mut self, label: SharedString, source_range: Range<usize>) {
         self.rendered_footnote_refs.push(RenderedFootnoteRef {
             source_range,
@@ -3927,9 +3962,10 @@ impl MarkdownElementBuilder {
         .fill();
 
         let checkbox = if let Some(on_toggle) = on_toggle {
+            let toggle_source_range = marker_source.clone();
             checkbox
                 .on_click(move |_state, window, cx| {
-                    on_toggle(marker_source.clone(), !checked, window, cx);
+                    on_toggle(toggle_source_range.clone(), !checked, window, cx);
                 })
                 .into_any_element()
         } else {
@@ -3943,6 +3979,7 @@ impl MarkdownElementBuilder {
             TextAlign::Right => checkbox_container.justify_end(),
         };
 
+        let checkbox = self.wrap_source_replacement(marker_source, checkbox);
         self.append_child(checkbox_container.child(checkbox).into_any_element());
     }
 
@@ -4001,6 +4038,7 @@ impl MarkdownElementBuilder {
                 lines: self.rendered_lines.into(),
                 links: self.rendered_links.into(),
                 image_links: self.rendered_image_links.into(),
+                source_replacements: self.rendered_source_replacements.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
             },
         }
@@ -4201,6 +4239,7 @@ struct RenderedText {
     lines: Rc<[RenderedLine]>,
     links: Rc<[RenderedLink]>,
     image_links: Rc<[RenderedImageLink]>,
+    source_replacements: Rc<[RenderedSourceReplacement]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
 }
 
@@ -4225,6 +4264,14 @@ struct RenderedImageLink {
     destination_url: SharedString,
 }
 
+#[derive(Clone)]
+struct RenderedSourceReplacement {
+    source_range: Range<usize>,
+    // Populated by the replacement wrapper's canvas after layout. Source-only
+    // syntax otherwise has no text-layout rectangle to paint or hit-test.
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RenderedFootnoteRef {
     source_range: Range<usize>,
@@ -4243,6 +4290,14 @@ impl RenderedText {
         let mut source_index = source_index.min(source.len());
         while !source.is_char_boundary(source_index) {
             source_index = source_index.saturating_sub(1);
+        }
+        if let Some(bounds) = self.source_replacements.iter().find_map(|replacement| {
+            (replacement.source_range.start <= source_index
+                && source_index < replacement.source_range.end)
+                .then(|| replacement.bounds.get())
+                .flatten()
+        }) {
+            return Some(bounds);
         }
         let source_end = source[source_index..]
             .chars()
@@ -4312,6 +4367,17 @@ impl RenderedText {
                     range.start.max(line_source_start)..range.end.min(line.source_end),
                 );
                 range_ix += 1;
+            }
+        }
+
+        for (highlight_ix, range) in &ranges {
+            for replacement in self.source_replacements.iter() {
+                if range.start < replacement.source_range.end
+                    && replacement.source_range.start < range.end
+                    && let Some(bounds) = replacement.bounds.get()
+                {
+                    all_bounds.push((*highlight_ix, bounds));
+                }
             }
         }
 
@@ -4419,6 +4485,15 @@ impl RenderedText {
     }
 
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        if let Some(source_index) = self.source_replacements.iter().find_map(|replacement| {
+            replacement
+                .bounds
+                .get()
+                .filter(|bounds| bounds.contains(&position))
+                .map(|_| replacement.source_range.start)
+        }) {
+            return Ok(source_index);
+        }
         let mut lines = self.lines.iter().peekable();
         let mut fallback_line: Option<&RenderedLine> = None;
 
@@ -6388,6 +6463,62 @@ mod tests {
             assert!(
                 bounds.size.width > Pixels::ZERO && bounds.size.height > Pixels::ZERO,
                 "cursor had empty geometry at source byte {source_index}: {bounds:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_task_checkboxes_own_source_geometry_for_rich_vim(cx: &mut TestAppContext) {
+        let source = "- [x] first\n- [ ] second";
+        let rendered = render_markdown(source, cx);
+        let marker_ranges = [
+            source.find("[x]").unwrap()..source.find("[x]").unwrap() + 3,
+            source.find("[ ]").unwrap()..source.find("[ ]").unwrap() + 3,
+        ];
+
+        assert_eq!(rendered.source_replacements.len(), marker_ranges.len());
+        for (replacement, marker_range) in rendered
+            .source_replacements
+            .iter()
+            .zip(marker_ranges.iter())
+        {
+            assert_eq!(&replacement.source_range, marker_range);
+            let replacement_bounds = replacement
+                .bounds
+                .get()
+                .expect("checkbox replacement should record its painted bounds");
+            assert!(
+                replacement_bounds.size.width > Pixels::ZERO
+                    && replacement_bounds.size.height > Pixels::ZERO
+            );
+
+            for source_index in marker_range.clone() {
+                assert_eq!(
+                    rendered.cursor_bounds_for_source_index(source, source_index),
+                    Some(replacement_bounds),
+                    "source byte {source_index} should paint the cursor on its checkbox"
+                );
+            }
+            assert!(
+                rendered
+                    .bounds_for_source_range(marker_range.clone())
+                    .contains(&replacement_bounds),
+                "selection over {marker_range:?} should include the checkbox"
+            );
+            assert_eq!(
+                rendered.source_index_for_position(replacement_bounds.center()),
+                Ok(marker_range.start),
+                "clicking a checkbox should place the source cursor on its marker"
+            );
+        }
+
+        let block_bounds =
+            rendered.bounds_for_sorted_source_ranges(marker_ranges.iter().cloned().enumerate());
+        for (row, replacement) in rendered.source_replacements.iter().enumerate() {
+            let replacement_bounds = replacement.bounds.get().unwrap();
+            assert!(
+                block_bounds.contains(&(row, replacement_bounds)),
+                "Visual Block row {row} should visibly select its checkbox"
             );
         }
     }
