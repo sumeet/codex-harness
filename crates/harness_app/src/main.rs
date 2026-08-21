@@ -760,6 +760,14 @@ fn logical_offset_for_rendered_index(
     logical_fragment.start + rendered_index.min(logical_fragment.len())
 }
 
+fn rich_transcript_entry_placement(
+    cursor_initialized: bool,
+    current_item: Option<usize>,
+    target_item: Option<usize>,
+) -> Option<usize> {
+    target_item.filter(|target| !cursor_initialized || current_item != Some(*target))
+}
+
 /// Make a visible structured-text fragment place the persistent Editor/Vim
 /// cursor at the clicked glyph. Without this adapter, the card-level click
 /// handler can only jump to the first row of the item.
@@ -789,6 +797,7 @@ fn rich_clickable_styled_text(
                     this.selected_item = item_index;
                     this.visual_anchor = None;
                     this.focus_mode = FocusMode::Buffer;
+                    this.transcript_cursor_initialized = true;
                     this.list_state.pause_following_tail();
                     this.transcript_editor.update(cx, |editor, cx| {
                         editor.set_cursor_in_item(item_index, body_offset, window, cx);
@@ -2711,6 +2720,7 @@ struct HarnessApp {
     buffer_view: bool,
     transcript_focus: FocusHandle,
     focus_mode: FocusMode,
+    transcript_cursor_initialized: bool,
     selected_item: usize,
     selected_task: usize,
     visual_anchor: Option<usize>,
@@ -2932,6 +2942,9 @@ impl HarnessApp {
                     this.rich_navigation_selection = Some(snapshot);
                 }
                 if let Some(item_index) = item_index {
+                    if this.focus_mode == FocusMode::Buffer {
+                        this.transcript_cursor_initialized = true;
+                    }
                     let changed = this.selected_item != item_index;
                     this.selected_item = item_index;
                     if !this.buffer_view && rich_vim_experiment() {
@@ -2994,6 +3007,7 @@ impl HarnessApp {
             } else {
                 FocusMode::Composer
             },
+            transcript_cursor_initialized: false,
             list_state,
             task_list_state,
             selected_task: 0,
@@ -3043,10 +3057,13 @@ impl HarnessApp {
             drop(this.sync_transcript_document(cx));
         }
         if start_in_text_view {
+            let selected_item = this.selected_item;
             this.transcript_editor.update(cx, |editor, cx| {
+                editor.set_cursor_at_item_last_line(selected_item, window, cx);
                 editor.reveal_tail(cx);
                 editor.enter_normal_mode(window, cx);
             });
+            this.transcript_cursor_initialized = true;
         }
         if replay_count.is_none() {
             this.connect(cx);
@@ -4095,6 +4112,7 @@ impl HarnessApp {
         self.retire_all_request_surfaces();
         self.list_state.splice(0..old_len, 0);
         self.selected_item = 0;
+        self.transcript_cursor_initialized = false;
         drop(self.sync_transcript_document(cx));
         cx.notify();
 
@@ -4174,6 +4192,7 @@ impl HarnessApp {
         self.mark_all_image_surfaces_dirty();
         self.list_state.splice(0..old_len, self.model.items.len());
         self.selected_item = self.model.items.len().saturating_sub(1);
+        self.transcript_cursor_initialized = false;
         self.list_state.set_follow_mode(FollowMode::Tail);
         drop(self.sync_transcript_document(cx));
         if self.buffer_view {
@@ -4201,6 +4220,7 @@ impl HarnessApp {
         self.selected_thread_id = None;
         self.loaded_thread_updated_at = None;
         self.selected_item = 0;
+        self.transcript_cursor_initialized = false;
         self.thread_read_only_reason = None;
         self.error = None;
         self.list_state.set_follow_mode(FollowMode::Tail);
@@ -4843,18 +4863,30 @@ impl HarnessApp {
         }
         if rich_vim_experiment() {
             let document = self.sync_transcript_document(cx);
-            let row = document.as_ref().and_then(|document| {
+            let target_item = document.as_ref().and_then(|document| {
                 document
-                    .item_rows
-                    .get(self.selected_item)
-                    .and_then(|row| *row)
+                    .segments
+                    .iter()
+                    .rev()
+                    .find(|segment| segment.item_index <= self.selected_item)
+                    .map(|segment| segment.item_index)
             });
+            let current_item = self
+                .transcript_editor
+                .update(cx, |editor, cx| editor.selected_item(cx));
+            let entry_placement = rich_transcript_entry_placement(
+                self.transcript_cursor_initialized,
+                current_item,
+                target_item,
+            );
             self.focus_mode = FocusMode::Buffer;
-            if let Some(row) = row {
+            if let Some(target_item) = entry_placement {
+                self.selected_item = target_item;
                 self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_cursor_row(row, window, cx);
+                    editor.set_cursor_at_item_last_line(target_item, window, cx);
                 });
             }
+            self.transcript_cursor_initialized = true;
             self.transcript_editor.focus_handle(cx).focus(window, cx);
             self.list_state.scroll_to_reveal_item(self.selected_item);
             cx.defer_in(window, |this, window, cx| {
@@ -8012,6 +8044,7 @@ impl HarnessApp {
                             this.selected_item = index;
                             this.visual_anchor = None;
                             this.focus_mode = FocusMode::Buffer;
+                            this.transcript_cursor_initialized = true;
                             this.list_state.pause_following_tail();
                             this.transcript_editor.update(cx, |editor, cx| {
                                 editor.set_cursor_in_item(index, body_offset, window, cx);
@@ -10119,6 +10152,25 @@ mod tests {
         assert_eq!(logical_offset_for_rendered_index(&fragment, 3), 13);
         assert_eq!(logical_offset_for_rendered_index(&fragment, 5), 15);
         assert_eq!(logical_offset_for_rendered_index(&fragment, usize::MAX), 15);
+    }
+
+    #[test]
+    fn composer_focus_enters_the_selected_item_once_then_preserves_vim_position() {
+        assert_eq!(
+            rich_transcript_entry_placement(false, Some(7), Some(7)),
+            Some(7),
+            "the Editor's default cursor is not a meaningful saved position"
+        );
+        assert_eq!(
+            rich_transcript_entry_placement(true, Some(7), Some(7)),
+            None,
+            "returning from the composer must preserve an established Vim cursor"
+        );
+        assert_eq!(
+            rich_transcript_entry_placement(true, Some(6), Some(7)),
+            Some(7),
+            "a newly selected streaming item should receive spatial focus"
+        );
     }
 
     #[test]

@@ -1375,6 +1375,10 @@ fn collapse_relocation_offset(
         .then_some(body.end)
 }
 
+fn last_line_start_offset(text: &str) -> usize {
+    text.rfind('\n').map_or(0, |offset| offset + 1)
+}
+
 fn user_transcript_background(cx: &App) -> Hsla {
     cx.theme().colors().element_background
 }
@@ -2296,6 +2300,30 @@ impl TranscriptEditor {
             });
         });
         true
+    }
+
+    /// Place the cursor at column zero of an item's last logical line. This is
+    /// the spatially nearest entry point when focus moves upward from the
+    /// composer into the Rich transcript.
+    pub fn set_cursor_at_item_last_line(
+        &mut self,
+        item_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.item_index == item_index)
+        else {
+            return false;
+        };
+        let body = self
+            .buffer
+            .read(cx)
+            .text_for_range(segment.body_range.clone())
+            .collect::<String>();
+        self.set_cursor_in_item(item_index, last_line_start_offset(&body), window, cx)
     }
 
     pub fn selected_item(&self, cx: &mut App) -> Option<usize> {
@@ -4415,6 +4443,17 @@ mod tests {
         assert_eq!(collapse_relocation_offset(5, 5, 5, &body), None);
         assert_eq!(collapse_relocation_offset(30, 30, 30, &body), None);
         assert_eq!(collapse_relocation_offset(35, 35, 35, &body), None);
+    }
+
+    #[test]
+    fn composer_entry_targets_the_last_logical_line_not_the_item_start() {
+        assert_eq!(last_line_start_offset("Set touchpad."), 0);
+        assert_eq!(
+            last_line_start_offset(
+                "Set touchpad.scroll_factor = 0.5.\nConfiguration reloaded successfully."
+            ),
+            "Set touchpad.scroll_factor = 0.5.\n".len()
+        );
     }
 
     #[test]

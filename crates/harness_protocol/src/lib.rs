@@ -665,35 +665,49 @@ fn selectable_transcript_body(
             selectable_markdown_text(normalized_content)
         }
     } else if item.kind == TranscriptKind::Command {
-        let text = normalized_content
-            .strip_prefix("$ ")
-            .unwrap_or(normalized_content)
-            .trim()
-            .to_owned();
-        let mut semantic_spans = Vec::new();
         if let Some(command) = item.command_transcript() {
+            let output = normalize_buffer_line_endings(command.output)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
             let command = normalize_buffer_line_endings(command.command)
                 .trim_end_matches(['\r', '\n'])
                 .to_owned();
-            if !command.is_empty() && text.starts_with(&command) {
+            let mut text = command.clone();
+            let mut semantic_spans = Vec::new();
+            if !command.is_empty() {
                 semantic_spans.push(TranscriptSemanticSpan {
                     range: 0..command.len(),
                     style: TranscriptSemanticStyle::CommandInvocation,
                 });
-                let output_start = text[command.len()..]
-                    .find(|character: char| !character.is_whitespace())
-                    .map(|offset| command.len() + offset);
-                if let Some(output_start) = output_start.filter(|start| *start < text.len()) {
-                    semantic_spans.push(TranscriptSemanticSpan {
-                        range: output_start..text.len(),
-                        style: TranscriptSemanticStyle::CommandOutput,
-                    });
-                }
             }
-        }
-        SelectableBodyProjection {
-            text,
-            semantic_spans,
+            if !output.is_empty() {
+                if !text.is_empty() {
+                    // This newline is the only logical separator painted by
+                    // the Rich command card. Keeping the protocol's blank
+                    // presentation line here would give native Vim an
+                    // invisible row on which its cursor could get stranded.
+                    text.push('\n');
+                }
+                let output_start = text.len();
+                text.push_str(&output);
+                semantic_spans.push(TranscriptSemanticSpan {
+                    range: output_start..text.len(),
+                    style: TranscriptSemanticStyle::CommandOutput,
+                });
+            }
+            SelectableBodyProjection {
+                text,
+                semantic_spans,
+            }
+        } else {
+            SelectableBodyProjection {
+                text: normalized_content
+                    .strip_prefix("$ ")
+                    .unwrap_or(normalized_content)
+                    .trim()
+                    .to_owned(),
+                semantic_spans: Vec::new(),
+            }
         }
     } else {
         SelectableBodyProjection {
@@ -4448,7 +4462,11 @@ mod tests {
             })
         );
         let projection = model.item_projection(0).unwrap();
-        assert_eq!(projection.body_text(), "printf '%s' \"hello\"\n\nhello");
+        assert_eq!(
+            projection.body_text(),
+            "printf '%s' \"hello\"\nhello",
+            "the navigation document must not retain the unpainted blank separator"
+        );
         let body_start = projection.segment.body_range.start;
         assert_eq!(
             projection.segment.semantic_spans,
@@ -4458,7 +4476,7 @@ mod tests {
                     style: TranscriptSemanticStyle::CommandInvocation,
                 },
                 TranscriptSemanticSpan {
-                    range: body_start + 21..body_start + 26,
+                    range: body_start + 20..body_start + 25,
                     style: TranscriptSemanticStyle::CommandOutput,
                 },
             ]
