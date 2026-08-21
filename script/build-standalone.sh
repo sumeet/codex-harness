@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-profile=${HARNESS_PROFILE:-dev}
+profile=${HARNESS_PROFILE:-release-fast}
 # The standalone dependency cut keeps the graph small enough to compile in
 # parallel again. Four workers balance this 20-thread CPU against the laptop's
 # 16 GiB RAM; callers can still override the value for a colder/roomier box.

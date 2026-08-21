@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-profile=${HARNESS_PROFILE:-dev}
+profile=${HARNESS_PROFILE:-release-fast}
 
 case "$profile" in
     dev)
