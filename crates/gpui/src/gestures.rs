@@ -21,7 +21,10 @@ use crate::{App, Axis, IsZero, Pixels, Point, TouchPhase, Window, point, px};
 const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 
 const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(200);
-const VELOCITY_MIN_SAMPLE_SPAN: Duration = Duration::from_millis(8);
+// Wayland pointer-axis timestamps have millisecond granularity. Requiring a
+// full 120 Hz frame here made otherwise valid two-frame releases alternate
+// between eligible and ineligible as their quantized span crossed 8 ms.
+const VELOCITY_MIN_SAMPLE_SPAN: Duration = Duration::from_millis(1);
 const VELOCITY_MAX_SAMPLES: usize = 3;
 const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 const MOMENTUM_MAX_VELOCITY: f32 = 8_000.;
@@ -95,18 +98,18 @@ impl ScrollVelocityRecorder {
             .samples
             .iter()
             .fold(Duration::ZERO, |span, sample| span + sample.interval);
-        if self.samples.len() < 2 || sample_span < VELOCITY_MIN_SAMPLE_SPAN {
+        if sample_span < VELOCITY_MIN_SAMPLE_SPAN {
             return None;
         }
 
-        // This is the same latest-three-frame linear regression Chromium's
-        // Wayland backend uses (and in turn matches libgestures). Iterating
-        // newest-to-oldest makes each accumulated delta a position at an
-        // increasing time before release; translating every time by the lift
-        // gap does not change the fitted slope. Each interval precedes its
-        // frame, so advance it only after observing that frame. In particular,
-        // the first Started frame may legitimately have a zero interval.
-        let mut time = release_age.as_secs_f32();
+        // Fit the endpoints of the measured motion segments. The first
+        // Started frame normally has a zero interval, so its delta has no
+        // measurable duration and serves only to establish the translated
+        // origin. Every subsequent delta, including the newest one, advances
+        // the fitted position. Fitting cumulative deltas without the origin
+        // would make the newest delta a constant translation and silently
+        // remove it from the release velocity.
+        let mut time = 0.;
         let mut position = Point::<f32>::default();
         let mut time_sum = 0.;
         let mut time_squared_sum = 0.;
@@ -114,7 +117,12 @@ impl ScrollVelocityRecorder {
         let mut y_sum = 0.;
         let mut time_x_sum = 0.;
         let mut time_y_sum = 0.;
-        for sample in self.samples.iter().rev() {
+        let mut count = 1_f32; // The translated origin at t = 0.
+        for sample in &self.samples {
+            if sample.interval.is_zero() {
+                continue;
+            }
+            time += sample.interval.as_secs_f32();
             position.x += sample.delta.x;
             position.y += sample.delta.y;
             time_sum += time;
@@ -123,9 +131,8 @@ impl ScrollVelocityRecorder {
             y_sum += position.y;
             time_x_sum += time * position.x;
             time_y_sum += time * position.y;
-            time += sample.interval.as_secs_f32();
+            count += 1.;
         }
-        let count = self.samples.len() as f32;
         let determinant = count * time_squared_sum - time_sum * time_sum;
         if determinant.abs() <= f32::EPSILON {
             return None;
@@ -214,9 +221,14 @@ impl KineticScroll {
 
     /// Finish a finger gesture and return the generation to schedule, if its
     /// measured release velocity is sufficient for a fling.
-    pub fn finish_at(&mut self, now: Instant, tuning: GestureTuning) -> Option<u64> {
+    pub fn finish_at(
+        &mut self,
+        source_now: Instant,
+        animation_now: Instant,
+        tuning: GestureTuning,
+    ) -> Option<u64> {
         let recorder = self.recorder.take()?;
-        let release = recorder.release_velocity(now)?;
+        let release = recorder.release_velocity(source_now)?;
         let raw_velocity = release.velocity;
         let mut velocity = raw_velocity;
         let speed = velocity.x.hypot(velocity.y);
@@ -246,7 +258,9 @@ impl KineticScroll {
         self.momentum = Some(ScrollMomentum {
             velocity,
             initial_velocity: velocity,
-            last_frame_at: now,
+            // Source timestamps are used only for release-velocity fitting;
+            // integration starts from the caller's frame/dispatch clock.
+            last_frame_at: animation_now,
             elapsed: Duration::ZERO,
             frames: 0,
             requested: Point::default(),
@@ -701,13 +715,18 @@ mod tests {
         kinetic.record_movement_at(point(px(0.), px(10.)), start + Duration::from_millis(10));
         kinetic.record_movement_at(point(px(0.), px(10.)), start + Duration::from_millis(20));
 
+        let animation_start = start + Duration::from_secs(1);
         let generation = kinetic
-            .finish_at(start + Duration::from_millis(20), GestureTuning::default())
+            .finish_at(
+                start + Duration::from_millis(20),
+                animation_start,
+                GestureTuning::default(),
+            )
             .expect("consumed motion should produce a fling");
         let step = kinetic
             .frame_at(
                 generation,
-                start + Duration::from_millis(30),
+                animation_start + Duration::from_millis(10),
                 GestureTuning::default(),
             )
             .expect("fling should produce a frame");
@@ -724,7 +743,11 @@ mod tests {
         kinetic.record_movement_at(point(px(0.), px(20.)), now);
 
         assert!(kinetic.recorder.is_none());
-        assert!(kinetic.finish_at(now, GestureTuning::default()).is_none());
+        assert!(
+            kinetic
+                .finish_at(now, now, GestureTuning::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -779,6 +802,79 @@ mod tests {
     }
 
     #[test]
+    fn release_velocity_tracks_the_newest_measured_delta() {
+        let start = Instant::now();
+        let mut recorder = ScrollVelocityRecorder::new(start);
+        recorder.record(point(px(0.), px(10.)), start);
+        recorder.record(point(px(0.), px(10.)), start + Duration::from_millis(10));
+        recorder.record(point(px(0.), px(-30.)), start + Duration::from_millis(20));
+
+        let release = recorder
+            .release_velocity(start + Duration::from_millis(20))
+            .expect("two measured intervals should fit a release velocity");
+        assert!(
+            release.velocity.y < 0.,
+            "the final reversal must determine the release direction: {:?}",
+            release.velocity
+        );
+    }
+
+    #[test]
+    fn release_velocity_is_sign_symmetric_at_millisecond_granularity() {
+        let start = Instant::now();
+        let release = |sign: f32| {
+            let mut recorder = ScrollVelocityRecorder::new(start);
+            recorder.record(point(px(0.), px(4. * sign)), start);
+            recorder.record(
+                point(px(0.), px(7. * sign)),
+                start + Duration::from_millis(1),
+            );
+            recorder
+                .release_velocity(start + Duration::from_millis(1))
+                .expect("one millisecond of measured motion should be eligible")
+                .velocity
+                .y
+        };
+
+        let positive = release(1.);
+        let negative = release(-1.);
+        assert!(positive > 0.);
+        assert!(negative < 0.);
+        assert!((positive + negative).abs() < 0.1);
+    }
+
+    #[test]
+    fn source_time_does_not_seed_the_animation_clock() {
+        let source_start = Instant::now()
+            .checked_sub(Duration::from_secs(60 * 60))
+            .expect("test Instant should support the source-clock lookback");
+        let mut kinetic = KineticScroll::default();
+        kinetic.begin_at(source_start);
+        kinetic.record_movement_at(point(px(0.), px(10.)), source_start);
+        kinetic.record_movement_at(
+            point(px(0.), px(10.)),
+            source_start + Duration::from_millis(10),
+        );
+        let animation_start = Instant::now();
+        let generation = kinetic
+            .finish_at(
+                source_start + Duration::from_millis(10),
+                animation_start,
+                GestureTuning::default(),
+            )
+            .expect("source-timed movement should produce a fling");
+
+        let step = kinetic
+            .frame_at(
+                generation,
+                animation_start + Duration::from_millis(8),
+                GestureTuning::default(),
+            )
+            .expect("the dispatch clock should drive the first frame");
+        assert!(step.delta.y > px(0.));
+    }
+
+    #[test]
     fn source_timestamps_preserve_velocity_when_dispatch_is_batched() {
         let source_start = Instant::now();
         let mut kinetic = KineticScroll::default();
@@ -795,6 +891,7 @@ mod tests {
         assert!(
             kinetic
                 .finish_at(
+                    source_start + Duration::from_millis(32),
                     source_start + Duration::from_millis(32),
                     GestureTuning::default(),
                 )

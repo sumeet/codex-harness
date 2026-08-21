@@ -343,10 +343,12 @@ impl ScrollManager {
 
     pub(crate) fn finish_kinetic_scroll(
         &mut self,
-        now: Instant,
+        source_now: Instant,
+        animation_now: Instant,
         tuning: GestureTuning,
     ) -> Option<u64> {
-        self.kinetic_scroll.finish_at(now, tuning)
+        self.kinetic_scroll
+            .finish_at(source_now, animation_now, tuning)
     }
 
     pub(crate) fn kinetic_scroll_frame(

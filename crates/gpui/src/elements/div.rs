@@ -3327,9 +3327,8 @@ impl Interactivity {
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let synthesize_momentum = div_event_synthesizes_momentum(event);
-                    let now = event
-                        .event_time
-                        .unwrap_or_else(|| cx.background_executor().now());
+                    let animation_now = cx.background_executor().now();
+                    let now = event.event_time.unwrap_or(animation_now);
                     let tuning = div_scroll_tuning(cx);
 
                     if event.touch_phase == TouchPhase::Cancelled {
@@ -3372,7 +3371,7 @@ impl Interactivity {
                             && let Some(generation) = scroll_kinetics
                                 .borrow_mut()
                                 .kinetic_scroll
-                                .finish_at(now, tuning)
+                                .finish_at(now, animation_now, tuning)
                         {
                             schedule_div_kinetic_scroll(
                                 scroll_offset.clone(),
@@ -3427,7 +3426,13 @@ impl Interactivity {
                                     .record_movement_at(consumed, now);
                             }
                             (event.touch_phase == TouchPhase::Ended)
-                                .then(|| scroll_kinetics.kinetic_scroll.finish_at(now, tuning))
+                                .then(|| {
+                                    scroll_kinetics.kinetic_scroll.finish_at(
+                                        now,
+                                        animation_now,
+                                        tuning,
+                                    )
+                                })
                                 .flatten()
                         })
                     } else {

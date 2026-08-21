@@ -548,9 +548,8 @@ impl EditorElement {
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let synthesize_momentum = editor_event_synthesizes_momentum(event);
-                    let now = event
-                        .event_time
-                        .unwrap_or_else(|| cx.background_executor().now());
+                    let animation_now = cx.background_executor().now();
+                    let now = event.event_time.unwrap_or(animation_now);
                     let tuning = platform_gesture_tuning(cx);
                     if event.is_lifecycle_only() {
                         let generation = editor.update(cx, |editor, _| {
@@ -563,7 +562,11 @@ impl EditorElement {
                                 editor.scroll_manager.cancel_kinetic_scroll();
                                 None
                             } else if event.touch_phase == TouchPhase::Ended {
-                                editor.scroll_manager.finish_kinetic_scroll(now, tuning)
+                                editor.scroll_manager.finish_kinetic_scroll(
+                                    now,
+                                    animation_now,
+                                    tuning,
+                                )
                             } else {
                                 None
                             }
@@ -692,7 +695,11 @@ impl EditorElement {
                                         .record_kinetic_scroll_movement(consumed, now);
                                 }
                                 if event.touch_phase == TouchPhase::Ended {
-                                    editor.scroll_manager.finish_kinetic_scroll(now, tuning)
+                                    editor.scroll_manager.finish_kinetic_scroll(
+                                        now,
+                                        animation_now,
+                                        tuning,
+                                    )
                                 } else {
                                     None
                                 }

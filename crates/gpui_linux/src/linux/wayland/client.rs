@@ -165,15 +165,30 @@ struct PointerAxisTimebase {
 #[derive(Debug, Default)]
 struct PointerAxisEventClock(Option<PointerAxisTimebase>);
 
+// `wl_pointer` supplies a source-clock duration, not an epoch that can be
+// converted directly to `Instant`. Keep ample past-clock
+// headroom so even a long finger gesture drained in one client dispatch
+// retains its protocol cadence without ever manufacturing future Instants.
+// Gesture velocity only depends on differences between these timestamps, and
+// momentum integration has a separate dispatch clock.
+const POINTER_AXIS_SOURCE_CLOCK_HEADROOM: Duration = Duration::from_secs(60 * 60);
+
+fn pointer_axis_source_epoch(received_at: Instant) -> Instant {
+    received_at
+        .checked_sub(POINTER_AXIS_SOURCE_CLOCK_HEADROOM)
+        .unwrap_or(received_at)
+}
+
 impl PointerAxisEventClock {
     fn resolve(&mut self, protocol_millis: u32, received_at: Instant) -> Instant {
         let Some(timebase) = self.0.as_mut() else {
+            let instant_start = pointer_axis_source_epoch(received_at);
             self.0 = Some(PointerAxisTimebase {
                 protocol_start_millis: protocol_millis,
-                instant_start: received_at,
-                last_resolved: received_at,
+                instant_start,
+                last_resolved: instant_start,
             });
-            return received_at;
+            return instant_start;
         };
 
         let elapsed_millis = protocol_millis.wrapping_sub(timebase.protocol_start_millis);
@@ -182,12 +197,13 @@ impl PointerAxisEventClock {
         // means the compositor clock moved backwards or the sequence is stale;
         // re-anchor rather than manufacturing an event weeks in the future.
         if elapsed_millis > i32::MAX as u32 {
+            let instant_start = pointer_axis_source_epoch(received_at);
             *timebase = PointerAxisTimebase {
                 protocol_start_millis: protocol_millis,
-                instant_start: received_at,
-                last_resolved: received_at,
+                instant_start,
+                last_resolved: instant_start,
             };
-            return received_at;
+            return instant_start;
         }
 
         let resolved = (timebase.instant_start + Duration::from_millis(elapsed_millis.into()))
@@ -199,6 +215,10 @@ impl PointerAxisEventClock {
 
     fn reset(&mut self) {
         self.0 = None;
+    }
+
+    fn last_resolved(&self) -> Option<Instant> {
+        self.0.map(|timebase| timebase.last_resolved)
     }
 }
 
@@ -2508,11 +2528,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 let event_time = dispatch
                     .synthesize_momentum
                     .then(|| {
-                        event_time_millis.map(|millis| {
-                            state
-                                .pointer_axis_event_clock
-                                .resolve(millis, Instant::now())
-                        })
+                        event_time_millis
+                            .map(|millis| {
+                                state
+                                    .pointer_axis_event_clock
+                                    .resolve(millis, Instant::now())
+                            })
+                            // AxisStop carries a timestamp in every supported
+                            // protocol version. Retaining the last source time
+                            // here also keeps a malformed/source-less terminal
+                            // frame out of the real dispatch clock domain.
+                            .or_else(|| state.pointer_axis_event_clock.last_resolved())
                     })
                     .flatten();
                 if dispatch.ended {
@@ -3059,9 +3085,38 @@ mod tests {
         let second = clock.resolve(1_008, received_at + Duration::from_millis(40));
         let third = clock.resolve(1_019, received_at + Duration::from_millis(40));
 
-        assert_eq!(first, received_at);
+        assert_eq!(first, pointer_axis_source_epoch(received_at));
         assert_eq!(second.duration_since(first), Duration::from_millis(8));
         assert_eq!(third.duration_since(second), Duration::from_millis(11));
+        assert!(third <= received_at + Duration::from_millis(40));
+    }
+
+    #[test]
+    fn pointer_axis_clock_preserves_a_batch_that_starts_at_receipt_time() {
+        let received_at = Instant::now();
+        let mut clock = PointerAxisEventClock::default();
+
+        let first = clock.resolve(1_000, received_at);
+        let second = clock.resolve(1_008, received_at);
+        let third = clock.resolve(1_019, received_at);
+
+        assert_eq!(second.duration_since(first), Duration::from_millis(8));
+        assert_eq!(third.duration_since(second), Duration::from_millis(11));
+        assert!(first <= received_at);
+        assert!(second <= received_at);
+        assert!(third <= received_at);
+    }
+
+    #[test]
+    fn pointer_axis_clock_preserves_more_than_three_seconds_of_batched_cadence() {
+        let received_at = Instant::now();
+        let mut clock = PointerAxisEventClock::default();
+
+        let first = clock.resolve(1_000, received_at);
+        let later = clock.resolve(11_000, received_at);
+
+        assert_eq!(later.duration_since(first), Duration::from_secs(10));
+        assert!(later <= received_at);
     }
 
     #[test]
@@ -3083,7 +3138,10 @@ mod tests {
 
         let reanchored = clock.resolve(999, received_at + Duration::from_millis(20));
 
-        assert_eq!(reanchored, received_at + Duration::from_millis(20));
+        assert_eq!(
+            reanchored,
+            pointer_axis_source_epoch(received_at + Duration::from_millis(20))
+        );
     }
 
     #[test]

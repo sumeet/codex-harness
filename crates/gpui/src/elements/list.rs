@@ -1669,9 +1669,8 @@ impl Element for List {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
                 let synthesize_momentum = list_event_synthesizes_momentum(event);
                 let tuning = kinetic_scroll_tuning(cx);
-                let now = event
-                    .event_time
-                    .unwrap_or_else(|| cx.background_executor().now());
+                let animation_now = cx.background_executor().now();
+                let now = event.event_time.unwrap_or(animation_now);
 
                 if event.touch_phase == TouchPhase::Cancelled {
                     list_state.0.borrow_mut().kinetic_scroll.cancel();
@@ -1699,7 +1698,7 @@ impl Element for List {
                             .0
                             .borrow_mut()
                             .kinetic_scroll
-                            .finish_at(now, tuning)
+                            .finish_at(now, animation_now, tuning)
                     {
                         schedule_list_kinetic_scroll(
                             list_state.clone(),
@@ -1730,7 +1729,7 @@ impl Element for List {
                         }
                     }
                     (synthesize_momentum && event.touch_phase == TouchPhase::Ended)
-                        .then(|| state.kinetic_scroll.finish_at(now, tuning))
+                        .then(|| state.kinetic_scroll.finish_at(now, animation_now, tuning))
                         .flatten()
                 };
                 if let Some(generation) = generation {
