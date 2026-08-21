@@ -450,9 +450,9 @@ pub struct Markdown {
     selection: Selection,
     // A host can keep keyboard selection state in another component (for
     // example Zed's real Editor/Vim engine) while Markdown remains the visual
-    // source of truth. This paint-only range never affects Markdown's mouse
+    // source of truth. These paint-only ranges never affect Markdown's mouse
     // selection, clipboard behavior, or focus handling.
-    external_selection: Option<Range<usize>>,
+    external_selections: Option<Vec<Range<usize>>>,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
@@ -653,7 +653,7 @@ impl Markdown {
         let mut this = Self {
             source,
             selection: Selection::default(),
-            external_selection: None,
+            external_selections: None,
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
@@ -1023,7 +1023,7 @@ impl Markdown {
         }
         self.source = source;
         self.selection = Selection::default();
-        self.external_selection = None;
+        self.external_selections = None;
         self.autoscroll_request = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
@@ -1068,10 +1068,27 @@ impl Markdown {
         selection: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        let selection = selection
-            .map(|range| range.start.min(self.source.len())..range.end.min(self.source.len()));
-        if self.external_selection != selection {
-            self.external_selection = selection;
+        self.set_external_selections(selection.map(|selection| vec![selection]), cx);
+    }
+
+    /// Paint source-coordinate selections owned by an external navigation
+    /// model. Separate ranges preserve rectangular selections without filling
+    /// the unrelated text between rows. Passing `None` restores Markdown's
+    /// native mouse selection; `Some(Vec::new())` deliberately paints none.
+    pub fn set_external_selections(
+        &mut self,
+        selections: Option<Vec<Range<usize>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let selections = selections.map(|selections| {
+            selections
+                .into_iter()
+                .map(|range| range.start.min(self.source.len())..range.end.min(self.source.len()))
+                .filter(|range| range.start < range.end)
+                .collect::<Vec<_>>()
+        });
+        if self.external_selections != selections {
+            self.external_selections = selections;
             cx.notify();
         }
     }
@@ -2065,17 +2082,25 @@ impl MarkdownElement {
 
     fn paint_selection(&self, rendered_text: &RenderedText, window: &mut Window, cx: &mut App) {
         let markdown = self.markdown.read(cx);
-        let selection = markdown
-            .external_selection
-            .clone()
-            .unwrap_or_else(|| markdown.selection.start..markdown.selection.end);
-        Self::paint_highlight_range(
-            selection.start,
-            selection.end,
-            self.style.selection_background_color,
-            rendered_text,
-            window,
-        );
+        if let Some(selections) = markdown.external_selections.as_ref() {
+            for selection in selections {
+                Self::paint_highlight_range(
+                    selection.start,
+                    selection.end,
+                    self.style.selection_background_color,
+                    rendered_text,
+                    window,
+                );
+            }
+        } else {
+            Self::paint_highlight_range(
+                markdown.selection.start,
+                markdown.selection.end,
+                self.style.selection_background_color,
+                rendered_text,
+                window,
+            );
+        }
     }
 
     fn paint_search_highlights(

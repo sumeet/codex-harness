@@ -326,20 +326,20 @@ impl RichNavigationPaint {
         }
     }
 
-    fn markdown_source_range(&self, source: &str) -> Option<Range<usize>> {
-        // Markdown currently accepts one external range. Character and
-        // linewise selections are already contiguous; for a Visual Block,
-        // use its logical envelope while structured renderers retain every
-        // individual row range.
+    fn markdown_source_ranges(&self, source: &str) -> Vec<Range<usize>> {
         let logical = if self.visual {
-            self.ranges.first()?.start..self.ranges.last()?.end
+            self.ranges.clone()
         } else {
-            self.cursor_range()?
+            self.cursor_range().into_iter().collect()
         };
-        Some(
-            markdown_source_offset_for_logical(&self.body_text, source, logical.start)
-                ..markdown_source_offset_for_logical(&self.body_text, source, logical.end),
-        )
+        logical
+            .into_iter()
+            .map(|range| {
+                markdown_source_offset_for_logical(&self.body_text, source, range.start)
+                    ..markdown_source_offset_for_logical(&self.body_text, source, range.end)
+            })
+            .filter(|range| range.start < range.end)
+            .collect()
     }
 }
 
@@ -2179,7 +2179,7 @@ struct CachedMarkdown {
     entity: Entity<Markdown>,
     search_query: Option<String>,
     search_ranges: Vec<Range<usize>>,
-    navigation_range: Option<Range<usize>>,
+    navigation_ranges: Option<Vec<Range<usize>>>,
     last_autoscroll_generation: Option<u64>,
 }
 
@@ -2666,19 +2666,17 @@ impl HarnessApp {
             head: selection.head,
             visual: snapshot.visual,
         };
-        let next_range = navigation
-            .markdown_source_range(&source)
-            .filter(|range| range.start < range.end);
+        let next_ranges = Some(navigation.markdown_source_ranges(&source));
         let Some(cached) = self.markdown_cache.get_mut(&key) else {
             return false;
         };
         if cached.source != source {
             return false;
         }
-        if cached.navigation_range != next_range {
-            cached.navigation_range = next_range.clone();
+        if cached.navigation_ranges != next_ranges {
+            cached.navigation_ranges = next_ranges.clone();
             cached.entity.update(cx, |markdown, cx| {
-                markdown.set_external_selection(next_range, cx)
+                markdown.set_external_selections(next_ranges, cx)
             });
         }
         true
@@ -5820,7 +5818,7 @@ impl HarnessApp {
                     entity,
                     search_query: None,
                     search_ranges: Vec::new(),
-                    navigation_range: None,
+                    navigation_ranges: None,
                     last_autoscroll_generation: None,
                 }
             });
@@ -5828,22 +5826,19 @@ impl HarnessApp {
             cached.source = source.to_string();
             cached.search_query = None;
             cached.search_ranges.clear();
-            cached.navigation_range = None;
+            cached.navigation_ranges = None;
             cached.last_autoscroll_generation = None;
             cached.entity.update(cx, |markdown, cx| {
                 markdown.reset(source.to_string().into(), cx)
             });
         }
 
-        let navigation_range = navigation.and_then(|navigation| {
-            navigation
-                .markdown_source_range(source)
-                .filter(|range| range.start < range.end)
-        });
-        if cached.navigation_range != navigation_range {
-            cached.navigation_range = navigation_range.clone();
+        let navigation_ranges =
+            navigation.map(|navigation| navigation.markdown_source_ranges(source));
+        if cached.navigation_ranges != navigation_ranges {
+            cached.navigation_ranges = navigation_ranges.clone();
             cached.entity.update(cx, |markdown, cx| {
-                markdown.set_external_selection(navigation_range, cx)
+                markdown.set_external_selections(navigation_ranges, cx)
             });
         }
 
@@ -7958,12 +7953,7 @@ impl HarnessApp {
                         item.kind,
                         model::TranscriptKind::Reasoning | model::TranscriptKind::Plan
                     ),
-                    |this| {
-                        this.border_l_2()
-                            .border_color(colors.text_accent.opacity(0.55))
-                            .pl_4()
-                            .py_1()
-                    },
+                    |this| this.py_1(),
                 )
                 .when(show_header, |this| this.child(header))
                 .when_some(reasoning_preview, |this, preview| {
@@ -9727,6 +9717,24 @@ mod tests {
             navigation_ranges_for_fragment(&navigation, 10..12),
             Vec::<Range<usize>>::new()
         );
+    }
+
+    #[test]
+    fn rich_vim_markdown_preserves_each_visual_block_row() {
+        let logical = "abcde\nabcde";
+        let source = "**abcde**\n*abcde*";
+        let navigation = RichNavigationPaint {
+            body_text: logical.into(),
+            ranges: vec![1..3, 7..9],
+            head: Some(8),
+            visual: true,
+        };
+
+        let ranges = navigation.markdown_source_ranges(source);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(&source[ranges[0].clone()], "bc");
+        assert_eq!(&source[ranges[1].clone()], "bc");
+        assert!(ranges[0].end < ranges[1].start);
     }
 
     #[test]
