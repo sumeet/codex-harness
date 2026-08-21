@@ -2818,6 +2818,10 @@ impl HarnessApp {
             read_only_refresh_task: Task::ready(()),
             reconnect_attempts: 0,
         };
+        if rich_vim_experiment() && !start_in_text_view {
+            this.transcript_editor
+                .update(cx, |editor, cx| editor.set_input_only(true, cx));
+        }
         if start_in_text_view || rich_vim_experiment() {
             drop(this.sync_transcript_document(cx));
         }
@@ -4691,6 +4695,10 @@ impl HarnessApp {
         }
         self.buffer_view = false;
         self.search_returns_to_buffer = false;
+        if rich_vim_experiment() {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.set_input_only(true, cx));
+        }
         self.focus_mode = if rich_vim_experiment() {
             FocusMode::Buffer
         } else {
@@ -4769,6 +4777,8 @@ impl HarnessApp {
                 .min(self.model.items.len().saturating_sub(1))
         });
         self.buffer_view = true;
+        self.transcript_editor
+            .update(cx, |editor, cx| editor.set_input_only(false, cx));
         let Some(document) = self.sync_transcript_document(cx) else {
             return;
         };
@@ -7979,11 +7989,11 @@ impl HarnessApp {
 
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_hybrid_surfaces(cx);
         let transcript_input_only = rich_vim_experiment() && !self.buffer_view;
         self.transcript_editor.update(cx, |editor, cx| {
             editor.set_input_only(transcript_input_only, cx)
         });
+        self.sync_hybrid_surfaces(cx);
         if rich_vim_experiment() && !self.buffer_view {
             if self.rich_navigation_selection.is_none() {
                 self.rich_navigation_selection = Some(

@@ -269,6 +269,7 @@ impl Render for LocalEditor {
 pub struct TranscriptEditor {
     buffer: Entity<Buffer>,
     editor: Entity<Editor>,
+    input_only: bool,
     typography_profile: TranscriptTypographyProfile,
     segments: Vec<TranscriptDocumentSegment>,
     segment_header_texts: Vec<String>,
@@ -2020,6 +2021,7 @@ impl TranscriptEditor {
         Self {
             buffer,
             editor,
+            input_only: false,
             typography_profile: TranscriptTypographyProfile::Reading,
             segments: Vec::new(),
             segment_header_texts: Vec::new(),
@@ -2053,6 +2055,42 @@ impl TranscriptEditor {
     }
 
     pub fn set_input_only(&mut self, input_only: bool, cx: &mut Context<Self>) {
+        if self.input_only == input_only {
+            self.editor
+                .update(cx, |editor, cx| editor.set_input_only(input_only, cx));
+            return;
+        }
+        self.input_only = input_only;
+
+        // Rich mode keeps this Editor mounted only for input, selection, Vim,
+        // and text geometry. Native header/diff/supplement replacement blocks
+        // exist solely to paint the Text view. Leaving them mounted in the
+        // hidden mirror makes an ordinary j/k motion expand to the replaced
+        // source range, which Vim correctly interprets as a visual selection.
+        // Drop those paint-only blocks while input-only and remount them from
+        // the retained logical specs when the Text view is restored.
+        if input_only {
+            self.unmount_all_supplements(cx);
+            self.unmount_all_replacements(cx);
+            let header_blocks = std::mem::take(&mut self.header_blocks);
+            let diff_file_blocks = std::mem::take(&mut self.diff_file_blocks);
+            if !header_blocks.is_empty() || !diff_file_blocks.is_empty() {
+                self.editor.update(cx, |editor, cx| {
+                    editor.remove_blocks(
+                        header_blocks
+                            .into_values()
+                            .chain(diff_file_blocks)
+                            .collect(),
+                        None,
+                        cx,
+                    );
+                });
+            }
+        }
+        self.viewport_decorations = None;
+        self.diff_highlights_dirty = true;
+        self.semantic_highlights_dirty = true;
+        self.search.highlights_dirty = true;
         self.editor
             .update(cx, |editor, cx| editor.set_input_only(input_only, cx));
     }
@@ -2516,6 +2554,9 @@ impl TranscriptEditor {
     }
 
     fn mount_unmounted_supplements(&mut self, cx: &mut Context<Self>) {
+        if self.input_only {
+            return;
+        }
         let pending = self
             .supplements
             .iter()
@@ -2552,6 +2593,9 @@ impl TranscriptEditor {
     }
 
     fn mount_unmounted_replacements(&mut self, cx: &mut Context<Self>) {
+        if self.input_only {
+            return;
+        }
         let pending = self
             .replacements
             .iter()
@@ -2887,6 +2931,9 @@ impl TranscriptEditor {
     }
 
     fn refresh_viewport_decorations(&mut self, cx: &mut Context<Self>) {
+        if self.input_only {
+            return;
+        }
         let desired = self.current_viewport_decoration_window(cx);
         let rebuild_headers = self
             .viewport_decorations
@@ -3772,9 +3819,11 @@ impl TranscriptEditor {
             );
         });
         self.refresh_semantic_font_geometry(cx);
-        self.mount_unmounted_supplements(cx);
-        self.mount_unmounted_replacements(cx);
-        self.refresh_viewport_decorations(cx);
+        if !self.input_only {
+            self.mount_unmounted_supplements(cx);
+            self.mount_unmounted_replacements(cx);
+            self.refresh_viewport_decorations(cx);
+        }
         true
     }
 
@@ -3968,9 +4017,11 @@ impl TranscriptEditor {
         if semantic_bodies_changed {
             self.refresh_semantic_font_geometry(cx);
         }
-        self.mount_unmounted_supplements(cx);
-        self.mount_unmounted_replacements(cx);
-        self.refresh_viewport_decorations(cx);
+        if !self.input_only {
+            self.mount_unmounted_supplements(cx);
+            self.mount_unmounted_replacements(cx);
+            self.refresh_viewport_decorations(cx);
+        }
         if should_request_tail_autoscroll(self.follow_tail, search_text_changed) {
             self.request_tail_autoscroll(cx);
         }
