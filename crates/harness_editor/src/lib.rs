@@ -29,7 +29,9 @@ use harness_protocol::{
     TranscriptSemanticSpan, TranscriptSemanticStyle, minimal_text_edit,
 };
 use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
-use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset as _};
+use multi_buffer::{
+    Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
+};
 use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
 use tree_sitter::{Query, StreamingIterator as _};
@@ -474,13 +476,26 @@ pub struct TranscriptItemSelection {
 /// A renderer-independent snapshot of the newest native Editor selection.
 ///
 /// Rich mode consumes this snapshot while the Editor remains the sole Vim
-/// state machine. `visual` distinguishes a character selection from the
-/// normal-mode block cursor represented by `head`.
+/// state machine. `visual` distinguishes a selection from the normal-mode
+/// block cursor represented by `head`; `linewise` records that Vim expanded
+/// the projected ranges to whole logical lines.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscriptSelectionSnapshot {
     pub visual: bool,
+    pub linewise: bool,
     pub reversed: bool,
     pub items: Vec<TranscriptItemSelection>,
+}
+
+fn linewise_selection_rows(start: Point, end: Point) -> RangeInclusive<u32> {
+    // A range ending at column zero owns the preceding newline, not the next
+    // row. This is the same boundary rule used by Vim's linewise yank path.
+    let last_row = if end.column == 0 && end.row > start.row {
+        end.row - 1
+    } else {
+        end.row
+    };
+    start.row..=last_row
 }
 
 struct TranscriptHeaderHighlight;
@@ -2146,12 +2161,27 @@ impl TranscriptEditor {
     /// Rich item it intersects. Rich rendering remains completely independent
     /// of Editor layout; this is only a shared logical-offset contract.
     pub fn selection_snapshot(&self, cx: &mut App) -> TranscriptSelectionSnapshot {
-        let selection = self.editor.update(cx, |editor, cx| {
+        let (selection, linewise) = self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            editor
+            let mut selection = editor
                 .selections
                 .newest_anchor()
-                .map(|anchor| anchor.to_offset(&snapshot).0)
+                .map(|anchor| anchor.to_offset(&snapshot));
+            let linewise = editor.selections.line_mode() && !selection.is_empty();
+            if linewise {
+                let start_point = selection.start.to_point(&snapshot);
+                let end_point = selection.end.to_point(&snapshot);
+                let rows = linewise_selection_rows(start_point, end_point);
+                selection.start = Point::new(*rows.start(), 0).to_offset(&snapshot);
+                let last_row = *rows.end();
+                selection.end = if last_row < snapshot.max_point().row {
+                    Point::new(last_row + 1, 0).to_offset(&snapshot)
+                } else {
+                    Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row)))
+                        .to_offset(&snapshot)
+                };
+            }
+            (selection.map(|offset| offset.0), linewise)
         });
         let head = selection.head();
         let visual = !selection.is_empty();
@@ -2200,6 +2230,7 @@ impl TranscriptEditor {
 
         TranscriptSelectionSnapshot {
             visual,
+            linewise,
             reversed: selection.reversed,
             items,
         }
@@ -4330,6 +4361,22 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linewise_selection_does_not_claim_a_row_at_its_exclusive_boundary() {
+        assert_eq!(
+            linewise_selection_rows(Point::new(4, 3), Point::new(6, 0)),
+            4..=5
+        );
+        assert_eq!(
+            linewise_selection_rows(Point::new(4, 3), Point::new(6, 1)),
+            4..=6
+        );
+        assert_eq!(
+            linewise_selection_rows(Point::new(4, 3), Point::new(4, 4)),
+            4..=4
+        );
+    }
 
     #[test]
     fn collapsing_a_body_relocates_only_selections_that_would_disappear() {
