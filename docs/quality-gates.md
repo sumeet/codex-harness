@@ -13,10 +13,10 @@ agent client.
 - The transcript uses the available width. It must not become a narrow centered
   reading column.
 - Rich prose uses proportional UI typography; monospace is reserved for code,
-  commands, terminal output, paths, and the Text projection.
+  commands, terminal output, paths, and the raw Editor projection.
 - Message kinds are distinguishable at a glance without turning every item into
-  a heavy card. Headers, left rules, status color, spacing, and disclosure are
-  restrained and consistent.
+  a heavy card. Headers, status color, spacing, and disclosure are restrained
+  and consistent; selection does not add a full-height rule beside an item.
 - Protocol bookkeeping, duplicate reasoning updates, raw JSON, opaque IDs, and
   lifecycle noise do not pollute the reading timeline. Meaningful state lives in
   semantic cards or compact chrome; exact raw events remain available for
@@ -32,15 +32,14 @@ agent client.
 - There is one vertical history scrollbar. A diff, terminal, image, form, or
   tool card may scroll horizontally when its content requires it, but never
   creates a nested vertical reading surface.
-- Rich mode supports fast semantic `j`/`k` navigation, search, disclosure,
-  block selection/yank, and predictable focus transfer to requests and the
-  composer.
-- Text mode is Zed's actual Editor/Vim behavior, not a reimplementation. Normal,
-  visual, text-object, register, yank, search, jumplist, and selection behavior
-  must operate on real Buffer text.
-- Switching Rich/Text preserves the selected semantic item and whether the user
-  is following the tail or reading above it. Switching modes never doubles as
-  Escape, silently changes modes, or steals a visual selection.
+- Rich paint is backed by Zed's actual Editor/Vim behavior, not a reimplementation.
+  Normal, Visual, Visual Line, Visual Block, text-object, register, yank, search,
+  jumplist, and selection behavior operate on real Buffer text while the
+  selection is projected onto the proportional Markdown and structured cards.
+- The raw Editor projection remains available for diagnostics. Switching
+  Rich/raw preserves the selected semantic item and whether the user is
+  following the tail or reading above it. Switching never doubles as Escape,
+  silently changes Vim mode, or steals a visual selection.
 - Streaming follows only while pinned. Any deliberate upward scroll or backward
   Vim motion pauses follow; returning to the bottom or sending a new turn
   re-engages it.
@@ -56,9 +55,9 @@ agent client.
 - Every ServerRequest is either rendered as an actionable live surface or
   answered immediately with a method-valid safe response/error. No request may
   become an inert transcript card or hang the turn.
-- Rich and Text share the same request entity, drafts, cursors, validation,
-  response latch, and protocol reply. Persisted historical requests never
-  revive as live controls.
+- Rich and raw Editor projections share the same request entity, drafts,
+  cursors, validation, response latch, and protocol reply. Persisted historical
+  requests never revive as live controls.
 - Exact protocol payloads remain in the raw journal even when their semantic UI
   projection is compact or intentionally omitted.
 
@@ -73,8 +72,9 @@ agent client.
   malformed or stale projection falls back safely instead of panicking.
 - Thread load/switch, empty tasks, disappearing files, malformed requests,
   App Server disconnects, and response failures are recoverable and visible.
-- Standalone builds remain serialized and memory-bounded; ordinary iteration
-  must not require rebuilding or linking the Zed application shell.
+- Standalone builds remain memory-bounded; the compact dependency graph may use
+  a small bounded worker pool. Ordinary iteration must not require rebuilding
+  or linking the Zed application shell.
 
 ## Required verification for a meaningful checkpoint
 
@@ -82,8 +82,8 @@ agent client.
 2. Build through `script/build-standalone.sh`; launching must never invoke
    Cargo.
 3. Inspect a full-height Rich replay around prose, reasoning, commands, diffs,
-   images, subagents, and requests. Inspect Text mode separately.
-4. Exercise Rich/Text switching, mouse and keyboard focus, character and block
+   images, subagents, and requests. Inspect the raw Editor projection separately.
+4. Exercise Rich/raw switching, mouse and keyboard focus, character and block
    selection/yank, `/ ? n N`, composer send, request submit/failure, and thread
    switching.
 5. Verify streaming follow-tail both pinned and paused while reading above.
@@ -196,3 +196,31 @@ multi-window use.
 Still open: live response-failure recovery and an editable form response;
 measured high-refresh-rate scrolling/input latency; and longer exploratory
 multi-window use.
+
+### 2026-08-21 — native Vim selection projected onto Rich paint
+
+- Rich is now backed by one persistent input-only Zed Editor/Vim state machine.
+  The raw Editor projection remains diagnostic rather than being required for
+  motions, registers, search, Visual, Visual Line, or Visual Block behavior.
+- Character selection contrast, whole-line Visual Line geometry, and every
+  disjoint Visual Block row are projected onto structured cards. Markdown's
+  external selection API now also accepts disjoint source ranges, so a block
+  spanning checklist rows paints only the selected columns instead of the
+  unrelated text between them. A real 1600x1000 replay verified separate `Fin`
+  and `Val` ranges, and the full-height Reasoning/Plan left rule was removed.
+- Markdown tests passed 142/142 and Harness app tests passed 75/75. The default
+  `release-fast` standalone binary rebuilt successfully.
+- A 1,000-item Rich `:perf-j` run on the 60 Hz headless output measured draw
+  p50 5.87 ms / p95 8.03 ms / max 9.04 ms, input dispatch p50 4.87 ms / p95
+  6.66 ms, and input-to-present p50 11.34 ms / p95 14.75 ms. No draw exceeded
+  16.67 ms. The measured ~18 ms presentation cadence is constrained by that
+  60 Hz output and is not a 120 Hz acceptance result.
+- Wayland touchpad release sampling now preserves the newest delta, separates
+  source timestamps from animation time, and tolerates same-dispatch timestamp
+  quantization. Gesture and Linux pointer-clock tests pass, but physical upward
+  and downward fling feel on the 120 Hz laptop panel remains a manual gate.
+
+Still open: exact mouse placement across every structured Rich fragment; visible
+cursor treatment for Markdown source bytes replaced by non-text elements such
+as checkboxes; a live editable form and response-failure recovery; physical
+120 Hz scrolling validation; and longer multi-window use.
