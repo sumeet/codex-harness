@@ -1534,6 +1534,24 @@ fn item_body_start_at_offset(
         .map_or(requested_offset, |segment| segment.body_range.start)
 }
 
+/// Resolve a document offset to exactly one semantic segment.
+///
+/// Transcript ranges are half-open and adjacent segments share an endpoint.
+/// At that endpoint the cursor belongs to the following segment; only the
+/// document's final endpoint belongs to the last segment. Keeping this choice
+/// in one helper prevents Rich paint from projecting one native cursor into
+/// both neighboring cards.
+fn segment_position_at_offset(
+    segments: &[TranscriptDocumentSegment],
+    offset: usize,
+) -> Option<usize> {
+    (!segments.is_empty()).then(|| {
+        segments
+            .partition_point(|segment| segment.whole_range.end <= offset)
+            .min(segments.len() - 1)
+    })
+}
+
 fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -> bool {
     let segment = &projection.segment;
     segment.whole_range == (0..projection.text.len())
@@ -2202,6 +2220,7 @@ impl TranscriptEditor {
             )
         });
         let visual = selections.iter().any(|selection| !selection.is_empty());
+        let head_segment_position = segment_position_at_offset(&self.segments, head);
         let mut items = Vec::new();
 
         for (segment_position, segment) in self.segments.iter().enumerate() {
@@ -2218,8 +2237,7 @@ impl TranscriptEditor {
                         ..selection.end.min(body.end) - body.start
                 })
                 .collect::<Vec<_>>();
-            let item_head = (segment.whole_range.start..=segment.whole_range.end)
-                .contains(&head)
+            let item_head = (head_segment_position == Some(segment_position))
                 .then_some(head.clamp(body.start, body.end) - body.start);
             if ranges.is_empty() && item_head.is_none() {
                 continue;
@@ -2301,18 +2319,8 @@ impl TranscriptEditor {
     }
 
     fn item_at_offset(&self, offset: usize) -> Option<usize> {
-        let segment_index = self
-            .segments
-            .partition_point(|segment| segment.whole_range.end <= offset)
-            .min(self.segments.len().saturating_sub(1));
-        self.segments
-            .get(segment_index)
-            .or_else(|| {
-                self.segments
-                    .iter()
-                    .rev()
-                    .find(|segment| segment.whole_range.start <= offset)
-            })
+        segment_position_at_offset(&self.segments, offset)
+            .and_then(|segment_position| self.segments.get(segment_position))
             .map(|segment| segment.item_index)
     }
 
@@ -4918,6 +4926,18 @@ mod tests {
 
     fn highlighted_text<'a>(text: &'a str, ranges: &[Range<usize>]) -> Vec<&'a str> {
         ranges.iter().map(|range| &text[range.clone()]).collect()
+    }
+
+    #[test]
+    fn adjacent_segments_have_exactly_one_cursor_owner() {
+        let segments = vec![segment(0, 0..5, 0..1, 1..5), segment(1, 5..10, 5..6, 6..10)];
+
+        assert_eq!(segment_position_at_offset(&segments, 0), Some(0));
+        assert_eq!(segment_position_at_offset(&segments, 4), Some(0));
+        assert_eq!(segment_position_at_offset(&segments, 5), Some(1));
+        assert_eq!(segment_position_at_offset(&segments, 9), Some(1));
+        assert_eq!(segment_position_at_offset(&segments, 10), Some(1));
+        assert_eq!(segment_position_at_offset(&[], 0), None);
     }
 
     #[test]

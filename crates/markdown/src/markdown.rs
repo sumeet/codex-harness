@@ -453,6 +453,10 @@ pub struct Markdown {
     // source of truth. These paint-only ranges never affect Markdown's mouse
     // selection, clipboard behavior, or focus handling.
     external_selections: Option<Vec<Range<usize>>>,
+    // A keyboard cursor is geometry, not a one-byte selection. Keeping it
+    // separate lets the renderer draw a caret at source positions that do not
+    // own a visible glyph (newlines, Markdown delimiters, and replacements).
+    external_cursor: Option<usize>,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
@@ -654,6 +658,7 @@ impl Markdown {
             source,
             selection: Selection::default(),
             external_selections: None,
+            external_cursor: None,
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
@@ -1024,6 +1029,7 @@ impl Markdown {
         self.source = source;
         self.selection = Selection::default();
         self.external_selections = None;
+        self.external_cursor = None;
         self.autoscroll_request = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
@@ -1080,6 +1086,18 @@ impl Markdown {
         selections: Option<Vec<Range<usize>>>,
         cx: &mut Context<Self>,
     ) {
+        self.set_external_navigation(selections, None, cx);
+    }
+
+    /// Paint source-coordinate keyboard navigation owned by an external
+    /// component. The cursor is intentionally distinct from selections: a
+    /// source position can be visible even when it has no glyph-shaped range.
+    pub fn set_external_navigation(
+        &mut self,
+        selections: Option<Vec<Range<usize>>>,
+        cursor: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
         let selections = selections.map(|selections| {
             selections
                 .into_iter()
@@ -1087,8 +1105,10 @@ impl Markdown {
                 .filter(|range| range.start < range.end)
                 .collect::<Vec<_>>()
         });
-        if self.external_selections != selections {
+        let cursor = cursor.map(|cursor| cursor.min(self.source.len()));
+        if self.external_selections != selections || self.external_cursor != cursor {
             self.external_selections = selections;
+            self.external_cursor = cursor;
             cx.notify();
         }
     }
@@ -2101,6 +2121,36 @@ impl MarkdownElement {
                 window,
             );
         }
+    }
+
+    fn paint_external_cursor(
+        &self,
+        rendered_text: &RenderedText,
+        element_bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let markdown = self.markdown.read(cx);
+        let Some(source_index) = markdown.external_cursor else {
+            return;
+        };
+
+        let cursor_bounds = rendered_text
+            .cursor_bounds_for_source_index(&markdown.source, source_index)
+            .unwrap_or_else(|| {
+                // A source made entirely from non-rendering nodes still owns a
+                // keyboard position. Keep the cursor visible at the Markdown
+                // surface origin rather than silently dropping it.
+                Bounds::new(element_bounds.origin, gpui::size(px(2.), px(20.)))
+            });
+        window.paint_quad(quad(
+            cursor_bounds,
+            Pixels::ZERO,
+            self.style.selection_background_color,
+            Edges::default(),
+            Hsla::transparent_black(),
+            BorderStyle::default(),
+        ));
     }
 
     fn paint_search_highlights(
@@ -3203,7 +3253,7 @@ impl Element for MarkdownElement {
         &mut self,
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         rendered_markdown: &mut Self::RequestLayoutState,
         hitbox: &mut Self::PrepaintState,
         window: &mut Window,
@@ -3235,6 +3285,7 @@ impl Element for MarkdownElement {
         rendered_markdown.element.paint(window, cx);
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
         self.paint_selection(&rendered_markdown.text, window, cx);
+        self.paint_external_cursor(&rendered_markdown.text, bounds, window, cx);
     }
 }
 
@@ -4181,6 +4232,37 @@ struct RenderedFootnoteRef {
 }
 
 impl RenderedText {
+    /// Return exactly one visible cursor rectangle for any source position.
+    /// Visible characters use their glyph-shaped bounds; source-only syntax
+    /// falls back to a thin caret at its mapped layout position.
+    fn cursor_bounds_for_source_index(
+        &self,
+        source: &str,
+        source_index: usize,
+    ) -> Option<Bounds<Pixels>> {
+        let mut source_index = source_index.min(source.len());
+        while !source.is_char_boundary(source_index) {
+            source_index = source_index.saturating_sub(1);
+        }
+        let source_end = source[source_index..]
+            .chars()
+            .next()
+            .map_or(source_index, |character| {
+                source_index + character.len_utf8()
+            });
+        if source_index < source_end
+            && let Some(bounds) = self
+                .bounds_for_source_range(source_index..source_end)
+                .into_iter()
+                .next()
+        {
+            return Some(bounds);
+        }
+
+        let (position, line_height) = self.position_for_source_index(source_index)?;
+        Some(Bounds::new(position, gpui::size(px(2.), line_height)))
+    }
+
     fn bounds_for_source_range(&self, range: Range<usize>) -> Vec<Bounds<Pixels>> {
         self.bounds_for_sorted_source_ranges([(0, range)])
             .into_iter()
@@ -4383,7 +4465,13 @@ impl RenderedText {
             let position = line.layout.position_for_index(rendered_index_within_line)?;
             return Some((position, line_height));
         }
-        None
+        // Source can end in non-rendering syntax or line breaks after the last
+        // rendered glyph. Anchor those positions to the end of the final line.
+        let line = self.lines.last()?;
+        let line_height = line.layout.line_height();
+        let rendered_index = line.rendered_index_for_source_index(line.source_end);
+        let position = line.layout.position_for_index(rendered_index)?;
+        Some((position, line_height))
     }
 
     fn surrounding_word_range(&self, source_index: usize) -> Range<usize> {
@@ -6276,6 +6364,31 @@ mod tests {
                 "row {row_index} should have a non-empty highlight"
             );
             row_top += line_height;
+        }
+    }
+
+    #[gpui::test]
+    fn test_keyboard_cursor_has_geometry_at_every_markdown_source_position(
+        cx: &mut TestAppContext,
+    ) {
+        let source = concat!(
+            "# Heading\n\n",
+            "- [x] **bold** and [link](https://example.com)\n",
+            "- [ ] `code`\n\n",
+            "> quote\n\n",
+            "---\n\n",
+            "tail\n",
+        );
+        let rendered = render_markdown(source, cx);
+
+        for source_index in (0..=source.len()).filter(|index| source.is_char_boundary(*index)) {
+            let bounds = rendered
+                .cursor_bounds_for_source_index(source, source_index)
+                .unwrap_or_else(|| panic!("cursor disappeared at source byte {source_index}"));
+            assert!(
+                bounds.size.width > Pixels::ZERO && bounds.size.height > Pixels::ZERO,
+                "cursor had empty geometry at source byte {source_index}: {bounds:?}"
+            );
         }
     }
 

@@ -224,3 +224,29 @@ Still open: exact mouse placement across every structured Rich fragment; visible
 cursor treatment for Markdown source bytes replaced by non-text elements such
 as checkboxes; a live editable form and response-failure recovery; physical
 120 Hz scrolling validation; and longer multi-window use.
+
+### 2026-08-21 — exact Rich cursor ownership
+
+- Transcript segment endpoints now have half-open ownership, so one native Vim
+  cursor cannot be projected into two adjacent cards. Structured fragments also
+  claim a Normal cursor exactly once across omitted protocol furniture and line
+  breaks.
+- Markdown has a first-class external keyboard cursor independent of Visual
+  selection. Every UTF-8 source position in a fixture containing headings,
+  tasks, emphasis, links, inline code, block quotes, rules, blank lines, and a
+  trailing newline produced non-empty cursor geometry.
+- Collapsing a selected command, entering it again from above, and entering it
+  again from below each retained one visible block cursor on its header. Leaving
+  transcript focus removed that cursor rather than leaving a second stale
+  cursor beside the composer. A cursor entering a progressive card's hidden
+  tail now reveals the full output, with the header as its transition-frame
+  owner.
+- Markdown tests passed 143/143, Harness Editor tests passed 55/55, and Harness
+  app tests passed 80/80. A rebuilt 1,000-item Rich `:perf-j` run measured draw
+  p50 4.64 ms / p95 6.02 ms / max 6.94 ms and input-to-present p50 10.18 ms /
+  p95 12.25 ms / max 14.53 ms, with no draw or input-to-present sample over
+  16.67 ms on the current compositor output.
+
+Still open before calling Rich Vim interaction complete: exhaustive real-window
+Visual/Visual Line/Visual Block traversal across diff and tool fragments, exact
+mouse placement across those fragments, and physical 120 Hz scrolling input.

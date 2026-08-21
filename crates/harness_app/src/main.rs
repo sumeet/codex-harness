@@ -298,49 +298,115 @@ struct RichSearchPaint {
 /// Item-local projection of the real Editor/Vim selection used by Rich
 /// renderers. `body_text` is the exact logical text on which Vim operated;
 /// renderers only translate its byte ranges into their visual fragments.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct RichNavigationPaint {
     body_text: Arc<str>,
     ranges: Vec<Range<usize>>,
     head: Option<usize>,
     visual: bool,
+    cursor_claimed: Rc<Cell<bool>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RichMarkdownNavigationPaint {
+    selections: Vec<Range<usize>>,
+    cursor: Option<usize>,
 }
 
 impl RichNavigationPaint {
     fn cursor_range(&self) -> Option<Range<usize>> {
-        let head = self.head?.min(self.body_text.len());
+        let mut head = self.head?.min(self.body_text.len());
+        while !self.body_text.is_char_boundary(head) {
+            head = head.saturating_sub(1);
+        }
         if head < self.body_text.len() {
+            let character = self.body_text[head..].chars().next()?;
+            if matches!(character, '\r' | '\n') {
+                if let Some((offset, character)) = self.body_text[head..]
+                    .char_indices()
+                    .find(|(_, character)| !matches!(character, '\r' | '\n'))
+                {
+                    let start = head + offset;
+                    return Some(start..start + character.len_utf8());
+                }
+                let (start, character) = self.body_text[..head]
+                    .char_indices()
+                    .rev()
+                    .find(|(_, character)| !matches!(character, '\r' | '\n'))?;
+                return Some(start..start + character.len_utf8());
+            }
             let end = self.body_text[head..]
                 .char_indices()
                 .nth(1)
                 .map_or(self.body_text.len(), |(offset, _)| head + offset);
             Some(head..end)
         } else if head > 0 {
-            let start = self.body_text[..head]
+            let (start, character) = self.body_text[..head]
                 .char_indices()
-                .next_back()
-                .map_or(0, |(offset, _)| offset);
-            Some(start..head)
+                .rev()
+                .find(|(_, character)| !matches!(character, '\r' | '\n'))?;
+            Some(start..start + character.len_utf8())
         } else {
             None
         }
     }
 
-    fn markdown_source_ranges(&self, source: &str) -> Vec<Range<usize>> {
-        let logical = if self.visual {
-            self.ranges.clone()
-        } else {
-            self.cursor_range().into_iter().collect()
-        };
-        logical
+    fn markdown_source_navigation(&self, source: &str) -> RichMarkdownNavigationPaint {
+        let selections = self
+            .visual
+            .then(|| self.ranges.clone())
+            .unwrap_or_default()
             .into_iter()
             .map(|range| {
                 markdown_source_offset_for_logical(&self.body_text, source, range.start)
                     ..markdown_source_offset_for_logical(&self.body_text, source, range.end)
             })
             .filter(|range| range.start < range.end)
-            .collect()
+            .collect();
+        let cursor = (!self.visual)
+            .then(|| {
+                self.cursor_range()
+                    .map(|range| range.start)
+                    .unwrap_or_default()
+            })
+            .map(|logical_offset| {
+                markdown_source_offset_for_logical(&self.body_text, source, logical_offset)
+            });
+        if cursor.is_some() {
+            self.cursor_claimed.set(true);
+        }
+        RichMarkdownNavigationPaint { selections, cursor }
     }
+}
+
+fn rich_navigation_needs_progressive_reveal(
+    kind: model::TranscriptKind,
+    expanded: bool,
+    expansion: OutputExpansion,
+    navigation: Option<&RichNavigationPaint>,
+) -> bool {
+    expanded
+        && kind.is_structured()
+        && expansion != OutputExpansion::All
+        && navigation.is_some_and(|navigation| {
+            !navigation.visual && navigation.head.is_some() && !navigation.cursor_claimed.get()
+        })
+}
+
+/// Give a logical cursor that has no visible body glyph exactly one stable
+/// owner in the card header. Collapsed folds use this immediately; progressive
+/// previews use it for the single frame in which their hidden tail expands.
+fn claim_rich_header_cursor(
+    title: &str,
+    navigation: Option<&RichNavigationPaint>,
+) -> Option<Range<usize>> {
+    let navigation = navigation?;
+    if navigation.visual || navigation.head.is_none() || navigation.cursor_claimed.get() {
+        return None;
+    }
+    let end = title.chars().next().map(char::len_utf8)?;
+    navigation.cursor_claimed.set(true);
+    Some(0..end)
 }
 
 /// Locate a visible Rich fragment in the logical transcript body, preserving
@@ -606,8 +672,26 @@ fn navigation_ranges_for_fragment(
         for selection in &navigation.ranges {
             append_intersection(selection);
         }
-    } else if let Some(cursor) = navigation.cursor_range() {
+    } else if !navigation.cursor_claimed.get()
+        && let Some(cursor) = navigation.cursor_range()
+    {
         append_intersection(&cursor);
+        if !ranges.is_empty() {
+            navigation.cursor_claimed.set(true);
+        } else if !fragment.is_empty() && cursor.end <= fragment.start {
+            // Structured renderers can omit logical separators or replace
+            // protocol furniture with native controls. Snap a cursor in such a
+            // gap to the next visible glyph, and claim it exactly once.
+            let first_character_end = navigation
+                .body_text
+                .get(fragment.clone())
+                .and_then(|text| text.chars().next())
+                .map_or(0, char::len_utf8);
+            if first_character_end > 0 {
+                ranges.push(0..first_character_end);
+                navigation.cursor_claimed.set(true);
+            }
+        }
     }
     ranges
 }
@@ -2179,7 +2263,7 @@ struct CachedMarkdown {
     entity: Entity<Markdown>,
     search_query: Option<String>,
     search_ranges: Vec<Range<usize>>,
-    navigation_ranges: Option<Vec<Range<usize>>>,
+    navigation: Option<RichMarkdownNavigationPaint>,
     last_autoscroll_generation: Option<u64>,
 }
 
@@ -2609,6 +2693,13 @@ struct HarnessApp {
 
 impl HarnessApp {
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
+        // The navigation Editor retains its selection while focus moves to the
+        // composer, search, approvals, or sidebar. Only paint that cached
+        // selection while the transcript itself owns keyboard focus; otherwise
+        // the window presents two independent Vim cursors.
+        if self.focus_mode != FocusMode::Buffer {
+            return None;
+        }
         let snapshot = self.rich_navigation_selection.as_ref()?;
         let item = snapshot
             .items
@@ -2619,6 +2710,7 @@ impl HarnessApp {
             ranges: item.ranges.clone(),
             head: item.head,
             visual: snapshot.visual,
+            cursor_claimed: Rc::new(Cell::new(false)),
         })
     }
 
@@ -2665,18 +2757,24 @@ impl HarnessApp {
             ranges: selection.ranges.clone(),
             head: selection.head,
             visual: snapshot.visual,
+            cursor_claimed: Rc::new(Cell::new(false)),
         };
-        let next_ranges = Some(navigation.markdown_source_ranges(&source));
+        let next_navigation = Some(navigation.markdown_source_navigation(&source));
         let Some(cached) = self.markdown_cache.get_mut(&key) else {
             return false;
         };
         if cached.source != source {
             return false;
         }
-        if cached.navigation_ranges != next_ranges {
-            cached.navigation_ranges = next_ranges.clone();
+        if cached.navigation != next_navigation {
+            cached.navigation = next_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
-                markdown.set_external_selections(next_ranges, cx)
+                let navigation = next_navigation.as_ref();
+                markdown.set_external_navigation(
+                    navigation.map(|navigation| navigation.selections.clone()),
+                    navigation.and_then(|navigation| navigation.cursor),
+                    cx,
+                )
             });
         }
         true
@@ -5818,7 +5916,7 @@ impl HarnessApp {
                     entity,
                     search_query: None,
                     search_ranges: Vec::new(),
-                    navigation_ranges: None,
+                    navigation: None,
                     last_autoscroll_generation: None,
                 }
             });
@@ -5826,19 +5924,24 @@ impl HarnessApp {
             cached.source = source.to_string();
             cached.search_query = None;
             cached.search_ranges.clear();
-            cached.navigation_ranges = None;
+            cached.navigation = None;
             cached.last_autoscroll_generation = None;
             cached.entity.update(cx, |markdown, cx| {
                 markdown.reset(source.to_string().into(), cx)
             });
         }
 
-        let navigation_ranges =
-            navigation.map(|navigation| navigation.markdown_source_ranges(source));
-        if cached.navigation_ranges != navigation_ranges {
-            cached.navigation_ranges = navigation_ranges.clone();
+        let markdown_navigation =
+            navigation.map(|navigation| navigation.markdown_source_navigation(source));
+        if cached.navigation != markdown_navigation {
+            cached.navigation = markdown_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
-                markdown.set_external_selections(navigation_ranges, cx)
+                let navigation = markdown_navigation.as_ref();
+                markdown.set_external_navigation(
+                    navigation.map(|navigation| navigation.selections.clone()),
+                    navigation.and_then(|navigation| navigation.cursor),
+                    cx,
+                )
             });
         }
 
@@ -7712,80 +7815,6 @@ impl HarnessApp {
                 .child(styled)
                 .into_any_element()
         });
-        let header_search = show_header.then_some(rich_search.as_ref()).flatten();
-        let highlighted_header_title =
-            searchable_styled_text(header_title, Vec::new(), header_search, cx);
-        let highlighted_status = visible_status
-            .as_ref()
-            .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
-
-        let header = div()
-            .id(("item-header", index))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Icon::new(icon)
-                    .size(IconSize::Small)
-                    .color(transcript_icon_color(item.kind, cursor)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_ui_sm(cx)
-                    .text_color(if cursor {
-                        colors.text
-                    } else {
-                        colors.text_muted
-                    })
-                    .child(highlighted_header_title),
-            )
-            .when_some(
-                visible_status.zip(highlighted_status),
-                |this, (status, highlighted)| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .text_ui_xs(cx)
-                            .text_color(match transcript_status_color(&status) {
-                                Color::Error => cx.theme().status().error,
-                                Color::Warning => cx.theme().status().warning,
-                                Color::Accent => colors.text_accent,
-                                _ => colors.text_muted,
-                            })
-                            .child(highlighted),
-                    )
-                },
-            )
-            .when(is_disclosure, |this| {
-                this.cursor_pointer()
-                    .on_click(move |_, window, cx| {
-                        disclosure_weak
-                            .update(cx, |this, cx| {
-                                if let Some(item) = this.model.items.get_mut(index) {
-                                    item.expanded = !item.expanded;
-                                    let item_key = item.key.clone();
-                                    let collapsed = !item.expanded;
-                                    this.list_state.splice(index..index + 1, 1);
-                                    if rich_vim_experiment() {
-                                        this.transcript_editor.update(cx, |editor, cx| {
-                                            editor.set_item_collapsed(
-                                                &item_key, collapsed, window, cx,
-                                            );
-                                        });
-                                    }
-                                    cx.notify();
-                                }
-                            })
-                            .ok();
-                    })
-                    .child(Disclosure::new(("item-disclosure", index), item.expanded))
-            });
-
         let markdown = (narrative
             && item.kind != model::TranscriptKind::Reasoning
             && item.expanded
@@ -7915,6 +7944,109 @@ impl HarnessApp {
                 ),
             })
         };
+
+        // Progressive cards render their visible fragments above. If none of
+        // them could claim the native cursor, it has entered a hidden tail.
+        // Reveal the complete output on the next frame; the header below owns
+        // the cursor during this frame so it never blinks out between states.
+        if rich_navigation_needs_progressive_reveal(
+            item.kind,
+            item.expanded,
+            output_expansion,
+            rich_navigation.as_ref(),
+        ) {
+            self.output_expansion
+                .insert(item.key.clone(), OutputExpansion::All);
+            cx.notify();
+        }
+
+        let header_search = show_header.then_some(rich_search.as_ref()).flatten();
+        let header_cursor_range = claim_rich_header_cursor(&header_title, rich_navigation.as_ref());
+        let header_highlights = header_cursor_range
+            .map(|range| {
+                vec![(
+                    range,
+                    gpui::HighlightStyle {
+                        background_color: rich_navigation.as_ref().map(|navigation| {
+                            rich_navigation_text_highlight_background(navigation, cx)
+                        }),
+                        ..Default::default()
+                    },
+                )]
+            })
+            .unwrap_or_default();
+        let highlighted_header_title =
+            searchable_styled_text(header_title, header_highlights, header_search, cx);
+        let highlighted_status = visible_status
+            .as_ref()
+            .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
+
+        let header = div()
+            .id(("item-header", index))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                Icon::new(icon)
+                    .size(IconSize::Small)
+                    .color(transcript_icon_color(item.kind, cursor)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_ui_sm(cx)
+                    .text_color(if cursor {
+                        colors.text
+                    } else {
+                        colors.text_muted
+                    })
+                    .child(highlighted_header_title),
+            )
+            .when_some(
+                visible_status.zip(highlighted_status),
+                |this, (status, highlighted)| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_ui_xs(cx)
+                            .text_color(match transcript_status_color(&status) {
+                                Color::Error => cx.theme().status().error,
+                                Color::Warning => cx.theme().status().warning,
+                                Color::Accent => colors.text_accent,
+                                _ => colors.text_muted,
+                            })
+                            .child(highlighted),
+                    )
+                },
+            )
+            .when(is_disclosure, |this| {
+                this.cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        disclosure_weak
+                            .update(cx, |this, cx| {
+                                if let Some(item) = this.model.items.get_mut(index) {
+                                    item.expanded = !item.expanded;
+                                    let item_key = item.key.clone();
+                                    let collapsed = !item.expanded;
+                                    this.list_state.splice(index..index + 1, 1);
+                                    if rich_vim_experiment() {
+                                        this.transcript_editor.update(cx, |editor, cx| {
+                                            editor.set_item_collapsed(
+                                                &item_key, collapsed, window, cx,
+                                            );
+                                        });
+                                    }
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    })
+                    .child(Disclosure::new(("item-disclosure", index), item.expanded))
+            });
 
         let raw = raw_visible.then(|| {
             let content =
@@ -9683,6 +9815,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(0),
             visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
         };
         let mut cursor = 0;
 
@@ -9707,6 +9840,7 @@ mod tests {
             ranges: vec![2..4, 8..10],
             head: Some(9),
             visual: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
         };
 
         assert_eq!(
@@ -9720,6 +9854,122 @@ mod tests {
     }
 
     #[test]
+    fn rich_navigation_cursor_crosses_newlines_and_hidden_furniture_once() {
+        let navigation = RichNavigationPaint {
+            body_text: "alpha\n<hidden>beta\ngamma".into(),
+            ranges: Vec::new(),
+            head: Some(7),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert!(navigation_ranges_for_fragment(&navigation, 0..5).is_empty());
+        assert_eq!(navigation_ranges_for_fragment(&navigation, 14..18), [0..1]);
+        assert!(navigation_ranges_for_fragment(&navigation, 19..24).is_empty());
+
+        let navigation = RichNavigationPaint {
+            body_text: "alpha\nbeta".into(),
+            ranges: Vec::new(),
+            head: Some(5),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert!(navigation_ranges_for_fragment(&navigation, 0..5).is_empty());
+        assert_eq!(navigation_ranges_for_fragment(&navigation, 6..10), [0..1]);
+    }
+
+    #[test]
+    fn rich_navigation_cursor_has_one_visible_structured_owner_at_every_offset() {
+        let body = "alpha\n<hidden>beta\ngamma\n";
+        let visible_fragments = [0..5, 14..18, 19..24];
+
+        for head in (0..=body.len()).filter(|offset| body.is_char_boundary(*offset)) {
+            let navigation = RichNavigationPaint {
+                body_text: body.into(),
+                ranges: Vec::new(),
+                head: Some(head),
+                visual: false,
+                cursor_claimed: Rc::new(Cell::new(false)),
+            };
+            let owners = visible_fragments
+                .iter()
+                .filter(|fragment| {
+                    !navigation_ranges_for_fragment(&navigation, (*fragment).clone()).is_empty()
+                })
+                .count();
+            assert_eq!(owners, 1, "cursor owner count at body byte {head}");
+        }
+    }
+
+    #[test]
+    fn rich_header_cursor_is_a_single_fallback_owner() {
+        let navigation = RichNavigationPaint {
+            body_text: "hidden body".into(),
+            ranges: Vec::new(),
+            head: Some(3),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert_eq!(
+            claim_rich_header_cursor("Command", Some(&navigation)),
+            Some(0..1)
+        );
+        assert!(navigation.cursor_claimed.get());
+        assert_eq!(claim_rich_header_cursor("Command", Some(&navigation)), None);
+
+        let unicode = RichNavigationPaint {
+            body_text: "hidden body".into(),
+            ranges: Vec::new(),
+            head: Some(3),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            claim_rich_header_cursor("🧭 Tool", Some(&unicode)),
+            Some(0.."🧭".len())
+        );
+    }
+
+    #[test]
+    fn hidden_progressive_cursor_reveals_content_before_it_can_disappear() {
+        let navigation = RichNavigationPaint {
+            body_text: "visible\nhidden".into(),
+            ranges: Vec::new(),
+            head: Some(9),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert!(rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Command,
+            true,
+            OutputExpansion::Preview,
+            Some(&navigation),
+        ));
+        navigation.cursor_claimed.set(true);
+        assert!(!rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Command,
+            true,
+            OutputExpansion::Preview,
+            Some(&navigation),
+        ));
+        navigation.cursor_claimed.set(false);
+        assert!(!rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Command,
+            true,
+            OutputExpansion::All,
+            Some(&navigation),
+        ));
+        assert!(!rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Agent,
+            true,
+            OutputExpansion::Preview,
+            Some(&navigation),
+        ));
+    }
+
+    #[test]
     fn rich_vim_markdown_preserves_each_visual_block_row() {
         let logical = "abcde\nabcde";
         let source = "**abcde**\n*abcde*";
@@ -9728,13 +9978,44 @@ mod tests {
             ranges: vec![1..3, 7..9],
             head: Some(8),
             visual: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
         };
 
-        let ranges = navigation.markdown_source_ranges(source);
-        assert_eq!(ranges.len(), 2);
-        assert_eq!(&source[ranges[0].clone()], "bc");
-        assert_eq!(&source[ranges[1].clone()], "bc");
-        assert!(ranges[0].end < ranges[1].start);
+        let paint = navigation.markdown_source_navigation(source);
+        assert_eq!(paint.selections.len(), 2);
+        assert_eq!(&source[paint.selections[0].clone()], "bc");
+        assert_eq!(&source[paint.selections[1].clone()], "bc");
+        assert!(paint.selections[0].end < paint.selections[1].start);
+        assert_eq!(paint.cursor, None);
+    }
+
+    #[test]
+    fn rich_vim_markdown_keeps_cursor_separate_from_selection() {
+        let logical = "Build a real Vim composer.";
+        let source = "Build a **real Vim composer**.";
+        let head = logical.find("real").unwrap();
+        let navigation = RichNavigationPaint {
+            body_text: logical.into(),
+            ranges: Vec::new(),
+            head: Some(head),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        let paint = navigation.markdown_source_navigation(source);
+        assert!(paint.selections.is_empty());
+        assert_eq!(paint.cursor, source.find("real"));
+        assert!(navigation.cursor_claimed.get());
+
+        let navigation = RichNavigationPaint {
+            body_text: logical.into(),
+            ranges: Vec::new(),
+            head: Some(logical.len()),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        let paint = navigation.markdown_source_navigation(source);
+        assert_eq!(paint.cursor, source.rfind('.'));
     }
 
     #[test]
