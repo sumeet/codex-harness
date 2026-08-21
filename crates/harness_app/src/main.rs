@@ -389,19 +389,28 @@ fn rich_navigation_needs_progressive_reveal(
         && kind.is_structured()
         && expansion != OutputExpansion::All
         && navigation.is_some_and(|navigation| {
-            !navigation.visual && navigation.head.is_some() && !navigation.cursor_claimed.get()
+            if navigation.visual {
+                !navigation.ranges.is_empty()
+            } else {
+                navigation.head.is_some() && !navigation.cursor_claimed.get()
+            }
         })
 }
 
-/// Give a logical cursor that has no visible body glyph exactly one stable
-/// owner in the card header. Collapsed folds use this immediately; progressive
-/// previews use it for the single frame in which their hidden tail expands.
-fn claim_rich_header_cursor(
+/// Give hidden Rich navigation a stable proxy in the card header. Collapsed
+/// folds show their full title for a Visual selection; a Normal cursor owns
+/// exactly its first glyph. Progressive previews use the latter for the single
+/// frame in which their hidden tail expands.
+fn rich_header_navigation_range(
     title: &str,
     navigation: Option<&RichNavigationPaint>,
+    collapsed: bool,
 ) -> Option<Range<usize>> {
     let navigation = navigation?;
-    if navigation.visual || navigation.head.is_none() || navigation.cursor_claimed.get() {
+    if navigation.visual {
+        return (collapsed && !navigation.ranges.is_empty()).then(|| 0..title.len());
+    }
+    if navigation.head.is_none() || navigation.cursor_claimed.get() {
         return None;
     }
     let end = title.chars().next().map(char::len_utf8)?;
@@ -742,6 +751,58 @@ fn navigation_searchable_styled_text(
     let navigation = navigation_highlights_for_fragment(navigation, logical_fragment, cx);
     let base = gpui::combine_highlights(base, navigation).collect::<Vec<_>>();
     searchable_styled_text(text, base, search, cx)
+}
+
+fn logical_offset_for_rendered_index(
+    logical_fragment: &Range<usize>,
+    rendered_index: usize,
+) -> usize {
+    logical_fragment.start + rendered_index.min(logical_fragment.len())
+}
+
+/// Make a visible structured-text fragment place the persistent Editor/Vim
+/// cursor at the clicked glyph. Without this adapter, the card-level click
+/// handler can only jump to the first row of the item.
+fn rich_clickable_styled_text(
+    id: String,
+    styled: StyledText,
+    item_index: usize,
+    logical_fragment: Range<usize>,
+    owner: Option<WeakEntity<HarnessApp>>,
+) -> AnyElement {
+    let Some(owner) = owner.filter(|_| !logical_fragment.is_empty()) else {
+        return styled.into_any_element();
+    };
+    let layout = styled.layout().clone();
+    div()
+        .id(id)
+        .min_w_0()
+        .on_click(move |event, window, cx| {
+            let rendered_index = match layout.index_for_position(event.position()) {
+                Ok(index) | Err(index) => index,
+            };
+            let body_offset = logical_offset_for_rendered_index(&logical_fragment, rendered_index);
+            cx.stop_propagation();
+            window.prevent_default();
+            owner
+                .update(cx, |this, cx| {
+                    this.selected_item = item_index;
+                    this.visual_anchor = None;
+                    this.focus_mode = FocusMode::Buffer;
+                    this.list_state.pause_following_tail();
+                    this.transcript_editor.update(cx, |editor, cx| {
+                        editor.set_cursor_in_item(item_index, body_offset, window, cx);
+                    });
+                    this.transcript_editor.focus_handle(cx).focus(window, cx);
+                    this.transcript_editor.update(cx, |editor, cx| {
+                        editor.enter_normal_mode(window, cx);
+                    });
+                    cx.notify();
+                })
+                .ok();
+        })
+        .child(styled)
+        .into_any_element()
 }
 
 fn search_context_snippet(
@@ -2495,6 +2556,7 @@ impl Render for HybridStructuredSurface {
                     None,
                     OutputExpansion::Preview,
                     None,
+                    Some(self.owner.clone()),
                     cx,
                 )),
                 model::TranscriptKind::Command => HarnessApp::render_command_content(
@@ -2504,6 +2566,7 @@ impl Render for HybridStructuredSurface {
                     None,
                     OutputExpansion::Preview,
                     None,
+                    Some(self.owner.clone()),
                     cx,
                 ),
                 _ => None,
@@ -6023,6 +6086,8 @@ impl HarnessApp {
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
         logical_body_start: usize,
+        item_index: usize,
+        owner: Option<WeakEntity<HarnessApp>>,
         cx: &App,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
@@ -6053,8 +6118,15 @@ impl HarnessApp {
                     Vec::new(),
                     search,
                     navigation,
-                    logical_line_range,
+                    logical_line_range.clone(),
                     cx,
+                );
+                let clickable_line = rich_clickable_styled_text(
+                    format!("rich-diff-line:{item_index}:{logical_line_offset}"),
+                    highlighted_line,
+                    item_index,
+                    logical_line_range,
+                    owner.clone(),
                 );
                 div()
                     .w_full()
@@ -6105,7 +6177,7 @@ impl HarnessApp {
                                 ),
                             ),
                     )
-                    .child(div().min_w_0().whitespace_nowrap().child(highlighted_line))
+                    .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
                     .into_any_element()
             })
             .collect()
@@ -6126,7 +6198,16 @@ impl HarnessApp {
             .unwrap_or_default();
         let toggle = progressive_diff_toggle(item, expansion)
             .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_diff_content(item, index, search, navigation, expansion, toggle, cx)
+        Self::render_diff_content(
+            item,
+            index,
+            search,
+            navigation,
+            expansion,
+            toggle,
+            Some(cx.weak_entity()),
+            cx,
+        )
     }
 
     fn render_diff_content(
@@ -6136,6 +6217,7 @@ impl HarnessApp {
         navigation: Option<&RichNavigationPaint>,
         expansion: OutputExpansion,
         toggle: Option<AnyElement>,
+        owner: Option<WeakEntity<HarnessApp>>,
         cx: &App,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -6175,8 +6257,15 @@ impl HarnessApp {
                 Vec::new(),
                 search,
                 navigation,
-                path_range,
+                path_range.clone(),
                 cx,
+            );
+            let clickable_path = rich_clickable_styled_text(
+                format!("rich-diff-path:{index}:{section_index}"),
+                highlighted_path,
+                index,
+                path_range,
+                owner.clone(),
             );
             sections.push(
                 div()
@@ -6214,7 +6303,7 @@ impl HarnessApp {
                                     .font_buffer(cx)
                                     .text_ui_sm(cx)
                                     .truncate()
-                                    .child(highlighted_path),
+                                    .child(clickable_path),
                             )
                             .when(additions > 0 || deletions > 0, |this| {
                                 this.child(
@@ -6245,6 +6334,8 @@ impl HarnessApp {
                                         search,
                                         navigation,
                                         content_range.start,
+                                        index,
+                                        owner.clone(),
                                         cx,
                                     )),
                             )
@@ -6348,8 +6439,15 @@ impl HarnessApp {
                 Vec::new(),
                 search,
                 navigation,
-                path_range,
+                path_range.clone(),
                 cx,
+            );
+            let clickable_path = rich_clickable_styled_text(
+                format!("rich-file-change-path:{index}:{section_index}"),
+                highlighted_path,
+                index,
+                path_range,
+                Some(cx.weak_entity()),
             );
             let content_range = rich_navigation_fragment_range(
                 navigation,
@@ -6406,7 +6504,7 @@ impl HarnessApp {
                                     .font_buffer(cx)
                                     .text_ui_sm(cx)
                                     .truncate()
-                                    .child(highlighted_path),
+                                    .child(clickable_path),
                             )
                             .child(
                                 div()
@@ -6458,6 +6556,8 @@ impl HarnessApp {
                                     search,
                                     navigation,
                                     content_range.start,
+                                    index,
+                                    Some(cx.weak_entity()),
                                     cx,
                                 )),
                         )
@@ -6607,8 +6707,15 @@ impl HarnessApp {
             Vec::new(),
             search,
             navigation,
-            body_range,
+            body_range.clone(),
             cx,
+        );
+        let clickable_content = rich_clickable_styled_text(
+            format!("rich-terminal:{index}"),
+            highlighted_content,
+            index,
+            body_range,
+            Some(cx.weak_entity()),
         );
         div()
             .id(("terminal-scroll", index))
@@ -6622,7 +6729,7 @@ impl HarnessApp {
             .line_height(relative(1.45))
             .text_color(colors.text)
             .whitespace_normal()
-            .child(highlighted_content)
+            .child(clickable_content)
             .when_some(preview.toggle, |this, toggle| {
                 this.child(
                     div()
@@ -6656,6 +6763,7 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let error_color = cx.theme().status().error;
         let mut logical_cursor = 0;
+        let owner = cx.weak_entity();
         div()
             .id(("activity-sections", index))
             .w_full()
@@ -6675,13 +6783,20 @@ impl HarnessApp {
                             heading,
                             &mut logical_cursor,
                         );
-                        navigation_searchable_styled_text(
+                        let highlighted = navigation_searchable_styled_text(
                             heading.clone(),
                             Vec::new(),
                             search,
                             navigation,
-                            range,
+                            range.clone(),
                             cx,
+                        );
+                        rich_clickable_styled_text(
+                            format!("rich-activity-heading:{index}:{section_index}"),
+                            highlighted,
+                            index,
+                            range,
+                            Some(owner.clone()),
                         )
                     });
                     let base = if section.is_json {
@@ -6699,8 +6814,15 @@ impl HarnessApp {
                         base,
                         search,
                         navigation,
-                        body_range,
+                        body_range.clone(),
                         cx,
+                    );
+                    let clickable_body = rich_clickable_styled_text(
+                        format!("rich-activity-body:{index}:{section_index}"),
+                        highlighted_body,
+                        index,
+                        body_range,
+                        Some(owner.clone()),
                     );
                     div()
                         .w_full()
@@ -6738,7 +6860,7 @@ impl HarnessApp {
                                     .line_height(relative(1.45))
                                     .text_color(if error { error_color } else { colors.text })
                                     .whitespace_normal()
-                                    .child(highlighted_body),
+                                    .child(clickable_body),
                             )
                         })
                 },
@@ -6782,8 +6904,17 @@ impl HarnessApp {
         let command = item.command_transcript().expect("command parsed above");
         let toggle = command_output_toggle(&command, expansion)
             .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_command_content(item, index, search, navigation, expansion, toggle, cx)
-            .expect("command parsed above")
+        Self::render_command_content(
+            item,
+            index,
+            search,
+            navigation,
+            expansion,
+            toggle,
+            Some(cx.weak_entity()),
+            cx,
+        )
+        .expect("command parsed above")
     }
 
     fn render_command_content(
@@ -6793,6 +6924,7 @@ impl HarnessApp {
         navigation: Option<&RichNavigationPaint>,
         expansion: OutputExpansion,
         toggle: Option<AnyElement>,
+        owner: Option<WeakEntity<HarnessApp>>,
         cx: &App,
     ) -> Option<AnyElement> {
         let command = item.command_transcript()?;
@@ -6850,6 +6982,20 @@ impl HarnessApp {
             output_start..output_start + displayed_output.len(),
             cx,
         );
+        let clickable_command = rich_clickable_styled_text(
+            format!("rich-command-text:{index}"),
+            highlighted_command,
+            index,
+            command_start..command_end,
+            owner.clone(),
+        );
+        let clickable_output = rich_clickable_styled_text(
+            format!("rich-command-output:{index}"),
+            highlighted_output,
+            index,
+            output_start..output_start + displayed_output.len(),
+            owner,
+        );
 
         Some(
             div()
@@ -6864,7 +7010,7 @@ impl HarnessApp {
                         .text_ui_sm(cx)
                         .line_height(relative(1.45))
                         .whitespace_normal()
-                        .child(highlighted_command),
+                        .child(clickable_command),
                 )
                 .when(!displayed_output.is_empty(), |this| {
                     this.child(
@@ -6884,7 +7030,7 @@ impl HarnessApp {
                             .line_height(relative(1.45))
                             .text_color(colors.text)
                             .whitespace_normal()
-                            .child(highlighted_output),
+                            .child(clickable_output),
                     )
                 })
                 .when_some(toggle, |this, toggle| {
@@ -7953,23 +8099,28 @@ impl HarnessApp {
             })
         };
 
-        // Progressive cards render their visible fragments above. If none of
-        // them could claim the native cursor, it has entered a hidden tail.
-        // Reveal the complete output on the next frame; the header below owns
-        // the cursor during this frame so it never blinks out between states.
-        if rich_navigation_needs_progressive_reveal(
+        // Progressive cards render their visible fragments above. Reveal a
+        // hidden Normal cursor only when no fragment claimed it; Visual mode
+        // reveals eagerly so no selected rows remain invisible. The header is
+        // a one-frame proxy while the complete output is mounted.
+        let revealing_hidden_navigation = rich_navigation_needs_progressive_reveal(
             item.kind,
             item.expanded,
             output_expansion,
             rich_navigation.as_ref(),
-        ) {
+        );
+        if revealing_hidden_navigation {
             self.output_expansion
                 .insert(item.key.clone(), OutputExpansion::All);
             cx.notify();
         }
 
         let header_search = show_header.then_some(rich_search.as_ref()).flatten();
-        let header_cursor_range = claim_rich_header_cursor(&header_title, rich_navigation.as_ref());
+        let header_cursor_range = rich_header_navigation_range(
+            &header_title,
+            rich_navigation.as_ref(),
+            !item.expanded || revealing_hidden_navigation,
+        );
         let header_highlights = header_cursor_range
             .map(|range| {
                 vec![(
@@ -9910,7 +10061,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_header_cursor_is_a_single_fallback_owner() {
+    fn rich_header_navigation_is_a_single_fallback_owner() {
         let navigation = RichNavigationPaint {
             body_text: "hidden body".into(),
             ranges: Vec::new(),
@@ -9920,11 +10071,14 @@ mod tests {
         };
 
         assert_eq!(
-            claim_rich_header_cursor("Command", Some(&navigation)),
+            rich_header_navigation_range("Command", Some(&navigation), true),
             Some(0..1)
         );
         assert!(navigation.cursor_claimed.get());
-        assert_eq!(claim_rich_header_cursor("Command", Some(&navigation)), None);
+        assert_eq!(
+            rich_header_navigation_range("Command", Some(&navigation), true),
+            None
+        );
 
         let unicode = RichNavigationPaint {
             body_text: "hidden body".into(),
@@ -9934,9 +10088,37 @@ mod tests {
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
-            claim_rich_header_cursor("🧭 Tool", Some(&unicode)),
+            rich_header_navigation_range("🧭 Tool", Some(&unicode), true),
             Some(0.."🧭".len())
         );
+
+        let visual = RichNavigationPaint {
+            body_text: "hidden body".into(),
+            ranges: vec![2..7],
+            head: Some(6),
+            visual: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            rich_header_navigation_range("Command", Some(&visual), true),
+            Some(0.."Command".len()),
+            "a collapsed card should visibly represent its hidden selection"
+        );
+        assert_eq!(
+            rich_header_navigation_range("Command", Some(&visual), false),
+            None,
+            "an expanded card paints Visual mode on its body fragments"
+        );
+    }
+
+    #[test]
+    fn rich_structured_text_hit_testing_stays_inside_its_logical_fragment() {
+        let fragment = 10..15;
+
+        assert_eq!(logical_offset_for_rendered_index(&fragment, 0), 10);
+        assert_eq!(logical_offset_for_rendered_index(&fragment, 3), 13);
+        assert_eq!(logical_offset_for_rendered_index(&fragment, 5), 15);
+        assert_eq!(logical_offset_for_rendered_index(&fragment, usize::MAX), 15);
     }
 
     #[test]
@@ -9974,6 +10156,26 @@ mod tests {
             true,
             OutputExpansion::Preview,
             Some(&navigation),
+        ));
+
+        let visual = RichNavigationPaint {
+            body_text: "visible\nhidden".into(),
+            ranges: vec![0..4],
+            head: Some(3),
+            visual: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert!(rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Command,
+            true,
+            OutputExpansion::Preview,
+            Some(&visual),
+        ));
+        assert!(!rich_navigation_needs_progressive_reveal(
+            model::TranscriptKind::Command,
+            true,
+            OutputExpansion::All,
+            Some(&visual),
         ));
     }
 
