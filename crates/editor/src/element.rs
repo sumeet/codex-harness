@@ -5202,6 +5202,41 @@ impl EditorElement {
                     paint_highlight(range.start, range.end, color, edges);
                 }
 
+                for (&row, overlay) in &layout.row_overlays {
+                    let mut origin_x = layout.hitbox.left();
+                    let mut width = layout.hitbox.size.width;
+                    if !overlay.include_gutter {
+                        origin_x += layout.gutter_hitbox.size.width;
+                        width -= layout.gutter_hitbox.size.width;
+                    }
+                    let inset = overlay
+                        .horizontal_inset
+                        .min((width - px(1.)).max(Pixels::ZERO) / 2.);
+                    origin_x += inset;
+                    width = (width - inset * 2.).max(px(1.));
+                    let row_top = layout.hitbox.origin.y
+                        + Pixels::from(
+                            (row.as_f64() - scroll_top)
+                                * ScrollPixelOffset::from(layout.position_map.line_height),
+                        );
+                    let bounds = Bounds {
+                        origin: point(origin_x, row_top),
+                        size: size(width, layout.position_map.line_height),
+                    };
+                    window.paint_quad(fill(bounds, overlay.background));
+                    if let Some(border) = overlay.top_border
+                        && overlay.top_border_width > Pixels::ZERO
+                    {
+                        window.paint_quad(fill(
+                            Bounds {
+                                origin: bounds.origin,
+                                size: size(bounds.size.width, overlay.top_border_width),
+                            },
+                            border,
+                        ));
+                    }
+                }
+
                 for (guide_x, active) in layout.wrap_guides.iter() {
                     let color = if *active {
                         cx.theme().colors().editor_active_wrap_guide
@@ -8386,9 +8421,13 @@ impl Element for EditorElement {
                         )
                     };
 
-                    let mut highlighted_rows = self
-                        .editor
-                        .update(cx, |editor, cx| editor.highlighted_display_rows(window, cx));
+                    let (mut highlighted_rows, row_overlays) =
+                        self.editor.update(cx, |editor, cx| {
+                            (
+                                editor.highlighted_display_rows(window, cx),
+                                editor.highlighted_display_row_overlays(window, cx),
+                            )
+                        });
 
                     let mut highlighted_ranges = self
                         .editor_with_selections(cx)
@@ -9672,6 +9711,7 @@ impl Element for EditorElement {
                         minimap,
                         active_rows,
                         highlighted_rows,
+                        row_overlays,
                         highlighted_ranges,
                         highlighted_gutter_ranges,
                         redacted_ranges,
@@ -9905,6 +9945,7 @@ pub struct EditorLayout {
     visible_display_row_range: Range<DisplayRow>,
     active_rows: BTreeMap<DisplayRow, LineHighlightSpec>,
     highlighted_rows: BTreeMap<DisplayRow, LineHighlight>,
+    row_overlays: BTreeMap<DisplayRow, crate::LineOverlay>,
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
     #[cfg(feature = "project-integration")]

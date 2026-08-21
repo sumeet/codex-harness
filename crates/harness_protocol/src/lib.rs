@@ -718,16 +718,25 @@ fn project_transcript_item(
     item_index: usize,
     item: &TranscriptItem,
 ) -> Option<TranscriptItemProjection> {
+    project_transcript_item_with_header(item_index, item, true)
+}
+
+fn project_transcript_item_with_header(
+    item_index: usize,
+    item: &TranscriptItem,
+    include_header: bool,
+) -> Option<TranscriptItemProjection> {
     if item.kind == TranscriptKind::Trace || !item.is_presentationally_visible() {
         return None;
     }
 
     let mut text = String::new();
     let header_start = text.len();
-    let show_header = !matches!(
-        (item.kind, item.title.as_str()),
-        (TranscriptKind::Agent, "Codex") | (TranscriptKind::User, "You")
-    );
+    let show_header = include_header
+        && !matches!(
+            (item.kind, item.title.as_str()),
+            (TranscriptKind::Agent, "Codex") | (TranscriptKind::User, "You")
+        );
     if show_header {
         text.push_str("━━━━ ");
         text.push_str(&normalize_buffer_line_endings(item.title.clone()));
@@ -1073,13 +1082,21 @@ impl TranscriptModel {
         let mut start = center.saturating_sub(item_limit / 2);
         let end = (start + item_limit).min(self.items.len());
         start = end.saturating_sub(item_limit);
-        self.document_range(start, end, true)
+        self.document_range(start, end, true, true)
     }
 
     /// Project every semantic transcript item into one selectable document.
     /// Unlike [`Self::document_window`], this never inserts truncation markers.
     pub fn full_document(&self) -> TranscriptDocument {
-        self.document_range(0, self.items.len(), false)
+        self.document_range(0, self.items.len(), false, true)
+    }
+
+    /// Project the selectable content used to drive the Rich transcript's
+    /// native Editor/Vim state. Rich headers are interactive chrome rather than
+    /// hidden text rows, so this document contains only the bodies users can
+    /// actually see and yank.
+    pub fn rich_navigation_document(&self) -> TranscriptDocument {
+        self.document_range(0, self.items.len(), false, false)
     }
 
     /// Project one model item without visiting or allocating the rest of the
@@ -1088,11 +1105,20 @@ impl TranscriptModel {
         project_transcript_item(item_index, self.items.get(item_index)?)
     }
 
+    /// Incremental counterpart to [`Self::rich_navigation_document`].
+    pub fn rich_navigation_item_projection(
+        &self,
+        item_index: usize,
+    ) -> Option<TranscriptItemProjection> {
+        project_transcript_item_with_header(item_index, self.items.get(item_index)?, false)
+    }
+
     fn document_range(
         &self,
         start: usize,
         end: usize,
         include_window_markers: bool,
+        include_headers: bool,
     ) -> TranscriptDocument {
         let mut text = String::new();
         let mut item_rows = vec![None; self.items.len()];
@@ -1108,7 +1134,9 @@ impl TranscriptModel {
         }
         for (index, item) in self.items[start..end].iter().enumerate() {
             let index = start + index;
-            let Some(projection) = project_transcript_item(index, item) else {
+            let Some(projection) =
+                project_transcript_item_with_header(index, item, include_headers)
+            else {
                 continue;
             };
             item_rows[index] = Some(current_row);
@@ -4650,6 +4678,30 @@ mod tests {
             segment.body_range.end,
         ] {
             assert!(document.text.is_char_boundary(offset));
+        }
+    }
+
+    #[test]
+    fn rich_navigation_document_contains_no_invisible_header_ornaments() {
+        let model = TranscriptModel::replay(8);
+        let document = model.rich_navigation_document();
+
+        assert!(!document.text.contains("━━━━"));
+        assert!(
+            document
+                .segments
+                .iter()
+                .all(|segment| segment.header_range.is_empty())
+        );
+        for segment in &document.segments {
+            let projection = model
+                .rich_navigation_item_projection(segment.item_index)
+                .unwrap();
+            assert_eq!(projection.text, document.text[segment.whole_range.clone()]);
+            assert_eq!(
+                projection.body_text(),
+                &document.text[segment.body_range.clone()]
+            );
         }
     }
 

@@ -10,7 +10,8 @@ use std::{
 };
 
 use editor::{
-    Addon, Bias, Editor, EditorEvent, Inlay, RowExt as _, RowHighlightOptions, SelectionEffects,
+    Addon, Bias, Editor, EditorEvent, Inlay, InlayHighlight, RowExt as _, RowHighlightOptions,
+    RowOverlayOptions, SelectionEffects,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
         FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
@@ -33,8 +34,8 @@ use settings::{KeybindSource, KeymapFile, Settings as _};
 use theme_settings::ThemeSettings;
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
-    Color, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
-    prelude::{ActiveTheme, LabelCommon as _},
+    Color, DiffStat, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
+    prelude::{ActiveTheme, LabelCommon as _, StyledTypography as _},
 };
 
 pub use editor::actions::{LocalNavigationBack, LocalNavigationForward};
@@ -271,11 +272,19 @@ pub struct TranscriptEditor {
     typography_profile: TranscriptTypographyProfile,
     segments: Vec<TranscriptDocumentSegment>,
     segment_header_texts: Vec<String>,
+    // The Rich selection bridge reads the selected logical body on every Vim
+    // motion. Retain the projected bodies with their segments so that motion
+    // clones an Arc instead of copying text back out of the Buffer.
+    segment_body_texts: Vec<Arc<str>>,
     model_item_count: usize,
     // Segment positions are stable across body-only streaming updates and
     // append-only growth. Keeping the ids keyed by position lets viewport
     // shifts retain blocks in the overlap instead of recreating every header.
     header_blocks: BTreeMap<usize, CustomBlockId>,
+    // Diff file headers are compact structural rows layered into otherwise
+    // selectable diff bodies. They are viewport-bounded and remounted when a
+    // streamed diff changes its file sections or counts.
+    diff_file_blocks: Vec<CustomBlockId>,
     collapsed_items: BTreeSet<String>,
     padding_inlays: Vec<InlayId>,
     next_padding_inlay_id: usize,
@@ -449,6 +458,30 @@ pub struct TranscriptSelectionChanged;
 
 impl EventEmitter<TranscriptSelectionChanged> for TranscriptEditor {}
 
+/// The portion of the real Editor/Vim selection that belongs to one Rich
+/// transcript item. Offsets are relative to the item's selectable body text,
+/// so a renderer can translate them into its own visual runs without knowing
+/// anything about ornamental transcript headers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptItemSelection {
+    pub item_index: usize,
+    pub body_text: Arc<str>,
+    pub range: Range<usize>,
+    pub head: Option<usize>,
+}
+
+/// A renderer-independent snapshot of the newest native Editor selection.
+///
+/// Rich mode consumes this snapshot while the Editor remains the sole Vim
+/// state machine. `visual` distinguishes a character selection from the
+/// normal-mode block cursor represented by `head`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptSelectionSnapshot {
+    pub visual: bool,
+    pub reversed: bool,
+    pub items: Vec<TranscriptItemSelection>,
+}
+
 struct TranscriptHeaderHighlight;
 struct UserTranscriptRows;
 struct ReasoningTranscriptRows;
@@ -478,6 +511,9 @@ struct DiffFileHeaderHighlight;
 struct DiffHunkHighlight;
 struct DiffAdditionHighlight;
 struct DiffDeletionHighlight;
+struct DiffAdditionRows;
+struct DiffDeletionRows;
+struct DiffGutterInlayHighlight;
 
 #[derive(Default)]
 struct TranscriptSearchState {
@@ -506,6 +542,7 @@ const FOLLOW_TAIL_SLOP_ROWS: f64 = 1.;
 const MAX_SEMANTIC_SPANS_PER_SEGMENT: usize = 2_048;
 const MAX_SCANNED_SEMANTIC_SPANS_PER_VIEWPORT: usize = 4_096;
 const MAX_SEMANTIC_SPAN_LOOKBEHIND: usize = 128;
+const MAX_NATIVE_DIFF_HEADER_SCAN_BYTES: usize = 512 * 1_024;
 
 #[derive(Clone, Debug)]
 struct ViewportDecorationWindow {
@@ -609,6 +646,210 @@ struct DiffHighlightRanges {
     additions: Vec<Range<usize>>,
     deletions: Vec<Range<usize>>,
     parsed_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeDiffFileHeader {
+    line_range: Range<usize>,
+    item_key: String,
+    file_index: usize,
+    path: String,
+    additions: usize,
+    deletions: usize,
+    counts_complete: bool,
+}
+
+fn normalized_diff_path(path: &str) -> Option<String> {
+    let path = path
+        .trim()
+        .trim_matches('"')
+        .split_once('\t')
+        .map_or(path.trim().trim_matches('"'), |(path, _)| path)
+        .trim_matches('"');
+    if path.is_empty() || path == "/dev/null" {
+        return None;
+    }
+    Some(
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+            .to_owned(),
+    )
+}
+
+fn diff_git_path(line: &str) -> Option<String> {
+    let header = line.strip_prefix("diff --git ")?;
+    header
+        .rsplit_once(" b/")
+        .map(|(_, path)| path)
+        .or_else(|| header.rsplit_once(" \"b/").map(|(_, path)| path))
+        .and_then(normalized_diff_path)
+}
+
+fn native_diff_file_headers(
+    text: &str,
+    base_offset: usize,
+    item_key: &str,
+    counts_complete: bool,
+) -> Vec<NativeDiffFileHeader> {
+    struct PendingHeader {
+        line_range: Range<usize>,
+        path: String,
+        additions: usize,
+        deletions: usize,
+        in_hunk: bool,
+    }
+
+    let mut headers = Vec::new();
+    let mut pending: Option<PendingHeader> = None;
+    let mut line_offset = 0;
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line_range = base_offset + line_offset..base_offset + line_offset + line.len();
+        line_offset += raw_line.len();
+
+        if let Some(path) = diff_git_path(line) {
+            if let Some(previous) = pending.take() {
+                let file_index = headers.len();
+                headers.push(NativeDiffFileHeader {
+                    line_range: previous.line_range,
+                    item_key: item_key.to_owned(),
+                    file_index,
+                    path: previous.path,
+                    additions: previous.additions,
+                    deletions: previous.deletions,
+                    counts_complete,
+                });
+            }
+            pending = Some(PendingHeader {
+                line_range,
+                path,
+                additions: 0,
+                deletions: 0,
+                in_hunk: false,
+            });
+            continue;
+        }
+
+        let Some(pending) = pending.as_mut() else {
+            continue;
+        };
+        if line.starts_with("@@") {
+            pending.in_hunk = true;
+        } else if pending.in_hunk && line.starts_with('+') && !line.starts_with("+++") {
+            pending.additions += 1;
+        } else if pending.in_hunk && line.starts_with('-') && !line.starts_with("---") {
+            pending.deletions += 1;
+        }
+    }
+    if let Some(previous) = pending {
+        let file_index = headers.len();
+        headers.push(NativeDiffFileHeader {
+            line_range: previous.line_range,
+            item_key: item_key.to_owned(),
+            file_index,
+            path: previous.path,
+            additions: previous.additions,
+            deletions: previous.deletions,
+            counts_complete,
+        });
+    }
+    headers
+}
+
+fn bounded_buffer_text(buffer: &Buffer, range: Range<usize>, byte_limit: usize) -> (String, bool) {
+    let complete = range.len() <= byte_limit;
+    let mut remaining = byte_limit;
+    let mut text = String::with_capacity(range.len().min(byte_limit));
+    for chunk in buffer.text_for_range(range) {
+        if remaining == 0 {
+            break;
+        }
+        if chunk.len() <= remaining {
+            text.push_str(chunk);
+            remaining -= chunk.len();
+        } else {
+            let mut end = remaining;
+            while end > 0 && !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.push_str(&chunk[..end]);
+            break;
+        }
+    }
+    (text, complete)
+}
+
+fn diff_hunk_starts(line: &str) -> Option<(usize, usize)> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "@@" {
+        return None;
+    }
+    let old_line = fields
+        .next()?
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    let new_line = fields
+        .next()?
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((old_line, new_line))
+}
+
+fn diff_gutter_inlays(text: &str, base_offset: usize) -> Vec<(usize, String)> {
+    let mut inlays = Vec::new();
+    let mut in_hunk = false;
+    let mut old_line = None;
+    let mut new_line = None;
+    let mut line_offset = 0;
+
+    for raw_line in text.split_inclusive('\n') {
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let (displayed_old, displayed_new) =
+            if line.starts_with("diff --git ") || line.starts_with("--- ") {
+                in_hunk = false;
+                (None, None)
+            } else if line.starts_with("@@") {
+                in_hunk = true;
+                if let Some((old_start, new_start)) = diff_hunk_starts(line) {
+                    old_line = Some(old_start);
+                    new_line = Some(new_start);
+                }
+                (None, None)
+            } else if in_hunk && line.starts_with('+') && !line.starts_with("+++") {
+                let displayed = new_line;
+                new_line = new_line.map(|line| line + 1);
+                (None, displayed)
+            } else if in_hunk && line.starts_with('-') && !line.starts_with("---") {
+                let displayed = old_line;
+                old_line = old_line.map(|line| line + 1);
+                (displayed, None)
+            } else if in_hunk && !line.starts_with("\\ No newline") {
+                let displayed = (old_line, new_line);
+                old_line = old_line.map(|line| line + 1);
+                new_line = new_line.map(|line| line + 1);
+                displayed
+            } else {
+                (None, None)
+            };
+        let old = displayed_old
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        let new = displayed_new
+            .map(|line| line.to_string())
+            .unwrap_or_default();
+        inlays.push((base_offset + line_offset, format!("{old:>3} {new:>3} ")));
+        line_offset += raw_line.len();
+    }
+    inlays
 }
 
 impl DiffHighlightRanges {
@@ -747,6 +988,12 @@ fn semantic_monospace_ranges(segments: &[TranscriptDocumentSegment]) -> Vec<Rang
         })
         .map(|span| span.range.clone())
         .collect::<Vec<_>>();
+    ranges.extend(
+        segments
+            .iter()
+            .filter(|segment| segment.kind == TranscriptKind::Diff)
+            .map(|segment| segment.body_range.clone()),
+    );
     ranges.sort_by_key(|range| (range.start, range.end));
     let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
     for range in ranges {
@@ -1120,6 +1367,14 @@ fn structured_transcript_background(cx: &App) -> Hsla {
 
 fn error_transcript_background(cx: &App) -> Hsla {
     cx.theme().status().error.opacity(0.1)
+}
+
+fn diff_addition_background(cx: &App) -> Hsla {
+    cx.theme().status().created_background.opacity(0.14)
+}
+
+fn diff_deletion_background(cx: &App) -> Hsla {
+    cx.theme().status().deleted_background.opacity(0.14)
 }
 
 fn transcript_card_border(cx: &App) -> Hsla {
@@ -1529,6 +1784,59 @@ fn native_header_block(
     }
 }
 
+fn native_diff_file_header_block(
+    placement: RangeInclusive<Anchor>,
+    header: NativeDiffFileHeader,
+) -> BlockProperties<Anchor> {
+    BlockProperties {
+        placement: BlockPlacement::Replace(placement),
+        height: Some(1),
+        style: BlockStyle::Spacer,
+        render: Arc::new(move |cx: &mut BlockContext| {
+            let colors = cx.theme().colors();
+            let path = header.path.clone();
+            let stat_id = format!("native-diff-stat:{}:{}", header.item_key, header.file_index);
+            div()
+                .id(cx.block_id)
+                .h(cx.line_height)
+                .w_full()
+                .min_w_0()
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_subheader_background.opacity(0.72))
+                .child(
+                    Icon::new(IconName::File)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .font_buffer(cx.app)
+                        .text_ui_sm(cx.app)
+                        .truncate()
+                        .child(path),
+                )
+                .when(
+                    header.counts_complete && (header.additions > 0 || header.deletions > 0),
+                    |this| {
+                        this.child(
+                            DiffStat::new(stat_id, header.additions, header.deletions)
+                                .label_size(LabelSize::XSmall),
+                        )
+                    },
+                )
+                .into_any_element()
+        }),
+        priority: 1,
+    }
+}
+
 fn transcript_item_is_foldable(segment: &TranscriptDocumentSegment) -> bool {
     !segment.body_range.is_empty()
         && matches!(
@@ -1715,8 +2023,10 @@ impl TranscriptEditor {
             typography_profile: TranscriptTypographyProfile::Reading,
             segments: Vec::new(),
             segment_header_texts: Vec::new(),
+            segment_body_texts: Vec::new(),
             model_item_count: 0,
             header_blocks: BTreeMap::new(),
+            diff_file_blocks: Vec::new(),
             collapsed_items: BTreeSet::new(),
             padding_inlays: Vec::new(),
             next_padding_inlay_id: 0,
@@ -1769,13 +2079,104 @@ impl TranscriptEditor {
 
     pub fn cursor_offset(&self, cx: &mut App) -> usize {
         self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.display_snapshot(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
             editor
                 .selections
-                .newest::<MultiBufferOffset>(&snapshot)
+                .newest_anchor()
                 .head()
+                .to_offset(&snapshot)
                 .0
         })
+    }
+
+    /// Project the real Editor/Vim selection into the selectable body of every
+    /// Rich item it intersects. Rich rendering remains completely independent
+    /// of Editor layout; this is only a shared logical-offset contract.
+    pub fn selection_snapshot(&self, cx: &mut App) -> TranscriptSelectionSnapshot {
+        let selection = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            editor
+                .selections
+                .newest_anchor()
+                .map(|anchor| anchor.to_offset(&snapshot).0)
+        });
+        let head = selection.head();
+        let visual = !selection.is_empty();
+        let mut items = Vec::new();
+
+        for (segment_position, segment) in self.segments.iter().enumerate() {
+            let body = segment.body_range.clone();
+            let intersects = if visual {
+                selection.start < body.end && body.start < selection.end
+            } else {
+                segment.whole_range.start <= head && head <= segment.whole_range.end
+            };
+            if !intersects {
+                continue;
+            }
+
+            let body_text = self
+                .segment_body_texts
+                .get(segment_position)
+                .cloned()
+                .unwrap_or_else(|| {
+                    Arc::from(
+                        self.buffer
+                            .read(cx)
+                            .text_for_range(body.clone())
+                            .collect::<String>(),
+                    )
+                });
+            let range = if visual {
+                selection.start.max(body.start) - body.start
+                    ..selection.end.min(body.end) - body.start
+            } else {
+                let offset = head.clamp(body.start, body.end) - body.start;
+                offset..offset
+            };
+            let item_head = (body.start..=body.end)
+                .contains(&head)
+                .then_some(head.clamp(body.start, body.end) - body.start);
+            items.push(TranscriptItemSelection {
+                item_index: segment.item_index,
+                body_text,
+                range,
+                head: item_head,
+            });
+        }
+
+        TranscriptSelectionSnapshot {
+            visual,
+            reversed: selection.reversed,
+            items,
+        }
+    }
+
+    /// Place the native cursor at an item-relative logical byte offset. This
+    /// is the mouse-placement bridge for Rich text runs.
+    pub fn set_cursor_in_item(
+        &mut self,
+        item_index: usize,
+        body_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(segment) = self
+            .segments
+            .iter()
+            .find(|segment| segment.item_index == item_index)
+        else {
+            return false;
+        };
+        let offset = (segment.body_range.start + body_offset).min(segment.body_range.end);
+        let text = self.buffer.read(cx).text();
+        let point = offset_to_point(&text, offset);
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_ranges([point..point]);
+            });
+        });
+        true
     }
 
     pub fn selected_item(&self, cx: &mut App) -> Option<usize> {
@@ -2178,10 +2579,14 @@ impl TranscriptEditor {
             .filter(|(_, segment)| replaced_item_keys.contains(&segment.item_key))
             .filter_map(|(position, _)| self.header_blocks.remove(&position))
             .collect::<Vec<_>>();
+        let diff_file_blocks_to_remove = std::mem::take(&mut self.diff_file_blocks);
 
         let block_ids = self.editor.update(cx, |editor, cx| {
             if !header_blocks_to_remove.is_empty() {
                 editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
+            }
+            if !diff_file_blocks_to_remove.is_empty() {
+                editor.remove_blocks(diff_file_blocks_to_remove.into_iter().collect(), None, cx);
             }
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let blocks = pending.iter().map(|(_, range, rows, view)| {
@@ -2243,6 +2648,20 @@ impl TranscriptEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let collapsed = !self.collapsed_items.contains(item_key);
+        self.set_item_collapsed(item_key, collapsed, window, cx)
+    }
+
+    /// Make the native navigation document agree with a Rich card's disclosure
+    /// state. This is idempotent so the Rich renderer can call it whenever the
+    /// user toggles a card without maintaining a second fold state machine.
+    pub fn set_item_collapsed(
+        &mut self,
+        item_key: &str,
+        collapsed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(segment) = self
             .segments
             .iter()
@@ -2260,7 +2679,7 @@ impl TranscriptEditor {
             .count()
             .max(1);
         let item_key = item_key.to_owned();
-        let collapsed = self.editor.update(cx, |editor, cx| {
+        let changed = self.editor.update(cx, |editor, cx| {
             let currently_folded = editor
                 .display_snapshot(cx)
                 .folds_in_range(
@@ -2268,11 +2687,13 @@ impl TranscriptEditor {
                 )
                 .next()
                 .is_some();
+            if currently_folded == collapsed {
+                return false;
+            }
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let anchors = clipped_anchor_range(&snapshot, body_range);
-            if currently_folded {
+            if !collapsed {
                 editor.unfold_ranges(&[anchors], true, false, cx);
-                false
             } else {
                 let mut placeholder: FoldPlaceholder = editor.default_fold_placeholder(cx);
                 placeholder.constrain_width = false;
@@ -2290,16 +2711,18 @@ impl TranscriptEditor {
                     window,
                     cx,
                 );
-                true
             }
+            true
         });
         if collapsed {
             self.collapsed_items.insert(item_key);
         } else {
             self.collapsed_items.remove(&item_key);
         }
-        self.pause_tail_follow();
-        cx.notify();
+        if changed {
+            self.pause_tail_follow();
+            cx.notify();
+        }
         true
     }
 
@@ -2513,10 +2936,41 @@ impl TranscriptEditor {
             .then(|| self.segments[row_segment_range].to_vec())
             .unwrap_or_default();
         let row_byte_range = desired.byte_range.clone();
-        let padding_offsets = rebuild_rows
+        let diff_file_blocks_to_remove = rebuild_diff_highlights
+            .then(|| std::mem::take(&mut self.diff_file_blocks))
+            .unwrap_or_default();
+        let diff_file_headers = rebuild_diff_highlights
             .then(|| {
                 let buffer = self.buffer.read(cx);
-                let mut offsets = Vec::new();
+                let visible_segments = segments_intersecting(&self.segments, &desired.byte_range);
+                self.segments[visible_segments]
+                    .iter()
+                    .filter(|segment| segment.kind == TranscriptKind::Diff)
+                    .filter(|segment| !replacement_item_keys.contains(segment.item_key.as_str()))
+                    .flat_map(|segment| {
+                        let (text, complete) = bounded_buffer_text(
+                            buffer,
+                            segment.body_range.clone(),
+                            MAX_NATIVE_DIFF_HEADER_SCAN_BYTES,
+                        );
+                        native_diff_file_headers(
+                            &text,
+                            segment.body_range.start,
+                            &segment.item_key,
+                            complete,
+                        )
+                        .into_iter()
+                        .filter(|header| {
+                            intersect_ranges(&header.line_range, &desired.byte_range).is_some()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let padding_specs = rebuild_rows
+            .then(|| {
+                let buffer = self.buffer.read(cx);
+                let mut specs = Vec::new();
                 for segment in &row_segments {
                     if !transcript_kind_is_card(segment.kind) {
                         continue;
@@ -2527,30 +2981,45 @@ impl TranscriptEditor {
                     if range.is_empty() {
                         continue;
                     }
+                    if segment.kind == TranscriptKind::Diff {
+                        let (text, _) = bounded_buffer_text(
+                            buffer,
+                            segment.body_range.clone(),
+                            MAX_NATIVE_DIFF_HEADER_SCAN_BYTES,
+                        );
+                        specs.extend(
+                            diff_gutter_inlays(&text, segment.body_range.start)
+                                .into_iter()
+                                .filter(|(offset, _)| range.contains(offset))
+                                .map(|(offset, text)| (offset, text, true)),
+                        );
+                        continue;
+                    }
                     let text = buffer.text_for_range(range.clone()).collect::<String>();
                     // The body start and every real hard-line start receive
                     // display-only padding. Soft wraps inherit the same indent
                     // from GPUI's line wrapper, while yanks remain byte-exact.
-                    offsets.push(range.start);
-                    offsets.extend(
+                    specs.push((range.start, "   ".to_owned(), false));
+                    specs.extend(
                         text.match_indices('\n')
                             .map(|(offset, _)| range.start + offset + 1)
-                            .filter(|offset| *offset < range.end),
+                            .filter(|offset| *offset < range.end)
+                            .map(|offset| (offset, "   ".to_owned(), false)),
                     );
                 }
-                offsets
+                specs
             })
             .unwrap_or_default();
         let padding_inlays_to_remove = rebuild_rows
             .then(|| std::mem::take(&mut self.padding_inlays))
             .unwrap_or_default();
-        let padding_inlays_to_insert = padding_offsets
+        let padding_inlays_to_insert = padding_specs
             .into_iter()
-            .map(|offset| {
+            .map(|(offset, text, diff_gutter)| {
                 let id = self.next_padding_inlay_id;
                 self.next_padding_inlay_id = self.next_padding_inlay_id.wrapping_add(1);
                 self.padding_inlays.push(InlayId::Custom(id));
-                (id, offset)
+                (id, offset, text, diff_gutter)
             })
             .collect::<Vec<_>>();
         let body_highlights = rebuild_rows.then(|| {
@@ -2621,85 +3090,269 @@ impl TranscriptEditor {
             .collect::<Vec<_>>();
 
         let transcript = cx.weak_entity();
-        let inserted_header_blocks = self.editor.update(cx, |editor, cx| {
-            if !header_blocks_to_remove.is_empty() {
-                editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
-            }
+        let (inserted_header_blocks, inserted_diff_file_blocks) =
+            self.editor.update(cx, |editor, cx| {
+                if !header_blocks_to_remove.is_empty() {
+                    editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
+                }
+                if !diff_file_blocks_to_remove.is_empty() {
+                    editor.remove_blocks(
+                        diff_file_blocks_to_remove.into_iter().collect(),
+                        None,
+                        cx,
+                    );
+                }
 
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            if rebuild_rows {
-                let inlays = padding_inlays_to_insert
-                    .into_iter()
-                    .map(|(id, offset)| {
-                        Inlay::custom(id, clipped_anchor_after(&snapshot, offset), "   ")
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                if rebuild_rows {
+                    let diff_gutter_highlights = padding_inlays_to_insert
+                        .iter()
+                        .filter(|(_, _, _, diff_gutter)| *diff_gutter)
+                        .map(|(id, offset, text, _)| InlayHighlight {
+                            inlay: InlayId::Custom(*id),
+                            inlay_position: clipped_anchor_after(&snapshot, *offset),
+                            range: 0..text.len(),
+                        })
+                        .collect();
+                    let inlays = padding_inlays_to_insert
+                        .into_iter()
+                        .map(|(id, offset, text, _)| {
+                            Inlay::custom(id, clipped_anchor_after(&snapshot, offset), text)
+                        })
+                        .collect();
+                    editor.splice_inlays(&padding_inlays_to_remove, inlays, cx);
+                    editor.highlight_inlays(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            DiffGutterInlayHighlight,
+                        >()),
+                        diff_gutter_highlights,
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_muted),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                }
+                let native_headers: Vec<_> = header_segments
+                    .iter()
+                    .zip(header_texts)
+                    .map(|(segment, header_text)| {
+                        let (start, end) =
+                            clipped_anchor_pair(&snapshot, segment.header_range.clone());
+                        native_header_block(
+                            start..=end,
+                            segment.item_key.clone(),
+                            segment.kind,
+                            native_header_text(&header_text).into(),
+                            transcript_item_is_foldable(segment),
+                            transcript.clone(),
+                        )
                     })
                     .collect();
-                editor.splice_inlays(&padding_inlays_to_remove, inlays, cx);
-            }
-            let native_headers: Vec<_> = header_segments
-                .iter()
-                .zip(header_texts)
-                .map(|(segment, header_text)| {
-                    let (start, end) = clipped_anchor_pair(&snapshot, segment.header_range.clone());
-                    native_header_block(
-                        start..=end,
-                        segment.item_key.clone(),
-                        segment.kind,
-                        native_header_text(&header_text).into(),
-                        transcript_item_is_foldable(segment),
-                        transcript.clone(),
-                    )
-                })
-                .collect();
-            let inserted_header_blocks = if !header_segments.is_empty() {
-                editor.insert_blocks(native_headers, None, cx)
-            } else {
-                Vec::new()
-            };
+                let inserted_header_blocks = if !header_segments.is_empty() {
+                    editor.insert_blocks(native_headers, None, cx)
+                } else {
+                    Vec::new()
+                };
+                let native_diff_headers = diff_file_headers.into_iter().filter_map(|header| {
+                    let (start_offset, end_offset) =
+                        replacement_anchor_offsets(header.line_range.clone())?;
+                    let start = snapshot.clip_offset(MultiBufferOffset(start_offset), Bias::Left);
+                    let end = snapshot.clip_offset(MultiBufferOffset(end_offset), Bias::Left);
+                    Some(native_diff_file_header_block(
+                        snapshot.anchor_before(start)..=snapshot.anchor_before(end),
+                        header,
+                    ))
+                });
+                let inserted_diff_file_blocks = editor.insert_blocks(native_diff_headers, None, cx);
 
-            if rebuild_rows {
-                editor.clear_row_highlights::<UserTranscriptRows>();
-                editor.clear_row_highlights::<ReasoningTranscriptRows>();
-                editor.clear_row_highlights::<StructuredTranscriptRows>();
-                editor.clear_row_highlights::<ErrorTranscriptRows>();
-                for segment in row_segments {
-                    let Some(range) = intersect_ranges(&segment.whole_range, &row_byte_range)
-                    else {
-                        continue;
-                    };
-                    let anchors = clipped_anchor_range(&snapshot, range);
-                    let options = transcript_row_options(segment.kind);
-                    match segment.kind {
-                        TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
-                            anchors,
-                            user_transcript_background,
-                            options,
+                if rebuild_rows {
+                    editor.clear_row_highlights::<UserTranscriptRows>();
+                    editor.clear_row_highlights::<ReasoningTranscriptRows>();
+                    editor.clear_row_highlights::<StructuredTranscriptRows>();
+                    editor.clear_row_highlights::<ErrorTranscriptRows>();
+                    editor.clear_row_overlays::<DiffAdditionRows>();
+                    editor.clear_row_overlays::<DiffDeletionRows>();
+                    for segment in row_segments {
+                        let Some(range) = intersect_ranges(&segment.whole_range, &row_byte_range)
+                        else {
+                            continue;
+                        };
+                        let anchors = clipped_anchor_range(&snapshot, range);
+                        let options = transcript_row_options(segment.kind);
+                        match segment.kind {
+                            TranscriptKind::User => editor.highlight_rows::<UserTranscriptRows>(
+                                anchors,
+                                user_transcript_background,
+                                options,
+                                cx,
+                            ),
+                            TranscriptKind::Reasoning | TranscriptKind::Plan => {
+                                editor.highlight_rows::<ReasoningTranscriptRows>(
+                                    anchors,
+                                    reasoning_transcript_background,
+                                    options,
+                                    cx,
+                                )
+                            }
+                            TranscriptKind::Error => editor.highlight_rows::<ErrorTranscriptRows>(
+                                anchors,
+                                error_transcript_background,
+                                options,
+                                cx,
+                            ),
+                            TranscriptKind::Agent | TranscriptKind::Trace => {}
+                            _ => editor.highlight_rows::<StructuredTranscriptRows>(
+                                anchors,
+                                structured_transcript_background,
+                                options,
+                                cx,
+                            ),
+                        }
+                    }
+
+                    if let Some((reasoning, plans)) = body_highlights {
+                        let anchors = |ranges: Vec<Range<usize>>| {
+                            ranges
+                                .into_iter()
+                                .map(|range| clipped_anchor_range(&snapshot, range))
+                                .collect::<Vec<_>>()
+                        };
+                        editor.highlight_text(
+                            HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                                ReasoningBodyHighlight,
+                            >()),
+                            anchors(reasoning),
+                            HighlightStyle {
+                                color: Some(cx.theme().colors().text_muted),
+                                font_style: Some(gpui::FontStyle::Italic),
+                                ..HighlightStyle::default()
+                            },
                             cx,
-                        ),
-                        TranscriptKind::Reasoning | TranscriptKind::Plan => editor
-                            .highlight_rows::<ReasoningTranscriptRows>(
-                            anchors,
-                            reasoning_transcript_background,
-                            options,
+                        );
+                        editor.highlight_text(
+                            HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                                PlanBodyHighlight,
+                            >()),
+                            anchors(plans),
+                            HighlightStyle {
+                                color: Some(cx.theme().colors().text_accent),
+                                font_weight: Some(FontWeight::BOLD),
+                                ..HighlightStyle::default()
+                            },
                             cx,
-                        ),
-                        TranscriptKind::Error => editor.highlight_rows::<ErrorTranscriptRows>(
-                            anchors,
-                            error_transcript_background,
-                            options,
-                            cx,
-                        ),
-                        TranscriptKind::Agent | TranscriptKind::Trace => {}
-                        _ => editor.highlight_rows::<StructuredTranscriptRows>(
-                            anchors,
-                            structured_transcript_background,
-                            options,
-                            cx,
-                        ),
+                        );
                     }
                 }
 
-                if let Some((reasoning, plans)) = body_highlights {
+                if let Some(diff_highlights) = diff_highlights {
+                    let DiffHighlightRanges {
+                        file_headers,
+                        hunks,
+                        additions,
+                        deletions,
+                        parsed_bytes: _,
+                    } = diff_highlights;
+                    let anchors = |ranges: Vec<Range<usize>>| {
+                        ranges
+                            .into_iter()
+                            .map(|range| clipped_anchor_range(&snapshot, range))
+                            .collect::<Vec<_>>()
+                    };
+                    let overlay_options = RowOverlayOptions {
+                        horizontal_inset: px(1.),
+                        ..RowOverlayOptions::default()
+                    };
+                    editor.clear_row_overlays::<DiffAdditionRows>();
+                    editor.clear_row_overlays::<DiffDeletionRows>();
+                    for range in &additions {
+                        editor.highlight_row_overlay::<DiffAdditionRows>(
+                            clipped_anchor_range(&snapshot, range.clone()),
+                            diff_addition_background,
+                            overlay_options,
+                            cx,
+                        );
+                    }
+                    for range in &deletions {
+                        editor.highlight_row_overlay::<DiffDeletionRows>(
+                            clipped_anchor_range(&snapshot, range.clone()),
+                            diff_deletion_background,
+                            overlay_options,
+                            cx,
+                        );
+                    }
+
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            DiffFileHeaderHighlight,
+                        >()),
+                        anchors(file_headers),
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_muted),
+                            font_weight: Some(FontWeight::BOLD),
+                            background_color: Some(
+                                cx.theme()
+                                    .colors()
+                                    .editor_subheader_background
+                                    .opacity(0.36),
+                            ),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            DiffHunkHighlight,
+                        >()),
+                        anchors(hunks),
+                        HighlightStyle {
+                            color: Some(cx.theme().status().modified),
+                            font_weight: Some(FontWeight::BOLD),
+                            background_color: Some(
+                                cx.theme().status().modified_background.opacity(0.16),
+                            ),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            DiffAdditionHighlight,
+                        >()),
+                        anchors(additions),
+                        HighlightStyle {
+                            color: Some(cx.theme().status().created),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            DiffDeletionHighlight,
+                        >()),
+                        anchors(deletions),
+                        HighlightStyle {
+                            color: Some(cx.theme().status().deleted),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                }
+
+                if let Some(semantic_highlights) = semantic_highlights {
+                    let SemanticHighlightRanges {
+                        headings,
+                        strong,
+                        emphasis,
+                        inline_code,
+                        links,
+                        code_blocks,
+                        block_quotes,
+                        strikethrough,
+                        command_invocations: _,
+                        command_outputs: _,
+                        scanned_spans: _,
+                    } = semantic_highlights;
                     let anchors = |ranges: Vec<Range<usize>>| {
                         ranges
                             .into_iter()
@@ -2708,21 +3361,43 @@ impl TranscriptEditor {
                     };
                     editor.highlight_text(
                         HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                            ReasoningBodyHighlight,
+                            MarkdownCodeBlockHighlight,
                         >()),
-                        anchors(reasoning),
+                        anchors(code_blocks),
                         HighlightStyle {
-                            color: Some(cx.theme().colors().text_muted),
-                            font_style: Some(gpui::FontStyle::Italic),
+                            background_color: Some(
+                                cx.theme()
+                                    .colors()
+                                    .editor_subheader_background
+                                    .opacity(0.72),
+                            ),
                             ..HighlightStyle::default()
                         },
                         cx,
                     );
                     editor.highlight_text(
                         HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                            PlanBodyHighlight,
+                            MarkdownBlockQuoteHighlight,
                         >()),
-                        anchors(plans),
+                        anchors(block_quotes),
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_muted),
+                            font_style: Some(gpui::FontStyle::Italic),
+                            background_color: Some(
+                                cx.theme()
+                                    .colors()
+                                    .editor_subheader_background
+                                    .opacity(0.28),
+                            ),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownHeadingHighlight,
+                        >()),
+                        anchors(headings),
                         HighlightStyle {
                             color: Some(cx.theme().colors().text_accent),
                             font_weight: Some(FontWeight::BOLD),
@@ -2730,335 +3405,190 @@ impl TranscriptEditor {
                         },
                         cx,
                     );
-                }
-            }
-
-            if let Some(diff_highlights) = diff_highlights {
-                let DiffHighlightRanges {
-                    file_headers,
-                    hunks,
-                    additions,
-                    deletions,
-                    parsed_bytes: _,
-                } = diff_highlights;
-                let anchors = |ranges: Vec<Range<usize>>| {
-                    ranges
-                        .into_iter()
-                        .map(|range| clipped_anchor_range(&snapshot, range))
-                        .collect::<Vec<_>>()
-                };
-
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        DiffFileHeaderHighlight,
-                    >()),
-                    anchors(file_headers),
-                    HighlightStyle {
-                        color: Some(cx.theme().colors().text_muted),
-                        font_weight: Some(FontWeight::BOLD),
-                        background_color: Some(
-                            cx.theme()
-                                .colors()
-                                .editor_subheader_background
-                                .opacity(0.36),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        DiffHunkHighlight,
-                    >()),
-                    anchors(hunks),
-                    HighlightStyle {
-                        color: Some(cx.theme().status().modified),
-                        font_weight: Some(FontWeight::BOLD),
-                        background_color: Some(
-                            cx.theme().status().modified_background.opacity(0.16),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        DiffAdditionHighlight,
-                    >()),
-                    anchors(additions),
-                    HighlightStyle {
-                        color: Some(cx.theme().status().created),
-                        background_color: Some(
-                            cx.theme().status().created_background.opacity(0.14),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        DiffDeletionHighlight,
-                    >()),
-                    anchors(deletions),
-                    HighlightStyle {
-                        color: Some(cx.theme().status().deleted),
-                        background_color: Some(
-                            cx.theme().status().deleted_background.opacity(0.14),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-            }
-
-            if let Some(semantic_highlights) = semantic_highlights {
-                let SemanticHighlightRanges {
-                    headings,
-                    strong,
-                    emphasis,
-                    inline_code,
-                    links,
-                    code_blocks,
-                    block_quotes,
-                    strikethrough,
-                    command_invocations: _,
-                    command_outputs: _,
-                    scanned_spans: _,
-                } = semantic_highlights;
-                let anchors = |ranges: Vec<Range<usize>>| {
-                    ranges
-                        .into_iter()
-                        .map(|range| clipped_anchor_range(&snapshot, range))
-                        .collect::<Vec<_>>()
-                };
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownCodeBlockHighlight,
-                    >()),
-                    anchors(code_blocks),
-                    HighlightStyle {
-                        background_color: Some(
-                            cx.theme()
-                                .colors()
-                                .editor_subheader_background
-                                .opacity(0.72),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownBlockQuoteHighlight,
-                    >()),
-                    anchors(block_quotes),
-                    HighlightStyle {
-                        color: Some(cx.theme().colors().text_muted),
-                        font_style: Some(gpui::FontStyle::Italic),
-                        background_color: Some(
-                            cx.theme()
-                                .colors()
-                                .editor_subheader_background
-                                .opacity(0.28),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownHeadingHighlight,
-                    >()),
-                    anchors(headings),
-                    HighlightStyle {
-                        color: Some(cx.theme().colors().text_accent),
-                        font_weight: Some(FontWeight::BOLD),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownStrongHighlight,
-                    >()),
-                    anchors(strong),
-                    HighlightStyle {
-                        font_weight: Some(FontWeight::BOLD),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownEmphasisHighlight,
-                    >()),
-                    anchors(emphasis),
-                    HighlightStyle {
-                        font_style: Some(gpui::FontStyle::Italic),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownInlineCodeHighlight,
-                    >()),
-                    anchors(inline_code),
-                    HighlightStyle {
-                        color: Some(cx.theme().colors().text_accent),
-                        background_color: Some(
-                            cx.theme()
-                                .colors()
-                                .editor_subheader_background
-                                .opacity(0.72),
-                        ),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                let link_color = cx.theme().colors().text_accent;
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownLinkHighlight,
-                    >()),
-                    anchors(links),
-                    HighlightStyle {
-                        color: Some(link_color),
-                        underline: Some(gpui::UnderlineStyle {
-                            thickness: px(1.),
-                            color: Some(link_color),
-                            wavy: false,
-                        }),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-                let strikethrough_color = cx.theme().colors().text_muted;
-                editor.highlight_text(
-                    HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
-                        MarkdownStrikethroughHighlight,
-                    >()),
-                    anchors(strikethrough),
-                    HighlightStyle {
-                        color: Some(strikethrough_color),
-                        strikethrough: Some(gpui::StrikethroughStyle {
-                            thickness: px(1.),
-                            color: Some(strikethrough_color),
-                        }),
-                        ..HighlightStyle::default()
-                    },
-                    cx,
-                );
-            }
-
-            if let Some(shell_highlights) = shell_semantic_highlights {
-                let anchors = |ranges: Vec<Range<usize>>| {
-                    ranges
-                        .into_iter()
-                        .map(|range| clipped_anchor_range(&snapshot, range))
-                        .collect::<Vec<_>>()
-                };
-                let fallback = HighlightStyle {
-                    color: Some(cx.theme().colors().text_accent),
-                    ..HighlightStyle::default()
-                };
-                let syntax = cx.theme().syntax();
-                let function_style = syntax.style_for_name("function").unwrap_or(fallback);
-                let variable_style = syntax.style_for_name("variable").unwrap_or(fallback);
-                let keyword_style = syntax.style_for_name("keyword").unwrap_or(fallback);
-                let operator_style = syntax.style_for_name("operator").unwrap_or(fallback);
-                let constant_style = syntax.style_for_name("constant").unwrap_or(fallback);
-                let string_style = syntax.style_for_name("string").unwrap_or(fallback);
-                let comment_style = syntax.style_for_name("comment").unwrap_or(fallback);
-                let embedded_style = syntax.style_for_name("embedded").unwrap_or(fallback);
-                let punctuation_style = syntax.style_for_name("punctuation").unwrap_or(fallback);
-                macro_rules! paint_shell {
-                    ($marker:ty, $ranges:expr, $style:expr) => {
-                        editor.highlight_text(
-                            HighlightKey::NavigationOverlay(
-                                NavigationOverlayKey::unique::<$marker>(),
-                            ),
-                            anchors($ranges),
-                            $style,
-                            cx,
-                        );
-                    };
-                }
-                paint_shell!(
-                    ShellFunctionHighlight,
-                    shell_highlights.functions,
-                    function_style
-                );
-                paint_shell!(
-                    ShellVariableHighlight,
-                    shell_highlights.variables,
-                    variable_style
-                );
-                paint_shell!(
-                    ShellKeywordHighlight,
-                    shell_highlights.keywords,
-                    keyword_style
-                );
-                paint_shell!(
-                    ShellOperatorHighlight,
-                    shell_highlights.operators,
-                    operator_style
-                );
-                paint_shell!(
-                    ShellConstantHighlight,
-                    shell_highlights.constants,
-                    constant_style
-                );
-                paint_shell!(ShellStringHighlight, shell_highlights.strings, string_style);
-                paint_shell!(
-                    ShellCommentHighlight,
-                    shell_highlights.comments,
-                    comment_style
-                );
-                paint_shell!(
-                    ShellEmbeddedHighlight,
-                    shell_highlights.embedded,
-                    embedded_style
-                );
-                paint_shell!(
-                    ShellPunctuationHighlight,
-                    shell_highlights.punctuation,
-                    punctuation_style
-                );
-            }
-
-            if let Some(search_highlights) = search_highlights {
-                if let Some(search_highlights) = search_highlights {
-                    let active_search_match = active_search_match.map(|range| {
-                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
-                    });
-                    let active_match_index = active_search_match.as_ref().and_then(|active| {
-                        search_highlights
-                            .iter()
-                            .position(|candidate| candidate == active)
-                    });
-                    let anchors = search_highlights
-                        .into_iter()
-                        .map(|range| clipped_anchor_range(&snapshot, range))
-                        .collect::<Vec<_>>();
-                    editor.highlight_background(
-                        HighlightKey::BufferSearchHighlights,
-                        &anchors,
-                        move |index, theme| {
-                            if active_match_index == Some(*index) {
-                                theme.colors().search_active_match_background
-                            } else {
-                                theme.colors().search_match_background
-                            }
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownStrongHighlight,
+                        >()),
+                        anchors(strong),
+                        HighlightStyle {
+                            font_weight: Some(FontWeight::BOLD),
+                            ..HighlightStyle::default()
                         },
                         cx,
                     );
-                } else {
-                    editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownEmphasisHighlight,
+                        >()),
+                        anchors(emphasis),
+                        HighlightStyle {
+                            font_style: Some(gpui::FontStyle::Italic),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownInlineCodeHighlight,
+                        >()),
+                        anchors(inline_code),
+                        HighlightStyle {
+                            color: Some(cx.theme().colors().text_accent),
+                            background_color: Some(
+                                cx.theme()
+                                    .colors()
+                                    .editor_subheader_background
+                                    .opacity(0.72),
+                            ),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    let link_color = cx.theme().colors().text_accent;
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownLinkHighlight,
+                        >()),
+                        anchors(links),
+                        HighlightStyle {
+                            color: Some(link_color),
+                            underline: Some(gpui::UnderlineStyle {
+                                thickness: px(1.),
+                                color: Some(link_color),
+                                wavy: false,
+                            }),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
+                    let strikethrough_color = cx.theme().colors().text_muted;
+                    editor.highlight_text(
+                        HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                            MarkdownStrikethroughHighlight,
+                        >()),
+                        anchors(strikethrough),
+                        HighlightStyle {
+                            color: Some(strikethrough_color),
+                            strikethrough: Some(gpui::StrikethroughStyle {
+                                thickness: px(1.),
+                                color: Some(strikethrough_color),
+                            }),
+                            ..HighlightStyle::default()
+                        },
+                        cx,
+                    );
                 }
-            }
-            inserted_header_blocks
-        });
+
+                if let Some(shell_highlights) = shell_semantic_highlights {
+                    let anchors = |ranges: Vec<Range<usize>>| {
+                        ranges
+                            .into_iter()
+                            .map(|range| clipped_anchor_range(&snapshot, range))
+                            .collect::<Vec<_>>()
+                    };
+                    let fallback = HighlightStyle {
+                        color: Some(cx.theme().colors().text_accent),
+                        ..HighlightStyle::default()
+                    };
+                    let syntax = cx.theme().syntax();
+                    let function_style = syntax.style_for_name("function").unwrap_or(fallback);
+                    let variable_style = syntax.style_for_name("variable").unwrap_or(fallback);
+                    let keyword_style = syntax.style_for_name("keyword").unwrap_or(fallback);
+                    let operator_style = syntax.style_for_name("operator").unwrap_or(fallback);
+                    let constant_style = syntax.style_for_name("constant").unwrap_or(fallback);
+                    let string_style = syntax.style_for_name("string").unwrap_or(fallback);
+                    let comment_style = syntax.style_for_name("comment").unwrap_or(fallback);
+                    let embedded_style = syntax.style_for_name("embedded").unwrap_or(fallback);
+                    let punctuation_style =
+                        syntax.style_for_name("punctuation").unwrap_or(fallback);
+                    macro_rules! paint_shell {
+                        ($marker:ty, $ranges:expr, $style:expr) => {
+                            editor.highlight_text(
+                                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                                    $marker,
+                                >()),
+                                anchors($ranges),
+                                $style,
+                                cx,
+                            );
+                        };
+                    }
+                    paint_shell!(
+                        ShellFunctionHighlight,
+                        shell_highlights.functions,
+                        function_style
+                    );
+                    paint_shell!(
+                        ShellVariableHighlight,
+                        shell_highlights.variables,
+                        variable_style
+                    );
+                    paint_shell!(
+                        ShellKeywordHighlight,
+                        shell_highlights.keywords,
+                        keyword_style
+                    );
+                    paint_shell!(
+                        ShellOperatorHighlight,
+                        shell_highlights.operators,
+                        operator_style
+                    );
+                    paint_shell!(
+                        ShellConstantHighlight,
+                        shell_highlights.constants,
+                        constant_style
+                    );
+                    paint_shell!(ShellStringHighlight, shell_highlights.strings, string_style);
+                    paint_shell!(
+                        ShellCommentHighlight,
+                        shell_highlights.comments,
+                        comment_style
+                    );
+                    paint_shell!(
+                        ShellEmbeddedHighlight,
+                        shell_highlights.embedded,
+                        embedded_style
+                    );
+                    paint_shell!(
+                        ShellPunctuationHighlight,
+                        shell_highlights.punctuation,
+                        punctuation_style
+                    );
+                }
+
+                if let Some(search_highlights) = search_highlights {
+                    if let Some(search_highlights) = search_highlights {
+                        let active_search_match = active_search_match.map(|range| {
+                            range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                        });
+                        let active_match_index = active_search_match.as_ref().and_then(|active| {
+                            search_highlights
+                                .iter()
+                                .position(|candidate| candidate == active)
+                        });
+                        let anchors = search_highlights
+                            .into_iter()
+                            .map(|range| clipped_anchor_range(&snapshot, range))
+                            .collect::<Vec<_>>();
+                        editor.highlight_background(
+                            HighlightKey::BufferSearchHighlights,
+                            &anchors,
+                            move |index, theme| {
+                                if active_match_index == Some(*index) {
+                                    theme.colors().search_active_match_background
+                                } else {
+                                    theme.colors().search_match_background
+                                }
+                            },
+                            cx,
+                        );
+                    } else {
+                        editor
+                            .clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
+                    }
+                }
+                (inserted_header_blocks, inserted_diff_file_blocks)
+            });
         debug_assert_eq!(
             header_positions_to_insert.len(),
             inserted_header_blocks.len()
@@ -3069,6 +3599,7 @@ impl TranscriptEditor {
         {
             self.header_blocks.insert(position, block_id);
         }
+        self.diff_file_blocks = inserted_diff_file_blocks;
         self.viewport_decorations = Some(desired);
         self.diff_highlights_dirty = false;
         self.semantic_highlights_dirty = false;
@@ -3116,9 +3647,11 @@ impl TranscriptEditor {
             self.unmount_all_replacements(cx);
             self.segments.clear();
             self.segment_header_texts.clear();
+            self.segment_body_texts.clear();
             self.collapsed_items.clear();
             self.model_item_count = document.item_rows.len();
             let previous_header_blocks = std::mem::take(&mut self.header_blocks);
+            let previous_diff_file_blocks = std::mem::take(&mut self.diff_file_blocks);
             self.viewport_decorations = None;
             self.diff_highlights_dirty = false;
             self.semantic_highlights_dirty = false;
@@ -3127,10 +3660,15 @@ impl TranscriptEditor {
                 if !previous_header_blocks.is_empty() {
                     editor.remove_blocks(previous_header_blocks.into_values().collect(), None, cx);
                 }
+                if !previous_diff_file_blocks.is_empty() {
+                    editor.remove_blocks(previous_diff_file_blocks.into_iter().collect(), None, cx);
+                }
                 editor.clear_row_highlights::<UserTranscriptRows>();
                 editor.clear_row_highlights::<ReasoningTranscriptRows>();
                 editor.clear_row_highlights::<StructuredTranscriptRows>();
                 editor.clear_row_highlights::<ErrorTranscriptRows>();
+                editor.clear_row_overlays::<DiffAdditionRows>();
+                editor.clear_row_overlays::<DiffDeletionRows>();
                 for key in [
                     NavigationOverlayKey::unique::<TranscriptHeaderHighlight>(),
                     NavigationOverlayKey::unique::<ReasoningBodyHighlight>(),
@@ -3182,8 +3720,14 @@ impl TranscriptEditor {
             .iter()
             .map(|segment| document.text[segment.header_range.clone()].to_owned())
             .collect();
+        self.segment_body_texts = document
+            .segments
+            .iter()
+            .map(|segment| Arc::<str>::from(&document.text[segment.body_range.clone()]))
+            .collect();
         self.model_item_count = document.item_rows.len();
         let previous_header_blocks = std::mem::take(&mut self.header_blocks);
+        let previous_diff_file_blocks = std::mem::take(&mut self.diff_file_blocks);
         self.viewport_decorations = None;
         self.diff_highlights_dirty = true;
         self.semantic_highlights_dirty = true;
@@ -3192,10 +3736,15 @@ impl TranscriptEditor {
             if !previous_header_blocks.is_empty() {
                 editor.remove_blocks(previous_header_blocks.into_values().collect(), None, cx);
             }
+            if !previous_diff_file_blocks.is_empty() {
+                editor.remove_blocks(previous_diff_file_blocks.into_iter().collect(), None, cx);
+            }
             editor.clear_row_highlights::<UserTranscriptRows>();
             editor.clear_row_highlights::<ReasoningTranscriptRows>();
             editor.clear_row_highlights::<StructuredTranscriptRows>();
             editor.clear_row_highlights::<ErrorTranscriptRows>();
+            editor.clear_row_overlays::<DiffAdditionRows>();
+            editor.clear_row_overlays::<DiffDeletionRows>();
 
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let headers = document
@@ -3240,6 +3789,7 @@ impl TranscriptEditor {
     ) -> bool {
         if self.model_item_count != old_model_item_count
             || self.segment_header_texts.len() != self.segments.len()
+            || self.segment_body_texts.len() != self.segments.len()
             || self.buffer.read(cx).len()
                 != self
                     .segments
@@ -3340,6 +3890,7 @@ impl TranscriptEditor {
         }
 
         let mut next_segments = self.segments.clone();
+        let mut next_body_texts = self.segment_body_texts.clone();
         for (segment_position, projection) in &updates {
             if !apply_projected_segment_shape(
                 &mut next_segments,
@@ -3348,11 +3899,13 @@ impl TranscriptEditor {
             ) {
                 return false;
             }
+            next_body_texts[*segment_position] = Arc::from(projection.body_text());
         }
 
         let mut append_text = String::new();
         let mut appended_segments = Vec::with_capacity(appended_projections.len());
         let mut appended_headers = Vec::with_capacity(appended_projections.len());
+        let mut appended_bodies = Vec::with_capacity(appended_projections.len());
         let mut next_offset = next_segments
             .last()
             .map_or(0, |segment| segment.whole_range.end);
@@ -3375,6 +3928,7 @@ impl TranscriptEditor {
                     .collect(),
             });
             appended_headers.push(projection.header_text().to_owned());
+            appended_bodies.push(Arc::from(projection.body_text()));
             next_offset += projection.text.len();
             append_text.push_str(&projection.text);
         }
@@ -3395,8 +3949,10 @@ impl TranscriptEditor {
 
         let appended_segment_start = next_segments.len();
         next_segments.extend(appended_segments);
+        next_body_texts.extend(appended_bodies);
         self.segments = next_segments;
         self.segment_header_texts.extend(appended_headers);
+        self.segment_body_texts = next_body_texts;
         self.model_item_count = old_model_item_count + appended.len();
         self.diff_highlights_dirty |= diff_bodies_changed;
         self.semantic_highlights_dirty |= semantic_bodies_changed;

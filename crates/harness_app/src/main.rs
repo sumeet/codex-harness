@@ -4,7 +4,7 @@ use std::{
     ops::Range,
     path::Path,
     rc::Rc,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,9 +19,9 @@ use gpui::{
 use gpui_platform::application;
 use harness_editor::{
     LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptReplacement,
-    TranscriptSelectionChanged, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
-    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious, shell_capture_priority,
-    shell_capture_ranges,
+    TranscriptSelectionChanged, TranscriptSelectionSnapshot, TranscriptSupplement,
+    TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext,
+    VimWordPrevious, shell_capture_priority, shell_capture_ranges,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -136,7 +136,7 @@ enum PerformanceJPhase {
 enum PerformanceJStep {
     Prepare,
     Baseline,
-    Dispatch,
+    Dispatch { down: bool },
     Report,
 }
 
@@ -175,11 +175,13 @@ impl PerformanceJRunState {
                 self.phase = PerformanceJPhase::Dispatch {
                     remaining: remaining - 1,
                 };
-                Some(PerformanceJStep::Dispatch)
+                Some(PerformanceJStep::Dispatch {
+                    down: remaining % 2 == 0,
+                })
             }
             PerformanceJPhase::Dispatch { remaining: 1 } => {
                 self.phase = PerformanceJPhase::Report;
-                Some(PerformanceJStep::Dispatch)
+                Some(PerformanceJStep::Dispatch { down: false })
             }
             PerformanceJPhase::Dispatch { remaining: 0 } | PerformanceJPhase::Report => {
                 self.phase = PerformanceJPhase::Complete;
@@ -195,20 +197,24 @@ struct PerformanceJDriver {
     state: PerformanceJRunState,
     g: Keystroke,
     j: Keystroke,
+    k: Keystroke,
+    pending_motion_origin: Option<usize>,
 }
 
 impl PerformanceJDriver {
-    fn new(generation: u64, g: Keystroke, j: Keystroke) -> Self {
+    fn new(generation: u64, g: Keystroke, j: Keystroke, k: Keystroke) -> Self {
         Self {
             state: PerformanceJRunState::new(generation),
             g,
             j,
+            k,
+            pending_motion_origin: None,
         }
     }
 }
 
 fn performance_j_has_room(logical_lines: usize) -> bool {
-    logical_lines > usize::from(PERFORMANCE_J_STEPS)
+    logical_lines > 1
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -272,6 +278,125 @@ struct RichSearchPaint {
     active_item: bool,
     active_claimed: Cell<bool>,
     remaining_ranges: Cell<usize>,
+}
+
+/// Item-local projection of the real Editor/Vim selection used by Rich
+/// renderers. `body_text` is the exact logical text on which Vim operated;
+/// renderers only translate its byte ranges into their visual fragments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RichNavigationPaint {
+    body_text: Arc<str>,
+    range: Range<usize>,
+    head: Option<usize>,
+    visual: bool,
+}
+
+impl RichNavigationPaint {
+    fn effective_range(&self) -> Option<Range<usize>> {
+        if self.visual {
+            return (self.range.start < self.range.end).then(|| self.range.clone());
+        }
+        let head = self.head?.min(self.body_text.len());
+        if head < self.body_text.len() {
+            let end = self.body_text[head..]
+                .char_indices()
+                .nth(1)
+                .map_or(self.body_text.len(), |(offset, _)| head + offset);
+            Some(head..end)
+        } else if head > 0 {
+            let start = self.body_text[..head]
+                .char_indices()
+                .next_back()
+                .map_or(0, |(offset, _)| offset);
+            Some(start..head)
+        } else {
+            None
+        }
+    }
+
+    fn markdown_source_range(&self, source: &str) -> Option<Range<usize>> {
+        let logical = self.effective_range()?;
+        Some(
+            markdown_source_offset_for_logical(&self.body_text, source, logical.start)
+                ..markdown_source_offset_for_logical(&self.body_text, source, logical.end),
+        )
+    }
+}
+
+/// Locate a visible Rich fragment in the logical transcript body, preserving
+/// order when the same text occurs more than once. Renderers use this small
+/// adapter instead of knowing anything about Editor-global offsets.
+fn rich_navigation_fragment_range(
+    navigation: Option<&RichNavigationPaint>,
+    fragment: &str,
+    logical_cursor: &mut usize,
+) -> Range<usize> {
+    let start = if let Some(navigation) = navigation {
+        let search_start = (*logical_cursor).min(navigation.body_text.len());
+        let Some(offset) = navigation.body_text[search_start..].find(fragment) else {
+            // The Rich renderer may show ornaments synthesized from structured
+            // protocol data. If they are absent from the logical document,
+            // leave them deliberately unselectable instead of shifting every
+            // subsequent fragment onto the wrong Vim bytes.
+            return search_start..search_start;
+        };
+        search_start + offset
+    } else {
+        *logical_cursor
+    };
+    let end = start + fragment.len();
+    *logical_cursor = end;
+    start..end
+}
+
+/// Map visible Markdown text back to its source by treating formatting marks
+/// as skippable source bytes. This deliberately uses the same plain-text
+/// projection that Vim sees. It handles ordinary emphasis, links, and inline
+/// code without allowing the cursor to disappear inside hidden delimiters.
+fn markdown_source_offset_for_logical(logical: &str, source: &str, requested: usize) -> usize {
+    let requested = requested.min(logical.len());
+    let mut source_cursor = 0;
+    for (logical_offset, character) in logical.char_indices() {
+        let found = source[source_cursor..]
+            .char_indices()
+            .find(|(_, source_character)| *source_character == character)
+            .map(|(offset, source_character)| {
+                source_cursor + offset..source_cursor + offset + source_character.len_utf8()
+            });
+        if let Some(found) = found {
+            if logical_offset >= requested || requested < logical_offset + character.len_utf8() {
+                return found.start;
+            }
+            source_cursor = found.end;
+        } else if logical_offset >= requested {
+            return source_cursor;
+        }
+    }
+    source_cursor.min(source.len())
+}
+
+/// Reverse the paint mapping for mouse placement. A click on a visible glyph
+/// becomes an offset in the delimiter-free text owned by the navigation
+/// Editor; clicks on hidden Markdown punctuation snap to the next visible
+/// glyph instead of placing Vim on a byte the Rich renderer cannot show.
+fn markdown_logical_offset_for_source(logical: &str, source: &str, requested: usize) -> usize {
+    let requested = requested.min(source.len());
+    let mut source_cursor = 0;
+    for (logical_offset, character) in logical.char_indices() {
+        let Some((offset, source_character)) = source[source_cursor..]
+            .char_indices()
+            .find(|(_, source_character)| *source_character == character)
+        else {
+            continue;
+        };
+        let found_start = source_cursor + offset;
+        let found_end = found_start + source_character.len_utf8();
+        if requested <= found_start || requested < found_end {
+            return logical_offset;
+        }
+        source_cursor = found_end;
+    }
+    logical.len()
 }
 
 impl RichSearchPaint {
@@ -420,6 +545,49 @@ fn searchable_styled_text(
         base
     };
     StyledText::new(text).with_highlights(highlights)
+}
+
+fn navigation_highlights_for_fragment(
+    navigation: Option<&RichNavigationPaint>,
+    fragment: Range<usize>,
+    cx: &App,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    let Some(navigation) = navigation else {
+        return Vec::new();
+    };
+    let Some(selection) = navigation.effective_range() else {
+        return Vec::new();
+    };
+    let start = selection.start.max(fragment.start);
+    let end = selection.end.min(fragment.end);
+    if start >= end {
+        return Vec::new();
+    }
+    let player = cx.theme().players().read_only();
+    vec![(
+        start - fragment.start..end - fragment.start,
+        gpui::HighlightStyle {
+            background_color: Some(if navigation.visual {
+                player.selection
+            } else {
+                player.cursor.opacity(0.62)
+            }),
+            ..Default::default()
+        },
+    )]
+}
+
+fn navigation_searchable_styled_text(
+    text: String,
+    base: Vec<(Range<usize>, gpui::HighlightStyle)>,
+    search: Option<&RichSearchPaint>,
+    navigation: Option<&RichNavigationPaint>,
+    logical_fragment: Range<usize>,
+    cx: &App,
+) -> StyledText {
+    let navigation = navigation_highlights_for_fragment(navigation, logical_fragment, cx);
+    let base = gpui::combine_highlights(base, navigation).collect::<Vec<_>>();
+    searchable_styled_text(text, base, search, cx)
 }
 
 fn search_context_snippet(
@@ -1941,6 +2109,7 @@ struct CachedMarkdown {
     entity: Entity<Markdown>,
     search_query: Option<String>,
     search_ranges: Vec<Range<usize>>,
+    navigation_range: Option<Range<usize>>,
     last_autoscroll_generation: Option<u64>,
 }
 
@@ -2091,8 +2260,29 @@ fn selectable_rich_command_experiment() -> bool {
     *ENABLED
 }
 
+fn selectable_rich_diff_experiment() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("HARNESS_SELECTABLE_RICH_DIFF")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    });
+    *ENABLED
+}
+
+fn rich_vim_experiment() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("HARNESS_RICH_VIM")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+    });
+    *ENABLED
+}
+
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
     if selectable_rich_command_experiment() && item.kind == model::TranscriptKind::Command {
+        return false;
+    }
+    if selectable_rich_diff_experiment() && item.kind == model::TranscriptKind::Diff {
         return false;
     }
     match item.kind {
@@ -2145,6 +2335,7 @@ impl Render for HybridStructuredSurface {
                     &self.item,
                     self.item_index,
                     None,
+                    None,
                     OutputExpansion::Preview,
                     None,
                     cx,
@@ -2152,6 +2343,7 @@ impl Render for HybridStructuredSurface {
                 model::TranscriptKind::Command => HarnessApp::render_command_content(
                     &self.item,
                     self.item_index,
+                    None,
                     None,
                     OutputExpansion::Preview,
                     None,
@@ -2294,6 +2486,7 @@ struct HarnessApp {
     composer_metrics: ComposerRenderMetrics,
     search_editor: Entity<LocalEditor>,
     transcript_editor: Entity<TranscriptEditor>,
+    rich_navigation_selection: Option<TranscriptSelectionSnapshot>,
     mode_indicator: Entity<ModeIndicator>,
     buffer_view: bool,
     transcript_focus: FocusHandle,
@@ -2342,6 +2535,20 @@ struct HarnessApp {
 }
 
 impl HarnessApp {
+    fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
+        let snapshot = self.rich_navigation_selection.as_ref()?;
+        let item = snapshot
+            .items
+            .iter()
+            .find(|item| item.item_index == item_index)?;
+        Some(RichNavigationPaint {
+            body_text: item.body_text.clone(),
+            range: item.range.clone(),
+            head: item.head,
+            visual: snapshot.visual,
+        })
+    }
+
     fn new(
         cwd: String,
         replay_count: Option<usize>,
@@ -2403,12 +2610,32 @@ impl HarnessApp {
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
-                let item_index = editor.update(cx, |editor, cx| editor.selected_item(cx));
-                if this.buffer_view
-                    && let Some(item_index) = item_index
-                    && this.selected_item != item_index
-                {
+                // Snapshot the native selection once at the event boundary. Rich
+                // rendering can then consume the cached logical ranges without
+                // rebuilding an Editor display snapshot and copying selected
+                // Buffer bodies again on every unrelated root render.
+                let snapshot = editor.update(cx, |editor, cx| editor.selection_snapshot(cx));
+                let item_index = snapshot
+                    .items
+                    .iter()
+                    .find_map(|item| item.head.map(|_| item.item_index));
+                let rich_selection_changed = !this.buffer_view
+                    && rich_vim_experiment()
+                    && this.rich_navigation_selection.as_ref() != Some(&snapshot);
+                if !this.buffer_view && rich_vim_experiment() {
+                    this.rich_navigation_selection = Some(snapshot);
+                }
+                if let Some(item_index) = item_index {
+                    let changed = this.selected_item != item_index;
                     this.selected_item = item_index;
+                    if !this.buffer_view && rich_vim_experiment() {
+                        this.list_state.pause_following_tail();
+                        this.list_state.scroll_to_reveal_item(item_index);
+                    }
+                    if changed || rich_selection_changed {
+                        cx.notify();
+                    }
+                } else if rich_selection_changed {
                     cx.notify();
                 }
             },
@@ -2452,6 +2679,7 @@ impl HarnessApp {
             composer_metrics,
             search_editor,
             transcript_editor,
+            rich_navigation_selection: None,
             mode_indicator,
             buffer_view: start_in_text_view,
             transcript_focus,
@@ -2501,8 +2729,10 @@ impl HarnessApp {
             read_only_refresh_task: Task::ready(()),
             reconnect_attempts: 0,
         };
-        if start_in_text_view {
+        if start_in_text_view || rich_vim_experiment() {
             drop(this.sync_transcript_document(cx));
+        }
+        if start_in_text_view {
             this.transcript_editor.update(cx, |editor, cx| {
                 editor.reveal_tail(cx);
                 editor.enter_normal_mode(window, cx);
@@ -2670,7 +2900,7 @@ impl HarnessApp {
         for index in &dirty_requests {
             self.list_state.splice(*index..*index + 1, 1);
         }
-        if self.buffer_view && !dirty_requests.is_empty() {
+        if (self.buffer_view || rich_vim_experiment()) && !dirty_requests.is_empty() {
             let item_count = self.model.items.len();
             if !self.sync_transcript_item_updates(item_count, &dirty_requests, cx) {
                 drop(self.sync_transcript_document(cx));
@@ -2722,7 +2952,7 @@ impl HarnessApp {
         if !self.search_query.is_empty() {
             self.update_search_matches_for_changes(old_len, &dirty_items);
         }
-        if document_changed && self.buffer_view {
+        if document_changed && (self.buffer_view || rich_vim_experiment()) {
             let incrementally_applied =
                 self.sync_transcript_item_updates(old_len, &dirty_items, cx);
             if !incrementally_applied {
@@ -2892,7 +3122,7 @@ impl HarnessApp {
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item_uses_hybrid_surface(item))
+            .filter(|(_, item)| self.buffer_view && item_uses_hybrid_surface(item))
             .map(|(index, item)| (index, item.clone()))
             .collect::<Vec<_>>();
         let desired_keys = candidates
@@ -3245,25 +3475,46 @@ impl HarnessApp {
             .iter()
             .copied()
             .filter(|item_index| *item_index < old_model_item_count)
-            .map(|item_index| (item_index, self.model.item_projection(item_index)))
+            .map(|item_index| {
+                let projection = if self.buffer_view {
+                    self.model.item_projection(item_index)
+                } else {
+                    self.model.rich_navigation_item_projection(item_index)
+                };
+                (item_index, projection)
+            })
             .collect::<Vec<_>>();
         let appended = (old_model_item_count..new_model_item_count)
-            .map(|item_index| self.model.item_projection(item_index))
+            .map(|item_index| {
+                if self.buffer_view {
+                    self.model.item_projection(item_index)
+                } else {
+                    self.model.rich_navigation_item_projection(item_index)
+                }
+            })
             .collect::<Vec<_>>();
 
-        self.transcript_editor.update(cx, |editor, cx| {
+        let applied = self.transcript_editor.update(cx, |editor, cx| {
             editor.apply_item_projections(old_model_item_count, &existing_updates, &appended, cx)
-        })
+        });
+        if applied && !self.buffer_view && rich_vim_experiment() {
+            self.rich_navigation_selection = None;
+        }
+        applied
     }
 
     fn sync_transcript_document(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<model::TranscriptDocument> {
-        if !self.buffer_view {
+        if !self.buffer_view && !rich_vim_experiment() {
             return None;
         }
-        let document = self.model.full_document();
+        let document = if self.buffer_view {
+            self.model.full_document()
+        } else {
+            self.model.rich_navigation_document()
+        };
         let old_text = self.transcript_editor.read(cx).text(cx);
         if old_text == document.text {
             self.transcript_editor
@@ -3275,6 +3526,9 @@ impl HarnessApp {
             editor.edit(old_range, replacement, cx);
             editor.decorate(&document, cx);
         });
+        if !self.buffer_view && rich_vim_experiment() {
+            self.rich_navigation_selection = None;
+        }
         Some(document)
     }
 
@@ -3490,7 +3744,7 @@ impl HarnessApp {
             }
         }
 
-        if self.buffer_view {
+        if self.buffer_view || rich_vim_experiment() {
             let incrementally_applied = !outcome.reset
                 && self.sync_transcript_item_updates(outcome.old_len, &dirty_items, cx);
             if !incrementally_applied {
@@ -3794,7 +4048,7 @@ impl HarnessApp {
             request.resolved = true;
         }
         self.list_state.splice(index..index + 1, 1);
-        if self.buffer_view {
+        if self.buffer_view || rich_vim_experiment() {
             let item_count = self.model.items.len();
             if !self.sync_transcript_item_updates(item_count, &[index], cx) {
                 drop(self.sync_transcript_document(cx));
@@ -3834,7 +4088,7 @@ impl HarnessApp {
                         }
                         this.dirty_request_surfaces.insert(request_key.clone());
                         this.list_state.splice(index..index + 1, 1);
-                        if this.buffer_view {
+                        if this.buffer_view || rich_vim_experiment() {
                             let item_count = this.model.items.len();
                             if !this.sync_transcript_item_updates(item_count, &[index], cx) {
                                 drop(this.sync_transcript_document(cx));
@@ -4263,7 +4517,7 @@ impl HarnessApp {
             item.status = Some(message);
             self.list_state.splice(index..index + 1, 1);
         }
-        if self.buffer_view {
+        if self.buffer_view || rich_vim_experiment() {
             let item_count = self.model.items.len();
             if !self.sync_transcript_item_updates(item_count, &[index], cx) {
                 drop(self.sync_transcript_document(cx));
@@ -4275,6 +4529,33 @@ impl HarnessApp {
     fn focus_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.buffer_view {
             self.focus_buffer_transcript(window, cx);
+            return;
+        }
+        if rich_vim_experiment() {
+            let document = self.sync_transcript_document(cx);
+            let row = document.as_ref().and_then(|document| {
+                document
+                    .item_rows
+                    .get(self.selected_item)
+                    .and_then(|row| *row)
+            });
+            self.focus_mode = FocusMode::Buffer;
+            if let Some(row) = row {
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_cursor_row(row, window, cx);
+                });
+            }
+            self.transcript_editor.focus_handle(cx).focus(window, cx);
+            self.list_state.scroll_to_reveal_item(self.selected_item);
+            cx.defer_in(window, |this, window, cx| {
+                if !this.buffer_view && this.focus_mode == FocusMode::Buffer {
+                    this.transcript_editor.update(cx, |editor, cx| {
+                        editor.enter_normal_mode(window, cx);
+                    });
+                    cx.notify();
+                }
+            });
+            cx.notify();
             return;
         }
         self.focus_mode = FocusMode::Transcript;
@@ -4290,6 +4571,17 @@ impl HarnessApp {
     }
 
     fn show_rich_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let rich_cursor = (rich_vim_experiment() && self.buffer_view)
+            .then(|| {
+                self.transcript_editor
+                    .update(cx, |editor, cx| editor.selection_snapshot(cx))
+            })
+            .and_then(|snapshot| {
+                snapshot
+                    .items
+                    .into_iter()
+                    .find_map(|item| item.head.map(|head| (item.item_index, head)))
+            });
         let was_following_tail =
             self.buffer_view && self.transcript_editor.read(cx).is_following_tail();
         let top_visible_item = self
@@ -4310,8 +4602,22 @@ impl HarnessApp {
         }
         self.buffer_view = false;
         self.search_returns_to_buffer = false;
-        self.focus_mode = FocusMode::Transcript;
-        self.transcript_focus.focus(window, cx);
+        self.focus_mode = if rich_vim_experiment() {
+            FocusMode::Buffer
+        } else {
+            FocusMode::Transcript
+        };
+        if rich_vim_experiment() {
+            drop(self.sync_transcript_document(cx));
+            if let Some((item_index, body_offset)) = rich_cursor {
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_cursor_in_item(item_index, body_offset, window, cx);
+                });
+            }
+            self.transcript_editor.focus_handle(cx).focus(window, cx);
+        } else {
+            self.transcript_focus.focus(window, cx);
+        }
         if was_following_tail {
             self.list_state.set_follow_mode(FollowMode::Tail);
         } else {
@@ -4322,7 +4628,9 @@ impl HarnessApp {
             });
         }
         cx.defer_in(window, move |this, _, cx| {
-            if !this.buffer_view && this.focus_mode == FocusMode::Transcript {
+            if !this.buffer_view
+                && matches!(this.focus_mode, FocusMode::Transcript | FocusMode::Buffer)
+            {
                 if this.list_state.is_following_tail() {
                     this.list_state.scroll_to_end();
                 } else if !preserved_viewport {
@@ -4339,6 +4647,15 @@ impl HarnessApp {
                 cx.notify();
             }
         });
+        if rich_vim_experiment() {
+            cx.defer_in(window, |this, window, cx| {
+                if !this.buffer_view && this.focus_mode == FocusMode::Buffer {
+                    this.transcript_editor.update(cx, |editor, cx| {
+                        editor.enter_normal_mode(window, cx);
+                    });
+                }
+            });
+        }
         cx.notify();
     }
 
@@ -4561,7 +4878,7 @@ impl HarnessApp {
     }
 
     fn performance_j_ready(&self, window: &Window, cx: &App) -> bool {
-        self.buffer_view
+        (self.buffer_view || rich_vim_experiment())
             && self.focus_mode == FocusMode::Buffer
             && self.transcript_editor.focus_handle(cx).is_focused(window)
     }
@@ -4612,11 +4929,31 @@ impl HarnessApp {
                 Some(PERFORMANCE_STATUS_DURATION),
                 cx,
             );
+            eprintln!("cancelled Harness :perf-j run: {reason}");
             log::warn!("cancelled Harness :perf-j run: {reason}");
         }
     }
 
     fn performance_j_step(&mut self, generation: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let pending_motion_origin = self
+            .performance_j_run
+            .as_mut()
+            .filter(|driver| driver.state.generation == generation)
+            .and_then(|driver| driver.pending_motion_origin.take());
+        if let Some(origin) = pending_motion_origin {
+            let current = self
+                .transcript_editor
+                .update(cx, |editor, cx| editor.cursor_offset(cx));
+            if current == origin {
+                self.cancel_performance_j(
+                    generation,
+                    "Vim motion was handled without moving the native cursor",
+                    cx,
+                );
+                return;
+            }
+        }
+
         let (step, key) = {
             let Some(driver) = self.performance_j_run.as_mut() else {
                 return;
@@ -4626,14 +4963,15 @@ impl HarnessApp {
             };
             let key = match step {
                 PerformanceJStep::Prepare => Some(driver.g.clone()),
-                PerformanceJStep::Dispatch => Some(driver.j.clone()),
+                PerformanceJStep::Dispatch { down: true } => Some(driver.j.clone()),
+                PerformanceJStep::Dispatch { down: false } => Some(driver.k.clone()),
                 PerformanceJStep::Baseline | PerformanceJStep::Report => None,
             };
             (step, key)
         };
 
         if step != PerformanceJStep::Report && !self.performance_j_ready(window, cx) {
-            self.cancel_performance_j(generation, "Text view lost focus", cx);
+            self.cancel_performance_j(generation, "Vim transcript navigation lost focus", cx);
             return;
         }
 
@@ -4647,7 +4985,7 @@ impl HarnessApp {
                     return;
                 };
                 self.set_performance_status(
-                    format!("Running {PERFORMANCE_J_STEPS}-frame Vim j performance sample…"),
+                    format!("Running {PERFORMANCE_J_STEPS}-frame Vim j/k performance sample…"),
                     None,
                     cx,
                 );
@@ -4663,15 +5001,25 @@ impl HarnessApp {
                 self.performance_reporter.mark_baseline(window);
                 Self::schedule_performance_j_step(generation, window, cx);
             }
-            PerformanceJStep::Dispatch => {
-                let Some(j) = key else {
-                    self.cancel_performance_j(generation, "Vim j key was unavailable", cx);
+            PerformanceJStep::Dispatch { down } => {
+                let Some(motion) = key else {
+                    self.cancel_performance_j(generation, "Vim motion key was unavailable", cx);
                     return;
                 };
+                let origin = self
+                    .transcript_editor
+                    .update(cx, |editor, cx| editor.cursor_offset(cx));
+                if let Some(driver) = self.performance_j_run.as_mut() {
+                    driver.pending_motion_origin = Some(origin);
+                }
                 Self::dispatch_performance_j_keys(
                     generation,
-                    vec![j],
-                    "Vim j was not handled",
+                    vec![motion],
+                    if down {
+                        "Vim j was not handled"
+                    } else {
+                        "Vim k was not handled"
+                    },
                     window,
                     cx,
                 );
@@ -4680,6 +5028,12 @@ impl HarnessApp {
                 self.performance_j_run = None;
                 match self.performance_reporter.snapshot_benchmark_report(window) {
                     Ok(report) => {
+                        // Keep the interactive clipboard handoff, but also put
+                        // the benchmark body in the application log. On
+                        // Wayland the clipboard is owned by this process, so a
+                        // headless validation run otherwise loses its only
+                        // report as soon as the harness exits.
+                        eprintln!("completed Harness :perf-j run\n{report}");
                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
                         self.set_performance_status(
                             format!(
@@ -4687,9 +5041,6 @@ impl HarnessApp {
                             ),
                             Some(PERFORMANCE_STATUS_DURATION),
                             cx,
-                        );
-                        log::info!(
-                            "completed Harness :perf-j run and copied the performance report"
                         );
                     }
                     Err(error) => {
@@ -4733,25 +5084,39 @@ impl HarnessApp {
                 return;
             }
         };
-        self.show_text_transcript(window, cx);
+        let k = match Keystroke::parse("k") {
+            Ok(keystroke) => keystroke,
+            Err(error) => {
+                self.set_performance_status(
+                    "Performance run could not prepare its Vim key",
+                    Some(PERFORMANCE_STATUS_DURATION),
+                    cx,
+                );
+                log::error!("failed to parse Harness :perf-j measurement key: {error}");
+                return;
+            }
+        };
+        if rich_vim_experiment() && !self.buffer_view {
+            self.focus_transcript(window, cx);
+        } else {
+            self.show_text_transcript(window, cx);
+        }
 
         let logical_lines = self.transcript_editor.read(cx).text(cx).lines().count();
         if !performance_j_has_room(logical_lines) {
             self.set_performance_status(
-                format!(
-                    ":perf-j needs more than {PERFORMANCE_J_STEPS} transcript lines ({logical_lines} available)"
-                ),
+                format!(":perf-j needs at least two transcript lines ({logical_lines} available)"),
                 Some(PERFORMANCE_STATUS_DURATION),
                 cx,
             );
             log::warn!(
-                "Harness :perf-j needs more than {PERFORMANCE_J_STEPS} transcript lines; found {logical_lines}"
+                "Harness :perf-j needs at least two transcript lines; found {logical_lines}"
             );
             return;
         }
 
-        self.performance_j_run = Some(PerformanceJDriver::new(generation, g, j));
-        self.set_performance_status("Preparing Vim j performance sample…", None, cx);
+        self.performance_j_run = Some(PerformanceJDriver::new(generation, g, j, k));
+        self.set_performance_status("Preparing Vim j/k performance sample…", None, cx);
         log::info!("starting Harness :perf-j run ({PERFORMANCE_J_STEPS} frames)");
         Self::schedule_performance_j_step(generation, window, cx);
     }
@@ -4942,8 +5307,15 @@ impl HarnessApp {
                 return;
             }
             item.expanded = !item.expanded;
+            let item_key = item.key.clone();
+            let collapsed = !item.expanded;
             self.list_state
                 .splice(self.selected_item..self.selected_item + 1, 1);
+            if rich_vim_experiment() {
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_item_collapsed(&item_key, collapsed, window, cx);
+                });
+            }
             cx.notify();
         }
     }
@@ -5298,6 +5670,7 @@ impl HarnessApp {
         key: &str,
         source: &str,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         autoscroll_generation: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
@@ -5311,6 +5684,7 @@ impl HarnessApp {
                     entity,
                     search_query: None,
                     search_ranges: Vec::new(),
+                    navigation_range: None,
                     last_autoscroll_generation: None,
                 }
             });
@@ -5318,9 +5692,22 @@ impl HarnessApp {
             cached.source = source.to_string();
             cached.search_query = None;
             cached.search_ranges.clear();
+            cached.navigation_range = None;
             cached.last_autoscroll_generation = None;
             cached.entity.update(cx, |markdown, cx| {
                 markdown.reset(source.to_string().into(), cx)
+            });
+        }
+
+        let navigation_range = navigation.and_then(|navigation| {
+            navigation
+                .markdown_source_range(source)
+                .filter(|range| range.start < range.end)
+        });
+        if cached.navigation_range != navigation_range {
+            cached.navigation_range = navigation_range.clone();
+            cached.entity.update(cx, |markdown, cx| {
+                markdown.set_external_selection(navigation_range, cx)
             });
         }
 
@@ -5400,6 +5787,8 @@ impl HarnessApp {
         content: &str,
         visible_line_count: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
+        logical_body_start: usize,
         cx: &App,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
@@ -5407,11 +5796,14 @@ impl HarnessApp {
         let mut in_hunk = false;
         let mut old_line = None;
         let mut new_line = None;
+        let mut logical_line_offset = logical_body_start;
         content
             .lines()
             .take(visible_line_count)
             .enumerate()
             .map(|(index, line)| {
+                let logical_line_range = logical_line_offset..logical_line_offset + line.len();
+                logical_line_offset += line.len() + 1;
                 let tone = diff_line_tone(line, &mut in_hunk);
                 let (displayed_old_line, displayed_new_line) = diff_line_numbers(
                     line,
@@ -5422,8 +5814,14 @@ impl HarnessApp {
                     &mut new_line,
                     index + 1,
                 );
-                let highlighted_line =
-                    searchable_styled_text(line.to_string(), Vec::new(), search, cx);
+                let highlighted_line = navigation_searchable_styled_text(
+                    line.to_string(),
+                    Vec::new(),
+                    search,
+                    navigation,
+                    logical_line_range,
+                    cx,
+                );
                 div()
                     .w_full()
                     .min_h(px(22.))
@@ -5484,6 +5882,7 @@ impl HarnessApp {
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expansion = self
@@ -5493,13 +5892,14 @@ impl HarnessApp {
             .unwrap_or_default();
         let toggle = progressive_diff_toggle(item, expansion)
             .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_diff_content(item, index, search, expansion, toggle, cx)
+        Self::render_diff_content(item, index, search, navigation, expansion, toggle, cx)
     }
 
     fn render_diff_content(
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         expansion: OutputExpansion,
         toggle: Option<AnyElement>,
         cx: &App,
@@ -5520,10 +5920,19 @@ impl HarnessApp {
             expansion,
         );
         let mut sections = Vec::new();
+        let mut logical_search_start = 0;
 
         for (section_index, (presentation, visible_lines)) in
             presentations.into_iter().zip(allocations).enumerate()
         {
+            let logical_body_start = navigation
+                .and_then(|navigation| {
+                    navigation.body_text[logical_search_start.min(navigation.body_text.len())..]
+                        .find(&presentation.content)
+                        .map(|offset| logical_search_start + offset)
+                })
+                .unwrap_or(logical_search_start);
+            logical_search_start = logical_body_start + presentation.content.len();
             let (additions, deletions) = diff_content_counts(&presentation.content);
             let highlighted_path =
                 searchable_styled_text(presentation.path, Vec::new(), search, cx);
@@ -5592,6 +6001,8 @@ impl HarnessApp {
                                         &presentation.content,
                                         visible_lines,
                                         search,
+                                        navigation,
+                                        logical_body_start,
                                         cx,
                                     )),
                             )
@@ -5656,6 +6067,7 @@ impl HarnessApp {
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -5681,13 +6093,27 @@ impl HarnessApp {
         );
         let toggle = progressive_file_change_toggle(item, expansion);
         let mut sections = Vec::new();
+        let mut logical_cursor = 0;
 
         for (section_index, (presentation, visible_lines)) in
             presentations.into_iter().zip(allocations).enumerate()
         {
             let (additions, deletions) = file_change_counts(&presentation);
-            let highlighted_path =
-                searchable_styled_text(presentation.path.clone(), Vec::new(), search, cx);
+            let path_range =
+                rich_navigation_fragment_range(navigation, &presentation.path, &mut logical_cursor);
+            let highlighted_path = navigation_searchable_styled_text(
+                presentation.path.clone(),
+                Vec::new(),
+                search,
+                navigation,
+                path_range,
+                cx,
+            );
+            let content_range = rich_navigation_fragment_range(
+                navigation,
+                &presentation.content,
+                &mut logical_cursor,
+            );
             let operation_color = match presentation.operation.as_str() {
                 "Added" => Color::Success,
                 "Deleted" => Color::Error,
@@ -5788,6 +6214,8 @@ impl HarnessApp {
                                     &presentation.content,
                                     visible_lines,
                                     search,
+                                    navigation,
+                                    content_range.start,
                                     cx,
                                 )),
                         )
@@ -5849,9 +6277,11 @@ impl HarnessApp {
     fn render_reasoning(
         content: &str,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let mut logical_search_start = 0;
         let steps = content
             .lines()
             .map(str::trim)
@@ -5864,14 +6294,33 @@ impl HarnessApp {
                     .to_string()
             })
             .filter(|line| !line.is_empty())
+            .map(|line| {
+                let start = navigation
+                    .and_then(|navigation| {
+                        navigation.body_text[logical_search_start.min(navigation.body_text.len())..]
+                            .find(&line)
+                            .map(|offset| logical_search_start + offset)
+                    })
+                    .unwrap_or(logical_search_start);
+                logical_search_start = start + line.len();
+                (start, line)
+            })
             .collect::<Vec<_>>();
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .children(steps.into_iter().map(|step| {
-                let highlighted_step = searchable_styled_text(step, Vec::new(), search, cx);
+            .children(steps.into_iter().map(|(start, step)| {
+                let end = start + step.len();
+                let highlighted_step = navigation_searchable_styled_text(
+                    step,
+                    Vec::new(),
+                    search,
+                    navigation,
+                    start..end,
+                    cx,
+                );
                 div()
                     .w_full()
                     .flex()
@@ -5898,6 +6347,7 @@ impl HarnessApp {
         item_key: &str,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -5907,7 +6357,17 @@ impl HarnessApp {
             .copied()
             .unwrap_or_default();
         let preview = structured_output_presentation(&content, "output lines", expansion);
-        let highlighted_content = searchable_styled_text(preview.content, Vec::new(), search, cx);
+        let mut logical_cursor = 0;
+        let body_range =
+            rich_navigation_fragment_range(navigation, &preview.content, &mut logical_cursor);
+        let highlighted_content = navigation_searchable_styled_text(
+            preview.content,
+            Vec::new(),
+            search,
+            navigation,
+            body_range,
+            cx,
+        );
         div()
             .id(("terminal-scroll", index))
             .w_full()
@@ -5939,6 +6399,7 @@ impl HarnessApp {
         item_key: &str,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let expansion = self
@@ -5947,11 +6408,12 @@ impl HarnessApp {
             .copied()
             .unwrap_or_default();
         let Some(presentation) = activity_output_presentation(&content, expansion) else {
-            return self.render_terminal(content, item_key, index, search, cx);
+            return self.render_terminal(content, item_key, index, search, navigation, cx);
         };
 
         let colors = cx.theme().colors().clone();
         let error_color = cx.theme().status().error;
+        let mut logical_cursor = 0;
         div()
             .id(("activity-sections", index))
             .w_full()
@@ -5966,15 +6428,38 @@ impl HarnessApp {
                         Some("Result" | "Structured result" | "Error")
                     );
                     let highlighted_heading = section.heading.as_ref().map(|heading| {
-                        searchable_styled_text(heading.clone(), Vec::new(), search, cx)
+                        let range = rich_navigation_fragment_range(
+                            navigation,
+                            heading,
+                            &mut logical_cursor,
+                        );
+                        navigation_searchable_styled_text(
+                            heading.clone(),
+                            Vec::new(),
+                            search,
+                            navigation,
+                            range,
+                            cx,
+                        )
                     });
                     let base = if section.is_json {
                         json_highlights(&section.body, cx)
                     } else {
                         Vec::new()
                     };
-                    let highlighted_body =
-                        searchable_styled_text(section.body.clone(), base, search, cx);
+                    let body_range = rich_navigation_fragment_range(
+                        navigation,
+                        &section.body,
+                        &mut logical_cursor,
+                    );
+                    let highlighted_body = navigation_searchable_styled_text(
+                        section.body.clone(),
+                        base,
+                        search,
+                        navigation,
+                        body_range,
+                        cx,
+                    );
                     div()
                         .w_full()
                         .min_w_0()
@@ -6034,10 +6519,18 @@ impl HarnessApp {
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if item.command_transcript().is_none() {
-            return self.render_terminal(item.content.clone(), &item.key, index, search, cx);
+            return self.render_terminal(
+                item.content.clone(),
+                &item.key,
+                index,
+                search,
+                navigation,
+                cx,
+            );
         }
         let expansion = self
             .output_expansion
@@ -6047,7 +6540,7 @@ impl HarnessApp {
         let command = item.command_transcript().expect("command parsed above");
         let toggle = command_output_toggle(&command, expansion)
             .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_command_content(item, index, search, expansion, toggle, cx)
+        Self::render_command_content(item, index, search, navigation, expansion, toggle, cx)
             .expect("command parsed above")
     }
 
@@ -6055,6 +6548,7 @@ impl HarnessApp {
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         expansion: OutputExpansion,
         toggle: Option<AnyElement>,
         cx: &App,
@@ -6087,14 +6581,33 @@ impl HarnessApp {
             output_limits.bytes,
         )
         .content;
-        let highlighted_command = searchable_styled_text(
+        let command_start = navigation
+            .and_then(|navigation| navigation.body_text.find(command_text))
+            .unwrap_or(0);
+        let command_end = command_start + displayed_command.len();
+        let output_start = navigation
+            .and_then(|navigation| {
+                navigation.body_text[command_start.min(navigation.body_text.len())..]
+                    .find(&displayed_output)
+                    .map(|offset| command_start + offset)
+            })
+            .unwrap_or(command_end);
+        let highlighted_command = navigation_searchable_styled_text(
             displayed_command.clone(),
             shell_highlights(&displayed_command, cx),
             search,
+            navigation,
+            command_start..command_end,
             cx,
         );
-        let highlighted_output =
-            searchable_styled_text(displayed_output.clone(), Vec::new(), search, cx);
+        let highlighted_output = navigation_searchable_styled_text(
+            displayed_output.clone(),
+            Vec::new(),
+            search,
+            navigation,
+            output_start..output_start + displayed_output.len(),
+            cx,
+        );
 
         Some(
             div()
@@ -6151,6 +6664,7 @@ impl HarnessApp {
         item: &TranscriptItem,
         index: usize,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -6166,14 +6680,23 @@ impl HarnessApp {
         let item_key = item.key.clone();
         let visible_result_count = total_results.min(progressive_web_limit(expansion));
         let toggle = progressive_web_toggle(expansion, total_results, has_hidden_content);
+        let mut logical_cursor = 0;
         let visible_results = presentation
             .results
             .into_iter()
             .take(visible_result_count)
             .enumerate()
             .map(|(result_index, result)| {
-                let highlighted_title =
-                    searchable_styled_text(result.title, Vec::new(), search, cx);
+                let title_range =
+                    rich_navigation_fragment_range(navigation, &result.title, &mut logical_cursor);
+                let highlighted_title = navigation_searchable_styled_text(
+                    result.title,
+                    Vec::new(),
+                    search,
+                    navigation,
+                    title_range,
+                    cx,
+                );
                 div()
                     .w_full()
                     .min_w_0()
@@ -6208,8 +6731,19 @@ impl HarnessApp {
                             )
                             .when_some(result.url, |this, url| {
                                 let open_url = url.clone();
-                                let highlighted_url =
-                                    searchable_styled_text(url, Vec::new(), search, cx);
+                                let url_range = rich_navigation_fragment_range(
+                                    navigation,
+                                    &url,
+                                    &mut logical_cursor,
+                                );
+                                let highlighted_url = navigation_searchable_styled_text(
+                                    url,
+                                    Vec::new(),
+                                    search,
+                                    navigation,
+                                    url_range,
+                                    cx,
+                                );
                                 this.child(
                                     div()
                                         .id(format!("web-result-url:{item_key}:{result_index}"))
@@ -6224,8 +6758,19 @@ impl HarnessApp {
                                 )
                             })
                             .when_some(result.snippet, |this, snippet| {
-                                let highlighted_snippet =
-                                    searchable_styled_text(snippet, Vec::new(), search, cx);
+                                let snippet_range = rich_navigation_fragment_range(
+                                    navigation,
+                                    &snippet,
+                                    &mut logical_cursor,
+                                );
+                                let highlighted_snippet = navigation_searchable_styled_text(
+                                    snippet,
+                                    Vec::new(),
+                                    search,
+                                    navigation,
+                                    snippet_range,
+                                    cx,
+                                );
                                 this.child(
                                     div()
                                         .min_w_0()
@@ -6271,7 +6816,14 @@ impl HarnessApp {
                 )
             })
             .when(total_results == 0, |this| {
-                this.child(self.render_terminal(item.content.clone(), &item.key, index, search, cx))
+                this.child(self.render_terminal(
+                    item.content.clone(),
+                    &item.key,
+                    index,
+                    search,
+                    navigation,
+                    cx,
+                ))
             })
             .into_any_element()
     }
@@ -6279,8 +6831,26 @@ impl HarnessApp {
     fn render_plain_prose(
         content: &str,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let mut paragraph_offset = 0;
+        let paragraphs = content
+            .split("\n\n")
+            .map(|paragraph| {
+                let paragraph_start = paragraph_offset;
+                paragraph_offset = (paragraph_offset + paragraph.len() + 2).min(content.len());
+                let mut line_offset = paragraph_start;
+                paragraph
+                    .lines()
+                    .map(|line| {
+                        let start = line_offset;
+                        line_offset += line.len() + 1;
+                        (start, line.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         div()
             .w_full()
             .min_w_0()
@@ -6289,15 +6859,22 @@ impl HarnessApp {
             .gap_3()
             .text_ui(cx)
             .line_height(relative(1.55))
-            .children(content.split("\n\n").map(|paragraph| {
+            .children(paragraphs.into_iter().map(|paragraph| {
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .children(paragraph.lines().map(|line| {
-                        let highlighted_line =
-                            searchable_styled_text(line.to_string(), Vec::new(), search, cx);
+                    .children(paragraph.into_iter().map(|(start, line)| {
+                        let end = start + line.len();
+                        let highlighted_line = navigation_searchable_styled_text(
+                            line,
+                            Vec::new(),
+                            search,
+                            navigation,
+                            start..end,
+                            cx,
+                        );
                         div()
                             .min_h(px(20.))
                             .whitespace_normal()
@@ -6311,13 +6888,23 @@ impl HarnessApp {
         item: &TranscriptItem,
         surface: Option<Entity<ImageSurface>>,
         search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let caption = image_caption_for_display(item).map(ToOwned::to_owned);
-        let highlighted_caption = caption
-            .as_ref()
-            .map(|caption| searchable_styled_text(caption.clone(), Vec::new(), search, cx));
+        let mut logical_cursor = 0;
+        let highlighted_caption = caption.as_ref().map(|caption| {
+            let range = rich_navigation_fragment_range(navigation, caption, &mut logical_cursor);
+            navigation_searchable_styled_text(
+                caption.clone(),
+                Vec::new(),
+                search,
+                navigation,
+                range,
+                cx,
+            )
+        });
         let surface_height = surface
             .as_ref()
             .map(|surface| px(surface.read(cx).rows() as f32 * 20.));
@@ -6851,13 +7438,15 @@ impl HarnessApp {
         if !item.is_presentationally_visible() {
             return div().into_any_element();
         }
+        let rich_navigation = self.rich_navigation_for_item(index);
         let cursor = matches!(
             self.focus_mode,
-            FocusMode::Transcript | FocusMode::Request | FocusMode::Approval
+            FocusMode::Transcript | FocusMode::Request | FocusMode::Approval | FocusMode::Buffer
         ) && index == self.selected_item;
-        let visual = self.visual_anchor.is_some_and(|anchor| {
-            (anchor.min(self.selected_item)..=anchor.max(self.selected_item)).contains(&index)
-        });
+        let visual = !rich_vim_experiment()
+            && self.visual_anchor.is_some_and(|anchor| {
+                (anchor.min(self.selected_item)..=anchor.max(self.selected_item)).contains(&index)
+            });
         let raw_visible = self.raw_visible.contains(&item.key);
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
         let request_method = item
@@ -7043,12 +7632,21 @@ impl HarnessApp {
             )
             .when(is_disclosure, |this| {
                 this.cursor_pointer()
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         disclosure_weak
                             .update(cx, |this, cx| {
                                 if let Some(item) = this.model.items.get_mut(index) {
                                     item.expanded = !item.expanded;
+                                    let item_key = item.key.clone();
+                                    let collapsed = !item.expanded;
                                     this.list_state.splice(index..index + 1, 1);
+                                    if rich_vim_experiment() {
+                                        this.transcript_editor.update(cx, |editor, cx| {
+                                            editor.set_item_collapsed(
+                                                &item_key, collapsed, window, cx,
+                                            );
+                                        });
+                                    }
                                     cx.notify();
                                 }
                             })
@@ -7067,6 +7665,7 @@ impl HarnessApp {
                 &item.key,
                 &item.content,
                 rich_search.as_ref(),
+                rich_navigation.as_ref(),
                 (active_search_item && self.search_visible)
                     .then_some(self.search_navigation_generation),
                 cx,
@@ -7078,39 +7677,90 @@ impl HarnessApp {
         } else if let Some(markdown) = markdown {
             let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             style.code_block_overflow_x_scroll = true;
-            Some(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .child(MarkdownElement::new(markdown, style))
-                    .into_any_element(),
-            )
+            if rich_vim_experiment() {
+                style.selection_background_color = cx.theme().players().read_only().selection;
+            }
+            let mut element = MarkdownElement::new(markdown, style);
+            if rich_vim_experiment() {
+                let source = item.content.clone();
+                let logical = self
+                    .model
+                    .item_projection(index)
+                    .map(|projection| projection.body_text().to_owned())
+                    .unwrap_or_else(|| source.clone());
+                let owner = cx.weak_entity();
+                element = element.on_source_click(move |source_offset, _, window, cx| {
+                    let body_offset =
+                        markdown_logical_offset_for_source(&logical, &source, source_offset);
+                    owner
+                        .update(cx, |this, cx| {
+                            this.selected_item = index;
+                            this.visual_anchor = None;
+                            this.focus_mode = FocusMode::Buffer;
+                            this.list_state.pause_following_tail();
+                            this.transcript_editor.update(cx, |editor, cx| {
+                                editor.set_cursor_in_item(index, body_offset, window, cx);
+                            });
+                            this.transcript_editor.focus_handle(cx).focus(window, cx);
+                            this.transcript_editor.update(cx, |editor, cx| {
+                                editor.enter_normal_mode(window, cx);
+                            });
+                            cx.notify();
+                        })
+                        .ok();
+                    true
+                });
+            }
+            Some(div().w_full().min_w_0().child(element).into_any_element())
         } else {
             Some(match item.kind {
                 model::TranscriptKind::User
                 | model::TranscriptKind::Agent
-                | model::TranscriptKind::Plan => {
-                    Self::render_plain_prose(&item.content, rich_search.as_ref(), cx)
-                }
-                model::TranscriptKind::Reasoning => {
-                    Self::render_reasoning(&item.content, rich_search.as_ref(), cx)
-                }
-                model::TranscriptKind::Command => {
-                    self.render_command(&item, index, rich_search.as_ref(), cx)
-                }
-                model::TranscriptKind::Web => {
-                    self.render_web_search(&item, index, rich_search.as_ref(), cx)
-                }
-                model::TranscriptKind::Diff => {
-                    self.render_diff(&item, index, rich_search.as_ref(), cx)
-                }
-                model::TranscriptKind::FileChange => {
-                    self.render_file_change(&item, index, rich_search.as_ref(), cx)
-                }
+                | model::TranscriptKind::Plan => Self::render_plain_prose(
+                    &item.content,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
+                model::TranscriptKind::Reasoning => Self::render_reasoning(
+                    &item.content,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
+                model::TranscriptKind::Command => self.render_command(
+                    &item,
+                    index,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
+                model::TranscriptKind::Web => self.render_web_search(
+                    &item,
+                    index,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
+                model::TranscriptKind::Diff => self.render_diff(
+                    &item,
+                    index,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
+                model::TranscriptKind::FileChange => self.render_file_change(
+                    &item,
+                    index,
+                    rich_search.as_ref(),
+                    rich_navigation.as_ref(),
+                    cx,
+                ),
                 model::TranscriptKind::Image => Self::render_image(
                     &item,
                     self.image_surfaces.get(&item.key).cloned(),
                     rich_search.as_ref(),
+                    rich_navigation.as_ref(),
                     cx,
                 ),
                 model::TranscriptKind::Tool
@@ -7120,6 +7770,7 @@ impl HarnessApp {
                     &item.key,
                     index,
                     rich_search.as_ref(),
+                    rich_navigation.as_ref(),
                     cx,
                 ),
                 _ => self.render_terminal(
@@ -7127,6 +7778,7 @@ impl HarnessApp {
                     &item.key,
                     index,
                     rich_search.as_ref(),
+                    rich_navigation.as_ref(),
                     cx,
                 ),
             })
@@ -7241,14 +7893,6 @@ impl HarnessApp {
             } else {
                 px(8.)
             })
-            .border_l_2()
-            .border_color(if cursor {
-                colors.text_accent
-            } else if visual {
-                colors.text_accent.opacity(0.45)
-            } else {
-                gpui::transparent_black()
-            })
             .when(visual, |this| {
                 this.bg(colors.element_selection_background.opacity(0.45))
             })
@@ -7268,6 +7912,16 @@ impl HarnessApp {
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_hybrid_surfaces(cx);
+        if rich_vim_experiment() && !self.buffer_view {
+            if self.rich_navigation_selection.is_none() {
+                self.rich_navigation_selection = Some(
+                    self.transcript_editor
+                        .update(cx, |editor, cx| editor.selection_snapshot(cx)),
+                );
+            }
+        } else {
+            self.rich_navigation_selection = None;
+        }
         self.sync_image_surfaces(window, cx);
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
@@ -7337,14 +7991,45 @@ impl Render for HarnessApp {
                 .child(self.transcript_editor.clone())
                 .into_any_element()
         } else {
-            list(
+            let rich_list = list(
                 list_state,
                 cx.processor(|this, index, window, cx| this.render_item(index, window, cx)),
             )
             .flex_1()
             .min_h_0()
-            .overflow_hidden()
-            .into_any_element()
+            .overflow_hidden();
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(rich_list)
+                .when(rich_vim_experiment(), |this| {
+                    // Keep the native Editor fully laid out so its Vim action
+                    // handlers and motion state remain real, but position it
+                    // outside the clipped Rich viewport. It contributes no
+                    // pixels and cannot intercept pointer input.
+                    this.child(
+                        div()
+                            .absolute()
+                            .left(px(-4096.))
+                            .top_0()
+                            // Vim needs the real Rich-column width so wrapped
+                            // motions agree with what the user sees. It does
+                            // not need a second viewport-height Editor painted
+                            // offscreen on every cursor move. A small five-row
+                            // viewport gives native vertical motions enough
+                            // context to resolve and autoscroll while keeping
+                            // layout local to the cursor neighborhood.
+                            .w_full()
+                            .h(px(120.))
+                            .opacity(0.)
+                            .child(self.transcript_editor.clone()),
+                    )
+                })
+                .into_any_element()
         };
         let search_status = if self.search_returns_to_buffer {
             "Enter to jump".to_string()
@@ -8828,6 +9513,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rich_vim_markdown_offsets_skip_formatting_marks_in_both_directions() {
+        let logical = "Build a real Vim composer with café.";
+        let source = "Build a **real Vim composer** with [café](https://example.com).";
+
+        let real = logical.find("real").unwrap();
+        let source_real = source.find("real").unwrap();
+        assert_eq!(
+            markdown_source_offset_for_logical(logical, source, real),
+            source_real
+        );
+        assert_eq!(
+            markdown_logical_offset_for_source(logical, source, source_real),
+            real
+        );
+
+        let cafe = logical.find("café").unwrap();
+        let source_cafe = source.find("café").unwrap();
+        assert_eq!(
+            markdown_source_offset_for_logical(logical, source, cafe),
+            source_cafe
+        );
+        assert_eq!(
+            markdown_logical_offset_for_source(logical, source, source_cafe),
+            cafe
+        );
+    }
+
+    #[test]
+    fn rich_navigation_fragments_preserve_order_and_skip_ornaments() {
+        let navigation = RichNavigationPaint {
+            body_text: "same\nvisible body\nsame".into(),
+            range: 0..0,
+            head: Some(0),
+            visual: false,
+        };
+        let mut cursor = 0;
+
+        assert_eq!(
+            rich_navigation_fragment_range(Some(&navigation), "same", &mut cursor),
+            0..4
+        );
+        assert_eq!(
+            rich_navigation_fragment_range(Some(&navigation), "ornamental label", &mut cursor),
+            4..4
+        );
+        assert_eq!(
+            rich_navigation_fragment_range(Some(&navigation), "same", &mut cursor),
+            18..22
+        );
+    }
+
+    #[test]
     fn performance_j_run_has_one_preparation_one_baseline_and_exact_move_count() {
         let mut run = PerformanceJRunState::new(7);
         let mut steps = Vec::new();
@@ -8841,10 +9578,19 @@ mod tests {
         assert_eq!(
             steps
                 .iter()
-                .filter(|step| **step == PerformanceJStep::Dispatch)
+                .filter(|step| matches!(step, PerformanceJStep::Dispatch { .. }))
                 .count(),
             usize::from(PERFORMANCE_J_STEPS)
         );
+        assert!(steps.windows(2).all(|pair| {
+            !matches!(
+                pair,
+                [
+                    PerformanceJStep::Dispatch { down: first },
+                    PerformanceJStep::Dispatch { down: second }
+                ] if first == second
+            )
+        }));
         assert_eq!(run.phase, PerformanceJPhase::Complete);
     }
 
@@ -8858,9 +9604,9 @@ mod tests {
     }
 
     #[test]
-    fn performance_j_requires_room_for_every_downward_motion() {
-        assert!(!performance_j_has_room(usize::from(PERFORMANCE_J_STEPS)));
-        assert!(performance_j_has_room(usize::from(PERFORMANCE_J_STEPS) + 1));
+    fn performance_jk_requires_two_lines_for_repeated_motion() {
+        assert!(!performance_j_has_room(1));
+        assert!(performance_j_has_room(2));
     }
 
     #[test]

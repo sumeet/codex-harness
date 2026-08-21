@@ -190,7 +190,9 @@ impl Editor {
         cx.notify();
     }
 
-    pub(crate) fn highlight_inlays(
+    /// Apply host-owned styling to display-only inlay text. The range is
+    /// relative to each inlay's own content and never changes Buffer offsets.
+    pub fn highlight_inlays(
         &mut self,
         key: HighlightKey,
         highlights: Vec<InlayHighlight>,

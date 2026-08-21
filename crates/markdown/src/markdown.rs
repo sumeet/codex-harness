@@ -448,6 +448,11 @@ impl Default for MermaidViewState {
 pub struct Markdown {
     source: SharedString,
     selection: Selection,
+    // A host can keep keyboard selection state in another component (for
+    // example Zed's real Editor/Vim engine) while Markdown remains the visual
+    // source of truth. This paint-only range never affects Markdown's mouse
+    // selection, clipboard behavior, or focus handling.
+    external_selection: Option<Range<usize>>,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
@@ -648,6 +653,7 @@ impl Markdown {
         let mut this = Self {
             source,
             selection: Selection::default(),
+            external_selection: None,
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
@@ -1017,6 +1023,7 @@ impl Markdown {
         }
         self.source = source;
         self.selection = Selection::default();
+        self.external_selection = None;
         self.autoscroll_request = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
@@ -1052,6 +1059,21 @@ impl Markdown {
 
     pub fn has_selection(&self) -> bool {
         self.selection.end > self.selection.start
+    }
+
+    /// Paint a source-coordinate selection owned by an external navigation
+    /// model. Passing `None` restores Markdown's native mouse selection.
+    pub fn set_external_selection(
+        &mut self,
+        selection: Option<Range<usize>>,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = selection
+            .map(|range| range.start.min(self.source.len())..range.end.min(self.source.len()));
+        if self.external_selection != selection {
+            self.external_selection = selection;
+            cx.notify();
+        }
     }
 
     pub fn selected_source(&self) -> Option<&str> {
@@ -2042,7 +2064,11 @@ impl MarkdownElement {
     }
 
     fn paint_selection(&self, rendered_text: &RenderedText, window: &mut Window, cx: &mut App) {
-        let selection = self.markdown.read(cx).selection.clone();
+        let markdown = self.markdown.read(cx);
+        let selection = markdown
+            .external_selection
+            .clone()
+            .unwrap_or_else(|| markdown.selection.start..markdown.selection.end);
         Self::paint_highlight_range(
             selection.start,
             selection.end,

@@ -1126,6 +1126,7 @@ pub struct Editor {
     buffers_with_disabled_indent_guides: HashSet<BufferId>,
     highlight_order: usize,
     highlighted_rows: TypeIdHashMap<Vec<RowHighlight>>,
+    row_overlays: TypeIdHashMap<Vec<RowOverlay>>,
     background_highlights: HashMap<HighlightKey, BackgroundHighlight>,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
@@ -1705,6 +1706,39 @@ struct RowHighlight {
     color: fn(&App) -> Hsla,
     options: RowHighlightOptions,
     type_id: TypeId,
+}
+
+struct RowOverlay {
+    index: usize,
+    range: Range<Anchor>,
+    color: fn(&App) -> Hsla,
+    options: RowOverlayOptions,
+}
+
+/// A paint layer placed above ordinary row/card backgrounds and below glyphs.
+///
+/// Unlike [`RowHighlightOptions`], overlays do not take ownership of a row or
+/// split the grouping used to draw an enclosing rounded card. They are useful
+/// for nested semantic washes such as added/deleted diff rows.
+#[derive(Clone, Copy)]
+pub struct RowOverlayOptions {
+    pub include_gutter: bool,
+    /// Keeps a translucent overlay inside an enclosing card's outline.
+    pub horizontal_inset: Pixels,
+    /// Optional separator painted at the top edge of every first overlay row.
+    pub top_border: Option<fn(&App) -> Hsla>,
+    pub top_border_width: Pixels,
+}
+
+impl Default for RowOverlayOptions {
+    fn default() -> Self {
+        Self {
+            include_gutter: false,
+            horizontal_inset: Pixels::ZERO,
+            top_border: None,
+            top_border_width: Pixels::ZERO,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2672,6 +2706,7 @@ impl Editor {
             buffers_with_disabled_indent_guides: HashSet::default(),
             highlight_order: 0,
             highlighted_rows: Default::default(),
+            row_overlays: Default::default(),
             background_highlights: HashMap::default(),
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
@@ -9849,6 +9884,79 @@ impl Editor {
         self.highlighted_rows.remove(&TypeId::of::<T>());
     }
 
+    /// Add a semantic background layer without replacing or splitting the
+    /// ordinary row highlight underneath it.
+    pub fn highlight_row_overlay<T: 'static>(
+        &mut self,
+        range: Range<Anchor>,
+        color: fn(&App) -> Hsla,
+        options: RowOverlayOptions,
+        cx: &mut Context<Self>,
+    ) {
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let overlays = self.row_overlays.entry(TypeId::of::<T>()).or_default();
+        let ix = overlays.binary_search_by(|overlay| {
+            Ordering::Equal
+                .then_with(|| overlay.range.start.cmp(&range.start, &snapshot))
+                .then_with(|| overlay.range.end.cmp(&range.end, &snapshot))
+        });
+        if let Err(ix) = ix {
+            let index = post_inc(&mut self.highlight_order);
+            overlays.insert(
+                ix,
+                RowOverlay {
+                    index,
+                    range,
+                    color,
+                    options,
+                },
+            );
+        }
+    }
+
+    pub fn clear_row_overlays<T: 'static>(&mut self) {
+        self.row_overlays.remove(&TypeId::of::<T>());
+    }
+
+    pub fn highlighted_display_row_overlays(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> BTreeMap<DisplayRow, LineOverlay> {
+        let snapshot = self.snapshot(window, cx);
+        let mut used_orders = HashMap::default();
+        self.row_overlays
+            .values()
+            .flat_map(|overlays| overlays.iter())
+            .fold(BTreeMap::default(), |mut rows, overlay| {
+                let start = overlay.range.start.to_display_point(&snapshot);
+                let end = overlay.range.end.to_display_point(&snapshot);
+                let start_row = start.row().0;
+                let end_row = if !overlay.range.end.is_max() && end.column() == 0 {
+                    end.row().0.saturating_sub(1)
+                } else {
+                    end.row().0
+                };
+                for row in start_row..=end_row {
+                    let used_order = used_orders.entry(row).or_insert(overlay.index);
+                    if overlay.index >= *used_order {
+                        *used_order = overlay.index;
+                        rows.insert(
+                            DisplayRow(row),
+                            LineOverlay {
+                                background: (overlay.color)(cx).into(),
+                                include_gutter: overlay.options.include_gutter,
+                                horizontal_inset: overlay.options.horizontal_inset,
+                                top_border: overlay.options.top_border.map(|border| border(cx)),
+                                top_border_width: overlay.options.top_border_width,
+                            },
+                        );
+                    }
+                }
+                rows
+            })
+    }
+
     /// For a highlight given context type, gets all anchor ranges that will be used for row highlighting.
     pub fn highlighted_rows<'a, T: 'static>(
         &'a self,
@@ -13526,6 +13634,15 @@ pub struct LineHighlight {
     pub include_gutter: bool,
     pub type_id: Option<TypeId>,
     pub group_id: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineOverlay {
+    pub background: Background,
+    pub include_gutter: bool,
+    pub horizontal_inset: Pixels,
+    pub top_border: Option<gpui::Hsla>,
+    pub top_border_width: Pixels,
 }
 
 struct LineManipulationResult {
