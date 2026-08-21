@@ -581,27 +581,44 @@ fn navigation_highlights_for_fragment(
     vec![(
         start - fragment.start..end - fragment.start,
         gpui::HighlightStyle {
-            background_color: Some(rich_navigation_highlight_background(navigation, cx)),
+            background_color: Some(rich_navigation_text_highlight_background(navigation, cx)),
             ..Default::default()
         },
     )]
 }
 
-/// Markdown paints its external selection after its glyphs, while StyledText
-/// paints highlight backgrounds below them. Keep one translucent color for
-/// both paths so a Visual selection never obscures the Rich text it selects.
-fn rich_navigation_selection_background(cx: &App) -> gpui::Hsla {
-    cx.theme().players().read_only().selection.alpha(0.28)
+/// Markdown paints its external selection after its glyphs, so it needs a
+/// translucent overlay. StyledText paints backgrounds below glyphs and can
+/// use the stronger native Vim player color without obscuring selected text.
+fn rich_navigation_overlay_selection_background(cx: &App) -> gpui::Hsla {
+    // Markdown paints its selection as an overlay after its glyphs. The
+    // theme's element-selection color is already tuned for that compositing
+    // order; the read-only player color is opaque and grayscale, so merely
+    // lowering its alpha makes selected Rich text look disabled.
+    cx.theme().colors().element_selection_background.alpha(0.42)
 }
 
-fn rich_navigation_highlight_background(
+fn rich_navigation_text_highlight_background(
     navigation: &RichNavigationPaint,
     cx: &App,
 ) -> gpui::Hsla {
     if navigation.visual {
-        rich_navigation_selection_background(cx)
+        // StyledText backgrounds are below their glyphs, so the stronger Vim
+        // player color stays crisp over syntax-colored diff and tool output.
+        cx.theme().players().local().selection
     } else {
-        cx.theme().players().read_only().cursor.opacity(0.62)
+        cx.theme().players().local().cursor.opacity(0.62)
+    }
+}
+
+fn rich_navigation_markdown_highlight_background(
+    navigation: &RichNavigationPaint,
+    cx: &App,
+) -> gpui::Hsla {
+    if navigation.visual {
+        rich_navigation_overlay_selection_background(cx)
+    } else {
+        cx.theme().players().local().cursor.opacity(0.62)
     }
 }
 
@@ -7773,7 +7790,7 @@ impl HarnessApp {
             style.code_block_overflow_x_scroll = true;
             if let Some(navigation) = rich_navigation.as_ref() {
                 style.selection_background_color =
-                    rich_navigation_highlight_background(navigation, cx);
+                    rich_navigation_markdown_highlight_background(navigation, cx);
             }
             let mut element = MarkdownElement::new(markdown, style);
             if rich_vim_experiment() {
