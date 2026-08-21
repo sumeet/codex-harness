@@ -83,6 +83,16 @@ pub const DEFAULT_ADDITIONAL_WINDOW_SIZE: Size<Pixels> = Size {
     height: Pixels(750.),
 };
 
+/// A focused CPU-side prepaint surface used by application performance
+/// diagnostics. These samples supplement the whole-window prepaint duration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepaintComponent {
+    /// A virtualized GPUI list's item measurement and prepaint pass.
+    List,
+    /// An Editor that retains input/layout state without painting visual layers.
+    InputOnlyEditor,
+}
+
 /// Represents the two different phases when dispatching events.
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum DispatchPhase {
@@ -2986,7 +2996,18 @@ impl Window {
         self.window_profiler.begin_measurement();
     }
 
+    /// Records one focused component inside the window's prepaint pass.
+    pub fn record_prepaint_component(&mut self, component: PrepaintComponent, duration: Duration) {
+        #[cfg(feature = "profiler")]
+        self.window_profiler
+            .record_prepaint_component(component, duration);
+        #[cfg(not(feature = "profiler"))]
+        let _ = (component, duration);
+    }
+
     fn draw_roots(&mut self, cx: &mut App) {
+        #[cfg(feature = "profiler")]
+        let prepaint_started_at = Instant::now();
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3056,6 +3077,8 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        #[cfg(feature = "profiler")]
+        let paint_started_at = Instant::now();
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -3074,6 +3097,12 @@ impl Window {
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector_hitbox(cx);
+
+        #[cfg(feature = "profiler")]
+        self.window_profiler.record_draw_phases(
+            paint_started_at.duration_since(prepaint_started_at),
+            Instant::now().duration_since(paint_started_at),
+        );
 
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();

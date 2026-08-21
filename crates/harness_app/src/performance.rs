@@ -56,6 +56,10 @@ impl PerformanceSnapshot {
 
 struct PerformanceSample {
     draw_duration: Histogram<u64>,
+    prepaint_duration: Histogram<u64>,
+    paint_duration: Histogram<u64>,
+    list_prepaint_duration: Histogram<u64>,
+    input_only_editor_prepaint_duration: Histogram<u64>,
     input_to_present: Histogram<u64>,
     input_arrival_interval: Histogram<u64>,
     input_dispatch_duration: Histogram<u64>,
@@ -86,6 +90,27 @@ impl PerformanceSample {
                 &current.frames.draw_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.draw_duration_histogram),
                 "draw duration",
+            )?,
+            prepaint_duration: histogram_delta(
+                &current.frames.prepaint_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.prepaint_duration_histogram),
+                "prepaint duration",
+            )?,
+            paint_duration: histogram_delta(
+                &current.frames.paint_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.paint_duration_histogram),
+                "paint duration",
+            )?,
+            list_prepaint_duration: histogram_delta(
+                &current.frames.list_prepaint_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.list_prepaint_duration_histogram),
+                "list prepaint duration",
+            )?,
+            input_only_editor_prepaint_duration: histogram_delta(
+                &current.frames.input_only_editor_prepaint_duration_histogram,
+                previous_frames
+                    .map(|snapshot| &snapshot.input_only_editor_prepaint_duration_histogram),
+                "input-only editor prepaint duration",
             )?,
             input_to_present: histogram_delta(
                 &current.input.latency_histogram,
@@ -128,6 +153,13 @@ impl PerformanceSample {
         [
             format!("Harness performance ({period})"),
             format_duration_histogram("draw", &self.draw_duration),
+            format_duration_histogram("prepaint", &self.prepaint_duration),
+            format_duration_histogram("paint", &self.paint_duration),
+            format_duration_histogram("list prepaint", &self.list_prepaint_duration),
+            format_duration_histogram(
+                "input-only editor prepaint",
+                &self.input_only_editor_prepaint_duration,
+            ),
             format_duration_histogram("input arrival", &self.input_arrival_interval),
             format_duration_histogram("input dispatch", &self.input_dispatch_duration),
             format_duration_histogram("input→present", &self.input_to_present),
@@ -272,6 +304,10 @@ mod tests {
         PerformanceSnapshot {
             frames: FrameDurationSnapshot {
                 draw_duration_histogram: histogram(draws),
+                prepaint_duration_histogram: histogram(draws),
+                paint_duration_histogram: histogram(draws),
+                list_prepaint_duration_histogram: histogram(draws),
+                input_only_editor_prepaint_duration_histogram: histogram(draws),
                 input_driven_present_interval_histogram: histogram(input_intervals),
                 present_interval_histogram: histogram(animation_intervals),
             },

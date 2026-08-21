@@ -238,6 +238,11 @@ pub struct DisplayMap {
     block_map: BlockMap,
     /// Regions of text that should be highlighted.
     text_highlights: TextHighlights,
+    /// Monotonic generation for geometry-affecting text highlights. Most
+    /// cursor-only frames do not change these ranges, so the expensive
+    /// anchor-to-tab-point projection can be reused.
+    font_variant_highlights_version: usize,
+    font_variant_ranges_cache: Option<(usize, usize, Arc<[FontVariantRange]>)>,
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     /// The semantic tokens from the language server.
@@ -431,6 +436,8 @@ impl DisplayMap {
             fold_placeholder,
             diagnostics_max_severity,
             text_highlights: Default::default(),
+            font_variant_highlights_version: 0,
+            font_variant_ranges_cache: None,
             inlay_highlights: Default::default(),
             semantic_token_highlights: Default::default(),
             clip_at_line_ends: false,
@@ -585,62 +592,67 @@ impl DisplayMap {
     fn sync_through_wrap(&mut self, cx: &mut App) -> (WrapSnapshot, WrapPatch) {
         let tab_size = Self::tab_size(&self.buffer, cx);
         let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
-        let font_variant_point_ranges = self
-            .text_highlights
-            .values()
-            .filter_map(|highlight| {
-                highlight
-                    .0
-                    .font_family
-                    .map(|variant| (variant, highlight.1.as_slice()))
-            })
-            .flat_map(|(variant, ranges)| {
-                ranges.iter().filter_map({
-                    let buffer_snapshot = &buffer_snapshot;
-                    move |range| {
-                        let range = range.to_point(buffer_snapshot);
-                        (range.start < range.end).then_some((range, variant))
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
         let edits = self.buffer_subscription.consume().into_inner();
 
-        let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, edits);
+        let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot.clone(), edits);
         let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
-        let mut font_variant_ranges = font_variant_point_ranges
-            .into_iter()
-            .filter_map(|(range, variant)| {
-                let start = snapshot.point_to_tab_point(range.start, Bias::Left);
-                let end = snapshot.point_to_tab_point(range.end, Bias::Right);
-                (start < end).then_some(FontVariantRange {
-                    range: start..end,
-                    variant,
+        let cache_key = (snapshot.version, self.font_variant_highlights_version);
+        let font_variant_ranges = if let Some((tab_version, highlight_version, ranges)) =
+            &self.font_variant_ranges_cache
+            && (*tab_version, *highlight_version) == cache_key
+        {
+            ranges.clone()
+        } else {
+            let mut ranges = self
+                .text_highlights
+                .values()
+                .filter_map(|highlight| {
+                    highlight
+                        .0
+                        .font_family
+                        .map(|variant| (variant, highlight.1.as_slice()))
                 })
-            })
-            .collect::<Vec<_>>();
-        font_variant_ranges.sort_by(|left, right| {
-            left.range
-                .start
-                .cmp(&right.range.start)
-                .then_with(|| left.range.end.cmp(&right.range.end))
-                .then_with(|| left.variant.cmp(&right.variant))
-        });
-        let mut merged_font_variant_ranges: Vec<FontVariantRange> =
-            Vec::with_capacity(font_variant_ranges.len());
-        for range in font_variant_ranges {
-            if let Some(previous) = merged_font_variant_ranges.last_mut()
-                && previous.variant == range.variant
-                && range.range.start <= previous.range.end
-            {
-                previous.range.end = previous.range.end.max(range.range.end);
-            } else {
-                merged_font_variant_ranges.push(range);
+                .flat_map(|(variant, ranges)| {
+                    ranges.iter().filter_map({
+                        let buffer_snapshot = &buffer_snapshot;
+                        let snapshot = &snapshot;
+                        move |range| {
+                            let range = range.to_point(buffer_snapshot);
+                            let start = snapshot.point_to_tab_point(range.start, Bias::Left);
+                            let end = snapshot.point_to_tab_point(range.end, Bias::Right);
+                            (start < end).then_some(FontVariantRange {
+                                range: start..end,
+                                variant,
+                            })
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            ranges.sort_by(|left, right| {
+                left.range
+                    .start
+                    .cmp(&right.range.start)
+                    .then_with(|| left.range.end.cmp(&right.range.end))
+                    .then_with(|| left.variant.cmp(&right.variant))
+            });
+            let mut merged: Vec<FontVariantRange> = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                if let Some(previous) = merged.last_mut()
+                    && previous.variant == range.variant
+                    && range.range.start <= previous.range.end
+                {
+                    previous.range.end = previous.range.end.max(range.range.end);
+                } else {
+                    merged.push(range);
+                }
             }
-        }
+            let ranges = Arc::<[FontVariantRange]>::from(merged);
+            self.font_variant_ranges_cache = Some((cache_key.0, cache_key.1, ranges.clone()));
+            ranges
+        };
         self.wrap_map.update(cx, |map, cx| {
-            map.sync_with_font_variant_ranges(snapshot, edits, merged_font_variant_ranges, cx)
+            map.sync_with_font_variant_ranges(snapshot, edits, font_variant_ranges, cx)
         })
     }
 
@@ -1220,6 +1232,11 @@ impl DisplayMap {
         cx: &App,
     ) {
         let multi_buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        let affects_font_variants = style.font_family.is_some()
+            || self
+                .text_highlights
+                .get(&key)
+                .is_some_and(|highlights| highlights.0.font_family.is_some());
         match Arc::make_mut(&mut self.text_highlights).entry(key) {
             Entry::Occupied(mut slot) => match Arc::get_mut(slot.get_mut()) {
                 Some((_, previous_ranges)) if merge => {
@@ -1245,6 +1262,10 @@ impl DisplayMap {
                 ranges.sort_by(|a, b| a.start.cmp(&b.start, &multi_buffer_snapshot));
                 slot.insert(Arc::new((style, ranges)));
             }
+        }
+        if affects_font_variants {
+            self.font_variant_highlights_version =
+                self.font_variant_highlights_version.wrapping_add(1);
         }
     }
 
@@ -1292,20 +1313,34 @@ impl DisplayMap {
     }
 
     pub fn clear_highlights(&mut self, key: HighlightKey) -> bool {
+        let cleared_font_variant = self
+            .text_highlights
+            .get(&key)
+            .is_some_and(|highlights| highlights.0.font_family.is_some());
         let mut cleared = Arc::make_mut(&mut self.text_highlights)
             .remove(&key)
             .is_some();
+        if cleared_font_variant {
+            self.font_variant_highlights_version =
+                self.font_variant_highlights_version.wrapping_add(1);
+        }
         cleared |= self.inlay_highlights.remove(&key).is_some();
         cleared
     }
 
     pub fn clear_highlights_with(&mut self, f: &mut dyn FnMut(&HighlightKey) -> bool) -> bool {
         let mut cleared = false;
-        Arc::make_mut(&mut self.text_highlights).retain(|k, _| {
+        let mut cleared_font_variant = false;
+        Arc::make_mut(&mut self.text_highlights).retain(|k, highlights| {
             let b = !f(k);
             cleared |= b;
+            cleared_font_variant |= b && highlights.0.font_family.is_some();
             b
         });
+        if cleared_font_variant {
+            self.font_variant_highlights_version =
+                self.font_variant_highlights_version.wrapping_add(1);
+        }
         self.inlay_highlights.retain(|k, _| {
             let b = !f(k);
             cleared |= b;
@@ -3966,6 +4001,101 @@ pub mod tests {
                 ("\"".to_string(), Some(Hsla::green()), None),
             ]
         );
+    }
+
+    #[gpui::test]
+    async fn test_font_variant_projection_is_cached_until_highlights_change(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| init_test(cx, &|_| {}));
+
+        let buffer = cx.new(|cx| Buffer::local("alpha beta", cx));
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+        let snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer.clone(),
+                font("Courier"),
+                px(16.),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+
+        let first = map.update(cx, |map, cx| {
+            map.highlight_text(
+                HighlightKey::Editor,
+                vec![
+                    snapshot.anchor_before(MultiBufferOffset(0))
+                        ..snapshot.anchor_after(MultiBufferOffset(5)),
+                ],
+                HighlightStyle {
+                    font_family: Some(gpui::FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                false,
+                cx,
+            );
+            map.sync_through_wrap(cx);
+            map.font_variant_ranges_cache
+                .as_ref()
+                .expect("font ranges should be cached")
+                .2
+                .clone()
+        });
+        let second = map.update(cx, |map, cx| {
+            map.sync_through_wrap(cx);
+            map.font_variant_ranges_cache
+                .as_ref()
+                .expect("font ranges should remain cached")
+                .2
+                .clone()
+        });
+        assert!(Arc::ptr_eq(&first, &second));
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(MultiBufferOffset(0)..MultiBufferOffset(0), "prefix ")],
+                None,
+                cx,
+            );
+        });
+        let after_buffer_edit = map.update(cx, |map, cx| {
+            map.sync_through_wrap(cx);
+            map.font_variant_ranges_cache
+                .as_ref()
+                .expect("edited font ranges should be cached")
+                .2
+                .clone()
+        });
+        assert!(!Arc::ptr_eq(&second, &after_buffer_edit));
+
+        let third = map.update(cx, |map, cx| {
+            map.highlight_text(
+                HighlightKey::Editor,
+                vec![
+                    snapshot.anchor_before(MultiBufferOffset(6))
+                        ..snapshot.anchor_after(MultiBufferOffset(10)),
+                ],
+                HighlightStyle {
+                    font_family: Some(gpui::FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                false,
+                cx,
+            );
+            map.sync_through_wrap(cx);
+            map.font_variant_ranges_cache
+                .as_ref()
+                .expect("changed font ranges should be cached")
+                .2
+                .clone()
+        });
+        assert!(!Arc::ptr_eq(&after_buffer_edit, &third));
     }
 
     #[gpui::test]

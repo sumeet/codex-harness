@@ -373,7 +373,7 @@ impl WrapMap {
         &mut self,
         tab_snapshot: TabSnapshot,
         edits: Vec<TabEdit>,
-        ranges: Vec<FontVariantRange>,
+        ranges: Arc<[FontVariantRange]>,
         cx: &mut Context<Self>,
     ) -> (WrapSnapshot, WrapPatch) {
         let (_, edits) = self.sync(tab_snapshot, edits, cx);
@@ -402,10 +402,9 @@ impl WrapMap {
 
     pub fn set_font_variant_ranges(
         &mut self,
-        ranges: Vec<FontVariantRange>,
+        ranges: Arc<[FontVariantRange]>,
         cx: &mut Context<Self>,
     ) -> bool {
-        let ranges: Arc<[FontVariantRange]> = ranges.into();
         if ranges == self.font_variant_ranges {
             false
         } else {

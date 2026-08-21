@@ -8215,6 +8215,7 @@ impl Element for EditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> Self::PrepaintState {
+        let input_only_prepaint_started_at = self.input_only.then(std::time::Instant::now);
         let _prepaint_depth_guard = request_layout.increment_prepaint_depth();
         let text_style = TextStyleRefinement {
             font_size: Some(self.style.text.font_size),
@@ -8232,7 +8233,7 @@ impl Element for EditorElement {
         }
 
         let rem_size = self.rem_size(cx);
-        window.with_rem_size(rem_size, |window| {
+        let layout = window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
@@ -9768,7 +9769,14 @@ impl Element for EditorElement {
                     }
                 })
             })
-        })
+        });
+        if let Some(started_at) = input_only_prepaint_started_at {
+            window.record_prepaint_component(
+                gpui::PrepaintComponent::InputOnlyEditor,
+                started_at.elapsed(),
+            );
+        }
+        layout
     }
 
     fn paint(

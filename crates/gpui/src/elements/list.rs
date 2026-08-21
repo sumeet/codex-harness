@@ -1593,6 +1593,7 @@ impl Element for List {
         window: &mut Window,
         cx: &mut App,
     ) -> ListPrepaintState {
+        let prepaint_started_at = std::time::Instant::now();
         let state = &mut *self.state.0.borrow_mut();
         state.reset = false;
 
@@ -1634,7 +1635,12 @@ impl Element for List {
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
-        ListPrepaintState { hitbox, layout }
+        let result = ListPrepaintState { hitbox, layout };
+        window.record_prepaint_component(
+            crate::PrepaintComponent::List,
+            prepaint_started_at.elapsed(),
+        );
+        result
     }
 
     fn paint(

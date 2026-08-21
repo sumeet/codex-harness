@@ -831,6 +831,14 @@ pub enum FrameEvent {
 pub struct FrameDurationSnapshot {
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
+    /// Histogram of root-tree layout and prepaint durations, in nanoseconds.
+    pub prepaint_duration_histogram: Histogram<u64>,
+    /// Histogram of root-tree paint durations, in nanoseconds.
+    pub paint_duration_histogram: Histogram<u64>,
+    /// Histogram of GPUI List prepaint invocations, in nanoseconds.
+    pub list_prepaint_duration_histogram: Histogram<u64>,
+    /// Histogram of input-only Editor prepaint invocations, in nanoseconds.
+    pub input_only_editor_prepaint_duration_histogram: Histogram<u64>,
     /// Histogram of intervals between consecutive input-driven presented
     /// frames, in nanoseconds.
     pub input_driven_present_interval_histogram: Histogram<u64>,
@@ -874,6 +882,10 @@ pub struct WindowProfiler {
     window_id: WindowId,
     active_activities: SmallVec<[WindowActivity; 4]>,
     draw_duration_histogram: Histogram<u64>,
+    prepaint_duration_histogram: Histogram<u64>,
+    paint_duration_histogram: Histogram<u64>,
+    list_prepaint_duration_histogram: Histogram<u64>,
+    input_only_editor_prepaint_duration_histogram: Histogram<u64>,
     input_driven_present_interval_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
@@ -899,6 +911,20 @@ impl WindowProfiler {
             active_activities: SmallVec::new(),
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
+            })?,
+            prepaint_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create prepaint duration histogram: {error}")
+            })?,
+            paint_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create paint duration histogram: {error}")
+            })?,
+            list_prepaint_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create list prepaint duration histogram: {error}")
+            })?,
+            input_only_editor_prepaint_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create input-only editor prepaint duration histogram: {error}"
+                )
             })?,
             input_driven_present_interval_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create input-driven present interval histogram: {error}")
@@ -1040,6 +1066,12 @@ impl WindowProfiler {
     pub fn frame_duration_snapshot(&self) -> FrameDurationSnapshot {
         FrameDurationSnapshot {
             draw_duration_histogram: self.draw_duration_histogram.clone(),
+            prepaint_duration_histogram: self.prepaint_duration_histogram.clone(),
+            paint_duration_histogram: self.paint_duration_histogram.clone(),
+            list_prepaint_duration_histogram: self.list_prepaint_duration_histogram.clone(),
+            input_only_editor_prepaint_duration_histogram: self
+                .input_only_editor_prepaint_duration_histogram
+                .clone(),
             input_driven_present_interval_histogram: self
                 .input_driven_present_interval_histogram
                 .clone(),
@@ -1127,6 +1159,29 @@ impl WindowProfiler {
             .record(duration.as_nanos() as u64)
             .ok();
         self.drew_since_last_present = true;
+    }
+
+    pub(crate) fn record_draw_phases(&mut self, prepaint: Duration, paint: Duration) {
+        self.prepaint_duration_histogram
+            .record(prepaint.as_nanos() as u64)
+            .ok();
+        self.paint_duration_histogram
+            .record(paint.as_nanos() as u64)
+            .ok();
+    }
+
+    pub(crate) fn record_prepaint_component(
+        &mut self,
+        component: crate::PrepaintComponent,
+        duration: Duration,
+    ) {
+        let histogram = match component {
+            crate::PrepaintComponent::List => &mut self.list_prepaint_duration_histogram,
+            crate::PrepaintComponent::InputOnlyEditor => {
+                &mut self.input_only_editor_prepaint_duration_histogram
+            }
+        };
+        histogram.record(duration.as_nanos() as u64).ok();
     }
 }
 
