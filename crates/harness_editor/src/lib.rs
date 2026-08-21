@@ -1350,6 +1350,16 @@ fn should_request_tail_autoscroll(follow_tail: bool, content_changed: bool) -> b
     follow_tail && content_changed
 }
 
+fn collapse_relocation_offset(
+    selection_start: usize,
+    selection_end: usize,
+    selection_head: usize,
+    body: &Range<usize>,
+) -> Option<usize> {
+    (body.contains(&selection_head) || selection_start < body.end && body.start < selection_end)
+        .then_some(body.end)
+}
+
 fn user_transcript_background(cx: &App) -> Hsla {
     cx.theme().colors().element_background
 }
@@ -2727,6 +2737,7 @@ impl TranscriptEditor {
             .lines()
             .count()
             .max(1);
+        let body_end_point = offset_to_point(&self.buffer.read(cx).text(), body_range.end);
         let item_key = item_key.to_owned();
         let changed = self.editor.update(cx, |editor, cx| {
             let currently_folded = editor
@@ -2740,6 +2751,26 @@ impl TranscriptEditor {
                 return false;
             }
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            if collapsed {
+                let selection = editor
+                    .selections
+                    .newest_anchor()
+                    .map(|anchor| anchor.to_offset(&snapshot).0);
+                if let Some(relocation_offset) = collapse_relocation_offset(
+                    selection.start,
+                    selection.end,
+                    selection.head(),
+                    &body_range,
+                ) {
+                    debug_assert_eq!(relocation_offset, body_range.end);
+                    editor.change_selections(
+                        SelectionEffects::default(),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([body_end_point..body_end_point]),
+                    );
+                }
+            }
             let anchors = clipped_anchor_range(&snapshot, body_range);
             if !collapsed {
                 editor.unfold_ranges(&[anchors], true, false, cx);
@@ -4299,6 +4330,20 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapsing_a_body_relocates_only_selections_that_would_disappear() {
+        let body = 10..30;
+
+        assert_eq!(collapse_relocation_offset(10, 10, 10, &body), Some(30));
+        assert_eq!(collapse_relocation_offset(18, 18, 18, &body), Some(30));
+        assert_eq!(collapse_relocation_offset(5, 15, 15, &body), Some(30));
+        assert_eq!(collapse_relocation_offset(25, 35, 25, &body), Some(30));
+
+        assert_eq!(collapse_relocation_offset(5, 5, 5, &body), None);
+        assert_eq!(collapse_relocation_offset(30, 30, 30, &body), None);
+        assert_eq!(collapse_relocation_offset(35, 35, 35, &body), None);
+    }
 
     #[test]
     fn transcript_and_vim_clipboard_use_project_free_editor_seams() {

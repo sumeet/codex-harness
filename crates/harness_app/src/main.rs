@@ -2286,9 +2286,12 @@ fn selectable_rich_diff_experiment() -> bool {
 
 fn rich_vim_experiment() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        // Rich rendering backed by the persistent native Editor is now the
+        // standalone default. Keep an explicit escape hatch while the Text
+        // projection remains useful for diagnosing selection/layout parity.
         std::env::var("HARNESS_RICH_VIM")
             .ok()
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+            .is_none_or(|value| !matches!(value.as_str(), "0" | "false" | "no"))
     });
     *ENABLED
 }
@@ -9552,6 +9555,11 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new(
             "o",
             FocusComposer,
+            Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "z a",
+            ToggleItem,
             Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
         ),
         KeyBinding::new(
