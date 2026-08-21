@@ -275,6 +275,43 @@ pub struct TranscriptDocument {
     pub segments: Vec<TranscriptDocumentSegment>,
 }
 
+impl TranscriptDocument {
+    /// Assemble independently projected semantic items into one Editor
+    /// document. The caller controls each item's body representation while
+    /// this constructor owns the offset and row bookkeeping.
+    pub fn from_item_projections(
+        model_item_count: usize,
+        projections: impl IntoIterator<Item = TranscriptItemProjection>,
+    ) -> Self {
+        let mut text = String::new();
+        let mut item_rows = vec![None; model_item_count];
+        let mut segments = Vec::new();
+        let mut current_row = 0_u32;
+
+        for projection in projections {
+            let item_index = projection.segment.item_index;
+            if item_index >= model_item_count {
+                continue;
+            }
+            item_rows[item_index] = Some(current_row);
+            let whole_start = text.len();
+            current_row += projection
+                .text
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count() as u32;
+            segments.push(shifted_segment(&projection.segment, whole_start));
+            text.push_str(&projection.text);
+        }
+
+        Self {
+            text,
+            item_rows,
+            segments,
+        }
+    }
+}
+
 /// The independently renderable text projection for one semantic transcript
 /// item. Segment ranges are relative to `text`, so consumers can relocate the
 /// projection without rebuilding the rest of the document.
@@ -291,6 +328,24 @@ impl TranscriptItemProjection {
 
     pub fn body_text(&self) -> &str {
         &self.text[self.segment.body_range.clone()]
+    }
+
+    /// Replace the selectable body while retaining this projection's item
+    /// identity and optional text-view header. Rich renderers use this to feed
+    /// Vim the same canonical visible text that their structured cards paint,
+    /// rather than protocol-only separator rows and metadata.
+    pub fn with_body_text(mut self, body: String) -> Self {
+        let body_start = self.segment.body_range.start;
+        self.text.truncate(body_start);
+        self.text.push_str(&body);
+        let body_end = self.text.len();
+        if !body.is_empty() {
+            self.text.push('\n');
+        }
+        self.segment.body_range = body_start..body_end;
+        self.segment.whole_range = 0..self.text.len();
+        self.segment.semantic_spans.clear();
+        self
     }
 }
 
@@ -4721,6 +4776,45 @@ mod tests {
                 &document.text[segment.body_range.clone()]
             );
         }
+    }
+
+    #[test]
+    fn callers_can_replace_rich_bodies_and_reassemble_exact_document_offsets() {
+        let model = TranscriptModel::replay(6);
+        let command = model
+            .rich_navigation_item_projection(5)
+            .unwrap()
+            .with_body_text("cargo check -p harness_app\nfinished".into());
+        assert_eq!(command.body_text(), "cargo check -p harness_app\nfinished");
+        assert_eq!(command.text, "cargo check -p harness_app\nfinished\n");
+        assert!(command.segment.header_range.is_empty());
+        assert!(command.segment.semantic_spans.is_empty());
+
+        let document = TranscriptDocument::from_item_projections(
+            model.items.len(),
+            [
+                model.rich_navigation_item_projection(4).unwrap(),
+                command.clone(),
+            ],
+        );
+        assert_eq!(document.segments.len(), 2);
+        assert_eq!(document.item_rows[4], Some(0));
+        assert_eq!(
+            document.item_rows[5],
+            Some(
+                model
+                    .rich_navigation_item_projection(4)
+                    .unwrap()
+                    .text
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count() as u32
+            )
+        );
+        assert_eq!(
+            &document.text[document.segments[1].body_range.clone()],
+            command.body_text()
+        );
     }
 
     #[test]

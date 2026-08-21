@@ -398,17 +398,18 @@ fn rich_navigation_needs_progressive_reveal(
 }
 
 /// Give hidden Rich navigation a stable proxy in the card header. Collapsed
-/// folds show their full title for a Visual selection; a Normal cursor owns
-/// exactly its first glyph. Progressive previews use the latter for the single
-/// frame in which their hidden tail expands.
+/// folds and non-text request/image surfaces show their full title for a
+/// Visual selection; a Normal cursor owns exactly its first glyph. Progressive
+/// previews use the latter for the single frame in which their hidden tail
+/// expands.
 fn rich_header_navigation_range(
     title: &str,
     navigation: Option<&RichNavigationPaint>,
-    collapsed: bool,
+    proxy_body: bool,
 ) -> Option<Range<usize>> {
     let navigation = navigation?;
     if navigation.visual {
-        return (collapsed && !navigation.ranges.is_empty()).then(|| 0..title.len());
+        return (proxy_body && !navigation.ranges.is_empty()).then(|| 0..title.len());
     }
     if navigation.head.is_none() || navigation.cursor_claimed.get() {
         return None;
@@ -925,6 +926,16 @@ fn transcript_item_searchable_body(item: &TranscriptItem) -> &str {
         image_caption_for_display(item).unwrap_or_default()
     } else {
         &item.content
+    }
+}
+
+fn rich_item_body_paints_navigation(item: &TranscriptItem) -> bool {
+    if item.pending_request.is_some() || !item.expanded {
+        return false;
+    }
+    match item.kind {
+        model::TranscriptKind::Image => image_caption_for_display(item).is_some(),
+        _ => !item.content.is_empty(),
     }
 }
 
@@ -2217,6 +2228,119 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
         related_queries: query_count.saturating_sub(1),
         results,
     }
+}
+
+fn reasoning_steps(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.trim_matches('*')
+                .trim_start_matches('#')
+                .trim_start_matches("- ")
+                .trim()
+                .to_string()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn append_rich_navigation_fragment(output: &mut String, fragment: &str) {
+    let fragment = fragment.trim_matches(['\r', '\n']);
+    if fragment.is_empty() {
+        return;
+    }
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str(fragment);
+}
+
+/// Build the text native Vim navigates from the same semantic presentations
+/// the Rich card renderer consumes. Every logical row must correspond to
+/// visible card text; protocol-only labels and presentation-only blank rows do
+/// not belong in this document.
+fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> String {
+    let mut output = String::new();
+    match item.kind {
+        model::TranscriptKind::Reasoning => {
+            for step in reasoning_steps(&item.content) {
+                append_rich_navigation_fragment(&mut output, &step);
+            }
+        }
+        model::TranscriptKind::Diff => {
+            for presentation in diff_file_presentations(&item.content) {
+                append_rich_navigation_fragment(&mut output, &presentation.path);
+                append_rich_navigation_fragment(&mut output, &presentation.content);
+            }
+        }
+        model::TranscriptKind::FileChange => {
+            for presentation in file_change_presentations(&item.content) {
+                append_rich_navigation_fragment(&mut output, &presentation.path);
+                append_rich_navigation_fragment(&mut output, &presentation.content);
+            }
+        }
+        model::TranscriptKind::Web => {
+            let presentation = web_search_presentation(&item.raw);
+            if presentation.results.is_empty() {
+                return fallback.to_owned();
+            }
+            for result in presentation.results {
+                append_rich_navigation_fragment(&mut output, &result.title);
+                if let Some(url) = result.url {
+                    append_rich_navigation_fragment(&mut output, &url);
+                }
+                if let Some(snippet) = result.snippet {
+                    append_rich_navigation_fragment(&mut output, &snippet);
+                }
+            }
+        }
+        model::TranscriptKind::Tool
+        | model::TranscriptKind::Subagent
+        | model::TranscriptKind::Review => {
+            let sections = activity_text_sections(&item.content);
+            if !sections.iter().any(|section| section.heading.is_some()) {
+                return fallback.to_owned();
+            }
+            for section in sections {
+                if let Some(heading) = section.heading {
+                    append_rich_navigation_fragment(&mut output, &heading);
+                }
+                append_rich_navigation_fragment(&mut output, &section.body);
+            }
+        }
+        model::TranscriptKind::Image => {
+            if let Some(caption) = image_caption_for_display(item) {
+                append_rich_navigation_fragment(&mut output, caption);
+            } else {
+                return fallback.to_owned();
+            }
+        }
+        _ => return fallback.to_owned(),
+    }
+    output
+}
+
+fn rich_navigation_item_projection(
+    model: &TranscriptModel,
+    item_index: usize,
+) -> Option<model::TranscriptItemProjection> {
+    let projection = model.rich_navigation_item_projection(item_index)?;
+    let item = model.items.get(item_index)?;
+    let body = rich_navigation_body_for_item(item, projection.body_text());
+    if body == projection.body_text() {
+        Some(projection)
+    } else {
+        Some(projection.with_body_text(body))
+    }
+}
+
+fn rich_navigation_document(model: &TranscriptModel) -> model::TranscriptDocument {
+    model::TranscriptDocument::from_item_projections(
+        model.items.len(),
+        (0..model.items.len()).filter_map(|index| rich_navigation_item_projection(model, index)),
+    )
 }
 
 fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
@@ -3806,7 +3930,7 @@ impl HarnessApp {
                 let projection = if self.buffer_view {
                     self.model.item_projection(item_index)
                 } else {
-                    self.model.rich_navigation_item_projection(item_index)
+                    rich_navigation_item_projection(&self.model, item_index)
                 };
                 (item_index, projection)
             })
@@ -3816,7 +3940,7 @@ impl HarnessApp {
                 if self.buffer_view {
                     self.model.item_projection(item_index)
                 } else {
-                    self.model.rich_navigation_item_projection(item_index)
+                    rich_navigation_item_projection(&self.model, item_index)
                 }
             })
             .collect::<Vec<_>>();
@@ -3840,7 +3964,7 @@ impl HarnessApp {
         let document = if self.buffer_view {
             self.model.full_document()
         } else {
-            self.model.rich_navigation_document()
+            rich_navigation_document(&self.model)
         };
         let old_text = self.transcript_editor.read(cx).text(cx);
         if old_text == document.text {
@@ -6656,18 +6780,8 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let mut logical_search_start = 0;
-        let steps = content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                line.trim_matches('*')
-                    .trim_start_matches('#')
-                    .trim_start_matches("- ")
-                    .trim()
-                    .to_string()
-            })
-            .filter(|line| !line.is_empty())
+        let steps = reasoning_steps(content)
+            .into_iter()
             .map(|line| {
                 let start = navigation
                     .and_then(|navigation| {
@@ -6975,10 +7089,16 @@ impl HarnessApp {
             command_limits.lines,
             command_limits.bytes,
         );
-        let displayed_command = if command_preview.footer.is_some() {
-            format!("{} …", command_preview.content.trim_end())
+        let visible_command_source = if command_preview.footer.is_some() {
+            command_preview.content.trim_end()
         } else {
-            command_preview.content
+            command_preview.content.as_str()
+        };
+        let visible_command_source_len = visible_command_source.len();
+        let displayed_command = if command_preview.footer.is_some() {
+            format!("{visible_command_source} …")
+        } else {
+            visible_command_source.to_owned()
         };
         let displayed_output = structured_output_preview_with_limits(
             &output,
@@ -6990,7 +7110,10 @@ impl HarnessApp {
         let command_start = navigation
             .and_then(|navigation| navigation.body_text.find(command_text))
             .unwrap_or(0);
-        let command_end = command_start + displayed_command.len();
+        // The ellipsis is presentation chrome, not a Vim byte. Keep its
+        // clickable/highlight range clamped to the actual command prefix so a
+        // long preview cannot spill into the output's logical row.
+        let command_end = command_start + visible_command_source_len;
         let output_start = navigation
             .and_then(|navigation| {
                 navigation.body_text[command_start.min(navigation.body_text.len())..]
@@ -8152,7 +8275,7 @@ impl HarnessApp {
         let header_cursor_range = rich_header_navigation_range(
             &header_title,
             rich_navigation.as_ref(),
-            !item.expanded || revealing_hidden_navigation,
+            !rich_item_body_paints_navigation(&item) || revealing_hidden_navigation,
         );
         let header_highlights = header_cursor_range
             .map(|range| {
@@ -10026,6 +10149,83 @@ mod tests {
     }
 
     #[test]
+    fn rich_navigation_bodies_contain_only_rows_painted_by_structured_renderers() {
+        let replay = TranscriptModel::replay(6);
+        let diff = rich_navigation_item_projection(&replay, 4).unwrap();
+        assert!(
+            diff.body_text()
+                .starts_with("crates/harness_app/src/main.rs\n@@ -83,7 +83,10 @@")
+        );
+        assert!(!diff.body_text().contains("diff --git"));
+
+        let command = rich_navigation_item_projection(&replay, 5).unwrap();
+        assert_eq!(
+            command.body_text(),
+            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+        );
+
+        let project = |kind, content: &str, raw: Value| {
+            let mut model = TranscriptModel::default();
+            model.items.push(TranscriptItem {
+                key: "canonical-fixture".into(),
+                protocol_id: Some("canonical-fixture".into()),
+                kind,
+                title: "Fixture".into(),
+                status: None,
+                content: content.into(),
+                raw,
+                event_count: 1,
+                expanded: true,
+                pending_request: None,
+            });
+            rich_navigation_item_projection(&model, 0)
+                .unwrap()
+                .body_text()
+                .to_owned()
+        };
+
+        assert_eq!(
+            project(
+                model::TranscriptKind::Tool,
+                "Arguments\n{\"query\":\"x\"}\n\nResult\nok",
+                Value::Null,
+            ),
+            "Arguments\n{\"query\":\"x\"}\nResult\nok"
+        );
+        assert_eq!(
+            project(
+                model::TranscriptKind::FileChange,
+                "Modified · /tmp/a\n@@ -1 +1 @@\n-old\n+new",
+                Value::Null,
+            ),
+            "/tmp/a\n@@ -1 +1 @@\n-old\n+new"
+        );
+        assert_eq!(
+            project(
+                model::TranscriptKind::Reasoning,
+                "**One**\n\n- Two",
+                Value::Null,
+            ),
+            "One\nTwo"
+        );
+        assert_eq!(
+            project(
+                model::TranscriptKind::Web,
+                "Query\nold protocol text\n\nResults\nold protocol result",
+                json!({
+                    "action": {"query": "zed"},
+                    "results": [{
+                        "title": "Zed Docs",
+                        "url": "https://zed.dev/docs",
+                        "snippet": "Fast editor"
+                    }]
+                }),
+            ),
+            "Zed Docs\nhttps://zed.dev/docs\nFast editor"
+        );
+    }
+
+    #[test]
     fn rich_navigation_preserves_each_visual_block_row() {
         let navigation = RichNavigationPaint {
             body_text: "abcdefghijkl".into(),
@@ -10232,9 +10432,26 @@ mod tests {
     }
 
     #[test]
-    fn rich_diff_maps_hidden_git_header_onto_visible_file_path() {
-        let body = "diff --git a/src/main.rs b/src/main.rs\n@@ -1 +1 @@\n-old\n+new";
-        let presentation = diff_file_presentations(body).pop().unwrap();
+    fn rich_diff_navigation_starts_on_the_visible_file_path() {
+        let mut model = TranscriptModel::default();
+        model.items.push(TranscriptItem {
+            key: "diff-fixture".into(),
+            protocol_id: Some("diff-fixture".into()),
+            kind: model::TranscriptKind::Diff,
+            title: "Working tree diff".into(),
+            status: None,
+            content: "diff --git a/src/main.rs b/src/main.rs\n@@ -1 +1 @@\n-old\n+new".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        });
+        let projection = rich_navigation_item_projection(&model, 0).unwrap();
+        let body = projection.body_text();
+        let presentation = diff_file_presentations(&model.items[0].content)
+            .pop()
+            .unwrap();
+        assert_eq!(body, "src/main.rs\n@@ -1 +1 @@\n-old\n+new");
 
         let normal = RichNavigationPaint {
             body_text: body.into(),
@@ -10251,6 +10468,7 @@ mod tests {
             &presentation.content,
             &mut logical_cursor,
         );
+        assert_eq!(path_range, 0.."src/main.rs".len());
         assert_eq!(&body[path_range.clone()], "src/main.rs");
         assert_eq!(
             navigation_ranges_for_fragment(&normal, path_range.clone()),
