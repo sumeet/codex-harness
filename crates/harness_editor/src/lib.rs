@@ -2052,6 +2052,11 @@ impl TranscriptEditor {
         self.typography_profile
     }
 
+    pub fn set_input_only(&mut self, input_only: bool, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| editor.set_input_only(input_only, cx));
+    }
+
     /// Change the whole transcript between the user's buffer font and Zed's UI
     /// reading font without rebuilding or replacing the selectable document.
     ///

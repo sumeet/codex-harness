@@ -250,6 +250,7 @@ pub struct EditorElement {
     editor: Entity<Editor>,
     style: EditorStyle,
     split_side: Option<SplitSide>,
+    input_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +267,17 @@ impl EditorElement {
             editor: editor.clone(),
             style,
             split_side: None,
+            input_only: false,
         }
+    }
+
+    /// Keep Editor layout, focus, key contexts, and action handlers active
+    /// without painting its visual layers. Hosts that project the same Buffer
+    /// into another renderer use this to retain the real Editor/Vim state
+    /// machine without drawing a duplicate offscreen transcript.
+    pub fn input_only(mut self, input_only: bool) -> Self {
+        self.input_only = input_only;
+        self
     }
 
     pub fn set_split_side(&mut self, side: SplitSide) {
@@ -9784,6 +9795,10 @@ impl Element for EditorElement {
             );
             self.register_actions(window, cx);
             self.register_key_listeners(window, cx, layout);
+        }
+
+        if self.input_only {
+            return;
         }
 
         let text_style = TextStyleRefinement {

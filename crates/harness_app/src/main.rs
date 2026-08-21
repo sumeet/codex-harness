@@ -195,17 +195,15 @@ impl PerformanceJRunState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PerformanceJDriver {
     state: PerformanceJRunState,
-    g: Keystroke,
     j: Keystroke,
     k: Keystroke,
     pending_motion_origin: Option<usize>,
 }
 
 impl PerformanceJDriver {
-    fn new(generation: u64, g: Keystroke, j: Keystroke, k: Keystroke) -> Self {
+    fn new(generation: u64, j: Keystroke, k: Keystroke) -> Self {
         Self {
             state: PerformanceJRunState::new(generation),
-            g,
             j,
             k,
             pending_motion_origin: None,
@@ -215,6 +213,23 @@ impl PerformanceJDriver {
 
 fn performance_j_has_room(logical_lines: usize) -> bool {
     logical_lines > 1
+}
+
+fn performance_j_candidate(model: &TranscriptModel) -> Option<usize> {
+    model.items.iter().enumerate().find_map(|(index, item)| {
+        (matches!(
+            item.kind,
+            model::TranscriptKind::User
+                | model::TranscriptKind::Agent
+                | model::TranscriptKind::Plan
+        ) && item.expanded
+            && item.status.as_deref() != Some("streaming")
+            && item.pending_request.is_none())
+        .then(|| model.rich_navigation_item_projection(index))
+        .flatten()
+        .filter(|projection| performance_j_has_room(projection.body_text().lines().count()))
+        .map(|_| index)
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2549,6 +2564,68 @@ impl HarnessApp {
         })
     }
 
+    /// Update a mounted Markdown message without invalidating HarnessApp.
+    ///
+    /// Most ordinary `j`/`k` motions remain within one user or agent message.
+    /// Markdown is already its own GPUI entity, so its external selection can
+    /// repaint independently; rebuilding the sidebar, composer, list, and all
+    /// visible cards for that motion is both unnecessary and the dominant
+    /// Rich+Vim latency cost.
+    fn update_cached_markdown_navigation(
+        &mut self,
+        item_index: usize,
+        snapshot: &TranscriptSelectionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(item) = self.model.items.get(item_index) else {
+            return false;
+        };
+        if !matches!(
+            item.kind,
+            model::TranscriptKind::User
+                | model::TranscriptKind::Agent
+                | model::TranscriptKind::Plan
+        ) || !item.expanded
+            || item.status.as_deref() == Some("streaming")
+            || item.content.is_empty()
+            || item.pending_request.is_some()
+        {
+            return false;
+        }
+        let Some(selection) = snapshot
+            .items
+            .iter()
+            .find(|selection| selection.item_index == item_index)
+        else {
+            return false;
+        };
+
+        let key = item.key.clone();
+        let source = item.content.clone();
+        let navigation = RichNavigationPaint {
+            body_text: selection.body_text.clone(),
+            range: selection.range.clone(),
+            head: selection.head,
+            visual: snapshot.visual,
+        };
+        let next_range = navigation
+            .markdown_source_range(&source)
+            .filter(|range| range.start < range.end);
+        let Some(cached) = self.markdown_cache.get_mut(&key) else {
+            return false;
+        };
+        if cached.source != source {
+            return false;
+        }
+        if cached.navigation_range != next_range {
+            cached.navigation_range = next_range.clone();
+            cached.entity.update(cx, |markdown, cx| {
+                markdown.set_external_selection(next_range, cx)
+            });
+        }
+        true
+    }
+
     fn new(
         cwd: String,
         replay_count: Option<usize>,
@@ -2622,6 +2699,18 @@ impl HarnessApp {
                 let rich_selection_changed = !this.buffer_view
                     && rich_vim_experiment()
                     && this.rich_navigation_selection.as_ref() != Some(&snapshot);
+                let local_markdown_repaint = rich_selection_changed
+                    && item_index.is_some_and(|item_index| {
+                        this.rich_navigation_selection
+                            .as_ref()
+                            .is_some_and(|previous| {
+                                previous.items.len() == 1
+                                    && snapshot.items.len() == 1
+                                    && previous.items[0].item_index == item_index
+                                    && snapshot.items[0].item_index == item_index
+                            })
+                            && this.update_cached_markdown_navigation(item_index, &snapshot, cx)
+                    });
                 if !this.buffer_view && rich_vim_experiment() {
                     this.rich_navigation_selection = Some(snapshot);
                 }
@@ -2632,10 +2721,10 @@ impl HarnessApp {
                         this.list_state.pause_following_tail();
                         this.list_state.scroll_to_reveal_item(item_index);
                     }
-                    if changed || rich_selection_changed {
+                    if changed || (rich_selection_changed && !local_markdown_repaint) {
                         cx.notify();
                     }
-                } else if rich_selection_changed {
+                } else if rich_selection_changed && !local_markdown_repaint {
                     cx.notify();
                 }
             },
@@ -4962,10 +5051,11 @@ impl HarnessApp {
                 return;
             };
             let key = match step {
-                PerformanceJStep::Prepare => Some(driver.g.clone()),
                 PerformanceJStep::Dispatch { down: true } => Some(driver.j.clone()),
                 PerformanceJStep::Dispatch { down: false } => Some(driver.k.clone()),
-                PerformanceJStep::Baseline | PerformanceJStep::Report => None,
+                PerformanceJStep::Prepare
+                | PerformanceJStep::Baseline
+                | PerformanceJStep::Report => None,
             };
             (step, key)
         };
@@ -4980,22 +5070,12 @@ impl HarnessApp {
                 self.transcript_editor.update(cx, |editor, cx| {
                     editor.enter_normal_mode(window, cx);
                 });
-                let Some(g) = key else {
-                    self.cancel_performance_j(generation, "Vim gg key was unavailable", cx);
-                    return;
-                };
                 self.set_performance_status(
                     format!("Running {PERFORMANCE_J_STEPS}-frame Vim j/k performance sample…"),
                     None,
                     cx,
                 );
-                Self::dispatch_performance_j_keys(
-                    generation,
-                    vec![g.clone(), g],
-                    "Vim gg was not handled",
-                    window,
-                    cx,
-                );
+                Self::schedule_performance_j_step(generation, window, cx);
             }
             PerformanceJStep::Baseline => {
                 self.performance_reporter.mark_baseline(window);
@@ -5060,17 +5140,14 @@ impl HarnessApp {
         self.performance_j_generation = self.performance_j_generation.wrapping_add(1);
         let generation = self.performance_j_generation;
         self.performance_j_run = None;
-        let g = match Keystroke::parse("g") {
-            Ok(keystroke) => keystroke,
-            Err(error) => {
-                self.set_performance_status(
-                    "Performance run could not prepare its Vim key",
-                    Some(PERFORMANCE_STATUS_DURATION),
-                    cx,
-                );
-                log::error!("failed to parse Harness :perf-j preparation key: {error}");
-                return;
-            }
+        let Some(candidate) = performance_j_candidate(&self.model) else {
+            self.set_performance_status(
+                ":perf-j needs a completed multi-line Markdown message",
+                Some(PERFORMANCE_STATUS_DURATION),
+                cx,
+            );
+            log::warn!("Harness :perf-j could not find a multi-line Markdown message");
+            return;
         };
         let j = match Keystroke::parse("j") {
             Ok(keystroke) => keystroke,
@@ -5096,26 +5173,17 @@ impl HarnessApp {
                 return;
             }
         };
+        self.selected_item = candidate;
         if rich_vim_experiment() && !self.buffer_view {
             self.focus_transcript(window, cx);
         } else {
             self.show_text_transcript(window, cx);
         }
+        self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_cursor_in_item(candidate, 0, window, cx);
+        });
 
-        let logical_lines = self.transcript_editor.read(cx).text(cx).lines().count();
-        if !performance_j_has_room(logical_lines) {
-            self.set_performance_status(
-                format!(":perf-j needs at least two transcript lines ({logical_lines} available)"),
-                Some(PERFORMANCE_STATUS_DURATION),
-                cx,
-            );
-            log::warn!(
-                "Harness :perf-j needs at least two transcript lines; found {logical_lines}"
-            );
-            return;
-        }
-
-        self.performance_j_run = Some(PerformanceJDriver::new(generation, g, j, k));
+        self.performance_j_run = Some(PerformanceJDriver::new(generation, j, k));
         self.set_performance_status("Preparing Vim j/k performance sample…", None, cx);
         log::info!("starting Harness :perf-j run ({PERFORMANCE_J_STEPS} frames)");
         Self::schedule_performance_j_step(generation, window, cx);
@@ -7912,6 +7980,10 @@ impl HarnessApp {
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_hybrid_surfaces(cx);
+        let transcript_input_only = rich_vim_experiment() && !self.buffer_view;
+        self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_input_only(transcript_input_only, cx)
+        });
         if rich_vim_experiment() && !self.buffer_view {
             if self.rich_navigation_selection.is_none() {
                 self.rich_navigation_selection = Some(
@@ -9607,6 +9679,13 @@ mod tests {
     fn performance_jk_requires_two_lines_for_repeated_motion() {
         assert!(!performance_j_has_room(1));
         assert!(performance_j_has_room(2));
+    }
+
+    #[test]
+    fn performance_j_uses_one_multiline_markdown_surface() {
+        let model = TranscriptModel::replay(3);
+
+        assert_eq!(performance_j_candidate(&model), Some(2));
     }
 
     #[test]

@@ -1066,6 +1066,10 @@ pub struct Editor {
     /// When inline assist editors are linked, they all render cursors because
     /// typing enters text into each of them, even the ones that aren't focused.
     pub(crate) show_cursor_when_unfocused: bool,
+    /// Register Editor input/actions and keep its display map laid out, but do
+    /// not paint visual layers. Used by alternate renderers that preserve the
+    /// native Editor/Vim state machine behind their own pixels.
+    input_only: bool,
     columnar_selection_state: Option<ColumnarSelectionState>,
     add_selections_state: Option<AddSelectionsState>,
     select_next_state: Option<SelectNextState>,
@@ -2636,6 +2640,7 @@ impl Editor {
         let mut editor = Self {
             focus_handle,
             show_cursor_when_unfocused: false,
+            input_only: false,
             last_focused_descendant: None,
             buffer: multi_buffer.clone(),
             display_map: display_map.clone(),
@@ -12994,9 +12999,18 @@ impl Focusable for Editor {
     }
 }
 
+impl Editor {
+    pub fn set_input_only(&mut self, input_only: bool, cx: &mut Context<Self>) {
+        if self.input_only != input_only {
+            self.input_only = input_only;
+            cx.notify();
+        }
+    }
+}
+
 impl Render for Editor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        EditorElement::new(&cx.entity(), self.create_style(cx))
+        EditorElement::new(&cx.entity(), self.create_style(cx)).input_only(self.input_only)
     }
 }
 

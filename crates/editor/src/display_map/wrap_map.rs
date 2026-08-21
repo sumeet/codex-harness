@@ -176,8 +176,19 @@ impl LineFragmentBuilder {
             if range_start >= range_end {
                 continue;
             }
-            let local_start = range_start - chunk_start;
-            let local_end = range_end - chunk_start;
+            // Display-map points should normally land on UTF-8 boundaries, but
+            // replacement/fold chunks can expose a temporarily interpolated
+            // geometry range while background wrapping catches up. Never let
+            // that transient state turn into an invalid `str` slice. Expanding
+            // to the surrounding scalar preserves the intended font choice for
+            // the complete glyph and keeps fragment byte lengths aligned with
+            // the source line.
+            let local_start = previous_char_boundary(text, range_start - chunk_start);
+            let local_end = next_char_boundary(text, range_end - chunk_start);
+            let local_start = local_start.max(emitted);
+            if local_start >= local_end {
+                continue;
+            }
             if emitted < local_start {
                 self.push_fragments_with_font(fragments, &text[emitted..local_start], None);
             }
@@ -243,6 +254,22 @@ impl LineFragmentBuilder {
             });
         Some(width)
     }
+}
+
+fn previous_char_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn next_char_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
 }
 
 fn is_standalone_grapheme(text: &str, start: usize, end: usize) -> bool {
@@ -1750,6 +1777,50 @@ mod tests {
             "combining-class invisibles like ZWJ have no replacement and must stay \
              inside their text fragment"
         );
+    }
+
+    #[gpui::test]
+    async fn test_font_ranges_clip_to_utf8_boundaries(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let text_system = cx.read(|cx| cx.text_system().clone());
+        let font = test_font();
+        let font_size = px(14.0);
+        let monospace_font_id = text_system.resolve_font(&gpui::font(".ZedMono"));
+        let mut fragment_builder = LineFragmentBuilder::with_font_variant_ranges(
+            text_system,
+            &font,
+            font_size,
+            Arc::from([FontVariantRange {
+                // Byte 7 is inside the three-byte box-drawing character at
+                // 6..9. Interpolated display-map ranges can briefly look like
+                // this while wrapping catches up to replacement blocks.
+                range: TabPoint::new(0, 6)..TabPoint::new(0, 7),
+                variant: FontFamilyVariant::Monospace,
+            }]),
+        );
+        let text = "abcdef━tail";
+        let mut fragments = Vec::new();
+
+        fragment_builder.push_fragments_at(&mut fragments, text, TabPoint::zero());
+
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|fragment| match fragment {
+                    LineFragment::Text { text, .. } => text.len(),
+                    LineFragment::Element { len_utf8, .. } => *len_utf8,
+                })
+                .sum::<usize>(),
+            text.len(),
+        );
+        assert!(fragments.iter().any(|fragment| matches!(
+            fragment,
+            LineFragment::Text {
+                text: "━",
+                font_id: Some(font_id),
+            } if *font_id == monospace_font_id
+        )));
     }
 
     #[gpui::test]
