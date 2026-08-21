@@ -469,7 +469,7 @@ impl EventEmitter<TranscriptSelectionChanged> for TranscriptEditor {}
 pub struct TranscriptItemSelection {
     pub item_index: usize,
     pub body_text: Arc<str>,
-    pub range: Range<usize>,
+    pub ranges: Vec<Range<usize>>,
     pub head: Option<usize>,
 }
 
@@ -2161,40 +2161,67 @@ impl TranscriptEditor {
     /// Rich item it intersects. Rich rendering remains completely independent
     /// of Editor layout; this is only a shared logical-offset contract.
     pub fn selection_snapshot(&self, cx: &mut App) -> TranscriptSelectionSnapshot {
-        let (selection, linewise) = self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let mut selection = editor
+        let (selections, linewise, head, reversed) = self.editor.update(cx, |editor, cx| {
+            let display_snapshot = editor.display_snapshot(cx);
+            let snapshot = display_snapshot.buffer_snapshot();
+            let newest = editor
                 .selections
                 .newest_anchor()
-                .map(|anchor| anchor.to_offset(&snapshot));
-            let linewise = editor.selections.line_mode() && !selection.is_empty();
+                .map(|anchor| anchor.to_offset(snapshot));
+            let mut selections = editor
+                .selections
+                .all_anchors(&display_snapshot)
+                .iter()
+                .map(|selection| selection.map(|anchor| anchor.to_offset(snapshot)))
+                .collect::<Vec<_>>();
+            let linewise = editor.selections.line_mode()
+                && selections.iter().any(|selection| !selection.is_empty());
             if linewise {
-                let start_point = selection.start.to_point(&snapshot);
-                let end_point = selection.end.to_point(&snapshot);
-                let rows = linewise_selection_rows(start_point, end_point);
-                selection.start = Point::new(*rows.start(), 0).to_offset(&snapshot);
-                let last_row = *rows.end();
-                selection.end = if last_row < snapshot.max_point().row {
-                    Point::new(last_row + 1, 0).to_offset(&snapshot)
-                } else {
-                    Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row)))
-                        .to_offset(&snapshot)
-                };
+                for selection in &mut selections {
+                    let start_point = selection.start.to_point(snapshot);
+                    let end_point = selection.end.to_point(snapshot);
+                    let rows = linewise_selection_rows(start_point, end_point);
+                    selection.start = Point::new(*rows.start(), 0).to_offset(snapshot);
+                    let last_row = *rows.end();
+                    selection.end = if last_row < snapshot.max_point().row {
+                        Point::new(last_row + 1, 0).to_offset(snapshot)
+                    } else {
+                        Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row)))
+                            .to_offset(snapshot)
+                    };
+                }
             }
-            (selection.map(|offset| offset.0), linewise)
+            (
+                selections
+                    .into_iter()
+                    .map(|selection| selection.map(|offset| offset.0))
+                    .collect::<Vec<_>>(),
+                linewise,
+                newest.head().0,
+                newest.reversed,
+            )
         });
-        let head = selection.head();
-        let visual = !selection.is_empty();
+        let visual = selections.iter().any(|selection| !selection.is_empty());
         let mut items = Vec::new();
 
         for (segment_position, segment) in self.segments.iter().enumerate() {
             let body = segment.body_range.clone();
-            let intersects = if visual {
-                selection.start < body.end && body.start < selection.end
-            } else {
-                segment.whole_range.start <= head && head <= segment.whole_range.end
-            };
-            if !intersects {
+            let ranges = selections
+                .iter()
+                .filter(|selection| {
+                    !selection.is_empty()
+                        && selection.start < body.end
+                        && body.start < selection.end
+                })
+                .map(|selection| {
+                    selection.start.max(body.start) - body.start
+                        ..selection.end.min(body.end) - body.start
+                })
+                .collect::<Vec<_>>();
+            let item_head = (segment.whole_range.start..=segment.whole_range.end)
+                .contains(&head)
+                .then_some(head.clamp(body.start, body.end) - body.start);
+            if ranges.is_empty() && item_head.is_none() {
                 continue;
             }
 
@@ -2210,20 +2237,10 @@ impl TranscriptEditor {
                             .collect::<String>(),
                     )
                 });
-            let range = if visual {
-                selection.start.max(body.start) - body.start
-                    ..selection.end.min(body.end) - body.start
-            } else {
-                let offset = head.clamp(body.start, body.end) - body.start;
-                offset..offset
-            };
-            let item_head = (body.start..=body.end)
-                .contains(&head)
-                .then_some(head.clamp(body.start, body.end) - body.start);
             items.push(TranscriptItemSelection {
                 item_index: segment.item_index,
                 body_text,
-                range,
+                ranges,
                 head: item_head,
             });
         }
@@ -2231,7 +2248,7 @@ impl TranscriptEditor {
         TranscriptSelectionSnapshot {
             visual,
             linewise,
-            reversed: selection.reversed,
+            reversed,
             items,
         }
     }

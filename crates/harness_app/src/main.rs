@@ -301,16 +301,13 @@ struct RichSearchPaint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RichNavigationPaint {
     body_text: Arc<str>,
-    range: Range<usize>,
+    ranges: Vec<Range<usize>>,
     head: Option<usize>,
     visual: bool,
 }
 
 impl RichNavigationPaint {
-    fn effective_range(&self) -> Option<Range<usize>> {
-        if self.visual {
-            return (self.range.start < self.range.end).then(|| self.range.clone());
-        }
+    fn cursor_range(&self) -> Option<Range<usize>> {
         let head = self.head?.min(self.body_text.len());
         if head < self.body_text.len() {
             let end = self.body_text[head..]
@@ -330,7 +327,15 @@ impl RichNavigationPaint {
     }
 
     fn markdown_source_range(&self, source: &str) -> Option<Range<usize>> {
-        let logical = self.effective_range()?;
+        // Markdown currently accepts one external range. Character and
+        // linewise selections are already contiguous; for a Visual Block,
+        // use its logical envelope while structured renderers retain every
+        // individual row range.
+        let logical = if self.visual {
+            self.ranges.first()?.start..self.ranges.last()?.end
+        } else {
+            self.cursor_range()?
+        };
         Some(
             markdown_source_offset_for_logical(&self.body_text, source, logical.start)
                 ..markdown_source_offset_for_logical(&self.body_text, source, logical.end),
@@ -570,21 +575,41 @@ fn navigation_highlights_for_fragment(
     let Some(navigation) = navigation else {
         return Vec::new();
     };
-    let Some(selection) = navigation.effective_range() else {
-        return Vec::new();
+    let background_color = rich_navigation_text_highlight_background(navigation, cx);
+    navigation_ranges_for_fragment(navigation, fragment)
+        .into_iter()
+        .map(|range| {
+            (
+                range,
+                gpui::HighlightStyle {
+                    background_color: Some(background_color),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+fn navigation_ranges_for_fragment(
+    navigation: &RichNavigationPaint,
+    fragment: Range<usize>,
+) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut append_intersection = |selection: &Range<usize>| {
+        let start = selection.start.max(fragment.start);
+        let end = selection.end.min(fragment.end);
+        if start < end {
+            ranges.push(start - fragment.start..end - fragment.start);
+        }
     };
-    let start = selection.start.max(fragment.start);
-    let end = selection.end.min(fragment.end);
-    if start >= end {
-        return Vec::new();
+    if navigation.visual {
+        for selection in &navigation.ranges {
+            append_intersection(selection);
+        }
+    } else if let Some(cursor) = navigation.cursor_range() {
+        append_intersection(&cursor);
     }
-    vec![(
-        start - fragment.start..end - fragment.start,
-        gpui::HighlightStyle {
-            background_color: Some(rich_navigation_text_highlight_background(navigation, cx)),
-            ..Default::default()
-        },
-    )]
+    ranges
 }
 
 /// Markdown paints its external selection after its glyphs, so it needs a
@@ -2591,7 +2616,7 @@ impl HarnessApp {
             .find(|item| item.item_index == item_index)?;
         Some(RichNavigationPaint {
             body_text: item.body_text.clone(),
-            range: item.range.clone(),
+            ranges: item.ranges.clone(),
             head: item.head,
             visual: snapshot.visual,
         })
@@ -2637,7 +2662,7 @@ impl HarnessApp {
         let source = item.content.clone();
         let navigation = RichNavigationPaint {
             body_text: selection.body_text.clone(),
-            range: selection.range.clone(),
+            ranges: selection.ranges.clone(),
             head: selection.head,
             visual: snapshot.visual,
         };
@@ -9665,7 +9690,7 @@ mod tests {
     fn rich_navigation_fragments_preserve_order_and_skip_ornaments() {
         let navigation = RichNavigationPaint {
             body_text: "same\nvisible body\nsame".into(),
-            range: 0..0,
+            ranges: Vec::new(),
             head: Some(0),
             visual: false,
         };
@@ -9682,6 +9707,25 @@ mod tests {
         assert_eq!(
             rich_navigation_fragment_range(Some(&navigation), "same", &mut cursor),
             18..22
+        );
+    }
+
+    #[test]
+    fn rich_navigation_preserves_each_visual_block_row() {
+        let navigation = RichNavigationPaint {
+            body_text: "abcdefghijkl".into(),
+            ranges: vec![2..4, 8..10],
+            head: Some(9),
+            visual: true,
+        };
+
+        assert_eq!(
+            navigation_ranges_for_fragment(&navigation, 3..9),
+            [0..1, 5..6]
+        );
+        assert_eq!(
+            navigation_ranges_for_fragment(&navigation, 10..12),
+            Vec::<Range<usize>>::new()
         );
     }
 
