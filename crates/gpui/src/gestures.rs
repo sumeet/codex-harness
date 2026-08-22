@@ -182,7 +182,7 @@ fn log_kinetic_scroll_end(id: usize, generation: u64, reason: &str, momentum: &S
     if !kinetic_scroll_diagnostics_enabled() {
         return;
     }
-    log::info!(
+    log::info!(target: "gpui_scroll",
         "gpui kinetic end id={id:x} generation={generation} reason={reason} frames={} elapsed_ms={:.2} initial_velocity=({:.1},{:.1}) final_velocity=({:.1},{:.1}) requested=({:.1},{:.1}) consumed=({:.1},{:.1})",
         momentum.frames,
         momentum.elapsed.as_secs_f64() * 1_000.,
@@ -244,12 +244,34 @@ impl KineticScroll {
         animation_now: Instant,
         tuning: GestureTuning,
     ) -> Option<u64> {
-        let recorder = self.recorder.take()?;
-        let release = recorder.release_velocity(source_now)?;
+        let Some(recorder) = self.recorder.take() else {
+            if kinetic_scroll_diagnostics_enabled() {
+                log::info!(target: "gpui_scroll", "gpui kinetic rejected reason=no-recorder");
+            }
+            return None;
+        };
+        let Some(release) = recorder.release_velocity(source_now) else {
+            if kinetic_scroll_diagnostics_enabled() {
+                log::info!(target: "gpui_scroll", "gpui kinetic rejected reason=no-release recorder={recorder:?}");
+            }
+            return None;
+        };
         let raw_velocity = release.velocity;
         let mut velocity = raw_velocity;
         let speed = velocity.x.hypot(velocity.y);
         if speed < tuning.min_fling_velocity {
+            if kinetic_scroll_diagnostics_enabled() {
+                log::info!(target: "gpui_scroll",
+                    "gpui kinetic rejected reason=below-threshold samples={} span_ms={:.2} release_age_ms={:.2} velocity=({:.1},{:.1}) speed={:.1} threshold={:.1}",
+                    release.sample_count,
+                    release.sample_span.as_secs_f64() * 1_000.,
+                    release.release_age.as_secs_f64() * 1_000.,
+                    velocity.x,
+                    velocity.y,
+                    speed,
+                    tuning.min_fling_velocity,
+                );
+            }
             return None;
         }
         if speed > MOMENTUM_MAX_VELOCITY {
@@ -259,7 +281,7 @@ impl KineticScroll {
         }
         let id = self as *const Self as usize;
         if kinetic_scroll_diagnostics_enabled() {
-            log::info!(
+            log::info!(target: "gpui_scroll",
                 "gpui kinetic release id={id:x} generation={} samples={} span_ms={:.2} release_age_ms={:.2} raw_velocity=({:.1},{:.1}) velocity=({:.1},{:.1}) decay_per_ms={:.6}",
                 self.generation,
                 release.sample_count,
@@ -366,7 +388,7 @@ impl KineticScroll {
         if kinetic_scroll_diagnostics_enabled()
             && (momentum.frames <= 16 || momentum.frames % 30 == 0)
         {
-            log::info!(
+            log::info!(target: "gpui_scroll",
                 "gpui kinetic frame id={id:x} generation={generation} frame={} elapsed_ms={:.2} requested=({:.2},{:.2}) consumed=({:.2},{:.2}) velocity=({:.1},{:.1}) total_requested=({:.1},{:.1}) total_consumed=({:.1},{:.1})",
                 momentum.frames,
                 momentum.elapsed.as_secs_f64() * 1_000.,

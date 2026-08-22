@@ -33,7 +33,8 @@ use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
     ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, Icon, IconButton,
     IconButtonShape, IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing,
-    SelectableButton, ThreadItem, TintColor, Toggleable, right_click_menu,
+    ScrollAxes, Scrollbars, SelectableButton, ThreadItem, TintColor, Toggleable, WithScrollbar,
+    right_click_menu,
 };
 
 mod image_surface;
@@ -5816,6 +5817,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -5979,7 +5981,14 @@ impl HarnessApp {
                     .overflow_x_scroll()
                     .overflow_y_scroll()
                     .track_scroll(&binding.handle)
-                    .children(rows),
+                    .children(rows)
+                    .custom_scrollbars(
+                        Scrollbars::always_visible(ScrollAxes::Both)
+                            .id(("rich-diff-scrollbar", index))
+                            .tracked_scroll_handle(&binding.handle),
+                        window,
+                        cx,
+                    ),
             )
             .into_any_element()
     }
@@ -6175,6 +6184,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -6372,7 +6382,14 @@ impl HarnessApp {
                     .overflow_x_scroll()
                     .overflow_y_scroll()
                     .track_scroll(&binding.handle)
-                    .children(rows),
+                    .children(rows)
+                    .custom_scrollbars(
+                        Scrollbars::always_visible(ScrollAxes::Both)
+                            .id(("file-change-scrollbar", index))
+                            .tracked_scroll_handle(&binding.handle),
+                        window,
+                        cx,
+                    ),
             )
             .into_any_element()
     }
@@ -6441,6 +6458,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -6493,6 +6511,13 @@ impl HarnessApp {
             .line_height(relative(1.45))
             .text_color(colors.text)
             .children(rows)
+            .custom_scrollbars(
+                Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .id(("terminal-scrollbar", index))
+                    .tracked_scroll_handle(&binding.handle),
+                window,
+                cx,
+            )
             .into_any_element()
     }
 
@@ -6503,11 +6528,12 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let sections = activity_text_sections(&content);
         if !sections.iter().any(|section| section.heading.is_some()) {
-            return self.render_terminal(content, item_key, index, search, navigation, cx);
+            return self.render_terminal(content, item_key, index, search, navigation, window, cx);
         }
 
         let colors = cx.theme().colors().clone();
@@ -6627,6 +6653,13 @@ impl HarnessApp {
             .overflow_y_scroll()
             .track_scroll(&binding.handle)
             .children(rows)
+            .custom_scrollbars(
+                Scrollbars::always_visible(ScrollAxes::Vertical)
+                    .id(("activity-scrollbar", index))
+                    .tracked_scroll_handle(&binding.handle),
+                window,
+                cx,
+            )
             .into_any_element()
     }
 
@@ -6636,6 +6669,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if item.command_transcript().is_none() {
@@ -6645,10 +6679,11 @@ impl HarnessApp {
                 index,
                 search,
                 navigation,
+                window,
                 cx,
             );
         }
-        self.render_rich_command_content(item, index, search, navigation, cx)
+        self.render_rich_command_content(item, index, search, navigation, window, cx)
             .expect("command parsed above")
     }
 
@@ -6658,6 +6693,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let command = item.command_transcript()?;
@@ -6767,6 +6803,13 @@ impl HarnessApp {
                 .line_height(relative(1.45))
                 .text_color(colors.text)
                 .children(rows)
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .id(("command-scrollbar", index))
+                        .tracked_scroll_handle(&binding.handle),
+                    window,
+                    cx,
+                )
                 .into_any_element(),
         )
     }
@@ -6916,6 +6959,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -7037,6 +7081,13 @@ impl HarnessApp {
                 .overflow_y_scroll()
                 .track_scroll(&binding.handle)
                 .children(visible_results)
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .id(("web-results-scrollbar", index))
+                        .tracked_scroll_handle(&binding.handle),
+                    window,
+                    cx,
+                )
         });
 
         div()
@@ -7067,6 +7118,7 @@ impl HarnessApp {
                     index,
                     search,
                     navigation,
+                    window,
                     cx,
                 ))
             })
@@ -7901,6 +7953,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
                 model::TranscriptKind::Web => self.render_web_search(
@@ -7908,6 +7961,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
                 model::TranscriptKind::Diff => self.render_diff(
@@ -7915,6 +7969,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
                 model::TranscriptKind::FileChange => self.render_file_change(
@@ -7922,6 +7977,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
                 model::TranscriptKind::Image => Self::render_image(
@@ -7939,6 +7995,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
                 _ => self.render_terminal(
@@ -7947,6 +8004,7 @@ impl HarnessApp {
                     index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    window,
                     cx,
                 ),
             })
@@ -8237,13 +8295,26 @@ impl Render for HarnessApp {
                 })
                 .into_any_element()
         } else {
-            list(
-                task_list_state,
-                cx.processor(|this, index, _, cx| this.render_task(index, cx)),
-            )
-            .flex_1()
-            .min_h_0()
-            .into_any_element()
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(
+                    list(
+                        task_list_state.clone(),
+                        cx.processor(|this, index, _, cx| this.render_task(index, cx)),
+                    )
+                    .flex_1()
+                    .min_h_0(),
+                )
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .id("task-list-scrollbar")
+                        .tracked_scroll_handle(&task_list_state),
+                    window,
+                    cx,
+                )
+                .into_any_element()
         };
         let transcript_body = if self.buffer_view {
             div()
@@ -8257,13 +8328,27 @@ impl Render for HarnessApp {
                 .child(self.transcript_editor.clone())
                 .into_any_element()
         } else {
-            let rich_list = list(
-                list_state,
-                cx.processor(|this, index, window, cx| this.render_item(index, window, cx)),
-            )
-            .flex_1()
-            .min_h_0()
-            .overflow_hidden();
+            let rich_list = div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .overflow_hidden()
+                .child(
+                    list(
+                        list_state.clone(),
+                        cx.processor(|this, index, window, cx| this.render_item(index, window, cx)),
+                    )
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden(),
+                )
+                .custom_scrollbars(
+                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                        .id("rich-transcript-scrollbar")
+                        .tracked_scroll_handle(&list_state),
+                    window,
+                    cx,
+                );
             div()
                 .relative()
                 .flex_1()
@@ -11691,9 +11776,16 @@ fn open_harness_window(
 }
 
 fn main() {
-    env_logger::builder()
+    let scroll_diagnostics = std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
+        .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"));
+    let mut logger = env_logger::builder();
+    logger
         .filter_level(log::LevelFilter::Warn)
-        .init();
+        .parse_default_env();
+    if scroll_diagnostics {
+        logger.filter_module("gpui_scroll", log::LevelFilter::Info);
+    }
+    logger.init();
     let replay_count = replay_count();
     let start_in_text_view = std::env::args().any(|argument| argument == "--text");
     let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")

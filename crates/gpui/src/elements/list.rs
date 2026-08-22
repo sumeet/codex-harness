@@ -1680,12 +1680,16 @@ impl Element for List {
                     if event.touch_phase == TouchPhase::Started {
                         accumulated_scroll_delta = ScrollDelta::default();
                         list_state.0.borrow_mut().kinetic_scroll.begin_at(now);
-                    } else if event.touch_phase == TouchPhase::Moved
-                        && !list_state.0.borrow().kinetic_scroll.is_recording()
-                    {
-                        // A source-less movement must not inherit momentum
-                        // from a completed gesture or open a new recorder.
-                        list_state.0.borrow_mut().kinetic_scroll.cancel();
+                    } else if !list_state.0.borrow().kinetic_scroll.is_recording() {
+                        if window.scroll_chain_allowed() {
+                            accumulated_scroll_delta = ScrollDelta::default();
+                            list_state.0.borrow_mut().kinetic_scroll.begin_at(now);
+                        } else {
+                            // A precise gesture belongs to the surface that
+                            // consumed its Started event. Do not let a list
+                            // that later moves under the pointer steal it.
+                            return;
+                        }
                     }
                 } else {
                     list_state.0.borrow_mut().kinetic_scroll.cancel();
@@ -1722,6 +1726,7 @@ impl Element for List {
                     if synthesize_momentum {
                         if consumed.is_zero() {
                             state.kinetic_scroll.cancel();
+                            window.allow_scroll_chain();
                         } else {
                             state
                                 .kinetic_scroll
@@ -1855,8 +1860,8 @@ mod test {
 
     use crate::{
         self as gpui, AppContext, Bounds, Context, Element, FollowMode, InteractiveElement,
-        IntoElement, ListState, ParentElement, Render, Styled, TestAppContext, Window, canvas, div,
-        list, point, px, size,
+        IntoElement, ListState, ParentElement, Render, ScrollHandle, StatefulInteractiveElement,
+        Styled, TestAppContext, Window, canvas, div, list, point, px, size,
     };
 
     #[gpui::test]
@@ -2183,6 +2188,91 @@ mod test {
             parent_events.get(),
             1,
             "a child at its bound leaves the event available for scroll chaining"
+        );
+    }
+
+    #[gpui::test]
+    fn nested_div_does_not_steal_a_list_gesture_that_started_outside_it(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let list_state = ListState::new(20, crate::ListAlignment::Top, px(20.)).measure_all();
+        let inner_handle = ScrollHandle::new();
+
+        struct TestView {
+            list: ListState,
+            inner: ScrollHandle,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.list.clone(), move |ix, _, _| {
+                    if ix == 2 {
+                        div()
+                            .id("nested-list-div")
+                            .h(px(20.))
+                            .w_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&inner)
+                            .child(div().h(px(200.)).w_full().flex_none())
+                            .into_any()
+                    } else {
+                        div().h(px(20.)).w_full().into_any()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                list: list_state.clone(),
+                inner: inner_handle.clone(),
+            })
+        });
+        let movement = |distance, touch_phase| ScrollWheelEvent {
+            position: point(px(50.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(distance))),
+            touch_phase,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        cx.simulate_event(movement(-40., TouchPhase::Started));
+        assert_eq!(list_state.logical_scroll_top().item_ix, 2);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        cx.simulate_event(movement(-10., TouchPhase::Moved));
+        assert_eq!(
+            inner_handle.offset(),
+            point(px(0.), px(0.)),
+            "the nested surface moved under the pointer but does not own this gesture"
+        );
+        assert_eq!(list_state.logical_scroll_top().offset_in_item, px(10.));
+
+        cx.simulate_event(movement(0., TouchPhase::Cancelled));
+        list_state.scroll_to(crate::ListOffset {
+            item_ix: 2,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        cx.simulate_event(movement(-10., TouchPhase::Started));
+        assert_eq!(inner_handle.offset().y, px(-10.));
+        assert_eq!(list_state.logical_scroll_top().offset_in_item, px(0.));
+
+        cx.simulate_event(movement(-1_000., TouchPhase::Moved));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.into_any_element()
+        });
+        cx.simulate_event(movement(-10., TouchPhase::Moved));
+        assert_eq!(
+            list_state.logical_scroll_top().offset_in_item,
+            px(10.),
+            "once the owning child reaches its edge, its ancestor adopts the gesture"
         );
     }
 

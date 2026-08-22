@@ -4,6 +4,7 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::{Rc, Weak},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -111,6 +112,14 @@ const MIN_KEYCODE: u32 = 8;
 
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
+
+fn scroll_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PointerAxes(u8);
@@ -2515,7 +2524,29 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             wl_pointer::Event::Frame => {
                 let frame = std::mem::take(&mut state.pointer_axis_frame);
                 let event_time_millis = frame.event_time_millis;
+                let active_axes_before = state.pointer_axis_sequence.active_finger_axes;
+                if scroll_diagnostics_enabled() {
+                    log::info!(target: "gpui_scroll",
+                        "wayland axis frame source={:?} protocol_ms={:?} continuous={:?} discrete={:?} moved={:?} stopped={:?} active_before={:?}",
+                        frame.source,
+                        frame.event_time_millis,
+                        frame.continuous_delta,
+                        frame.discrete_delta,
+                        frame.moved_axes,
+                        frame.stopped_axes,
+                        active_axes_before,
+                    );
+                }
                 let dispatch = finish_pointer_axis_frame(frame, &mut state.pointer_axis_sequence);
+                if scroll_diagnostics_enabled() {
+                    log::info!(target: "gpui_scroll",
+                        "wayland axis dispatch movement={:?} ended={} synthesize_momentum={} active_after={:?}",
+                        dispatch.movement,
+                        dispatch.ended,
+                        dispatch.synthesize_momentum,
+                        state.pointer_axis_sequence.active_finger_axes,
+                    );
+                }
                 if dispatch.movement.is_none() && !dispatch.ended {
                     return;
                 }

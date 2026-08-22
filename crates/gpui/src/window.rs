@@ -1161,6 +1161,12 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// Set by a nested scroll surface when an in-flight precise gesture has
+    /// reached its bound. Only then may an ancestor that did not receive the
+    /// gesture's `Started` event adopt the remaining gesture. This is reset
+    /// before every pointer event so a surface that merely moves underneath a
+    /// stationary touchpad pointer cannot steal an outer scroll.
+    scroll_chain_allowed: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -1843,6 +1849,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            scroll_chain_allowed: false,
             modifiers,
             capslock,
             scale_factor,
@@ -2762,6 +2769,19 @@ impl Window {
     /// The position of the mouse relative to the window.
     pub fn mouse_position(&self) -> Point<Pixels> {
         self.mouse_position
+    }
+
+    /// Permit the current precise scroll gesture to continue in an ancestor
+    /// scroll surface. Scroll containers call this only after the surface that
+    /// owns the gesture reaches its bound.
+    pub fn allow_scroll_chain(&mut self) {
+        self.scroll_chain_allowed = true;
+    }
+
+    /// Whether a nested owner has explicitly offered the current scroll event
+    /// to an ancestor at its bound.
+    pub fn scroll_chain_allowed(&self) -> bool {
+        self.scroll_chain_allowed
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -5112,6 +5132,9 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
+        if event.is::<crate::ScrollWheelEvent>() {
+            self.scroll_chain_allowed = false;
+        }
         let hit_test = self.rendered_frame.hit_test(self.mouse_position());
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;

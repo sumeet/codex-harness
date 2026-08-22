@@ -622,10 +622,16 @@ impl EditorElement {
                             if synthesize_momentum {
                                 if event.touch_phase == TouchPhase::Started {
                                     editor.scroll_manager.begin_kinetic_scroll(now);
-                                } else if event.touch_phase == TouchPhase::Moved
-                                    && !editor.scroll_manager.is_recording_kinetic_scroll()
-                                {
-                                    editor.scroll_manager.cancel_kinetic_scroll();
+                                } else if !editor.scroll_manager.is_recording_kinetic_scroll() {
+                                    if window.scroll_chain_allowed() {
+                                        editor.scroll_manager.begin_kinetic_scroll(now);
+                                    } else {
+                                        // Keep precise gestures latched to the
+                                        // surface that consumed their Started
+                                        // event. This editor may have moved
+                                        // under the fixed pointer since then.
+                                        return None;
+                                    }
                                 }
                             } else {
                                 editor.scroll_manager.cancel_kinetic_scroll();
@@ -689,6 +695,7 @@ impl EditorElement {
                             if synthesize_momentum {
                                 if consumed == gpui::Point::default() {
                                     editor.scroll_manager.cancel_kinetic_scroll();
+                                    window.allow_scroll_chain();
                                 } else {
                                     editor
                                         .scroll_manager

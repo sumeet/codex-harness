@@ -3348,10 +3348,18 @@ impl Interactivity {
                         if synthesize_momentum {
                             if event.touch_phase == TouchPhase::Started {
                                 scroll_kinetics.borrow_mut().kinetic_scroll.begin_at(now);
-                            } else if event.touch_phase == TouchPhase::Moved
-                                && !scroll_kinetics.borrow().kinetic_scroll.is_recording()
-                            {
-                                scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
+                            } else if !scroll_kinetics.borrow().kinetic_scroll.is_recording() {
+                                // Precise gestures are latched to the surface
+                                // that consumed their Started event. A nested
+                                // surface that later moves beneath the fixed
+                                // pointer must not steal the gesture. It may
+                                // adopt only when its child explicitly offers
+                                // edge chaining for this event.
+                                if window.scroll_chain_allowed() {
+                                    scroll_kinetics.borrow_mut().kinetic_scroll.begin_at(now);
+                                } else {
+                                    return;
+                                }
                             }
                         } else {
                             scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
@@ -3420,6 +3428,7 @@ impl Interactivity {
                             let mut scroll_kinetics = scroll_kinetics.borrow_mut();
                             if consumed.is_zero() {
                                 scroll_kinetics.kinetic_scroll.cancel();
+                                window.allow_scroll_chain();
                             } else {
                                 scroll_kinetics
                                     .kinetic_scroll
