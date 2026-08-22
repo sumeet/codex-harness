@@ -263,7 +263,12 @@ fn finish_pointer_axis_frame(
             .or_else(|| frame.discrete_delta.map(ScrollDelta::Lines))
     };
 
-    let movement = movement.map(|delta| {
+    // Hyprland/libinput commonly accompanies `axis_stop` with an explicit
+    // zero-valued axis event in the same frame. That is terminal protocol
+    // bookkeeping, not content motion. Dispatching it as `Moved` causes
+    // scroll surfaces to cancel their velocity recorder immediately before
+    // the separate `Ended` event can release it.
+    let movement = movement.filter(|delta| !delta.is_zero()).map(|delta| {
         let phase = if source == AxisSource::Finger {
             let phase = if sequence.active_finger_axes.is_empty() {
                 TouchPhase::Started
@@ -2525,7 +2530,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 let frame = std::mem::take(&mut state.pointer_axis_frame);
                 let event_time_millis = frame.event_time_millis;
                 let active_axes_before = state.pointer_axis_sequence.active_finger_axes;
-                if scroll_diagnostics_enabled() {
+                let has_axis_data = frame.source.is_some()
+                    || frame.event_time_millis.is_some()
+                    || frame.continuous_delta.is_some()
+                    || frame.discrete_delta.is_some()
+                    || frame.moved_axes != PointerAxes::default()
+                    || frame.stopped_axes != PointerAxes::default()
+                    || active_axes_before != PointerAxes::default();
+                if scroll_diagnostics_enabled() && has_axis_data {
                     log::info!(target: "gpui_scroll",
                         "wayland axis frame source={:?} protocol_ms={:?} continuous={:?} discrete={:?} moved={:?} stopped={:?} active_before={:?}",
                         frame.source,
@@ -2538,7 +2550,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     );
                 }
                 let dispatch = finish_pointer_axis_frame(frame, &mut state.pointer_axis_sequence);
-                if scroll_diagnostics_enabled() {
+                if scroll_diagnostics_enabled() && has_axis_data {
                     log::info!(target: "gpui_scroll",
                         "wayland axis dispatch movement={:?} ended={} synthesize_momentum={} active_after={:?}",
                         dispatch.movement,
@@ -3215,6 +3227,9 @@ mod tests {
 
         let ended = finish_pointer_axis_frame(
             PointerAxisFrame {
+                // This is the terminal frame shape emitted by
+                // Hyprland/libinput on real touchpads.
+                continuous_delta: Some(point(px(0.), px(0.))),
                 stopped_axes: vertical,
                 ..Default::default()
             },

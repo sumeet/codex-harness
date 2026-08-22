@@ -8299,6 +8299,8 @@ impl Render for HarnessApp {
                 .flex_1()
                 .min_h_0()
                 .relative()
+                .flex()
+                .flex_col()
                 .child(
                     list(
                         task_list_state.clone(),
@@ -8332,6 +8334,8 @@ impl Render for HarnessApp {
                 .relative()
                 .flex_1()
                 .min_h_0()
+                .flex()
+                .flex_col()
                 .overflow_hidden()
                 .child(
                     list(
