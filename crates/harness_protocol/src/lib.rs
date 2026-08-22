@@ -347,6 +347,22 @@ impl TranscriptItemProjection {
         self.segment.semantic_spans.clear();
         self
     }
+
+    /// Remove the item separator when this projection is the final visible
+    /// item in a document. Item projections normally own one trailing newline
+    /// so they can be appended independently, but retaining that separator at
+    /// EOF creates a real empty Editor row that a document-end Vim motion can
+    /// enter even though no Rich surface paints it.
+    pub fn without_terminal_separator(mut self) -> Self {
+        if self.text.ends_with('\n')
+            && self.segment.whole_range.end == self.text.len()
+            && self.segment.body_range.end + 1 == self.segment.whole_range.end
+        {
+            self.text.pop();
+            self.segment.whole_range.end -= 1;
+        }
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4814,6 +4830,33 @@ mod tests {
         assert_eq!(
             &document.text[document.segments[1].body_range.clone()],
             command.body_text()
+        );
+    }
+
+    #[test]
+    fn final_projection_can_drop_only_its_unpainted_separator_row() {
+        let model = TranscriptModel::replay(6);
+        let projection = model.rich_navigation_item_projection(5).unwrap();
+        assert!(projection.text.ends_with('\n'));
+        assert_eq!(
+            projection.segment.body_range.end + 1,
+            projection.segment.whole_range.end
+        );
+
+        let terminal = projection.clone().without_terminal_separator();
+        assert!(!terminal.text.ends_with('\n'));
+        assert_eq!(terminal.body_text(), projection.body_text());
+        assert_eq!(terminal.segment.body_range, projection.segment.body_range);
+        assert_eq!(terminal.segment.whole_range.end, terminal.text.len());
+        assert_eq!(
+            terminal.segment.whole_range.end,
+            terminal.segment.body_range.end
+        );
+
+        assert_eq!(
+            terminal.clone().without_terminal_separator(),
+            terminal,
+            "removing the terminal separator is idempotent"
         );
     }
 

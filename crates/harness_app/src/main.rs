@@ -2329,11 +2329,19 @@ fn rich_navigation_item_projection(
     let projection = model.rich_navigation_item_projection(item_index)?;
     let item = model.items.get(item_index)?;
     let body = rich_navigation_body_for_item(item, projection.body_text());
-    if body == projection.body_text() {
-        Some(projection)
+    let projection = if body == projection.body_text() {
+        projection
     } else {
-        Some(projection.with_body_text(body))
-    }
+        projection.with_body_text(body)
+    };
+    let has_following_visible_item = model.items[item_index + 1..]
+        .iter()
+        .any(TranscriptItem::is_presentationally_visible);
+    Some(if has_following_visible_item {
+        projection
+    } else {
+        projection.without_terminal_separator()
+    })
 }
 
 fn rich_navigation_document(model: &TranscriptModel) -> model::TranscriptDocument {
@@ -3922,7 +3930,7 @@ impl HarnessApp {
         if new_model_item_count < old_model_item_count {
             return false;
         }
-        let existing_updates = dirty_items
+        let mut existing_updates = dirty_items
             .iter()
             .copied()
             .filter(|item_index| *item_index < old_model_item_count)
@@ -3944,6 +3952,26 @@ impl HarnessApp {
                 }
             })
             .collect::<Vec<_>>();
+
+        // Rich projections deliberately omit the final separator so `G`
+        // cannot enter an unpainted EOF row. When a visible item is appended,
+        // the formerly-final item must gain that separator before the new
+        // projection is appended. Make that boundary transfer an ordinary
+        // incremental item update instead of forcing a full document rebuild.
+        if !self.buffer_view
+            && appended.iter().any(Option::is_some)
+            && let Some(previous_last) = (0..old_model_item_count)
+                .rev()
+                .find(|index| self.model.items[*index].is_presentationally_visible())
+            && !existing_updates
+                .iter()
+                .any(|(item_index, _)| *item_index == previous_last)
+        {
+            existing_updates.push((
+                previous_last,
+                rich_navigation_item_projection(&self.model, previous_last),
+            ));
+        }
 
         let applied = self.transcript_editor.update(cx, |editor, cx| {
             editor.apply_item_projections(old_model_item_count, &existing_updates, &appended, cx)
@@ -10223,6 +10251,46 @@ mod tests {
             ),
             "Zed Docs\nhttps://zed.dev/docs\nFast editor"
         );
+    }
+
+    #[test]
+    fn rich_navigation_document_has_no_unpainted_terminal_row() {
+        let replay = TranscriptModel::replay(6);
+        let document = rich_navigation_document(&replay);
+        let last = document.segments.last().unwrap();
+
+        assert!(!document.text.ends_with('\n'));
+        assert_eq!(last.whole_range.end, document.text.len());
+        assert_eq!(last.body_range.end, document.text.len());
+        assert_eq!(
+            &document.text[last.body_range.clone()],
+            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+        );
+
+        let previous = &document.segments[document.segments.len() - 2];
+        assert_eq!(
+            &document.text[previous.whole_range.end - 1..previous.whole_range.end],
+            "\n"
+        );
+        assert_eq!(previous.whole_range.end, last.whole_range.start);
+    }
+
+    #[test]
+    fn appending_visible_item_transfers_the_terminal_separator() {
+        let before_model = TranscriptModel::replay(5);
+        let before = rich_navigation_document(&before_model);
+        assert!(!before.text.ends_with('\n'));
+
+        let after_model = TranscriptModel::replay(6);
+        let previous_last = rich_navigation_item_projection(&after_model, 4).unwrap();
+        let appended = rich_navigation_item_projection(&after_model, 5).unwrap();
+        assert!(previous_last.text.ends_with('\n'));
+        assert!(!appended.text.ends_with('\n'));
+
+        let mut incrementally_appended = before.text;
+        incrementally_appended.push('\n');
+        incrementally_appended.push_str(&appended.text);
+        assert_eq!(incrementally_appended, rich_navigation_document(&after_model).text);
     }
 
     #[test]
