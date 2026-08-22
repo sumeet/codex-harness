@@ -4928,6 +4928,72 @@ mod tests {
     }
 
     #[gpui::test]
+    fn tracked_div_single_frame_flicks_start_momentum_in_both_directions(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let handle = ScrollHandle::new();
+
+        struct TestView(ScrollHandle);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .id("single-frame-flick-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.0)
+                    .child(div().w_full().h(px(400.)).flex_none())
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(handle.clone())));
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        let movement = |distance, touch_phase| ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(distance))),
+            touch_phase,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        let finish = || ScrollWheelEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Pixels(Point::default()),
+            touch_phase: TouchPhase::Ended,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+
+        cx.simulate_event(movement(-1., TouchPhase::Started));
+        cx.simulate_event(finish());
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+        assert!(
+            handle.offset().y < px(-1.),
+            "a one-frame downward flick should continue after release"
+        );
+
+        handle.set_offset(point(px(0.), px(-100.)));
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(
+            cx.update(|window, cx| window.simulate_next_frame(cx)),
+            1,
+            "the cancelled downward callback should drain before the upward gesture"
+        );
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.into_any_element()
+        });
+        cx.simulate_event(movement(1., TouchPhase::Started));
+        cx.simulate_event(finish());
+        cx.executor().advance_clock(Duration::from_millis(8));
+        assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 1);
+        assert!(
+            handle.offset().y > px(-99.),
+            "a one-frame upward flick should continue after release"
+        );
+    }
+
+    #[gpui::test]
     fn untracked_stateful_div_claims_consumed_scroll_and_chains_at_its_edge(
         cx: &mut TestAppContext,
     ) {

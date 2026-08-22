@@ -25,6 +25,12 @@ const VELOCITY_RELEASE_MAX_AGE: Duration = Duration::from_millis(200);
 // full 120 Hz frame here made otherwise valid two-frame releases alternate
 // between eligible and ineligible as their quantized span crossed 8 ms.
 const VELOCITY_MIN_SAMPLE_SPAN: Duration = Duration::from_millis(1);
+// A short Wayland finger flick can be delivered as one non-zero Started
+// frame followed by a lifecycle-only Ended frame. There is no second motion
+// timestamp to fit in that case, so use one 120 Hz frame as the bounded
+// duration of that sole movement sample. Time spent paused before release is
+// added below and naturally damps the estimate.
+const VELOCITY_SINGLE_SAMPLE_SPAN: Duration = Duration::from_nanos(8_333_333);
 const VELOCITY_MAX_SAMPLES: usize = 3;
 const MOMENTUM_STOP_VELOCITY: f32 = 10.;
 const MOMENTUM_MAX_VELOCITY: f32 = 8_000.;
@@ -99,6 +105,17 @@ impl ScrollVelocityRecorder {
             .iter()
             .fold(Duration::ZERO, |span, sample| span + sample.interval);
         if sample_span < VELOCITY_MIN_SAMPLE_SPAN {
+            if self.samples.len() == 1 {
+                let sample = self.samples.front()?;
+                let estimated_span = VELOCITY_SINGLE_SAMPLE_SPAN + release_age;
+                let seconds = estimated_span.as_secs_f32();
+                return Some(ScrollRelease {
+                    velocity: point(sample.delta.x / seconds, sample.delta.y / seconds),
+                    sample_count: 1,
+                    sample_span: estimated_span,
+                    release_age,
+                });
+            }
             return None;
         }
 
@@ -841,6 +858,51 @@ mod tests {
         assert!(positive > 0.);
         assert!(negative < 0.);
         assert!((positive + negative).abs() < 0.1);
+    }
+
+    #[test]
+    fn single_frame_flick_is_sign_symmetric_and_starts_momentum() {
+        let start = Instant::now();
+        let release = |sign: f32| {
+            let mut kinetic = KineticScroll::default();
+            kinetic.begin_at(start);
+            kinetic.record_movement_at(point(px(0.), px(sign)), start);
+            let generation = kinetic
+                .finish_at(start, start, GestureTuning::default())
+                .expect("one consumed finger frame should retain a short flick");
+            kinetic
+                .momentum
+                .as_ref()
+                .filter(|_| generation == kinetic.generation)
+                .expect("the matching momentum generation should be active")
+                .initial_velocity
+                .y
+        };
+
+        let positive = release(1.);
+        let negative = release(-1.);
+        assert!(positive > GestureTuning::default().min_fling_velocity);
+        assert!(negative < -GestureTuning::default().min_fling_velocity);
+        assert!((positive + negative).abs() < 0.1);
+    }
+
+    #[test]
+    fn pausing_after_a_single_motion_frame_damps_the_release() {
+        let start = Instant::now();
+        let mut kinetic = KineticScroll::default();
+        kinetic.begin_at(start);
+        kinetic.record_movement_at(point(px(0.), px(10.)), start);
+
+        assert!(
+            kinetic
+                .finish_at(
+                    start + VELOCITY_RELEASE_MAX_AGE,
+                    start + VELOCITY_RELEASE_MAX_AGE,
+                    GestureTuning::default(),
+                )
+                .is_none(),
+            "a finger held after one movement must not manufacture a fling"
+        );
     }
 
     #[test]

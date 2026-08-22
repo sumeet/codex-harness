@@ -12,9 +12,9 @@ use assets::Assets;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListState, Render, SharedString,
-    StyledText, Task, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions,
-    deferred, div, list, prelude::*, px, relative, size,
+    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListState, Render, ScrollHandle,
+    SharedString, StyledText, Task, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, deferred, div, list, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -112,14 +112,14 @@ const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
 const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
+#[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
 const PROGRESSIVE_OUTPUT_MEDIUM_BYTES: usize = 16 * 1_024;
 const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
-const PROGRESSIVE_WEB_MEDIUM_RESULTS: usize = 10;
-const PROGRESSIVE_WEB_LARGE_RESULTS: usize = 50;
 const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
+const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 
@@ -239,6 +239,7 @@ struct StructuredOutputPreview {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 enum OutputExpansion {
     #[default]
     Preview,
@@ -247,33 +248,10 @@ enum OutputExpansion {
     All,
 }
 
-impl OutputExpansion {
-    fn candidates_after(self) -> &'static [Self] {
-        match self {
-            Self::Preview => &[Self::Medium, Self::Large, Self::All],
-            Self::Medium => &[Self::Large, Self::All],
-            Self::Large => &[Self::All],
-            Self::All => &[Self::Preview],
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OutputLimits {
     lines: usize,
     bytes: usize,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ProgressiveOutputPresentation {
-    content: String,
-    toggle: Option<ProgressiveOutputToggle>,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ProgressiveOutputToggle {
-    label: String,
-    next: OutputExpansion,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -305,6 +283,18 @@ struct RichNavigationPaint {
     head: Option<usize>,
     visual: bool,
     cursor_claimed: Rc<Cell<bool>>,
+}
+
+#[derive(Clone)]
+struct RichNestedScrollBinding {
+    handle: ScrollHandle,
+    reveal_cursor: bool,
+}
+
+#[derive(Default)]
+struct RichNestedScrollState {
+    handle: ScrollHandle,
+    last_cursor: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -379,29 +369,9 @@ impl RichNavigationPaint {
     }
 }
 
-fn rich_navigation_needs_progressive_reveal(
-    kind: model::TranscriptKind,
-    expanded: bool,
-    expansion: OutputExpansion,
-    navigation: Option<&RichNavigationPaint>,
-) -> bool {
-    expanded
-        && kind.is_structured()
-        && expansion != OutputExpansion::All
-        && navigation.is_some_and(|navigation| {
-            if navigation.visual {
-                !navigation.ranges.is_empty()
-            } else {
-                navigation.head.is_some() && !navigation.cursor_claimed.get()
-            }
-        })
-}
-
 /// Give hidden Rich navigation a stable proxy in the card header. Collapsed
 /// folds and non-text request/image surfaces show their full title for a
-/// Visual selection; a Normal cursor owns exactly its first glyph. Progressive
-/// previews use the latter for the single frame in which their hidden tail
-/// expands.
+/// Visual selection; a Normal cursor owns exactly its first glyph.
 fn rich_header_navigation_range(
     title: &str,
     navigation: Option<&RichNavigationPaint>,
@@ -443,6 +413,67 @@ fn rich_navigation_fragment_range(
     let end = start + fragment.len();
     *logical_cursor = end;
     start..end
+}
+
+fn logical_line_fragments(text: &str, logical_start: usize) -> Vec<(String, Range<usize>)> {
+    let mut offset = logical_start;
+    text.split('\n')
+        .map(|line| {
+            let range = offset..offset + line.len();
+            offset = range.end.saturating_add(1);
+            (line.to_owned(), range)
+        })
+        .collect()
+}
+
+fn highlights_for_local_fragment(
+    highlights: &[(Range<usize>, gpui::HighlightStyle)],
+    fragment: Range<usize>,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    highlights
+        .iter()
+        .filter_map(|(range, style)| {
+            let start = range.start.max(fragment.start);
+            let end = range.end.min(fragment.end);
+            (start < end).then(|| (start - fragment.start..end - fragment.start, style.clone()))
+        })
+        .collect()
+}
+
+fn reveal_rich_nested_cursor(
+    binding: Option<&RichNestedScrollBinding>,
+    navigation: Option<&RichNavigationPaint>,
+    row_ranges: &[Option<Range<usize>>],
+) {
+    let Some(binding) = binding.filter(|binding| binding.reveal_cursor) else {
+        return;
+    };
+    let Some(cursor) = navigation
+        .and_then(RichNavigationPaint::cursor_range)
+        .map(|range| range.start)
+    else {
+        return;
+    };
+    if let Some(row) = rich_nested_cursor_row(cursor, row_ranges) {
+        binding.handle.scroll_to_item(row);
+    }
+}
+
+fn rich_nested_cursor_row(cursor: usize, row_ranges: &[Option<Range<usize>>]) -> Option<usize> {
+    // Structured renderers can omit logical separators and protocol
+    // furniture. Match navigation_ranges_for_fragment: prefer the exact row,
+    // then reveal the next real glyph when the cursor lands in such a gap.
+    let exact = row_ranges.iter().position(|range| {
+        range
+            .as_ref()
+            .is_some_and(|range| range.start <= cursor && cursor < range.end)
+    });
+    let next = row_ranges.iter().position(|range| {
+        range
+            .as_ref()
+            .is_some_and(|range| !range.is_empty() && cursor <= range.start)
+    });
+    exact.or(next)
 }
 
 /// Map visible Markdown text back to its source by treating formatting marks
@@ -983,19 +1014,6 @@ struct ActivityTextSection {
     body: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct ActivitySectionPresentation {
-    heading: Option<String>,
-    body: String,
-    is_json: bool,
-}
-
-#[derive(Debug, Eq, PartialEq)]
-struct ActivityOutputPresentation {
-    sections: Vec<ActivitySectionPresentation>,
-    toggle: Option<ProgressiveOutputToggle>,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JsonTokenKind {
     Key,
@@ -1045,90 +1063,6 @@ fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
         }
     }
     sections
-}
-
-fn activity_sections_fit_output_expansion(
-    sections: &[ActivityTextSection],
-    expansion: OutputExpansion,
-) -> bool {
-    sections.iter().all(|section| {
-        content_fits_output_expansion(
-            &section.body,
-            expansion,
-            STRUCTURED_OUTPUT_PREVIEW_LINES,
-            STRUCTURED_OUTPUT_PREVIEW_BYTES,
-        )
-    })
-}
-
-fn activity_output_toggle(
-    sections: &[ActivityTextSection],
-    current: OutputExpansion,
-) -> Option<ProgressiveOutputToggle> {
-    if activity_sections_fit_output_expansion(sections, OutputExpansion::Preview) {
-        return None;
-    }
-
-    let next = next_useful_output_expansion(current, |candidate| {
-        activity_sections_fit_output_expansion(sections, candidate)
-    });
-    let label = match next {
-        OutputExpansion::Preview => "Collapse to preview".into(),
-        OutputExpansion::Medium | OutputExpansion::Large => {
-            let limits = output_limits(
-                next,
-                STRUCTURED_OUTPUT_PREVIEW_LINES,
-                STRUCTURED_OUTPUT_PREVIEW_BYTES,
-            );
-            if sections
-                .iter()
-                .any(|section| section.body.lines().count() > limits.lines)
-            {
-                format!("Show up to {} lines per section", limits.lines)
-            } else {
-                format!("Show up to {} KiB per section", limits.bytes / 1_024)
-            }
-        }
-        OutputExpansion::All => "Show all activity".into(),
-    };
-    Some(ProgressiveOutputToggle { label, next })
-}
-
-fn activity_output_presentation(
-    content: &str,
-    expansion: OutputExpansion,
-) -> Option<ActivityOutputPresentation> {
-    let sections = activity_text_sections(content);
-    if !sections.iter().any(|section| section.heading.is_some()) {
-        return None;
-    }
-
-    let limits = output_limits(
-        expansion,
-        STRUCTURED_OUTPUT_PREVIEW_LINES,
-        STRUCTURED_OUTPUT_PREVIEW_BYTES,
-    );
-    let toggle = activity_output_toggle(&sections, expansion);
-    let sections = sections
-        .into_iter()
-        .map(|section| {
-            let is_json = is_valid_json(&section.body);
-            let body = structured_output_preview_with_limits(
-                &section.body,
-                "section",
-                limits.lines,
-                limits.bytes,
-            )
-            .content;
-            ActivitySectionPresentation {
-                heading: section.heading,
-                body,
-                is_json,
-            }
-        })
-        .collect();
-
-    Some(ActivityOutputPresentation { sections, toggle })
 }
 
 fn is_valid_json(content: &str) -> bool {
@@ -1213,6 +1147,7 @@ fn json_tokens_unchecked(content: &str) -> Vec<JsonToken> {
     tokens
 }
 
+#[cfg(test)]
 fn structured_output_preview(content: &str, noun: &str) -> StructuredOutputPreview {
     structured_output_preview_with_limits(
         content,
@@ -1289,111 +1224,6 @@ fn output_limits(
     }
 }
 
-fn content_fits_output_expansion(
-    content: &str,
-    expansion: OutputExpansion,
-    preview_lines: usize,
-    preview_bytes: usize,
-) -> bool {
-    let limits = output_limits(expansion, preview_lines, preview_bytes);
-    structured_output_preview_with_limits(content, "output", limits.lines, limits.bytes)
-        .footer
-        .is_none()
-}
-
-fn next_useful_output_expansion(
-    current: OutputExpansion,
-    fits: impl Fn(OutputExpansion) -> bool,
-) -> OutputExpansion {
-    if current == OutputExpansion::All {
-        return OutputExpansion::Preview;
-    }
-    current
-        .candidates_after()
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == OutputExpansion::All || !fits(*candidate))
-        .unwrap_or(OutputExpansion::All)
-}
-
-fn progressive_output_label(
-    noun: &str,
-    total_lines: usize,
-    total_bytes: usize,
-    preview_lines: usize,
-    preview_bytes: usize,
-    next: OutputExpansion,
-) -> String {
-    match next {
-        OutputExpansion::Preview => "Collapse to preview".into(),
-        OutputExpansion::Medium | OutputExpansion::Large => {
-            let limits = output_limits(next, preview_lines, preview_bytes);
-            if total_lines > limits.lines {
-                format!("Show first {} {noun}", limits.lines)
-            } else if total_bytes > limits.bytes {
-                format!("Show first {} KiB {noun}", limits.bytes / 1_024)
-            } else {
-                format!("Show more {noun}")
-            }
-        }
-        OutputExpansion::All if total_lines > preview_lines => {
-            format!("Show all {total_lines} {noun}")
-        }
-        OutputExpansion::All => format!("Show all {noun}"),
-    }
-}
-
-fn structured_output_presentation_with_limits(
-    content: &str,
-    noun: &str,
-    expansion: OutputExpansion,
-    preview_lines: usize,
-    preview_bytes: usize,
-) -> ProgressiveOutputPresentation {
-    let preview =
-        structured_output_preview_with_limits(content, noun, preview_lines, preview_bytes);
-    if preview.footer.is_none() {
-        return ProgressiveOutputPresentation {
-            content: content.to_string(),
-            toggle: None,
-        };
-    }
-
-    let limits = output_limits(expansion, preview_lines, preview_bytes);
-    let visible = structured_output_preview_with_limits(content, noun, limits.lines, limits.bytes);
-    let next = next_useful_output_expansion(expansion, |candidate| {
-        content_fits_output_expansion(content, candidate, preview_lines, preview_bytes)
-    });
-    ProgressiveOutputPresentation {
-        content: visible.content,
-        toggle: Some(ProgressiveOutputToggle {
-            label: progressive_output_label(
-                noun,
-                content.lines().count(),
-                content.len(),
-                preview_lines,
-                preview_bytes,
-                next,
-            ),
-            next,
-        }),
-    }
-}
-
-fn structured_output_presentation(
-    content: &str,
-    noun: &str,
-    expansion: OutputExpansion,
-) -> ProgressiveOutputPresentation {
-    structured_output_presentation_with_limits(
-        content,
-        noun,
-        expansion,
-        STRUCTURED_OUTPUT_PREVIEW_LINES,
-        STRUCTURED_OUTPUT_PREVIEW_BYTES,
-    )
-}
-
 fn command_output_for_display(output: &str) -> &str {
     output.trim_end_matches(['\r', '\n'])
 }
@@ -1405,42 +1235,6 @@ fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> u
         OutputExpansion::Large => PROGRESSIVE_OUTPUT_LARGE_LINES,
         OutputExpansion::All => usize::MAX,
     }
-}
-
-fn progressive_web_limit(expansion: OutputExpansion) -> usize {
-    match expansion {
-        OutputExpansion::Preview => WEB_RESULT_PREVIEW_COUNT,
-        OutputExpansion::Medium => PROGRESSIVE_WEB_MEDIUM_RESULTS,
-        OutputExpansion::Large => PROGRESSIVE_WEB_LARGE_RESULTS,
-        OutputExpansion::All => usize::MAX,
-    }
-}
-
-fn next_web_expansion(current: OutputExpansion, result_count: usize) -> OutputExpansion {
-    next_useful_output_expansion(current, |candidate| {
-        candidate != OutputExpansion::Preview && result_count <= progressive_web_limit(candidate)
-    })
-}
-
-fn progressive_web_toggle(
-    current: OutputExpansion,
-    result_count: usize,
-    has_hidden_content: bool,
-) -> Option<ProgressiveOutputToggle> {
-    has_hidden_content.then(|| {
-        let next = next_web_expansion(current, result_count);
-        let label = match next {
-            OutputExpansion::Preview => "Collapse to preview".into(),
-            OutputExpansion::Medium | OutputExpansion::Large => {
-                format!("Show first {} results", progressive_web_limit(next))
-            }
-            OutputExpansion::All if result_count > WEB_RESULT_PREVIEW_COUNT => {
-                format!("Show all {result_count} results")
-            }
-            OutputExpansion::All => "Show all result details".into(),
-        };
-        ProgressiveOutputToggle { label, next }
-    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1642,91 +1436,6 @@ fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
     presentations
 }
 
-fn file_change_counts_for_limits(item: &TranscriptItem) -> (usize, usize) {
-    let presentations = file_change_presentations(&item.content);
-    let changed_lines = presentations
-        .iter()
-        .map(|presentation| presentation.content.lines().count())
-        .sum();
-    (presentations.len(), changed_lines)
-}
-
-fn file_change_fits_output_expansion(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
-    let (files, changed_lines) = file_change_counts_for_limits(item);
-    let limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
-    files <= limit && changed_lines <= limit
-}
-
-fn next_file_change_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
-    next_useful_output_expansion(current, |candidate| {
-        file_change_fits_output_expansion(item, candidate)
-    })
-}
-
-fn progressive_file_change_toggle(
-    item: &TranscriptItem,
-    current: OutputExpansion,
-) -> Option<ProgressiveOutputToggle> {
-    let (files, changed_lines) = file_change_counts_for_limits(item);
-    if files <= STRUCTURED_OUTPUT_PREVIEW_LINES && changed_lines <= STRUCTURED_OUTPUT_PREVIEW_LINES
-    {
-        return None;
-    }
-    let next = next_file_change_expansion(item, current);
-    let label = match next {
-        OutputExpansion::Preview => "Collapse to preview".into(),
-        OutputExpansion::Medium | OutputExpansion::Large => format!(
-            "Show up to {} files / changed lines",
-            progressive_line_limit(next, STRUCTURED_OUTPUT_PREVIEW_LINES)
-        ),
-        OutputExpansion::All => {
-            format!("Show all {files} files and {changed_lines} changed lines")
-        }
-    };
-    Some(ProgressiveOutputToggle { label, next })
-}
-
-fn diff_counts_for_limits(item: &TranscriptItem) -> (usize, usize) {
-    let presentations = diff_file_presentations(&item.content);
-    let detail_lines = presentations
-        .iter()
-        .map(|presentation| presentation.content.lines().count())
-        .sum();
-    (presentations.len(), detail_lines)
-}
-
-fn diff_fits_output_expansion(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
-    let (files, detail_lines) = diff_counts_for_limits(item);
-    let limit = progressive_line_limit(expansion, STRUCTURED_OUTPUT_PREVIEW_LINES);
-    files <= limit && detail_lines <= limit
-}
-
-fn next_diff_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
-    next_useful_output_expansion(current, |candidate| {
-        diff_fits_output_expansion(item, candidate)
-    })
-}
-
-fn progressive_diff_toggle(
-    item: &TranscriptItem,
-    current: OutputExpansion,
-) -> Option<ProgressiveOutputToggle> {
-    let (files, detail_lines) = diff_counts_for_limits(item);
-    if files <= STRUCTURED_OUTPUT_PREVIEW_LINES && detail_lines <= STRUCTURED_OUTPUT_PREVIEW_LINES {
-        return None;
-    }
-    let next = next_diff_expansion(item, current);
-    let label = match next {
-        OutputExpansion::Preview => "Collapse to preview".into(),
-        OutputExpansion::Medium | OutputExpansion::Large => format!(
-            "Show up to {} files / diff lines",
-            progressive_line_limit(next, STRUCTURED_OUTPUT_PREVIEW_LINES)
-        ),
-        OutputExpansion::All => format!("Show all {files} files and {detail_lines} diff lines"),
-    };
-    Some(ProgressiveOutputToggle { label, next })
-}
-
 fn file_change_counts(presentation: &FileChangePresentation) -> (usize, usize) {
     let unified = presentation
         .content
@@ -1835,188 +1544,13 @@ fn diff_line_numbers(
     }
 }
 
-fn transcript_output_is_expandable(item: &TranscriptItem) -> bool {
-    match item.kind {
-        model::TranscriptKind::Command => item.command_transcript().is_some_and(|command| {
-            structured_output_preview_with_limits(
-                command.command.trim_end_matches(['\r', '\n']),
-                "command",
-                COMMAND_PREVIEW_LINES,
-                COMMAND_PREVIEW_BYTES,
-            )
-            .footer
-            .is_some()
-                || structured_output_preview(command_output_for_display(&command.output), "output")
-                    .footer
-                    .is_some()
-        }),
-        model::TranscriptKind::Web => {
-            web_search_has_hidden_content(&web_search_presentation(&item.raw))
-        }
-        model::TranscriptKind::Diff => !diff_fits_output_expansion(item, OutputExpansion::Preview),
-        model::TranscriptKind::FileChange => {
-            !file_change_fits_output_expansion(item, OutputExpansion::Preview)
-        }
-        model::TranscriptKind::Image | model::TranscriptKind::Approval => false,
-        model::TranscriptKind::Tool
-        | model::TranscriptKind::Subagent
-        | model::TranscriptKind::Review => {
-            activity_output_presentation(&item.content, OutputExpansion::Preview)
-                .map(|presentation| presentation.toggle.is_some())
-                .unwrap_or_else(|| {
-                    structured_output_preview(&item.content, "output")
-                        .footer
-                        .is_some()
-                })
-        }
-        kind if kind.is_structured() => structured_output_preview(&item.content, "output")
-            .footer
-            .is_some(),
-        _ => false,
-    }
-}
-
-fn command_fits_output_expansion(
-    command: &model::CommandTranscript,
-    expansion: OutputExpansion,
-) -> bool {
-    content_fits_output_expansion(
-        command.command.trim_end_matches(['\r', '\n']),
-        expansion,
-        COMMAND_PREVIEW_LINES,
-        COMMAND_PREVIEW_BYTES,
-    ) && content_fits_output_expansion(
-        command_output_for_display(&command.output),
-        expansion,
-        STRUCTURED_OUTPUT_PREVIEW_LINES,
-        STRUCTURED_OUTPUT_PREVIEW_BYTES,
-    )
-}
-
-fn next_command_expansion(
-    command: &model::CommandTranscript,
-    current: OutputExpansion,
-) -> OutputExpansion {
-    next_useful_output_expansion(current, |candidate| {
-        command_fits_output_expansion(command, candidate)
-    })
-}
-
-fn command_output_toggle(
-    command: &model::CommandTranscript,
-    current: OutputExpansion,
-) -> Option<ProgressiveOutputToggle> {
-    if command_fits_output_expansion(command, OutputExpansion::Preview) {
-        return None;
-    }
-    let next = next_command_expansion(command, current);
-    let label = match next {
-        OutputExpansion::Preview => "Collapse to preview".into(),
-        OutputExpansion::Medium | OutputExpansion::Large => format!(
-            "Show up to {} lines per section",
-            output_limits(next, STRUCTURED_OUTPUT_PREVIEW_LINES, usize::MAX).lines
-        ),
-        OutputExpansion::All => "Show all command and output".into(),
-    };
-    Some(ProgressiveOutputToggle { label, next })
-}
-
-fn output_expansion_reveals_all(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
-    match item.kind {
-        model::TranscriptKind::Command => item
-            .command_transcript()
-            .is_some_and(|command| command_fits_output_expansion(&command, expansion)),
-        model::TranscriptKind::Web => {
-            let presentation = web_search_presentation(&item.raw);
-            expansion != OutputExpansion::Preview
-                && presentation.results.len() <= progressive_web_limit(expansion)
-        }
-        model::TranscriptKind::Diff => diff_fits_output_expansion(item, expansion),
-        model::TranscriptKind::FileChange => file_change_fits_output_expansion(item, expansion),
-        model::TranscriptKind::Image | model::TranscriptKind::Approval => true,
-        model::TranscriptKind::Tool
-        | model::TranscriptKind::Subagent
-        | model::TranscriptKind::Review => {
-            let sections = activity_text_sections(&item.content);
-            if sections.iter().any(|section| section.heading.is_some()) {
-                activity_sections_fit_output_expansion(&sections, expansion)
-            } else {
-                content_fits_output_expansion(
-                    &item.content,
-                    expansion,
-                    STRUCTURED_OUTPUT_PREVIEW_LINES,
-                    STRUCTURED_OUTPUT_PREVIEW_BYTES,
-                )
-            }
-        }
-        kind if kind.is_structured() => content_fits_output_expansion(
-            &item.content,
-            expansion,
-            STRUCTURED_OUTPUT_PREVIEW_LINES,
-            STRUCTURED_OUTPUT_PREVIEW_BYTES,
-        ),
-        _ => true,
-    }
-}
-
-fn next_item_output_expansion(item: &TranscriptItem, current: OutputExpansion) -> OutputExpansion {
-    match item.kind {
-        model::TranscriptKind::Command => item
-            .command_transcript()
-            .map(|command| next_command_expansion(&command, current))
-            .unwrap_or(OutputExpansion::Preview),
-        model::TranscriptKind::Web => {
-            let presentation = web_search_presentation(&item.raw);
-            next_web_expansion(current, presentation.results.len())
-        }
-        model::TranscriptKind::Diff => next_diff_expansion(item, current),
-        model::TranscriptKind::FileChange => next_file_change_expansion(item, current),
-        model::TranscriptKind::Image | model::TranscriptKind::Approval => OutputExpansion::Preview,
-        model::TranscriptKind::Tool
-        | model::TranscriptKind::Subagent
-        | model::TranscriptKind::Review => {
-            let sections = activity_text_sections(&item.content);
-            if sections.iter().any(|section| section.heading.is_some()) {
-                activity_output_toggle(&sections, current)
-                    .map(|toggle| toggle.next)
-                    .unwrap_or(OutputExpansion::Preview)
-            } else {
-                next_useful_output_expansion(current, |candidate| {
-                    content_fits_output_expansion(
-                        &item.content,
-                        candidate,
-                        STRUCTURED_OUTPUT_PREVIEW_LINES,
-                        STRUCTURED_OUTPUT_PREVIEW_BYTES,
-                    )
-                })
-            }
-        }
-        kind if kind.is_structured() => next_useful_output_expansion(current, |candidate| {
-            content_fits_output_expansion(
-                &item.content,
-                candidate,
-                STRUCTURED_OUTPUT_PREVIEW_LINES,
-                STRUCTURED_OUTPUT_PREVIEW_BYTES,
-            )
-        }),
-        _ => OutputExpansion::Preview,
-    }
-}
-
 fn rich_search_match_needs_context(item: &TranscriptItem, expansion: OutputExpansion) -> bool {
+    let _ = expansion;
     !item.expanded
-        || (transcript_output_is_expandable(item) && !output_expansion_reveals_all(item, expansion))
 }
 
 fn folded_contains(text: &str, query: &str) -> bool {
     !folded_match_byte_ranges(text, query, 1).is_empty()
-}
-
-fn visible_line_prefix_contains(content: &str, visible_lines: usize, query: &str) -> bool {
-    content
-        .lines()
-        .take(visible_lines)
-        .any(|line| folded_contains(line, query))
 }
 
 /// Whether the active Rich card already paints the matching text. Search
@@ -2024,7 +1558,7 @@ fn visible_line_prefix_contains(content: &str, visible_lines: usize, query: &str
 /// metadata that the card always exposes (notably file paths and commands).
 fn rich_search_query_is_visible(
     item: &TranscriptItem,
-    expansion: OutputExpansion,
+    _expansion: OutputExpansion,
     query: &str,
 ) -> bool {
     if (transcript_item_shows_header(item)
@@ -2043,105 +1577,46 @@ fn rich_search_query_is_visible(
     match item.kind {
         model::TranscriptKind::Command => item.command_transcript().is_some_and(|transcript| {
             let command_text = transcript.command.trim_end_matches(['\r', '\n']);
-            let command_limits =
-                output_limits(expansion, COMMAND_PREVIEW_LINES, COMMAND_PREVIEW_BYTES);
-            let visible_command = structured_output_preview_with_limits(
-                command_text,
-                "command",
-                command_limits.lines,
-                command_limits.bytes,
-            );
-            let command = visible_command.content.as_str();
             let output_text = command_output_for_display(&transcript.output);
-            let output_limits = output_limits(
-                expansion,
-                STRUCTURED_OUTPUT_PREVIEW_LINES,
-                STRUCTURED_OUTPUT_PREVIEW_BYTES,
-            );
-            let visible_output = structured_output_preview_with_limits(
-                output_text,
-                "output",
-                output_limits.lines,
-                output_limits.bytes,
-            );
-            let output = visible_output.content.as_str();
-            folded_contains(command, query) || folded_contains(output, query)
+            folded_contains(command_text, query) || folded_contains(output_text, query)
         }),
-        model::TranscriptKind::FileChange => {
-            let presentations = file_change_presentations(&item.content);
-            let allocations = progressive_file_line_allocations(
-                &presentations
-                    .iter()
-                    .map(|presentation| presentation.content.lines().count())
-                    .collect::<Vec<_>>(),
-                expansion,
-            );
-            for (presentation, visible_lines) in presentations.into_iter().zip(allocations) {
+        model::TranscriptKind::FileChange => file_change_presentations(&item.content)
+            .into_iter()
+            .any(|presentation| {
                 let (additions, deletions) = file_change_counts(&presentation);
-                if ((additions == 0 && deletions == 0)
+                ((additions == 0 && deletions == 0)
                     && folded_contains(&presentation.operation, query))
                     || folded_contains(&presentation.path, query)
-                {
-                    return true;
-                }
-                if visible_line_prefix_contains(&presentation.content, visible_lines, query) {
-                    return true;
-                }
-            }
-            false
-        }
+                    || folded_contains(&presentation.content, query)
+            }),
         model::TranscriptKind::Diff => {
-            let presentations = diff_file_presentations(&item.content);
-            let allocations = progressive_file_line_allocations(
-                &presentations
-                    .iter()
-                    .map(|presentation| presentation.content.lines().count())
-                    .collect::<Vec<_>>(),
-                expansion,
-            );
-            presentations
+            diff_file_presentations(&item.content)
                 .into_iter()
-                .zip(allocations)
-                .any(|(presentation, visible_lines)| {
+                .any(|presentation| {
                     folded_contains(&presentation.path, query)
-                        || visible_line_prefix_contains(&presentation.content, visible_lines, query)
+                        || folded_contains(&presentation.content, query)
                 })
         }
-        model::TranscriptKind::Web => web_search_presentation(&item.raw)
-            .results
-            .iter()
-            .take(progressive_web_limit(expansion))
-            .any(|result| {
-                folded_contains(&result.title, query)
-                    || result
-                        .url
-                        .as_deref()
-                        .is_some_and(|url| folded_contains(url, query))
-                    || result
-                        .snippet
-                        .as_deref()
-                        .is_some_and(|snippet| folded_contains(snippet, query))
-            }),
+        model::TranscriptKind::Web => {
+            web_search_presentation(&item.raw)
+                .results
+                .iter()
+                .any(|result| {
+                    folded_contains(&result.title, query)
+                        || result
+                            .url
+                            .as_deref()
+                            .is_some_and(|url| folded_contains(url, query))
+                        || result
+                            .snippet
+                            .as_deref()
+                            .is_some_and(|snippet| folded_contains(snippet, query))
+                })
+        }
         model::TranscriptKind::Tool
         | model::TranscriptKind::Subagent
-        | model::TranscriptKind::Review => activity_output_presentation(&item.content, expansion)
-            .map(|presentation| {
-                presentation.sections.iter().any(|section| {
-                    section
-                        .heading
-                        .as_deref()
-                        .is_some_and(|heading| folded_contains(heading, query))
-                        || folded_contains(&section.body, query)
-                })
-            })
-            .unwrap_or_else(|| {
-                let visible = structured_output_presentation(&item.content, "output", expansion);
-                folded_contains(&visible.content, query)
-            }),
-        kind if kind.is_structured() => {
-            let visible = structured_output_presentation(&item.content, "output", expansion);
-            folded_contains(&visible.content, query)
-        }
+        | model::TranscriptKind::Review => folded_contains(&item.content, query),
+        kind if kind.is_structured() => folded_contains(&item.content, query),
         _ => folded_contains(transcript_item_searchable_body(item), query),
     }
 }
@@ -2163,6 +1638,7 @@ fn compact_web_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[cfg(test)]
 fn web_search_has_hidden_content(presentation: &WebSearchPresentation) -> bool {
     presentation.results.len() > WEB_RESULT_PREVIEW_COUNT
         || presentation.results.iter().any(|result| {
@@ -2857,7 +2333,6 @@ struct HarnessApp {
     selected_task: usize,
     visual_anchor: Option<usize>,
     raw_visible: HashSet<String>,
-    output_expansion: HashMap<String, OutputExpansion>,
     markdown_cache: HashMap<String, CachedMarkdown>,
     search_visible: bool,
     search_query: String,
@@ -2885,6 +2360,7 @@ struct HarnessApp {
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
     hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
+    rich_nested_scrolls: HashMap<String, RichNestedScrollState>,
     list_state: ListState,
     task_list_state: ListState,
     sidebar_open: bool,
@@ -2897,6 +2373,26 @@ struct HarnessApp {
 }
 
 impl HarnessApp {
+    fn rich_nested_scroll_binding(
+        &mut self,
+        item_key: &str,
+        navigation: Option<&RichNavigationPaint>,
+    ) -> RichNestedScrollBinding {
+        let cursor = navigation
+            .and_then(RichNavigationPaint::cursor_range)
+            .map(|range| range.start);
+        let state = self
+            .rich_nested_scrolls
+            .entry(item_key.to_owned())
+            .or_default();
+        let reveal_cursor = cursor.is_some() && cursor != state.last_cursor;
+        state.last_cursor = cursor;
+        RichNestedScrollBinding {
+            handle: state.handle.clone(),
+            reveal_cursor,
+        }
+    }
+
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
         // The navigation Editor retains its selection while focus moves to the
         // composer, search, approvals, or sidebar. Only paint that cached
@@ -3145,7 +2641,6 @@ impl HarnessApp {
             selected_task: 0,
             visual_anchor: None,
             raw_visible: HashSet::default(),
-            output_expansion: HashMap::default(),
             markdown_cache: HashMap::default(),
             search_visible: false,
             search_query: String::new(),
@@ -3173,6 +2668,7 @@ impl HarnessApp {
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             hybrid_surfaces: HashMap::default(),
+            rich_nested_scrolls: HashMap::default(),
             sidebar_open: true,
             sidebar_user_override: false,
             server_task: Task::ready(()),
@@ -4255,8 +3751,8 @@ impl HarnessApp {
         self.model.clear();
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
+        self.rich_nested_scrolls.clear();
         self.raw_visible.clear();
-        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -4334,8 +3830,8 @@ impl HarnessApp {
         }
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         self.markdown_cache.clear();
+        self.rich_nested_scrolls.clear();
         self.raw_visible.clear();
-        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -4361,8 +3857,8 @@ impl HarnessApp {
         self.model.clear();
         self.mark_all_image_surfaces_dirty();
         self.markdown_cache.clear();
+        self.rich_nested_scrolls.clear();
         self.raw_visible.clear();
-        self.output_expansion.clear();
         self.request_answers.clear();
         self.request_editors.clear();
         self.request_question_cursor.clear();
@@ -5800,29 +5296,7 @@ impl HarnessApp {
     }
 
     fn toggle_selected_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.model.items.get(self.selected_item) else {
-            return;
-        };
-        if !item.expanded || !transcript_output_is_expandable(item) {
-            self.toggle_selected(window, cx);
-            return;
-        }
-
-        let item_key = item.key.clone();
-        let current = self
-            .output_expansion
-            .get(&item_key)
-            .copied()
-            .unwrap_or_default();
-        let next = next_item_output_expansion(item, current);
-        if next == OutputExpansion::Preview {
-            self.output_expansion.remove(&item_key);
-        } else {
-            self.output_expansion.insert(item_key, next);
-        }
-        self.list_state
-            .splice(self.selected_item..self.selected_item + 1, 1);
-        cx.notify();
+        self.toggle_selected(window, cx);
     }
 
     fn toggle_raw(&mut self, cx: &mut Context<Self>) {
@@ -6233,37 +5707,6 @@ impl HarnessApp {
         cached.entity.clone()
     }
 
-    fn render_output_toggle(
-        item_key: &str,
-        index: usize,
-        toggle: ProgressiveOutputToggle,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let item_key = item_key.to_string();
-        let toggle_key = item_key.clone();
-        let next = toggle.next;
-        div()
-            .id(format!("output-toggle:{item_key}"))
-            .w_full()
-            .py_1()
-            .cursor_pointer()
-            .text_ui_xs(cx)
-            .text_color(colors.text_muted)
-            .hover(|this| this.text_color(colors.text))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if next == OutputExpansion::Preview {
-                    this.output_expansion.remove(&toggle_key);
-                } else {
-                    this.output_expansion.insert(toggle_key.clone(), next);
-                }
-                this.list_state.splice(index..index + 1, 1);
-                cx.notify();
-            }))
-            .child(toggle.label)
-            .into_any_element()
-    }
-
     fn render_diff_lines(
         content: &str,
         visible_line_count: usize,
@@ -6375,23 +5818,170 @@ impl HarnessApp {
         navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
-        let toggle = progressive_diff_toggle(item, expansion)
-            .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_diff_content(
-            item,
-            index,
-            search,
-            navigation,
-            expansion,
-            toggle,
-            Some(cx.weak_entity()),
-            cx,
-        )
+        let colors = cx.theme().colors().clone();
+        let presentations = diff_file_presentations(&item.content);
+        let file_count = presentations.len();
+        let (total_additions, total_deletions) = aggregate_diff_counts(
+            presentations
+                .iter()
+                .map(|presentation| presentation.content.as_str()),
+        );
+        let owner = cx.weak_entity();
+        let mut logical_cursor = 0;
+        let mut row_ranges = Vec::new();
+        let mut rows = Vec::new();
+
+        for (section_index, presentation) in presentations.into_iter().enumerate() {
+            if section_index > 0 {
+                row_ranges.push(None);
+                rows.push(
+                    div()
+                        .w_full()
+                        .h(px(9.))
+                        .mt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .into_any_element(),
+                );
+            }
+            let path_range =
+                rich_navigation_fragment_range(navigation, &presentation.path, &mut logical_cursor);
+            let content_range = rich_navigation_fragment_range(
+                navigation,
+                &presentation.content,
+                &mut logical_cursor,
+            );
+            let (additions, deletions) = diff_content_counts(&presentation.content);
+            let highlighted_path = navigation_searchable_styled_text(
+                presentation.path,
+                Vec::new(),
+                search,
+                navigation,
+                path_range.clone(),
+                cx,
+            );
+            let clickable_path = rich_clickable_styled_text(
+                format!("rich-diff-path:{index}:{section_index}"),
+                highlighted_path,
+                index,
+                path_range.clone(),
+                Some(owner.clone()),
+            );
+            row_ranges.push(Some(path_range));
+            rows.push(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_subheader_background.opacity(0.72))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .truncate()
+                            .child(clickable_path),
+                    )
+                    .when(additions > 0 || deletions > 0, |this| {
+                        this.child(
+                            DiffStat::new(
+                                format!("rich-diff-file-stat:{index}:{section_index}"),
+                                additions,
+                                deletions,
+                            )
+                            .label_size(LabelSize::XSmall)
+                            .tooltip(format!(
+                                "{additions} lines added, {deletions} lines removed"
+                            )),
+                        )
+                    })
+                    .into_any_element(),
+            );
+
+            if !presentation.content.is_empty() {
+                let line_count = presentation.content.lines().count();
+                row_ranges.extend(
+                    logical_line_fragments(&presentation.content, content_range.start)
+                        .into_iter()
+                        .take(line_count)
+                        .map(|(_, range)| Some(range)),
+                );
+                rows.extend(Self::render_diff_lines(
+                    &presentation.content,
+                    usize::MAX,
+                    search,
+                    navigation,
+                    content_range.start,
+                    index,
+                    Some(owner.clone()),
+                    cx,
+                ));
+            }
+        }
+
+        let binding = self.rich_nested_scroll_binding(&item.key, navigation);
+        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
+        div()
+            .id(("rich-diff-output", index))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .when(file_count > 1, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .pb_1()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .child(
+                            Label::new(format!("{file_count} files"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .when(total_additions > 0 || total_deletions > 0, |this| {
+                            this.child(
+                                DiffStat::new(
+                                    format!("rich-diff-total-stat:{index}"),
+                                    total_additions,
+                                    total_deletions,
+                                )
+                                .label_size(LabelSize::XSmall)
+                                .tooltip(format!(
+                                    "{total_additions} total lines added, {total_deletions} total lines removed"
+                                )),
+                            )
+                        }),
+                )
+            })
+            .child(
+                div()
+                    .id(("rich-diff-scroll", index))
+                    .w_full()
+                    .min_w_0()
+                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                    .overflow_x_scroll()
+                    .overflow_y_scroll()
+                    .track_scroll(&binding.handle)
+                    .children(rows),
+            )
+            .into_any_element()
     }
 
     fn render_diff_content(
@@ -6596,25 +6186,24 @@ impl HarnessApp {
                 (total_additions + additions, total_deletions + deletions)
             },
         );
-        let expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
-        let allocations = progressive_file_line_allocations(
-            &presentations
-                .iter()
-                .map(|presentation| presentation.content.lines().count())
-                .collect::<Vec<_>>(),
-            expansion,
-        );
-        let toggle = progressive_file_change_toggle(item, expansion);
-        let mut sections = Vec::new();
+        let owner = cx.weak_entity();
         let mut logical_cursor = 0;
+        let mut row_ranges = Vec::new();
+        let mut rows = Vec::new();
 
-        for (section_index, (presentation, visible_lines)) in
-            presentations.into_iter().zip(allocations).enumerate()
-        {
+        for (section_index, presentation) in presentations.into_iter().enumerate() {
+            if section_index > 0 {
+                row_ranges.push(None);
+                rows.push(
+                    div()
+                        .w_full()
+                        .h(px(9.))
+                        .mt_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .into_any_element(),
+                );
+            }
             let (additions, deletions) = file_change_counts(&presentation);
             let path_range =
                 rich_navigation_fragment_range(navigation, &presentation.path, &mut logical_cursor);
@@ -6630,8 +6219,8 @@ impl HarnessApp {
                 format!("rich-file-change-path:{index}:{section_index}"),
                 highlighted_path,
                 index,
-                path_range,
-                Some(cx.weak_entity()),
+                path_range.clone(),
+                Some(owner.clone()),
             );
             let content_range = rich_navigation_fragment_range(
                 navigation,
@@ -6650,112 +6239,99 @@ impl HarnessApp {
                 Color::Accent => colors.text_accent,
                 _ => colors.text_muted,
             };
-            sections.push(
+            row_ranges.push(Some(path_range));
+            rows.push(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .when(section_index > 0, |this| {
-                        this.mt_1()
-                            .pt_2()
-                            .border_t_1()
-                            .border_color(colors.border_variant)
-                    })
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_subheader_background.opacity(0.72))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .child(
                         div()
-                            .w_full()
                             .min_w_0()
+                            .flex_1()
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .truncate()
+                            .child(clickable_path),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_xs()
-                            .border_b_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.editor_subheader_background.opacity(0.72))
-                            .child(
-                                Icon::new(IconName::File)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .font_buffer(cx)
-                                    .text_ui_sm(cx)
-                                    .truncate()
-                                    .child(clickable_path),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .when(additions > 0 || deletions > 0, |this| {
-                                        this.child(
-                                            DiffStat::new(
-                                                format!(
-                                                    "file-change-stat:{index}:{section_index}"
-                                                ),
-                                                additions,
-                                                deletions,
-                                            )
-                                            .label_size(LabelSize::XSmall)
-                                            .tooltip(format!(
-                                                "{additions} lines added, {deletions} lines removed"
-                                            )),
-                                        )
-                                    })
-                                    .when(additions == 0 && deletions == 0, |this| {
-                                        let operation = searchable_styled_text(
-                                            presentation.operation,
-                                            Vec::new(),
-                                            search,
-                                            cx,
-                                        );
-                                        this.child(
-                                            div()
-                                                .text_ui_xs(cx)
-                                                .text_color(operation_text_color)
-                                                .child(operation),
-                                        )
-                                    }),
-                            ),
-                    )
-                    .when(!presentation.content.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .id(format!("file-change-scroll:{index}:{section_index}"))
-                                .w_full()
-                                .min_w_0()
-                                .overflow_x_scroll()
-                                .children(Self::render_diff_lines(
-                                    &presentation.content,
-                                    visible_lines,
+                            .when(additions > 0 || deletions > 0, |this| {
+                                this.child(
+                                    DiffStat::new(
+                                        format!("file-change-stat:{index}:{section_index}"),
+                                        additions,
+                                        deletions,
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(format!(
+                                        "{additions} lines added, {deletions} lines removed"
+                                    )),
+                                )
+                            })
+                            .when(additions == 0 && deletions == 0, |this| {
+                                let operation = searchable_styled_text(
+                                    presentation.operation,
+                                    Vec::new(),
                                     search,
-                                    navigation,
-                                    content_range.start,
-                                    index,
-                                    Some(cx.weak_entity()),
                                     cx,
-                                )),
-                        )
-                    }),
+                                );
+                                this.child(
+                                    div()
+                                        .text_ui_xs(cx)
+                                        .text_color(operation_text_color)
+                                        .child(operation),
+                                )
+                            }),
+                    )
+                    .into_any_element(),
             );
+
+            if !presentation.content.is_empty() {
+                let line_count = presentation.content.lines().count();
+                row_ranges.extend(
+                    logical_line_fragments(&presentation.content, content_range.start)
+                        .into_iter()
+                        .take(line_count)
+                        .map(|(_, range)| Some(range)),
+                );
+                rows.extend(Self::render_diff_lines(
+                    &presentation.content,
+                    usize::MAX,
+                    search,
+                    navigation,
+                    content_range.start,
+                    index,
+                    Some(owner.clone()),
+                    cx,
+                ));
+            }
         }
 
+        let binding = self.rich_nested_scroll_binding(&item.key, navigation);
+        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
         div()
             .id(("file-change-output", index))
             .w_full()
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_1()
             .when(file_count > 1, |this| {
                 this.child(
                     div()
@@ -6787,16 +6363,17 @@ impl HarnessApp {
                         }),
                 )
             })
-            .children(sections)
-            .when_some(toggle, |this, toggle| {
-                this.child(
-                    div()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
-                )
-            })
+            .child(
+                div()
+                    .id(("file-change-scroll", index))
+                    .w_full()
+                    .min_w_0()
+                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                    .overflow_x_scroll()
+                    .overflow_y_scroll()
+                    .track_scroll(&binding.handle)
+                    .children(rows),
+            )
             .into_any_element()
     }
 
@@ -6867,52 +6444,55 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let expansion = self
-            .output_expansion
-            .get(item_key)
-            .copied()
-            .unwrap_or_default();
-        let preview = structured_output_presentation(&content, "output lines", expansion);
         let mut logical_cursor = 0;
-        let body_range =
-            rich_navigation_fragment_range(navigation, &preview.content, &mut logical_cursor);
-        let highlighted_content = navigation_searchable_styled_text(
-            preview.content,
-            Vec::new(),
-            search,
-            navigation,
-            body_range.clone(),
-            cx,
-        );
-        let clickable_content = rich_clickable_styled_text(
-            format!("rich-terminal:{index}"),
-            highlighted_content,
-            index,
-            body_range,
-            Some(cx.weak_entity()),
-        );
+        let body_range = rich_navigation_fragment_range(navigation, &content, &mut logical_cursor);
+        let lines = logical_line_fragments(&content, body_range.start);
+        let row_ranges = lines
+            .iter()
+            .map(|(_, range)| Some(range.clone()))
+            .collect::<Vec<_>>();
+        let binding = self.rich_nested_scroll_binding(item_key, navigation);
+        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
+        let owner = cx.weak_entity();
+        let rows = lines
+            .into_iter()
+            .enumerate()
+            .map(|(line_index, (line, range))| {
+                let highlighted = navigation_searchable_styled_text(
+                    line,
+                    Vec::new(),
+                    search,
+                    navigation,
+                    range.clone(),
+                    cx,
+                );
+                let clickable = rich_clickable_styled_text(
+                    format!("rich-terminal:{index}:{line_index}"),
+                    highlighted,
+                    index,
+                    range,
+                    Some(owner.clone()),
+                );
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(20.))
+                    .whitespace_normal()
+                    .child(clickable)
+            })
+            .collect::<Vec<_>>();
         div()
             .id(("terminal-scroll", index))
             .w_full()
             .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1()
+            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&binding.handle)
             .font_buffer(cx)
             .text_ui_sm(cx)
             .line_height(relative(1.45))
             .text_color(colors.text)
-            .whitespace_normal()
-            .child(clickable_content)
-            .when_some(preview.toggle, |this, toggle| {
-                this.child(
-                    div()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(item_key, index, toggle, cx)),
-                )
-            })
+            .children(rows)
             .into_any_element()
     }
 
@@ -6925,130 +6505,128 @@ impl HarnessApp {
         navigation: Option<&RichNavigationPaint>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let expansion = self
-            .output_expansion
-            .get(item_key)
-            .copied()
-            .unwrap_or_default();
-        let Some(presentation) = activity_output_presentation(&content, expansion) else {
+        let sections = activity_text_sections(&content);
+        if !sections.iter().any(|section| section.heading.is_some()) {
             return self.render_terminal(content, item_key, index, search, navigation, cx);
-        };
+        }
 
         let colors = cx.theme().colors().clone();
         let error_color = cx.theme().status().error;
         let mut logical_cursor = 0;
         let owner = cx.weak_entity();
+        let mut row_ranges = Vec::new();
+        let mut rows = Vec::new();
+
+        for (section_index, section) in sections.into_iter().enumerate() {
+            let error = section.heading.as_deref() == Some("Error");
+            let primary = matches!(
+                section.heading.as_deref(),
+                Some("Result" | "Structured result" | "Error")
+            );
+            if section_index > 0 {
+                row_ranges.push(None);
+                rows.push(
+                    div()
+                        .w_full()
+                        .h(px(9.))
+                        .my_1()
+                        .border_t_1()
+                        .border_color(colors.border_variant)
+                        .into_any_element(),
+                );
+            }
+            if let Some(heading) = section.heading {
+                let range =
+                    rich_navigation_fragment_range(navigation, &heading, &mut logical_cursor);
+                let highlighted = navigation_searchable_styled_text(
+                    heading,
+                    Vec::new(),
+                    search,
+                    navigation,
+                    range.clone(),
+                    cx,
+                );
+                let clickable = rich_clickable_styled_text(
+                    format!("rich-activity-heading:{index}:{section_index}"),
+                    highlighted,
+                    index,
+                    range.clone(),
+                    Some(owner.clone()),
+                );
+                row_ranges.push(Some(range));
+                rows.push(
+                    div()
+                        .w_full()
+                        .min_h(px(18.))
+                        .text_ui_xs(cx)
+                        .text_color(if error {
+                            error_color
+                        } else if primary {
+                            colors.text
+                        } else {
+                            colors.text_muted
+                        })
+                        .child(clickable)
+                        .into_any_element(),
+                );
+            }
+
+            if !section.body.is_empty() {
+                let body_range =
+                    rich_navigation_fragment_range(navigation, &section.body, &mut logical_cursor);
+                let json = is_valid_json(&section.body)
+                    .then(|| json_highlights(&section.body, cx))
+                    .unwrap_or_default();
+                for (line_index, (line, range)) in
+                    logical_line_fragments(&section.body, body_range.start)
+                        .into_iter()
+                        .enumerate()
+                {
+                    let local = range.start - body_range.start..range.end - body_range.start;
+                    let base = highlights_for_local_fragment(&json, local);
+                    let highlighted = navigation_searchable_styled_text(
+                        line,
+                        base,
+                        search,
+                        navigation,
+                        range.clone(),
+                        cx,
+                    );
+                    let clickable = rich_clickable_styled_text(
+                        format!("rich-activity-body:{index}:{section_index}:{line_index}"),
+                        highlighted,
+                        index,
+                        range.clone(),
+                        Some(owner.clone()),
+                    );
+                    row_ranges.push(Some(range));
+                    rows.push(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .min_h(px(20.))
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .line_height(relative(1.45))
+                            .text_color(if error { error_color } else { colors.text })
+                            .whitespace_normal()
+                            .child(clickable)
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+
+        let binding = self.rich_nested_scroll_binding(item_key, navigation);
+        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
         div()
             .id(("activity-sections", index))
             .w_full()
             .min_w_0()
-            .flex()
-            .flex_col()
-            .children(presentation.sections.into_iter().enumerate().map(
-                |(section_index, section)| {
-                    let error = section.heading.as_deref() == Some("Error");
-                    let primary = matches!(
-                        section.heading.as_deref(),
-                        Some("Result" | "Structured result" | "Error")
-                    );
-                    let highlighted_heading = section.heading.as_ref().map(|heading| {
-                        let range = rich_navigation_fragment_range(
-                            navigation,
-                            heading,
-                            &mut logical_cursor,
-                        );
-                        let highlighted = navigation_searchable_styled_text(
-                            heading.clone(),
-                            Vec::new(),
-                            search,
-                            navigation,
-                            range.clone(),
-                            cx,
-                        );
-                        rich_clickable_styled_text(
-                            format!("rich-activity-heading:{index}:{section_index}"),
-                            highlighted,
-                            index,
-                            range,
-                            Some(owner.clone()),
-                        )
-                    });
-                    let base = if section.is_json {
-                        json_highlights(&section.body, cx)
-                    } else {
-                        Vec::new()
-                    };
-                    let body_range = rich_navigation_fragment_range(
-                        navigation,
-                        &section.body,
-                        &mut logical_cursor,
-                    );
-                    let highlighted_body = navigation_searchable_styled_text(
-                        section.body.clone(),
-                        base,
-                        search,
-                        navigation,
-                        body_range.clone(),
-                        cx,
-                    );
-                    let clickable_body = rich_clickable_styled_text(
-                        format!("rich-activity-body:{index}:{section_index}"),
-                        highlighted_body,
-                        index,
-                        body_range,
-                        Some(owner.clone()),
-                    );
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .when(section_index > 0, |this| {
-                            this.mt_1()
-                                .pt_2()
-                                .border_t_1()
-                                .border_color(colors.border_variant)
-                        })
-                        .when_some(highlighted_heading, |this, heading| {
-                            this.child(
-                                div()
-                                    .text_ui_xs(cx)
-                                    .text_color(if error {
-                                        error_color
-                                    } else if primary {
-                                        colors.text
-                                    } else {
-                                        colors.text_muted
-                                    })
-                                    .child(heading),
-                            )
-                        })
-                        .when(!section.body.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .font_buffer(cx)
-                                    .text_ui_sm(cx)
-                                    .line_height(relative(1.45))
-                                    .text_color(if error { error_color } else { colors.text })
-                                    .whitespace_normal()
-                                    .child(clickable_body),
-                            )
-                        })
-                },
-            ))
-            .when_some(presentation.toggle, |this, toggle| {
-                this.child(
-                    div()
-                        .mt_1()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(item_key, index, toggle, cx)),
-                )
-            })
+            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&binding.handle)
+            .children(rows)
             .into_any_element()
     }
 
@@ -7070,25 +6648,127 @@ impl HarnessApp {
                 cx,
             );
         }
-        let expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
-        let command = item.command_transcript().expect("command parsed above");
-        let toggle = command_output_toggle(&command, expansion)
-            .map(|toggle| Self::render_output_toggle(&item.key, index, toggle, cx));
-        Self::render_command_content(
-            item,
-            index,
-            search,
-            navigation,
-            expansion,
-            toggle,
-            Some(cx.weak_entity()),
-            cx,
+        self.render_rich_command_content(item, index, search, navigation, cx)
+            .expect("command parsed above")
+    }
+
+    fn render_rich_command_content(
+        &mut self,
+        item: &TranscriptItem,
+        index: usize,
+        search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let command = item.command_transcript()?;
+        let colors = cx.theme().colors().clone();
+        let command_text = command.command.trim_end_matches(['\r', '\n']);
+        let output = command_output_for_display(&command.output);
+        let command_start = navigation
+            .and_then(|navigation| navigation.body_text.find(command_text))
+            .unwrap_or(0);
+        let output_start = navigation
+            .and_then(|navigation| {
+                navigation.body_text[command_start.min(navigation.body_text.len())..]
+                    .find(output)
+                    .map(|offset| command_start + offset)
+            })
+            .unwrap_or(command_start + command_text.len());
+        let owner = cx.weak_entity();
+        let mut row_ranges = Vec::new();
+        let mut rows = Vec::new();
+
+        for (line_index, (line, range)) in logical_line_fragments(command_text, command_start)
+            .into_iter()
+            .enumerate()
+        {
+            let highlighted = navigation_searchable_styled_text(
+                line.clone(),
+                shell_highlights(&line, cx),
+                search,
+                navigation,
+                range.clone(),
+                cx,
+            );
+            let clickable = rich_clickable_styled_text(
+                format!("rich-command-text:{index}:{line_index}"),
+                highlighted,
+                index,
+                range.clone(),
+                Some(owner.clone()),
+            );
+            row_ranges.push(Some(range));
+            rows.push(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(20.))
+                    .whitespace_normal()
+                    .child(clickable)
+                    .into_any_element(),
+            );
+        }
+
+        if !output.is_empty() {
+            row_ranges.push(None);
+            rows.push(
+                div()
+                    .w_full()
+                    .h(px(9.))
+                    .my_1()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .into_any_element(),
+            );
+            for (line_index, (line, range)) in logical_line_fragments(output, output_start)
+                .into_iter()
+                .enumerate()
+            {
+                let highlighted = navigation_searchable_styled_text(
+                    line,
+                    Vec::new(),
+                    search,
+                    navigation,
+                    range.clone(),
+                    cx,
+                );
+                let clickable = rich_clickable_styled_text(
+                    format!("rich-command-output:{index}:{line_index}"),
+                    highlighted,
+                    index,
+                    range.clone(),
+                    Some(owner.clone()),
+                );
+                row_ranges.push(Some(range));
+                rows.push(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .min_h(px(20.))
+                        .whitespace_normal()
+                        .child(clickable)
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let binding = self.rich_nested_scroll_binding(&item.key, navigation);
+        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
+        Some(
+            div()
+                .id(("command-output", index))
+                .w_full()
+                .min_w_0()
+                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .track_scroll(&binding.handle)
+                .font_buffer(cx)
+                .text_ui_sm(cx)
+                .line_height(relative(1.45))
+                .text_color(colors.text)
+                .children(rows)
+                .into_any_element(),
         )
-        .expect("command parsed above")
     }
 
     fn render_command_content(
@@ -7241,33 +6921,57 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let presentation = web_search_presentation(&item.raw);
         let total_results = presentation.results.len();
-        let has_hidden_content = web_search_has_hidden_content(&presentation);
-        let expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
-        let expanded = expansion != OutputExpansion::Preview;
         let item_key = item.key.clone();
-        let visible_result_count = total_results.min(progressive_web_limit(expansion));
-        let toggle = progressive_web_toggle(expansion, total_results, has_hidden_content);
         let mut logical_cursor = 0;
+        let mut row_ranges = Vec::new();
         let visible_results = presentation
             .results
             .into_iter()
-            .take(visible_result_count)
             .enumerate()
             .map(|(result_index, result)| {
                 let title_range =
                     rich_navigation_fragment_range(navigation, &result.title, &mut logical_cursor);
+                let result_start = title_range.start;
                 let highlighted_title = navigation_searchable_styled_text(
                     result.title,
                     Vec::new(),
                     search,
                     navigation,
-                    title_range,
+                    title_range.clone(),
                     cx,
                 );
+                let url = result.url.map(|url| {
+                    let range =
+                        rich_navigation_fragment_range(navigation, &url, &mut logical_cursor);
+                    let highlighted = navigation_searchable_styled_text(
+                        url.clone(),
+                        Vec::new(),
+                        search,
+                        navigation,
+                        range.clone(),
+                        cx,
+                    );
+                    (url, highlighted, range)
+                });
+                let snippet = result.snippet.map(|snippet| {
+                    let range =
+                        rich_navigation_fragment_range(navigation, &snippet, &mut logical_cursor);
+                    let highlighted = navigation_searchable_styled_text(
+                        snippet,
+                        Vec::new(),
+                        search,
+                        navigation,
+                        range.clone(),
+                        cx,
+                    );
+                    (highlighted, range)
+                });
+                let result_end = snippet
+                    .as_ref()
+                    .map(|(_, range)| range.end)
+                    .or_else(|| url.as_ref().map(|(_, _, range)| range.end))
+                    .unwrap_or(title_range.end);
+                row_ranges.push(Some(result_start..result_end));
                 div()
                     .w_full()
                     .min_w_0()
@@ -7293,28 +6997,9 @@ impl HarnessApp {
                             .flex()
                             .flex_col()
                             .gap_0p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_ui_sm(cx)
-                                    .when(!expanded, |this| this.truncate())
-                                    .child(highlighted_title),
-                            )
-                            .when_some(result.url, |this, url| {
+                            .child(div().min_w_0().text_ui_sm(cx).child(highlighted_title))
+                            .when_some(url, |this, (url, highlighted_url, _)| {
                                 let open_url = url.clone();
-                                let url_range = rich_navigation_fragment_range(
-                                    navigation,
-                                    &url,
-                                    &mut logical_cursor,
-                                );
-                                let highlighted_url = navigation_searchable_styled_text(
-                                    url,
-                                    Vec::new(),
-                                    search,
-                                    navigation,
-                                    url_range,
-                                    cx,
-                                );
                                 this.child(
                                     div()
                                         .id(format!("web-result-url:{item_key}:{result_index}"))
@@ -7322,32 +7007,17 @@ impl HarnessApp {
                                         .cursor_pointer()
                                         .text_ui_xs(cx)
                                         .text_color(colors.text_accent)
-                                        .when(!expanded, |this| this.truncate())
                                         .hover(|this| this.underline())
                                         .on_click(move |_, _, cx| cx.open_url(&open_url))
                                         .child(highlighted_url),
                                 )
                             })
-                            .when_some(result.snippet, |this, snippet| {
-                                let snippet_range = rich_navigation_fragment_range(
-                                    navigation,
-                                    &snippet,
-                                    &mut logical_cursor,
-                                );
-                                let highlighted_snippet = navigation_searchable_styled_text(
-                                    snippet,
-                                    Vec::new(),
-                                    search,
-                                    navigation,
-                                    snippet_range,
-                                    cx,
-                                );
+                            .when_some(snippet, |this, (highlighted_snippet, _)| {
                                 this.child(
                                     div()
                                         .min_w_0()
                                         .text_ui_xs(cx)
                                         .text_color(colors.text_muted)
-                                        .when(!expanded, |this| this.truncate())
                                         .child(highlighted_snippet),
                                 )
                             }),
@@ -7355,6 +7025,19 @@ impl HarnessApp {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
+
+        let results_scroll = (total_results > 0).then(|| {
+            let binding = self.rich_nested_scroll_binding(&item.key, navigation);
+            reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
+            div()
+                .id(("web-results-scroll", index))
+                .w_full()
+                .min_w_0()
+                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .track_scroll(&binding.handle)
+                .children(visible_results)
+        });
 
         div()
             .w_full()
@@ -7376,16 +7059,7 @@ impl HarnessApp {
                     .color(Color::Muted),
                 )
             })
-            .children(visible_results)
-            .when_some(toggle, |this, toggle| {
-                this.child(
-                    div()
-                        .pt_1()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .child(Self::render_output_toggle(&item.key, index, toggle, cx)),
-                )
-            })
+            .when_some(results_scroll, |this, results| this.child(results))
             .when(total_results == 0, |this| {
                 this.child(self.render_terminal(
                     item.content.clone(),
@@ -8107,11 +7781,6 @@ impl HarnessApp {
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
         let visible_status = item.display_status().map(ToOwned::to_owned);
-        let output_expansion = self
-            .output_expansion
-            .get(&item.key)
-            .copied()
-            .unwrap_or_default();
         let header_title = transcript_item_header_title(&item).to_owned();
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = transcript_item_shows_header(&item);
@@ -8124,9 +7793,9 @@ impl HarnessApp {
         let search_context = (self.search_visible
             && active_search_item
             && is_disclosure
-            && rich_search_match_needs_context(&item, output_expansion)
+            && rich_search_match_needs_context(&item, OutputExpansion::Preview)
             && !raw_search_visible
-            && !rich_search_query_is_visible(&item, output_expansion, &self.search_query))
+            && !rich_search_query_is_visible(&item, OutputExpansion::Preview, &self.search_query))
         .then(|| item_search_context_snippet(&item, &self.search_query, 180))
         .flatten()
         .map(|snippet| {
@@ -8283,27 +7952,18 @@ impl HarnessApp {
             })
         };
 
-        // Progressive cards render their visible fragments above. Reveal a
-        // hidden Normal cursor only when no fragment claimed it; Visual mode
-        // reveals eagerly so no selected rows remain invisible. The header is
-        // a one-frame proxy while the complete output is mounted.
-        let revealing_hidden_navigation = rich_navigation_needs_progressive_reveal(
-            item.kind,
-            item.expanded,
-            output_expansion,
-            rich_navigation.as_ref(),
-        );
-        if revealing_hidden_navigation {
-            self.output_expansion
-                .insert(item.key.clone(), OutputExpansion::All);
-            cx.notify();
-        }
-
         let header_search = show_header.then_some(rich_search.as_ref()).flatten();
+        // Every expanded Rich structured body is complete and scrollable. If
+        // a renderer deliberately has no glyph for a protocol-only offset,
+        // keep Vim visible on the header instead of mounting a second,
+        // progressively expanded copy of the body.
+        let body_left_navigation_unclaimed = rich_navigation
+            .as_ref()
+            .is_some_and(|navigation| !navigation.cursor_claimed.get());
         let header_cursor_range = rich_header_navigation_range(
             &header_title,
             rich_navigation.as_ref(),
-            !rich_item_body_paints_navigation(&item) || revealing_hidden_navigation,
+            !rich_item_body_paints_navigation(&item) || body_left_navigation_unclaimed,
         );
         let header_highlights = header_cursor_range
             .map(|range| {
@@ -10290,7 +9950,10 @@ mod tests {
         let mut incrementally_appended = before.text;
         incrementally_appended.push('\n');
         incrementally_appended.push_str(&appended.text);
-        assert_eq!(incrementally_appended, rich_navigation_document(&after_model).text);
+        assert_eq!(
+            incrementally_appended,
+            rich_navigation_document(&after_model).text
+        );
     }
 
     #[test]
@@ -10336,6 +9999,21 @@ mod tests {
         };
         assert!(navigation_ranges_for_fragment(&navigation, 0..5).is_empty());
         assert_eq!(navigation_ranges_for_fragment(&navigation, 6..10), [0..1]);
+    }
+
+    #[test]
+    fn rich_nested_cursor_reveals_exact_rows_and_skips_unpainted_furniture() {
+        let rows = [Some(0..5), None, Some(14..18), Some(19..24)];
+
+        assert_eq!(rich_nested_cursor_row(2, &rows), Some(0));
+        assert_eq!(rich_nested_cursor_row(15, &rows), Some(2));
+        assert_eq!(rich_nested_cursor_row(20, &rows), Some(3));
+        assert_eq!(
+            rich_nested_cursor_row(7, &rows),
+            Some(2),
+            "a logical cursor in protocol-only furniture must reveal the next painted glyph"
+        );
+        assert_eq!(rich_nested_cursor_row(25, &rows), None);
     }
 
     #[test]
@@ -10439,64 +10117,6 @@ mod tests {
             Some(7),
             "a newly selected streaming item should receive spatial focus"
         );
-    }
-
-    #[test]
-    fn hidden_progressive_cursor_reveals_content_before_it_can_disappear() {
-        let navigation = RichNavigationPaint {
-            body_text: "visible\nhidden".into(),
-            ranges: Vec::new(),
-            head: Some(9),
-            visual: false,
-            cursor_claimed: Rc::new(Cell::new(false)),
-        };
-
-        assert!(rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Command,
-            true,
-            OutputExpansion::Preview,
-            Some(&navigation),
-        ));
-        navigation.cursor_claimed.set(true);
-        assert!(!rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Command,
-            true,
-            OutputExpansion::Preview,
-            Some(&navigation),
-        ));
-        navigation.cursor_claimed.set(false);
-        assert!(!rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Command,
-            true,
-            OutputExpansion::All,
-            Some(&navigation),
-        ));
-        assert!(!rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Agent,
-            true,
-            OutputExpansion::Preview,
-            Some(&navigation),
-        ));
-
-        let visual = RichNavigationPaint {
-            body_text: "visible\nhidden".into(),
-            ranges: vec![0..4],
-            head: Some(3),
-            visual: true,
-            cursor_claimed: Rc::new(Cell::new(false)),
-        };
-        assert!(rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Command,
-            true,
-            OutputExpansion::Preview,
-            Some(&visual),
-        ));
-        assert!(!rich_navigation_needs_progressive_reveal(
-            model::TranscriptKind::Command,
-            true,
-            OutputExpansion::All,
-            Some(&visual),
-        ));
     }
 
     #[test]
@@ -10743,17 +10363,6 @@ mod tests {
         assert!(preview.content.is_char_boundary(preview.content.len()));
         assert_eq!(preview.footer.as_deref(), Some("Show more output"));
 
-        let expanded =
-            structured_output_presentation(&content, "output lines", OutputExpansion::All);
-        assert_eq!(expanded.content, content);
-        assert_eq!(
-            expanded.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Collapse to preview".into(),
-                next: OutputExpansion::Preview,
-            })
-        );
-
         let command = std::iter::repeat_n("echo 'hello'", COMMAND_PREVIEW_LINES + 3)
             .collect::<Vec<_>>()
             .join("\n");
@@ -10770,218 +10379,6 @@ mod tests {
         assert_eq!(
             command_preview.footer.as_deref(),
             Some("Show 3 more command lines")
-        );
-    }
-
-    #[test]
-    fn huge_output_expands_in_bounded_deterministic_steps_before_show_all() {
-        let content = (0..10_000)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let preview =
-            structured_output_presentation(&content, "output lines", OutputExpansion::Preview);
-        assert_eq!(
-            preview.content.lines().count(),
-            STRUCTURED_OUTPUT_PREVIEW_LINES
-        );
-        assert_eq!(
-            preview.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Show first 100 output lines".into(),
-                next: OutputExpansion::Medium,
-            })
-        );
-
-        let medium =
-            structured_output_presentation(&content, "output lines", OutputExpansion::Medium);
-        assert_eq!(
-            medium.content.lines().count(),
-            PROGRESSIVE_OUTPUT_MEDIUM_LINES
-        );
-        assert_eq!(
-            medium.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Show first 500 output lines".into(),
-                next: OutputExpansion::Large,
-            })
-        );
-
-        let large =
-            structured_output_presentation(&content, "output lines", OutputExpansion::Large);
-        assert_eq!(
-            large.content.lines().count(),
-            PROGRESSIVE_OUTPUT_LARGE_LINES
-        );
-        assert_eq!(
-            large.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Show all 10000 output lines".into(),
-                next: OutputExpansion::All,
-            })
-        );
-
-        let all = structured_output_presentation(&content, "output lines", OutputExpansion::All);
-        assert_eq!(all.content.lines().count(), 10_000);
-        assert_eq!(
-            all.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Collapse to preview".into(),
-                next: OutputExpansion::Preview,
-            })
-        );
-    }
-
-    #[test]
-    fn short_overflow_skips_useless_steps_and_byte_limits_bound_single_lines() {
-        let twelve_lines = std::iter::repeat_n("line", 12)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let preview =
-            structured_output_presentation(&twelve_lines, "output lines", OutputExpansion::Preview);
-        assert_eq!(
-            preview.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Show all 12 output lines".into(),
-                next: OutputExpansion::All,
-            })
-        );
-
-        let huge_line = "x".repeat(PROGRESSIVE_OUTPUT_LARGE_BYTES * 4);
-        for (expansion, bound, label) in [
-            (
-                OutputExpansion::Preview,
-                STRUCTURED_OUTPUT_PREVIEW_BYTES,
-                "Show first 16 KiB output",
-            ),
-            (
-                OutputExpansion::Medium,
-                PROGRESSIVE_OUTPUT_MEDIUM_BYTES,
-                "Show first 64 KiB output",
-            ),
-            (
-                OutputExpansion::Large,
-                PROGRESSIVE_OUTPUT_LARGE_BYTES,
-                "Show all output",
-            ),
-        ] {
-            let presentation = structured_output_presentation(&huge_line, "output", expansion);
-            assert!(presentation.content.len() <= bound);
-            assert_eq!(presentation.toggle.unwrap().label, label);
-        }
-    }
-
-    #[test]
-    fn command_progression_bounds_both_sections_and_keeps_explicit_collapse() {
-        let command = model::CommandTranscript {
-            command: std::iter::repeat_n("printf '%s\\n' value", 1_000)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            cwd: None,
-            output: std::iter::repeat_n("value", 1_000)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
-        assert_eq!(
-            command_output_toggle(&command, OutputExpansion::Preview),
-            Some(ProgressiveOutputToggle {
-                label: "Show up to 100 lines per section".into(),
-                next: OutputExpansion::Medium,
-            })
-        );
-        assert_eq!(
-            command_output_toggle(&command, OutputExpansion::Medium),
-            Some(ProgressiveOutputToggle {
-                label: "Show up to 500 lines per section".into(),
-                next: OutputExpansion::Large,
-            })
-        );
-        assert_eq!(
-            command_output_toggle(&command, OutputExpansion::Large),
-            Some(ProgressiveOutputToggle {
-                label: "Show all command and output".into(),
-                next: OutputExpansion::All,
-            })
-        );
-        assert_eq!(
-            command_output_toggle(&command, OutputExpansion::All),
-            Some(ProgressiveOutputToggle {
-                label: "Collapse to preview".into(),
-                next: OutputExpansion::Preview,
-            })
-        );
-    }
-
-    #[test]
-    fn web_results_use_smaller_semantic_steps_before_explicit_show_all() {
-        assert_eq!(
-            progressive_web_toggle(OutputExpansion::Preview, 200, true),
-            Some(ProgressiveOutputToggle {
-                label: "Show first 10 results".into(),
-                next: OutputExpansion::Medium,
-            })
-        );
-        assert_eq!(
-            progressive_web_toggle(OutputExpansion::Medium, 200, true),
-            Some(ProgressiveOutputToggle {
-                label: "Show first 50 results".into(),
-                next: OutputExpansion::Large,
-            })
-        );
-        assert_eq!(
-            progressive_web_toggle(OutputExpansion::Large, 200, true),
-            Some(ProgressiveOutputToggle {
-                label: "Show all 200 results".into(),
-                next: OutputExpansion::All,
-            })
-        );
-        assert_eq!(
-            progressive_web_toggle(OutputExpansion::All, 200, true),
-            Some(ProgressiveOutputToggle {
-                label: "Collapse to preview".into(),
-                next: OutputExpansion::Preview,
-            })
-        );
-    }
-
-    #[test]
-    fn file_change_limits_bound_metadata_only_histories_too() {
-        let content = (0..1_000)
-            .map(|index| format!("Modified · /tmp/file-{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let item = TranscriptItem {
-            key: "many-files".into(),
-            protocol_id: None,
-            kind: model::TranscriptKind::FileChange,
-            title: "File changes · 1000 files".into(),
-            status: None,
-            content,
-            raw: Value::Null,
-            event_count: 1,
-            expanded: true,
-            pending_request: None,
-        };
-
-        assert_eq!(file_change_counts_for_limits(&item), (1_000, 0));
-        assert!(!file_change_fits_output_expansion(
-            &item,
-            OutputExpansion::Preview
-        ));
-        assert_eq!(
-            progressive_file_change_toggle(&item, OutputExpansion::Preview),
-            Some(ProgressiveOutputToggle {
-                label: "Show up to 100 files / changed lines".into(),
-                next: OutputExpansion::Medium,
-            })
-        );
-        assert_eq!(
-            progressive_file_change_toggle(&item, OutputExpansion::Large),
-            Some(ProgressiveOutputToggle {
-                label: "Show all 1000 files and 0 changed lines".into(),
-                next: OutputExpansion::All,
-            })
         );
     }
 
@@ -11035,7 +10432,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_diff_search_tracks_fairly_visible_file_sections() {
+    fn aggregate_diff_search_sees_every_nested_scroll_row() {
         let first_lines = std::iter::once("@@ -1 +1 @@".to_string())
             .chain((0..40).map(|index| format!(" context {index}")))
             .chain(std::iter::once("+hidden-tail-needle".into()))
@@ -11070,7 +10467,7 @@ mod tests {
             OutputExpansion::Preview,
             "visible-later-needle"
         ));
-        assert!(!rich_search_query_is_visible(
+        assert!(rich_search_query_is_visible(
             &item,
             OutputExpansion::Preview,
             "hidden-tail-needle"
@@ -11126,7 +10523,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_file_change_search_keeps_later_metadata_and_details_visible() {
+    fn multi_file_change_search_sees_every_nested_scroll_row() {
         let first_lines = std::iter::once("@@ -1 +1 @@".to_string())
             .chain((0..40).map(|index| format!(" context {index}")))
             .chain(std::iter::once("+hidden-first-tail".into()))
@@ -11160,7 +10557,7 @@ mod tests {
             OutputExpansion::Preview,
             "visible-later-change"
         ));
-        assert!(!rich_search_query_is_visible(
+        assert!(rich_search_query_is_visible(
             &item,
             OutputExpansion::Preview,
             "hidden-first-tail"
@@ -11194,7 +10591,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_search_exposes_matches_hidden_by_output_previews() {
+    fn rich_search_context_is_reserved_for_collapsed_cards() {
         let mut item = TranscriptItem {
             key: "tool-1".into(),
             protocol_id: None,
@@ -11210,7 +10607,7 @@ mod tests {
             pending_request: None,
         };
 
-        assert!(rich_search_match_needs_context(
+        assert!(!rich_search_match_needs_context(
             &item,
             OutputExpansion::Preview
         ));
@@ -11248,7 +10645,7 @@ mod tests {
             OutputExpansion::Preview,
             "reverse_engineering.md"
         ));
-        assert!(!rich_search_query_is_visible(
+        assert!(rich_search_query_is_visible(
             &item,
             OutputExpansion::Preview,
             "hidden needle"
@@ -11276,106 +10673,6 @@ mod tests {
                     body: "First paragraph\n\nSecond paragraph".into(),
                 },
             ]
-        );
-    }
-
-    #[test]
-    fn huge_activity_arguments_do_not_hide_result_or_error_sections() {
-        let arguments = serde_json::to_string_pretty(&json!({
-            "paths": (0..2_000)
-                .map(|index| format!("src/module-{index}.rs"))
-                .collect::<Vec<_>>()
-        }))
-        .unwrap();
-        let content = format!(
-            "Arguments\n{arguments}\n\nResult\ncreated the index\n\nError\nsecondary operation failed"
-        );
-        let presentation =
-            activity_output_presentation(&content, OutputExpansion::Preview).unwrap();
-
-        assert_eq!(presentation.sections.len(), 3);
-        let arguments = &presentation.sections[0];
-        assert_eq!(arguments.heading.as_deref(), Some("Arguments"));
-        assert!(arguments.is_json);
-        assert!(arguments.body.lines().count() <= STRUCTURED_OUTPUT_PREVIEW_LINES);
-        assert!(arguments.body.len() <= STRUCTURED_OUTPUT_PREVIEW_BYTES);
-        assert_eq!(presentation.sections[1].heading.as_deref(), Some("Result"));
-        assert_eq!(presentation.sections[1].body, "created the index");
-        assert_eq!(presentation.sections[2].heading.as_deref(), Some("Error"));
-        assert_eq!(presentation.sections[2].body, "secondary operation failed");
-        assert_eq!(
-            presentation.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Show up to 100 lines per section".into(),
-                next: OutputExpansion::Medium,
-            })
-        );
-    }
-
-    #[test]
-    fn malformed_activity_json_falls_back_to_plain_section_text() {
-        let presentation = activity_output_presentation(
-            "Arguments\n{\"path\": \"README.md\"\n\nResult\nstill available",
-            OutputExpansion::Preview,
-        )
-        .unwrap();
-
-        assert!(!presentation.sections[0].is_json);
-        assert_eq!(presentation.sections[0].body, "{\"path\": \"README.md\"");
-        assert_eq!(presentation.sections[1].body, "still available");
-        assert!(json_tokens(&presentation.sections[0].body).is_none());
-    }
-
-    #[test]
-    fn activity_sections_expand_independently_through_bounded_stages() {
-        let arguments = serde_json::to_string_pretty(
-            &(0..10_000)
-                .map(|index| json!({ "id": index }))
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let result = (0..10_000)
-            .map(|line| format!("result {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let content = format!("Arguments\n{arguments}\n\nResult\n{result}");
-
-        for (expansion, line_limit, byte_limit, next) in [
-            (
-                OutputExpansion::Preview,
-                STRUCTURED_OUTPUT_PREVIEW_LINES,
-                STRUCTURED_OUTPUT_PREVIEW_BYTES,
-                OutputExpansion::Medium,
-            ),
-            (
-                OutputExpansion::Medium,
-                PROGRESSIVE_OUTPUT_MEDIUM_LINES,
-                PROGRESSIVE_OUTPUT_MEDIUM_BYTES,
-                OutputExpansion::Large,
-            ),
-            (
-                OutputExpansion::Large,
-                PROGRESSIVE_OUTPUT_LARGE_LINES,
-                PROGRESSIVE_OUTPUT_LARGE_BYTES,
-                OutputExpansion::All,
-            ),
-        ] {
-            let presentation = activity_output_presentation(&content, expansion).unwrap();
-            assert!(presentation.sections.iter().all(|section| {
-                section.body.lines().count() <= line_limit && section.body.len() <= byte_limit
-            }));
-            assert_eq!(presentation.toggle.unwrap().next, next);
-        }
-
-        let all = activity_output_presentation(&content, OutputExpansion::All).unwrap();
-        assert_eq!(all.sections[0].body, arguments);
-        assert_eq!(all.sections[1].body, result);
-        assert_eq!(
-            all.toggle,
-            Some(ProgressiveOutputToggle {
-                label: "Collapse to preview".into(),
-                next: OutputExpansion::Preview,
-            })
         );
     }
 
