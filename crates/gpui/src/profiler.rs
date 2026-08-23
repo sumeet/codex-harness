@@ -829,6 +829,9 @@ pub enum FrameEvent {
 #[cfg(feature = "profiler")]
 #[derive(Clone)]
 pub struct FrameDurationSnapshot {
+    /// Histogram of intervals between platform frame requests, in nanoseconds.
+    /// On Wayland, these requests are driven by `wl_surface.frame` callbacks.
+    pub frame_request_interval_histogram: Histogram<u64>,
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
     /// Histogram of root-tree layout and prepaint durations, in nanoseconds.
@@ -881,6 +884,7 @@ enum WindowActivity {
 pub struct WindowProfiler {
     window_id: WindowId,
     active_activities: SmallVec<[WindowActivity; 4]>,
+    frame_request_interval_histogram: Histogram<u64>,
     draw_duration_histogram: Histogram<u64>,
     prepaint_duration_histogram: Histogram<u64>,
     paint_duration_histogram: Histogram<u64>,
@@ -895,6 +899,7 @@ pub struct WindowProfiler {
     input_dispatch_duration_histogram: Histogram<u64>,
     events_per_frame_histogram: Histogram<u64>,
     mid_draw_events_dropped: u64,
+    last_frame_request_at: Option<Instant>,
     last_invalidating_input_at: Option<Instant>,
     last_input_driven_present_at: Option<Instant>,
     last_present_at: Option<Instant>,
@@ -909,6 +914,9 @@ impl WindowProfiler {
         Ok(Self {
             window_id,
             active_activities: SmallVec::new(),
+            frame_request_interval_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create frame request interval histogram: {error}")
+            })?,
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
             })?,
@@ -947,6 +955,7 @@ impl WindowProfiler {
                 anyhow::anyhow!("Failed to create events per frame histogram: {error}")
             })?,
             mid_draw_events_dropped: 0,
+            last_frame_request_at: None,
             last_invalidating_input_at: None,
             last_input_driven_present_at: None,
             last_present_at: None,
@@ -1065,6 +1074,7 @@ impl WindowProfiler {
     /// Returns a snapshot of the current frame-duration histograms.
     pub fn frame_duration_snapshot(&self) -> FrameDurationSnapshot {
         FrameDurationSnapshot {
+            frame_request_interval_histogram: self.frame_request_interval_histogram.clone(),
             draw_duration_histogram: self.draw_duration_histogram.clone(),
             prepaint_duration_histogram: self.prepaint_duration_histogram.clone(),
             paint_duration_histogram: self.paint_duration_histogram.clone(),
@@ -1086,11 +1096,26 @@ impl WindowProfiler {
     pub fn begin_measurement(&mut self) {
         self.first_input_at = None;
         self.pending_input_count = 0;
+        self.last_frame_request_at = None;
         self.last_invalidating_input_at = None;
         self.last_input_driven_present_at = None;
         self.last_present_at = None;
         self.animating_at_last_present = false;
         self.drew_since_last_present = false;
+    }
+
+    /// Records the platform asking GPUI to service a frame.
+    pub fn record_frame_request(&mut self) {
+        self.record_frame_request_at(Instant::now());
+    }
+
+    fn record_frame_request_at(&mut self, now: Instant) {
+        if let Some(previous) = self.last_frame_request_at {
+            self.frame_request_interval_histogram
+                .record(now.duration_since(previous).as_nanos() as u64)
+                .ok();
+        }
+        self.last_frame_request_at = Some(now);
     }
 
     fn record_present_at(
@@ -1348,6 +1373,30 @@ mod tests {
                         .as_nanos() as u64
             );
         }
+    }
+
+    #[test]
+    fn records_platform_frame_request_intervals_and_resets_the_anchor() {
+        let window_id = WindowId::from(0xF12A);
+        let mut window_profiler =
+            WindowProfiler::new(window_id).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        window_profiler.record_frame_request_at(start);
+        window_profiler.record_frame_request_at(start + FRAME);
+        assert!(
+            window_profiler
+                .frame_request_interval_histogram
+                .value_at_quantile(0.5)
+                .abs_diff(FRAME.as_nanos() as u64)
+                < 10_000
+        );
+
+        window_profiler.begin_measurement();
+        window_profiler.record_frame_request_at(start + FRAME * 10);
+        assert_eq!(window_profiler.frame_request_interval_histogram.len(), 1);
+        window_profiler.record_frame_request_at(start + FRAME * 11);
+        assert_eq!(window_profiler.frame_request_interval_histogram.len(), 2);
     }
 
     #[test]

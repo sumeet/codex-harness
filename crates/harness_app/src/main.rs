@@ -12,9 +12,9 @@ use assets::Assets;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListState, Render, ScrollHandle,
-    SharedString, StyledText, Task, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, deferred, div, list, prelude::*, px, relative, size,
+    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState,
+    Render, ScrollHandle, SharedString, StyledText, Task, UpdateGlobal, WeakEntity, Window,
+    WindowBounds, WindowOptions, actions, deferred, div, list, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -267,11 +267,12 @@ struct SearchTextRanges {
     active: Option<usize>,
 }
 
+#[derive(Clone)]
 struct RichSearchPaint {
     query: SharedString,
     active_item: bool,
-    active_claimed: Cell<bool>,
-    remaining_ranges: Cell<usize>,
+    active_claimed: Rc<Cell<bool>>,
+    remaining_ranges: Rc<Cell<usize>>,
 }
 
 /// Item-local projection of the real Editor/Vim selection used by Rich
@@ -296,6 +297,37 @@ struct RichNestedScrollBinding {
 struct RichNestedScrollState {
     handle: ScrollHandle,
     last_cursor: Option<usize>,
+    command: Option<RichCommandSurface>,
+}
+
+#[derive(Clone, Copy)]
+enum RichCommandSource {
+    Command,
+    Output,
+}
+
+#[derive(Clone)]
+enum RichCommandRow {
+    Text {
+        source: RichCommandSource,
+        source_range: Range<usize>,
+        line_index: usize,
+    },
+    Divider,
+}
+
+#[derive(Clone)]
+struct RichCommandData {
+    command: Arc<str>,
+    output: Arc<str>,
+    rows: Arc<[RichCommandRow]>,
+}
+
+struct RichCommandSurface {
+    event_count: usize,
+    content_len: usize,
+    data: RichCommandData,
+    list_state: ListState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -532,8 +564,8 @@ impl RichSearchPaint {
         Self {
             query: query.into(),
             active_item,
-            active_claimed: Cell::new(false),
-            remaining_ranges: Cell::new(RICH_SEARCH_HIGHLIGHT_LIMIT),
+            active_claimed: Rc::new(Cell::new(false)),
+            remaining_ranges: Rc::new(Cell::new(RICH_SEARCH_HIGHLIGHT_LIMIT)),
         }
     }
 
@@ -1227,6 +1259,76 @@ fn output_limits(
 
 fn command_output_for_display(output: &str) -> &str {
     output.trim_end_matches(['\r', '\n'])
+}
+
+fn normalize_command_line_endings(mut text: String) -> String {
+    if text.contains('\r') {
+        text = text.replace("\r\n", "\n").replace('\r', "\n");
+    }
+    text
+}
+
+fn command_line_ranges(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    let mut offset = 0;
+    text.split('\n').map(move |line| {
+        let range = offset..offset + line.len();
+        offset = range.end.saturating_add(1);
+        range
+    })
+}
+
+fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
+    let transcript = item.command_transcript()?;
+    let command: Arc<str> = Arc::from(normalize_command_line_endings(
+        transcript.command.trim_end_matches(['\r', '\n']).to_owned(),
+    ));
+    let output: Arc<str> = Arc::from(normalize_command_line_endings(
+        command_output_for_display(&transcript.output).to_owned(),
+    ));
+    let mut rows = command_line_ranges(&command)
+        .enumerate()
+        .map(|(line_index, source_range)| RichCommandRow::Text {
+            source: RichCommandSource::Command,
+            source_range,
+            line_index,
+        })
+        .collect::<Vec<_>>();
+    if !output.is_empty() {
+        rows.push(RichCommandRow::Divider);
+        rows.extend(
+            command_line_ranges(&output)
+                .enumerate()
+                .map(|(line_index, source_range)| RichCommandRow::Text {
+                    source: RichCommandSource::Output,
+                    source_range,
+                    line_index,
+                }),
+        );
+    }
+    Some(RichCommandData {
+        command,
+        output,
+        rows: rows.into(),
+    })
+}
+
+fn rich_command_row_logical_range(
+    data: &RichCommandData,
+    row: &RichCommandRow,
+) -> Option<Range<usize>> {
+    let RichCommandRow::Text {
+        source,
+        source_range,
+        ..
+    } = row
+    else {
+        return None;
+    };
+    let base = match source {
+        RichCommandSource::Command => 0,
+        RichCommandSource::Output => data.command.len() + usize::from(!data.command.is_empty()),
+    };
+    Some(base + source_range.start..base + source_range.end)
 }
 
 fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> usize {
@@ -2114,6 +2216,14 @@ fn rich_vim_experiment() -> bool {
     *ENABLED
 }
 
+fn slow_list_diagnostics() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("GPUI_SLOW_LIST_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    });
+    *ENABLED
+}
+
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
     if selectable_rich_command_experiment() && item.kind == model::TranscriptKind::Command {
         return false;
@@ -2394,6 +2504,68 @@ impl HarnessApp {
         }
     }
 
+    fn rich_command_surface(
+        &mut self,
+        item: &TranscriptItem,
+        navigation: Option<&RichNavigationPaint>,
+    ) -> Option<(RichCommandData, ListState)> {
+        let needs_rebuild = self
+            .rich_nested_scrolls
+            .get(&item.key)
+            .and_then(|state| state.command.as_ref())
+            .is_none_or(|surface| {
+                surface.event_count != item.event_count || surface.content_len != item.content.len()
+            });
+
+        if needs_rebuild {
+            let data = rich_command_data(item)?;
+            let row_count = data.rows.len();
+            let state = self
+                .rich_nested_scrolls
+                .entry(item.key.clone())
+                .or_default();
+            let list_state = state
+                .command
+                .as_ref()
+                .map(|surface| surface.list_state.clone())
+                .unwrap_or_else(|| ListState::new(row_count, ListAlignment::Top, px(240.)));
+            list_state.set_diagnostics_name(format!("command:{}", item.key));
+            if list_state.item_count() != row_count {
+                list_state.splice(0..list_state.item_count(), row_count);
+            }
+            state.command = Some(RichCommandSurface {
+                event_count: item.event_count,
+                content_len: item.content.len(),
+                data,
+                list_state,
+            });
+        }
+
+        let state = self.rich_nested_scrolls.get_mut(&item.key)?;
+        let surface = state.command.as_ref()?;
+        let cursor = navigation
+            .and_then(RichNavigationPaint::cursor_range)
+            .map(|range| range.start);
+        if cursor.is_some() && cursor != state.last_cursor {
+            let cursor = cursor.unwrap();
+            let row = surface
+                .data
+                .rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| {
+                    rich_command_row_logical_range(&surface.data, row).map(|range| (index, range))
+                })
+                .find(|(_, range)| range.contains(&cursor) || range.end == cursor)
+                .map(|(index, _)| index);
+            if let Some(row) = row {
+                surface.list_state.scroll_to_reveal_item(row);
+            }
+        }
+        state.last_cursor = cursor;
+        Some((surface.data.clone(), surface.list_state.clone()))
+    }
+
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
         // The navigation Editor retains its selection while focus moves to the
         // composer, search, approvals, or sidebar. Only paint that cached
@@ -2600,8 +2772,10 @@ impl HarnessApp {
             .map(|item| item.key.clone())
             .collect();
         let list_state = ListState::new(model.items.len(), ListAlignment::Top, px(1600.));
+        list_state.set_diagnostics_name("transcript");
         list_state.set_follow_mode(FollowMode::Tail);
         let task_list_state = ListState::new(0, ListAlignment::Top, px(54.));
+        task_list_state.set_diagnostics_name("tasks");
         let transcript_focus = cx.focus_handle();
         if start_in_text_view {
             transcript_editor.focus_handle(cx).focus(window, cx);
@@ -2693,6 +2867,81 @@ impl HarnessApp {
                 editor.enter_normal_mode(window, cx);
             });
             this.transcript_cursor_initialized = true;
+        }
+        match automatic_performance_capture() {
+            Some(AutomaticPerformanceCapture::Timed(capture_duration)) => {
+                this.set_performance_status("Performance capture warming up…", None, cx);
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_secs(2)).await;
+                    if this
+                        .update_in(cx, |this, window, cx| {
+                            this.performance_reporter.mark_baseline(window);
+                            this.set_performance_status(
+                                format!(
+                                    "Recording scroll performance for {:.0}s…",
+                                    capture_duration.as_secs_f64()
+                                ),
+                                None,
+                                cx,
+                            );
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    cx.background_executor().timer(capture_duration).await;
+                    _ = this.update_in(cx, |this, window, cx| {
+                        match this.performance_reporter.snapshot_report(window) {
+                            Ok(report) => {
+                                eprintln!(
+                                    "completed automatic Harness performance capture\n{report}"
+                                );
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(report));
+                                this.set_performance_status(
+                                    "Performance capture complete · report copied",
+                                    Some(Duration::from_secs(4)),
+                                    cx,
+                                );
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "failed automatic Harness performance capture: {error:#}"
+                                );
+                                this.set_performance_status(
+                                    "Performance capture failed",
+                                    Some(Duration::from_secs(4)),
+                                    cx,
+                                );
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+            Some(AutomaticPerformanceCapture::UntilClose) => {
+                this.performance_reporter.mark_baseline(window);
+                this.set_performance_status(
+                    "Performance capture armed · close Harness when done",
+                    Some(Duration::from_secs(4)),
+                    cx,
+                );
+                let owner = cx.weak_entity();
+                window.on_window_should_close(cx, move |window, cx| {
+                    _ = owner.update(cx, |this, _| {
+                        match this.performance_reporter.snapshot_report(window) {
+                            Ok(report) => eprintln!(
+                                "completed close-triggered Harness performance capture\n{report}"
+                            ),
+                            Err(error) => eprintln!(
+                                "failed close-triggered Harness performance capture: {error:#}"
+                            ),
+                        }
+                    });
+                    true
+                });
+            }
+            None => {}
         }
         if replay_count.is_none() {
             this.connect(cx);
@@ -3830,6 +4079,16 @@ impl HarnessApp {
             Err(error) => log::warn!("could not restore transcript history: {error}"),
         }
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
+        if slow_list_diagnostics_enabled() {
+            for (index, item) in self.model.items.iter().enumerate() {
+                eprintln!(
+                    "transcript-item item={index} kind={:?} content_bytes={} events={}",
+                    item.kind,
+                    item.content.len(),
+                    item.event_count,
+                );
+            }
+        }
         self.markdown_cache.clear();
         self.rich_nested_scrolls.clear();
         self.raw_visible.clear();
@@ -5985,6 +6244,10 @@ impl HarnessApp {
                     .custom_scrollbars(
                         Scrollbars::always_visible(ScrollAxes::Both)
                             .id(("rich-diff-scrollbar", index))
+                            .with_track_along(
+                                ScrollAxes::Both,
+                                colors.border_variant.opacity(0.24),
+                            )
                             .tracked_scroll_handle(&binding.handle),
                         window,
                         cx,
@@ -6386,6 +6649,10 @@ impl HarnessApp {
                     .custom_scrollbars(
                         Scrollbars::always_visible(ScrollAxes::Both)
                             .id(("file-change-scrollbar", index))
+                            .with_track_along(
+                                ScrollAxes::Both,
+                                colors.border_variant.opacity(0.24),
+                            )
                             .tracked_scroll_handle(&binding.handle),
                         window,
                         cx,
@@ -6514,6 +6781,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Vertical)
                     .id(("terminal-scrollbar", index))
+                    .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -6656,6 +6924,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::always_visible(ScrollAxes::Vertical)
                     .id(("activity-scrollbar", index))
+                    .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -6672,19 +6941,18 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if item.command_transcript().is_none() {
-            return self.render_terminal(
-                item.content.clone(),
-                &item.key,
-                index,
-                search,
-                navigation,
-                window,
-                cx,
-            );
-        }
         self.render_rich_command_content(item, index, search, navigation, window, cx)
-            .expect("command parsed above")
+            .unwrap_or_else(|| {
+                self.render_terminal(
+                    item.content.clone(),
+                    &item.key,
+                    index,
+                    search,
+                    navigation,
+                    window,
+                    cx,
+                )
+            })
     }
 
     fn render_rich_command_content(
@@ -6696,117 +6964,91 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let command = item.command_transcript()?;
+        let (data, list_state) = self.rich_command_surface(item, navigation)?;
         let colors = cx.theme().colors().clone();
-        let command_text = command.command.trim_end_matches(['\r', '\n']);
-        let output = command_output_for_display(&command.output);
-        let command_start = navigation
-            .and_then(|navigation| navigation.body_text.find(command_text))
-            .unwrap_or(0);
-        let output_start = navigation
-            .and_then(|navigation| {
-                navigation.body_text[command_start.min(navigation.body_text.len())..]
-                    .find(output)
-                    .map(|offset| command_start + offset)
-            })
-            .unwrap_or(command_start + command_text.len());
         let owner = cx.weak_entity();
-        let mut row_ranges = Vec::new();
-        let mut rows = Vec::new();
-
-        for (line_index, (line, range)) in logical_line_fragments(command_text, command_start)
-            .into_iter()
-            .enumerate()
-        {
-            let highlighted = navigation_searchable_styled_text(
-                line.clone(),
-                shell_highlights(&line, cx),
-                search,
-                navigation,
-                range.clone(),
-                cx,
-            );
-            let clickable = rich_clickable_styled_text(
-                format!("rich-command-text:{index}:{line_index}"),
-                highlighted,
-                index,
-                range.clone(),
-                Some(owner.clone()),
-            );
-            row_ranges.push(Some(range));
-            rows.push(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .min_h(px(20.))
-                    .whitespace_normal()
-                    .child(clickable)
-                    .into_any_element(),
-            );
-        }
-
-        if !output.is_empty() {
-            row_ranges.push(None);
-            rows.push(
-                div()
+        let search = search.cloned();
+        let navigation = navigation.cloned();
+        let render_data = data.clone();
+        let row_colors = colors.clone();
+        let rows = list(list_state.clone(), move |row_index, _, cx| {
+            let row = &render_data.rows[row_index];
+            match row {
+                RichCommandRow::Divider => div()
                     .w_full()
                     .h(px(9.))
                     .my_1()
                     .border_t_1()
-                    .border_color(colors.border_variant)
+                    .border_color(row_colors.border_variant)
                     .into_any_element(),
-            );
-            for (line_index, (line, range)) in logical_line_fragments(output, output_start)
-                .into_iter()
-                .enumerate()
-            {
-                let highlighted = navigation_searchable_styled_text(
-                    line,
-                    Vec::new(),
-                    search,
-                    navigation,
-                    range.clone(),
-                    cx,
-                );
-                let clickable = rich_clickable_styled_text(
-                    format!("rich-command-output:{index}:{line_index}"),
-                    highlighted,
-                    index,
-                    range.clone(),
-                    Some(owner.clone()),
-                );
-                row_ranges.push(Some(range));
-                rows.push(
+                RichCommandRow::Text {
+                    source,
+                    source_range,
+                    line_index,
+                } => {
+                    let source_text = match source {
+                        RichCommandSource::Command => &render_data.command,
+                        RichCommandSource::Output => &render_data.output,
+                    };
+                    let line = &source_text[source_range.clone()];
+                    let logical_range = rich_command_row_logical_range(&render_data, row)
+                        .expect("command text row has a logical range");
+                    let base_highlights = match source {
+                        RichCommandSource::Command => shell_highlights(line, cx),
+                        RichCommandSource::Output => Vec::new(),
+                    };
+                    let highlighted = navigation_searchable_styled_text(
+                        line.to_owned(),
+                        base_highlights,
+                        search.as_ref(),
+                        navigation.as_ref(),
+                        logical_range.clone(),
+                        cx,
+                    );
+                    let id = match source {
+                        RichCommandSource::Command => {
+                            format!("rich-command-text:{index}:{line_index}")
+                        }
+                        RichCommandSource::Output => {
+                            format!("rich-command-output:{index}:{line_index}")
+                        }
+                    };
+                    let clickable = rich_clickable_styled_text(
+                        id,
+                        highlighted,
+                        index,
+                        logical_range,
+                        Some(owner.clone()),
+                    );
                     div()
                         .w_full()
                         .min_w_0()
                         .min_h(px(20.))
                         .whitespace_normal()
                         .child(clickable)
-                        .into_any_element(),
-                );
+                        .into_any_element()
+                }
             }
-        }
-
-        let binding = self.rich_nested_scroll_binding(&item.key, navigation);
-        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
+        })
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
         Some(
             div()
                 .id(("command-output", index))
                 .w_full()
                 .min_w_0()
+                .relative()
                 .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                .overflow_y_scroll()
-                .track_scroll(&binding.handle)
                 .font_buffer(cx)
                 .text_ui_sm(cx)
                 .line_height(relative(1.45))
                 .text_color(colors.text)
-                .children(rows)
+                .child(rows)
                 .custom_scrollbars(
                     Scrollbars::always_visible(ScrollAxes::Vertical)
                         .id(("command-scrollbar", index))
-                        .tracked_scroll_handle(&binding.handle),
+                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                        .tracked_scroll_handle(&list_state),
                     window,
                     cx,
                 )
@@ -7084,6 +7326,7 @@ impl HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::always_visible(ScrollAxes::Vertical)
                         .id(("web-results-scrollbar", index))
+                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
                         .tracked_scroll_handle(&binding.handle),
                     window,
                     cx,
@@ -7731,7 +7974,20 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let render_started_at = slow_list_diagnostics().then(std::time::Instant::now);
+        let clone_started_at = slow_list_diagnostics().then(std::time::Instant::now);
         let item = self.model.items[index].clone();
+        if let Some(started_at) = clone_started_at {
+            let elapsed = started_at.elapsed();
+            if elapsed >= Duration::from_millis(4) {
+                eprintln!(
+                    "slow-transcript phase=clone item={index} kind={:?} content_bytes={} elapsed_ms={:.2}",
+                    item.kind,
+                    item.content.len(),
+                    elapsed.as_secs_f64() * 1_000.
+                );
+            }
+        }
         if !item.is_presentationally_visible() {
             return div().into_any_element();
         }
@@ -8202,7 +8458,7 @@ impl HarnessApp {
                 .into_any_element()
         };
 
-        div()
+        let element = div()
             .id(("transcript-item", index))
             .w_full()
             .px(if narrow { px(10.) } else { px(18.) })
@@ -8225,7 +8481,19 @@ impl HarnessApp {
                 this.focus_transcript(window, cx);
             }))
             .child(content)
-            .into_any_element()
+            .into_any_element();
+        if let Some(started_at) = render_started_at {
+            let elapsed = started_at.elapsed();
+            if elapsed >= Duration::from_millis(4) {
+                eprintln!(
+                    "slow-transcript phase=construct item={index} kind={:?} content_bytes={} elapsed_ms={:.2}",
+                    item.kind,
+                    item.content.len(),
+                    elapsed.as_secs_f64() * 1_000.
+                );
+            }
+        }
+        element
     }
 }
 
@@ -8312,6 +8580,7 @@ impl Render for HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::always_visible(ScrollAxes::Vertical)
                         .id("task-list-scrollbar")
+                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
                         .tracked_scroll_handle(&task_list_state),
                     window,
                     cx,
@@ -8349,6 +8618,7 @@ impl Render for HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::always_visible(ScrollAxes::Vertical)
                         .id("rich-transcript-scrollbar")
+                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
                         .tracked_scroll_handle(&list_state),
                     window,
                     cx,
@@ -9754,6 +10024,29 @@ fn replay_count() -> Option<usize> {
         .and_then(|count| count.parse().ok())
 }
 
+enum AutomaticPerformanceCapture {
+    Timed(Duration),
+    UntilClose,
+}
+
+fn automatic_performance_capture() -> Option<AutomaticPerformanceCapture> {
+    let value = std::env::var("HARNESS_PERF_CAPTURE_SECONDS").ok()?;
+    if value.eq_ignore_ascii_case("close") {
+        return Some(AutomaticPerformanceCapture::UntilClose);
+    }
+    let seconds = value.parse::<f64>().ok()?;
+    (seconds.is_finite() && seconds > 0.)
+        .then(|| AutomaticPerformanceCapture::Timed(Duration::from_secs_f64(seconds)))
+}
+
+fn slow_list_diagnostics_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("GPUI_SLOW_LIST_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    });
+    *ENABLED
+}
+
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
@@ -9999,6 +10292,50 @@ mod tests {
                 }),
             ),
             "Zed Docs\nhttps://zed.dev/docs\nFast editor"
+        );
+    }
+
+    #[test]
+    fn virtual_command_rows_preserve_the_navigation_document() {
+        let replay = TranscriptModel::replay(6);
+        let item = &replay.items[5];
+        let data = rich_command_data(item).expect("replay command should be structured");
+        let projection = rich_navigation_item_projection(&replay, 5)
+            .expect("command should participate in rich navigation");
+        let body = projection.body_text();
+
+        assert_eq!(&*data.command, "cargo check -p harness_app");
+        assert!(data.output.starts_with("Finished replay frame 5"));
+        assert!(!data.output.ends_with('\n'));
+        assert!(matches!(data.rows.get(1), Some(RichCommandRow::Divider)));
+
+        for row in data.rows.iter() {
+            let RichCommandRow::Text {
+                source,
+                source_range,
+                ..
+            } = row
+            else {
+                assert!(rich_command_row_logical_range(&data, row).is_none());
+                continue;
+            };
+            let source_text = match source {
+                RichCommandSource::Command => &data.command,
+                RichCommandSource::Output => &data.output,
+            };
+            let logical_range = rich_command_row_logical_range(&data, row).unwrap();
+            assert_eq!(&body[logical_range], &source_text[source_range.clone()]);
+        }
+    }
+
+    #[test]
+    fn command_row_ranges_normalize_line_endings_and_drop_only_terminal_newlines() {
+        let normalized = normalize_command_line_endings("one\r\ntwo\rthree\r\n".into());
+        assert_eq!(normalized, "one\ntwo\nthree\n");
+        assert_eq!(command_output_for_display(&normalized), "one\ntwo\nthree");
+        assert_eq!(
+            command_line_ranges(command_output_for_display(&normalized)).collect::<Vec<_>>(),
+            vec![0..3, 4..7, 8..13]
         );
     }
 

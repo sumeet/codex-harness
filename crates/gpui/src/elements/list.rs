@@ -16,10 +16,36 @@ use crate::{
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    ops::Range,
+    rc::Rc,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
+
+const SLOW_LIST_ITEM_THRESHOLD: Duration = Duration::from_millis(4);
+
+fn slow_list_diagnostics() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("GPUI_SLOW_LIST_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    });
+    *ENABLED
+}
+
+fn report_slow_list_item(name: Option<&str>, phase: &str, index: usize, elapsed: Duration) {
+    if elapsed >= SLOW_LIST_ITEM_THRESHOLD {
+        eprintln!(
+            "slow-list name={} phase={phase} item={index} elapsed_ms={:.2}",
+            name.unwrap_or("unnamed"),
+            elapsed.as_secs_f64() * 1_000.
+        );
+    }
+}
 
 /// Construct a new list element
 pub fn list(
@@ -102,6 +128,7 @@ impl std::fmt::Debug for ListState {
 }
 
 struct StateInner {
+    diagnostics_name: Option<String>,
     last_layout_bounds: Option<Bounds<Pixels>>,
     last_padding: Option<Edges<Pixels>>,
     items: SumTree<ListItem>,
@@ -356,6 +383,7 @@ impl ListState {
     /// that the list doesn't flicker or pop in when scrolling.
     pub fn new(item_count: usize, alignment: ListAlignment, overdraw: Pixels) -> Self {
         let this = Self(Rc::new(RefCell::new(StateInner {
+            diagnostics_name: None,
             last_layout_bounds: None,
             last_padding: None,
             items: SumTree::default(),
@@ -372,6 +400,12 @@ impl ListState {
         })));
         this.splice(0..0, item_count);
         this
+    }
+
+    /// Label slow-item diagnostics emitted when `GPUI_SLOW_LIST_DIAGNOSTICS`
+    /// is enabled, so nested lists can be distinguished from their ancestors.
+    pub fn set_diagnostics_name(&self, name: impl Into<String>) {
+        self.0.borrow_mut().diagnostics_name = Some(name.into());
     }
 
     /// Set the list to measure all items in the list in the first layout phase.
@@ -1134,8 +1168,17 @@ impl StateInner {
             // If we're within the visible area or the height wasn't cached, render and measure the item's element
             if visible_height < available_height || size.is_none() {
                 let item_index = scroll_top.item_ix + ix;
+                let item_started_at = slow_list_diagnostics().then(Instant::now);
                 let mut element = render_item(item_index, window, cx);
                 let element_size = element.layout_as_root(available_item_space, window, cx);
+                if let Some(started_at) = item_started_at {
+                    report_slow_list_item(
+                        self.diagnostics_name.as_deref(),
+                        "layout-forward",
+                        item_index,
+                        started_at.elapsed(),
+                    );
+                }
                 size = Some(element_size);
 
                 // If there's a pending scroll adjustment for the scroll-top
@@ -1195,8 +1238,17 @@ impl StateInner {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
+                    let item_started_at = slow_list_diagnostics().then(Instant::now);
                     let mut element = render_item(item_index, window, cx);
                     let element_size = element.layout_as_root(available_item_space, window, cx);
+                    if let Some(started_at) = item_started_at {
+                        report_slow_list_item(
+                            self.diagnostics_name.as_deref(),
+                            "layout-backfill",
+                            item_index,
+                            started_at.elapsed(),
+                        );
+                    }
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
                     measured_items.push_front(ListItem::Measured {
@@ -1244,8 +1296,19 @@ impl StateInner {
                 let size = if let ListItem::Measured { size, .. } = item {
                     *size
                 } else {
+                    let item_index = cursor.start().0;
+                    let item_started_at = slow_list_diagnostics().then(Instant::now);
                     let mut element = render_item(cursor.start().0, window, cx);
-                    element.layout_as_root(available_item_space, window, cx)
+                    let size = element.layout_as_root(available_item_space, window, cx);
+                    if let Some(started_at) = item_started_at {
+                        report_slow_list_item(
+                            self.diagnostics_name.as_deref(),
+                            "layout-leading-overdraw",
+                            item_index,
+                            started_at.elapsed(),
+                        );
+                    }
+                    size
                 };
 
                 leading_overdraw += size.height;
@@ -1289,8 +1352,17 @@ impl StateInner {
             while let Some(item) = cursor.item() {
                 if item.contains_focused(window, cx) {
                     let item_index = cursor.start().0;
+                    let item_started_at = slow_list_diagnostics().then(Instant::now);
                     let mut element = render_item(cursor.start().0, window, cx);
                     let size = element.layout_as_root(available_item_space, window, cx);
+                    if let Some(started_at) = item_started_at {
+                        report_slow_list_item(
+                            self.diagnostics_name.as_deref(),
+                            "layout-focused-offscreen",
+                            item_index,
+                            started_at.elapsed(),
+                        );
+                    }
                     item_layouts.push_back(ItemLayout {
                         index: item_index,
                         element,
@@ -1343,9 +1415,18 @@ impl StateInner {
                 let mut item_origin = bounds.origin + Point::new(px(0.), padding.top);
                 item_origin.y -= layout_response.scroll_top.offset_in_item;
                 for item in &mut layout_response.item_layouts {
+                    let item_started_at = slow_list_diagnostics().then(Instant::now);
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         item.element.prepaint_at(item_origin, window, cx);
                     });
+                    if let Some(started_at) = item_started_at {
+                        report_slow_list_item(
+                            self.diagnostics_name.as_deref(),
+                            "prepaint",
+                            item.index,
+                            started_at.elapsed(),
+                        );
+                    }
 
                     if let Some(autoscroll_bounds) = window.take_autoscroll()
                         && autoscroll

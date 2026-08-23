@@ -55,6 +55,7 @@ impl PerformanceSnapshot {
 }
 
 struct PerformanceSample {
+    frame_request_interval: Histogram<u64>,
     draw_duration: Histogram<u64>,
     prepaint_duration: Histogram<u64>,
     paint_duration: Histogram<u64>,
@@ -86,6 +87,11 @@ impl PerformanceSample {
         };
 
         Ok(Self {
+            frame_request_interval: histogram_delta(
+                &current.frames.frame_request_interval_histogram,
+                previous_frames.map(|snapshot| &snapshot.frame_request_interval_histogram),
+                "frame request interval",
+            )?,
             draw_duration: histogram_delta(
                 &current.frames.draw_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.draw_duration_histogram),
@@ -152,6 +158,7 @@ impl PerformanceSample {
             .unwrap_or_else(|| "cumulative".into());
         [
             format!("Harness performance ({period})"),
+            format_duration_histogram("platform frame callback", &self.frame_request_interval),
             format_duration_histogram("draw", &self.draw_duration),
             format_duration_histogram("prepaint", &self.prepaint_duration),
             format_duration_histogram("paint", &self.paint_duration),
@@ -303,6 +310,7 @@ mod tests {
     ) -> PerformanceSnapshot {
         PerformanceSnapshot {
             frames: FrameDurationSnapshot {
+                frame_request_interval_histogram: histogram(animation_intervals),
                 draw_duration_histogram: histogram(draws),
                 prepaint_duration_histogram: histogram(draws),
                 paint_duration_histogram: histogram(draws),

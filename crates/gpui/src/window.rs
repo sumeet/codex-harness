@@ -1560,7 +1560,11 @@ impl Window {
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
                 let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
+                    .update(&mut cx, |_, _window, cx| {
+                        #[cfg(feature = "profiler")]
+                        _window.window_profiler.record_frame_request();
+                        cx.thermal_state()
+                    })
                     .log_err();
 
                 // Throttle frame rate based on conditions:
