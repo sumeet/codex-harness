@@ -5,7 +5,7 @@ use std::{
     path::Path,
     rc::Rc,
     sync::{Arc, LazyLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use assets::Assets;
@@ -126,6 +126,7 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
+const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PerformanceJPhase {
@@ -2515,6 +2516,7 @@ struct HarnessApp {
     replay_count: Option<usize>,
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
+    thread_snapshots: ThreadSnapshotCache,
     selected_thread_id: Option<String>,
     loaded_thread_updated_at: Option<i64>,
     connecting: bool,
@@ -2573,6 +2575,33 @@ struct HarnessApp {
     reconnect_task: Task<()>,
     read_only_refresh_task: Task<()>,
     reconnect_attempts: u8,
+}
+
+#[derive(Default)]
+struct ThreadSnapshotCache {
+    entries: VecDeque<CodexThread>,
+}
+
+impl ThreadSnapshotCache {
+    fn take(&mut self, thread_id: &str) -> Option<CodexThread> {
+        let index = self
+            .entries
+            .iter()
+            .position(|thread| thread.id == thread_id)?;
+        self.entries.remove(index)
+    }
+
+    fn insert(&mut self, thread: CodexThread) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|cached| cached.id == thread.id)
+        {
+            self.entries.remove(index);
+        }
+        self.entries.push_front(thread);
+        self.entries.truncate(THREAD_SNAPSHOT_CACHE_LIMIT);
+    }
 }
 
 impl HarnessApp {
@@ -2952,6 +2981,7 @@ impl HarnessApp {
             replay_count,
             client: None,
             threads: Vec::new(),
+            thread_snapshots: ThreadSnapshotCache::default(),
             selected_thread_id: initial_thread_id,
             loaded_thread_updated_at: None,
             connecting: false,
@@ -4050,7 +4080,8 @@ impl HarnessApp {
                 active = thread_has_active_turn(&thread);
                 if this
                     .update(cx, |this, cx| {
-                        this.apply_read_only_thread_refresh(thread, cx)
+                        this.apply_read_only_thread_refresh(&thread, cx);
+                        this.thread_snapshots.insert(thread);
                     })
                     .is_err()
                 {
@@ -4060,10 +4091,18 @@ impl HarnessApp {
         });
     }
 
-    fn apply_read_only_thread_refresh(&mut self, thread: CodexThread, cx: &mut Context<Self>) {
+    fn apply_read_only_thread_refresh(&mut self, thread: &CodexThread, cx: &mut Context<Self>) {
         if self.selected_thread_id.as_deref() != Some(thread.id.as_str())
             || self.thread_read_only_reason.is_none()
         {
+            return;
+        }
+
+        self.apply_loaded_thread_refresh(thread, cx);
+    }
+
+    fn apply_loaded_thread_refresh(&mut self, thread: &CodexThread, cx: &mut Context<Self>) {
+        if self.selected_thread_id.as_deref() != Some(thread.id.as_str()) {
             return;
         }
 
@@ -4149,6 +4188,14 @@ impl HarnessApp {
             return;
         };
         let thread_id = thread.id.clone();
+        if self.selected_thread_id.as_deref() == Some(thread_id.as_str())
+            && (self.loading_thread || !self.model.items.is_empty())
+        {
+            return;
+        }
+        let cached_thread = self.thread_snapshots.take(&thread_id);
+        let had_cached_thread = cached_thread.is_some();
+        let load_started_at = thread_load_diagnostics_enabled().then(Instant::now);
         let Some(client) = self.client.clone() else {
             return;
         };
@@ -4175,49 +4222,121 @@ impl HarnessApp {
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
         drop(self.sync_transcript_document(cx));
+        if let Some(cached_thread) = cached_thread {
+            self.load_thread(&cached_thread, cx);
+            self.thread_snapshots.insert(cached_thread);
+            if thread_load_diagnostics_enabled() {
+                eprintln!("thread-load cache-hit thread={thread_id}");
+            }
+        }
         cx.notify();
 
         self.request_task = cx.spawn(async move |this, cx| {
+            let read_started_at = Instant::now();
             let read = client.read_thread(&thread_id).await;
-            let result = match read {
-                Ok(read_thread) => match client.resume_thread(&thread_id).await {
-                    Ok(resumed) => Ok((resumed, None)),
-                    Err(error) => {
-                        log::warn!("could not resume task {thread_id}; opening read-only: {error}");
-                        Ok((
-                            read_thread,
-                            Some(
-                                "Another Codex client owns this task. History is available read-only."
-                                    .to_string(),
-                            ),
-                        ))
-                    }
-                },
-                Err(error) => Err(error),
-            };
-            if this
-                .update(cx, |this, cx| {
-                    this.loading_thread = false;
-                    match result {
-                        Ok((thread, warning)) => {
-                            let read_only = warning.is_some();
-                            let active = thread_has_active_turn(&thread);
-                            this.load_thread(thread, cx);
-                            this.thread_read_only_reason = warning.map(Into::into);
-                            if read_only {
-                                this.schedule_read_only_refresh(active, cx);
+            if thread_load_diagnostics_enabled() {
+                eprintln!(
+                    "thread-load read thread={thread_id} elapsed_ms={:.1} success={}",
+                    read_started_at.elapsed().as_secs_f64() * 1_000.,
+                    read.is_ok(),
+                );
+            }
+            let read_thread = match read {
+                Ok(thread) => thread,
+                Err(error) => {
+                    if this
+                        .update(cx, |this, cx| {
+                            if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                                return;
                             }
-                            this.error = None;
-                        }
-                        Err(error) => {
+                            this.loading_thread = false;
                             this.thread_read_only_reason = Some(
                                 "This task could not be loaded. Choose another task or start a new one."
                                     .into(),
                             );
                             this.error = Some(format!("Could not open task: {error}").into());
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    return;
+                }
+            };
+            let active = thread_has_active_turn(&read_thread);
+            let content_ready = this
+                .update(cx, |this, cx| {
+                    if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                        return false;
+                    }
+                    if had_cached_thread {
+                        this.apply_loaded_thread_refresh(&read_thread, cx);
+                    } else {
+                        this.load_thread(&read_thread, cx);
+                    }
+                    this.thread_snapshots.insert(read_thread);
+                    this.error = None;
+                    if thread_load_diagnostics_enabled() {
+                        eprintln!(
+                            "thread-load content-ready thread={thread_id} total_ms={:.1}",
+                            load_started_at
+                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !content_ready {
+                return;
+            }
+
+            let resume_started_at = Instant::now();
+            let resume = client.resume_thread(&thread_id).await;
+            if thread_load_diagnostics_enabled() {
+                eprintln!(
+                    "thread-load resume thread={thread_id} elapsed_ms={:.1} success={}",
+                    resume_started_at.elapsed().as_secs_f64() * 1_000.,
+                    resume.is_ok(),
+                );
+            }
+            if this
+                .update(cx, |this, cx| {
+                    let update_started_at = Instant::now();
+                    if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                        return;
+                    }
+                    this.loading_thread = false;
+                    match resume {
+                        Ok(thread) => {
+                            this.apply_loaded_thread_refresh(&thread, cx);
+                            this.thread_snapshots.insert(thread);
+                            this.thread_read_only_reason = None;
+                            this.error = None;
+                        }
+                        Err(error) => {
+                            log::warn!(
+                                "could not resume task {thread_id}; opening read-only: {error}"
+                            );
+                            this.thread_read_only_reason = Some(
+                                "Another Codex client owns this task. History is available read-only."
+                                    .into(),
+                            );
+                            this.schedule_read_only_refresh(active, cx);
+                            this.error = None;
                         }
                     }
                     cx.notify();
+                    if thread_load_diagnostics_enabled() {
+                        eprintln!(
+                            "thread-load foreground thread={thread_id} elapsed_ms={:.1} total_ms={:.1}",
+                            update_started_at.elapsed().as_secs_f64() * 1_000.,
+                            load_started_at
+                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
+                                .unwrap_or_default(),
+                        );
+                    }
                 })
                 .is_err()
             {
@@ -4226,14 +4345,18 @@ impl HarnessApp {
         });
     }
 
-    fn load_thread(&mut self, thread: CodexThread, cx: &mut Context<Self>) {
+    fn load_thread(&mut self, thread: &CodexThread, cx: &mut Context<Self>) {
+        let load_started_at = Instant::now();
         let old_len = self.model.items.len();
         self.selected_thread_id = Some(thread.id.clone());
         self.loaded_thread_updated_at = Some(thread.updated_at);
         if !thread.cwd.is_empty() {
             self.cwd = thread.cwd.clone();
         }
-        self.model.load_thread(&thread);
+        let model_started_at = Instant::now();
+        self.model.load_thread(thread);
+        let model_elapsed = model_started_at.elapsed();
+        let persisted_started_at = Instant::now();
         match self.model.merge_persisted_transcript(&thread.id) {
             Ok(restored) if restored > 0 => {
                 log::info!("restored {restored} live-only transcript items")
@@ -4241,6 +4364,7 @@ impl HarnessApp {
             Ok(_) => {}
             Err(error) => log::warn!("could not restore transcript history: {error}"),
         }
+        let persisted_elapsed = persisted_started_at.elapsed();
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         if slow_list_diagnostics_enabled() {
             for (index, item) in self.model.items.iter().enumerate() {
@@ -4265,12 +4389,25 @@ impl HarnessApp {
         self.selected_item = self.model.items.len().saturating_sub(1);
         self.transcript_cursor_initialized = false;
         self.list_state.set_follow_mode(FollowMode::Tail);
+        let document_started_at = Instant::now();
         drop(self.sync_transcript_document(cx));
+        let document_elapsed = document_started_at.elapsed();
         if self.buffer_view {
             self.transcript_editor
                 .update(cx, |editor, cx| editor.reveal_tail(cx));
         }
         cx.notify();
+        if thread_load_diagnostics_enabled() {
+            eprintln!(
+                "thread-load model thread={} items={} model_ms={:.1} persisted_ms={:.1} document_ms={:.1} total_ms={:.1}",
+                thread.id,
+                self.model.items.len(),
+                model_elapsed.as_secs_f64() * 1_000.,
+                persisted_elapsed.as_secs_f64() * 1_000.,
+                document_elapsed.as_secs_f64() * 1_000.,
+                load_started_at.elapsed().as_secs_f64() * 1_000.,
+            );
+        }
     }
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10263,6 +10400,14 @@ fn slow_list_diagnostics_enabled() -> bool {
     *ENABLED
 }
 
+fn thread_load_diagnostics_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("HARNESS_THREAD_LOAD_TRACE")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    });
+    *ENABLED
+}
+
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
@@ -10380,6 +10525,33 @@ fn load_harness_keymaps(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn cached_thread(id: &str, updated_at: i64) -> CodexThread {
+        CodexThread {
+            id: id.into(),
+            name: None,
+            preview: String::new(),
+            cwd: String::new(),
+            updated_at,
+            turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn thread_snapshot_cache_replaces_and_evicts_least_recent_snapshots() {
+        let mut cache = ThreadSnapshotCache::default();
+        cache.insert(cached_thread("a", 1));
+        cache.insert(cached_thread("b", 1));
+
+        let a = cache.take("a").expect("cached snapshot");
+        cache.insert(a);
+        cache.insert(cached_thread("c", 1));
+
+        assert!(cache.take("b").is_none());
+        assert_eq!(cache.take("a").unwrap().updated_at, 1);
+        cache.insert(cached_thread("c", 2));
+        assert_eq!(cache.take("c").unwrap().updated_at, 2);
+    }
 
     #[test]
     fn rich_vim_markdown_offsets_skip_formatting_marks_in_both_directions() {
