@@ -837,6 +837,12 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
         None
     }
+    /// Whether platform input dispatch synchronously requests a GPUI frame.
+    /// Frame callbacks can use this to avoid re-presenting an unchanged scene
+    /// solely to sustain high-rate input.
+    fn draws_immediately_after_input(&self) -> bool {
+        false
+    }
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);

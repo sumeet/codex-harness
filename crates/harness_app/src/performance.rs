@@ -57,6 +57,7 @@ impl PerformanceSnapshot {
 struct PerformanceSample {
     frame_request_interval: Histogram<u64>,
     draw_duration: Histogram<u64>,
+    platform_present_duration: Histogram<u64>,
     prepaint_duration: Histogram<u64>,
     paint_duration: Histogram<u64>,
     list_prepaint_duration: Histogram<u64>,
@@ -96,6 +97,11 @@ impl PerformanceSample {
                 &current.frames.draw_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.draw_duration_histogram),
                 "draw duration",
+            )?,
+            platform_present_duration: histogram_delta(
+                &current.frames.platform_present_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.platform_present_duration_histogram),
+                "platform present duration",
             )?,
             prepaint_duration: histogram_delta(
                 &current.frames.prepaint_duration_histogram,
@@ -160,6 +166,7 @@ impl PerformanceSample {
             format!("Harness performance ({period})"),
             format_duration_histogram("platform frame callback", &self.frame_request_interval),
             format_duration_histogram("draw", &self.draw_duration),
+            format_duration_histogram("platform draw/submit", &self.platform_present_duration),
             format_duration_histogram("prepaint", &self.prepaint_duration),
             format_duration_histogram("paint", &self.paint_duration),
             format_duration_histogram("list prepaint", &self.list_prepaint_duration),
@@ -312,6 +319,7 @@ mod tests {
             frames: FrameDurationSnapshot {
                 frame_request_interval_histogram: histogram(animation_intervals),
                 draw_duration_histogram: histogram(draws),
+                platform_present_duration_histogram: histogram(draws),
                 prepaint_duration_histogram: histogram(draws),
                 paint_duration_histogram: histogram(draws),
                 list_prepaint_duration_histogram: histogram(draws),

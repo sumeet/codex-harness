@@ -834,6 +834,10 @@ pub struct FrameDurationSnapshot {
     pub frame_request_interval_histogram: Histogram<u64>,
     /// Histogram of `Window::draw` durations, in nanoseconds.
     pub draw_duration_histogram: Histogram<u64>,
+    /// Histogram of synchronous platform draw/submission durations, in
+    /// nanoseconds. This covers the work after GPUI builds the scene and before
+    /// the frame is handed back to the platform event loop.
+    pub platform_present_duration_histogram: Histogram<u64>,
     /// Histogram of root-tree layout and prepaint durations, in nanoseconds.
     pub prepaint_duration_histogram: Histogram<u64>,
     /// Histogram of root-tree paint durations, in nanoseconds.
@@ -886,6 +890,7 @@ pub struct WindowProfiler {
     active_activities: SmallVec<[WindowActivity; 4]>,
     frame_request_interval_histogram: Histogram<u64>,
     draw_duration_histogram: Histogram<u64>,
+    platform_present_duration_histogram: Histogram<u64>,
     prepaint_duration_histogram: Histogram<u64>,
     paint_duration_histogram: Histogram<u64>,
     list_prepaint_duration_histogram: Histogram<u64>,
@@ -919,6 +924,9 @@ impl WindowProfiler {
             })?,
             draw_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create draw duration histogram: {error}")
+            })?,
+            platform_present_duration_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create platform present duration histogram: {error}")
             })?,
             prepaint_duration_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create prepaint duration histogram: {error}")
@@ -1076,6 +1084,7 @@ impl WindowProfiler {
         FrameDurationSnapshot {
             frame_request_interval_histogram: self.frame_request_interval_histogram.clone(),
             draw_duration_histogram: self.draw_duration_histogram.clone(),
+            platform_present_duration_histogram: self.platform_present_duration_histogram.clone(),
             prepaint_duration_histogram: self.prepaint_duration_histogram.clone(),
             paint_duration_histogram: self.paint_duration_histogram.clone(),
             list_prepaint_duration_histogram: self.list_prepaint_duration_histogram.clone(),
@@ -1184,6 +1193,12 @@ impl WindowProfiler {
             .record(duration.as_nanos() as u64)
             .ok();
         self.drew_since_last_present = true;
+    }
+
+    pub(crate) fn record_platform_present_duration(&mut self, duration: Duration) {
+        self.platform_present_duration_histogram
+            .record(duration.as_nanos() as u64)
+            .ok();
     }
 
     pub(crate) fn record_draw_phases(&mut self, prepaint: Duration, paint: Duration) {

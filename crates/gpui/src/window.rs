@@ -1420,6 +1420,8 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        let platform_draws_immediately_after_input =
+            platform_window.draws_immediately_after_input();
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1619,12 +1621,15 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting if input was recently arriving at a high rate (>= 60fps).
-                // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // A real scene update or an explicit platform request requires
+                // presentation. High-rate input alone does not: on Wayland the
+                // input path can already have submitted the newly drawn scene,
+                // and presenting it again from the following frame callback
+                // duplicates GPU work without changing what is visible.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || (!platform_draws_immediately_after_input
+                        && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -3033,12 +3038,18 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        #[cfg(feature = "profiler")]
+        let platform_present_started_at = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
-        self.window_profiler.record_present(
-            self.active.get(),
-            !self.next_frame_callbacks.borrow().is_empty(),
-        );
+        {
+            self.window_profiler
+                .record_platform_present_duration(platform_present_started_at.elapsed());
+            self.window_profiler.record_present(
+                self.active.get(),
+                !self.next_frame_callbacks.borrow().is_empty(),
+            );
+        }
         self.needs_present.set(false);
         profiling::finish_frame!();
     }

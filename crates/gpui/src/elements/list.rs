@@ -27,7 +27,20 @@ use sum_tree::{Bias, Dimensions, SumTree};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
-const SLOW_LIST_ITEM_THRESHOLD: Duration = Duration::from_millis(4);
+const DEFAULT_SLOW_LIST_ITEM_THRESHOLD: Duration = Duration::from_millis(4);
+
+fn slow_list_item_threshold() -> Duration {
+    static THRESHOLD: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var("GPUI_SLOW_LIST_THRESHOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.)
+            .map(Duration::from_secs_f64)
+            .map(|duration| duration / 1_000)
+            .unwrap_or(DEFAULT_SLOW_LIST_ITEM_THRESHOLD)
+    });
+    *THRESHOLD
+}
 
 fn slow_list_diagnostics() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
@@ -46,7 +59,7 @@ fn nested_scroll_diagnostics() -> bool {
 }
 
 fn report_slow_list_item(name: Option<&str>, phase: &str, index: usize, elapsed: Duration) {
-    if elapsed >= SLOW_LIST_ITEM_THRESHOLD {
+    if elapsed >= slow_list_item_threshold() {
         eprintln!(
             "slow-list name={} phase={phase} item={index} elapsed_ms={:.2}",
             name.unwrap_or("unnamed"),
@@ -1264,7 +1277,6 @@ impl StateInner {
 
         // Prepare to start walking upward from the item at the scroll top.
         cursor.seek(&Count(scroll_top.item_ix), Bias::Right);
-
         // If the rendered items do not fill the visible region, then adjust
         // the scroll top upward.
         if rendered_height - scroll_top.offset_in_item < available_height {
@@ -1302,9 +1314,12 @@ impl StateInner {
                 }
             }
 
+            let visible_start = cursor.start().0;
+            let visible_offset = rendered_height - available_height;
+
             scroll_top = ListOffset {
-                item_ix: cursor.start().0,
-                offset_in_item: rendered_height - available_height,
+                item_ix: visible_start,
+                offset_in_item: visible_offset,
             };
 
             match self.alignment {
@@ -1322,9 +1337,14 @@ impl StateInner {
             };
         }
 
-        // Measure items in the leading overdraw
+        // Always measure one item immediately before the visible range. A
+        // variable-height list otherwise assigns zero height to every unknown
+        // item above a followed tail, so zero overdraw appears to have no
+        // remaining scroll range and traps the first upward gesture. This
+        // boundary sentinel is measured but not painted.
+        let mut needs_boundary_sentinel = self.alignment == ListAlignment::Top;
         let mut leading_overdraw = scroll_top.offset_in_item;
-        while leading_overdraw < self.overdraw {
+        while leading_overdraw < self.overdraw || needs_boundary_sentinel {
             cursor.prev();
             if let Some(item) = cursor.item() {
                 let size = if let ListItem::Measured { size, .. } = item {
@@ -1346,6 +1366,7 @@ impl StateInner {
                 };
 
                 leading_overdraw += size.height;
+                needs_boundary_sentinel = false;
                 measured_items.push_front(ListItem::Measured {
                     size,
                     focus_handle: item.focus_handle(),
@@ -1757,12 +1778,17 @@ impl Element for List {
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
         state.last_layout_scroll_top = Some(layout.scroll_top);
-        let result = ListPrepaintState { hitbox, layout };
-        window.record_prepaint_component(
-            crate::PrepaintComponent::List,
-            prepaint_started_at.elapsed(),
-        );
-        result
+        let prepaint_elapsed = prepaint_started_at.elapsed();
+        if slow_list_diagnostics() {
+            report_slow_list_item(
+                state.diagnostics_name.as_deref(),
+                "total-prepaint",
+                layout.scroll_top.item_ix,
+                prepaint_elapsed,
+            );
+        }
+        window.record_prepaint_component(crate::PrepaintComponent::List, prepaint_elapsed);
+        ListPrepaintState { hitbox, layout }
     }
 
     fn paint(
@@ -3359,6 +3385,49 @@ mod test {
         assert!(
             !state.is_following_tail(),
             "follow-tail should disengage when the user scrolls toward the start"
+        );
+    }
+
+    #[gpui::test]
+    fn test_zero_overdraw_walks_out_of_a_variable_height_followed_tail(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(40, crate::ListAlignment::Top, px(0.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |index, _, _| {
+                    let height = 31. + (index % 5) as f32 * 13.;
+                    div().h(px(height)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| cx.new(|_| TestView(state.clone())));
+        state.set_follow_mode(FollowMode::Tail);
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        assert!(state.logical_scroll_top().item_ix > 0);
+
+        for _ in 0..160 {
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(50.), px(100.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(20.))),
+                synthesize_momentum: false,
+                ..Default::default()
+            });
+            cx.draw(point(px(0.), px(0.)), size(px(100.), px(200.)), |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+
+        assert_eq!(
+            state.logical_scroll_top().item_ix,
+            0,
+            "each repaint should discover the next unknown row above the viewport"
         );
     }
 

@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     ptr::NonNull,
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use collections::{FxHashMap, HashMap};
@@ -55,6 +55,16 @@ pub(crate) struct Callbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
+}
+
+fn immediate_input_draw_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("GPUI_WAYLAND_IMMEDIATE_INPUT_DRAW").is_none_or(|value| {
+            value != std::ffi::OsStr::new("0")
+                && !value.eq_ignore_ascii_case(std::ffi::OsStr::new("false"))
+        })
+    });
+    *ENABLED
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1325,15 +1335,31 @@ impl WaylandWindowStatePtr {
         if self.is_blocked() {
             return;
         }
+        // High-rate pointer motion can arrive far above the display refresh
+        // rate. Leave hover-only motion paced by the compositor, while direct
+        // manipulation, typing, and button state changes get the low-latency
+        // input-driven path.
+        let draw_immediately = matches!(
+            &input,
+            PlatformInput::KeyDown(_)
+                | PlatformInput::KeyUp(_)
+                | PlatformInput::ModifiersChanged(_)
+                | PlatformInput::MouseDown(_)
+                | PlatformInput::MouseUp(_)
+                | PlatformInput::ScrollWheel(_)
+                | PlatformInput::Pinch(_)
+                | PlatformInput::Touch(_)
+        );
+        let mut propagate = true;
         let callback = self.callbacks.borrow_mut().input.take();
         if let Some(mut fun) = callback {
             let result = fun(input.clone());
             self.callbacks.borrow_mut().input = Some(fun);
-            if !result.propagate {
-                return;
-            }
+            propagate = result.propagate;
         }
-        if let PlatformInput::KeyDown(event) = input
+
+        if propagate
+            && let PlatformInput::KeyDown(event) = input
             && event.keystroke.modifiers.is_subset_of(&Modifiers::shift())
             && let Some(key_char) = &event.keystroke.key_char
         {
@@ -1343,6 +1369,24 @@ impl WaylandWindowStatePtr {
                 input_handler.replace_text_in_range(None, key_char);
                 self.state.borrow_mut().input_handler = Some(input_handler);
             }
+        }
+
+        // A Wayland frame callback can precede pointer input from the same
+        // compositor cycle. Waiting for the next callback in that case adds a
+        // full refresh interval and repeatedly coalesces 120 Hz input into
+        // fewer submitted frames. Let all input processing finish, then render
+        // any dirtied GPUI or fallback text-input state immediately. The
+        // compositor still controls when the committed buffer is shown.
+        if draw_immediately && immediate_input_draw_enabled() {
+            let callback = self.callbacks.borrow_mut().request_frame.take();
+            if let Some(mut fun) = callback {
+                fun(RequestFrameOptions::default());
+                self.callbacks.borrow_mut().request_frame = Some(fun);
+            }
+        }
+
+        if !propagate {
+            return;
         }
     }
 
@@ -1428,6 +1472,10 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn draws_immediately_after_input(&self) -> bool {
+        immediate_input_draw_enabled()
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.borrow().bounds
     }
