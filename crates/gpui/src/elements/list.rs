@@ -1428,10 +1428,8 @@ impl StateInner {
                         );
                     }
 
-                    if let Some(autoscroll_bounds) = window.take_autoscroll()
-                        && autoscroll
-                    {
-                        if autoscroll_bounds.top() < bounds.top() {
+                    if let Some(autoscroll_bounds) = window.take_autoscroll() {
+                        if autoscroll && autoscroll_bounds.top() < bounds.top() {
                             let mut item_ix = item.index;
                             let mut offset_in_item = autoscroll_bounds.top() - item_origin.y;
 
@@ -1465,7 +1463,7 @@ impl StateInner {
                                 item_ix,
                                 offset_in_item,
                             });
-                        } else if autoscroll_bounds.bottom() > bounds.bottom() {
+                        } else if autoscroll && autoscroll_bounds.bottom() > bounds.bottom() {
                             let mut cursor = self.items.cursor::<Count>(());
                             cursor.seek(&Count(item.index), Bias::Right);
                             let mut height = bounds.size.height - padding.top - padding.bottom;
@@ -1495,6 +1493,14 @@ impl StateInner {
                                     Pixels::ZERO
                                 },
                             });
+                        } else {
+                            // The requested descendant is already visible inside this
+                            // list. Forward its exact bounds so an enclosing list can
+                            // reveal the nested surface instead of merely revealing
+                            // this list's (potentially much taller) parent item. The
+                            // second prepaint after an inner adjustment also lands here,
+                            // which lets one request climb an arbitrary list hierarchy.
+                            window.request_autoscroll(autoscroll_bounds);
                         }
                     }
 
@@ -1996,6 +2002,63 @@ mod test {
         );
         assert_eq!(scroll_top.item_ix, 0);
         assert_eq!(scroll_top.offset_in_item, px(10.));
+    }
+
+    #[gpui::test]
+    fn nested_list_forwards_visible_descendant_autoscroll_to_outer_list(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let outer = ListState::new(3, crate::ListAlignment::Top, px(20.));
+        let inner = ListState::new(10, crate::ListAlignment::Top, px(20.)).measure_all();
+        outer.scroll_to(gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(0.),
+        });
+
+        struct TestView {
+            outer: ListState,
+            inner: ListState,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.outer.clone(), move |ix, _, _| {
+                    if ix == 1 {
+                        list(inner.clone(), |inner_ix, _, _| {
+                            if inner_ix == 8 {
+                                canvas(
+                                    |bounds, window, _| window.request_autoscroll(bounds),
+                                    |_, _, _, _| {},
+                                )
+                                .h(px(10.))
+                                .w_full()
+                                .into_any()
+                            } else {
+                                div().h(px(10.)).w_full().into_any()
+                            }
+                        })
+                        .h(px(100.))
+                        .w_full()
+                        .into_any()
+                    } else {
+                        div().h(px(20.)).w_full().into_any()
+                    }
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(60.)), |_, cx| {
+            cx.new(|_| TestView {
+                outer: outer.clone(),
+                inner,
+            })
+            .into_any_element()
+        });
+
+        let scroll_top = outer.logical_scroll_top();
+        assert_eq!(scroll_top.item_ix, 1);
+        assert_eq!(scroll_top.offset_in_item, px(30.));
     }
 
     #[gpui::test]

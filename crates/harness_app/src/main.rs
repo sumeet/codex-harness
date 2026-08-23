@@ -14,7 +14,8 @@ use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
     IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState,
     Render, ScrollHandle, SharedString, StyledText, Task, UpdateGlobal, WeakEntity, Window,
-    WindowBounds, WindowOptions, actions, deferred, div, list, prelude::*, px, relative, size,
+    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
+    relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -120,7 +121,9 @@ const PROGRESSIVE_OUTPUT_MEDIUM_BYTES: usize = 16 * 1_024;
 const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
 const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
+const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 140.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
+const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 
@@ -307,13 +310,10 @@ enum RichCommandSource {
 }
 
 #[derive(Clone)]
-enum RichCommandRow {
-    Text {
-        source: RichCommandSource,
-        source_range: Range<usize>,
-        line_index: usize,
-    },
-    Divider,
+struct RichCommandRow {
+    source: RichCommandSource,
+    source_range: Range<usize>,
+    line_index: usize,
 }
 
 #[derive(Clone)]
@@ -321,13 +321,15 @@ struct RichCommandData {
     command: Arc<str>,
     output: Arc<str>,
     rows: Arc<[RichCommandRow]>,
+    command_row_count: usize,
 }
 
 struct RichCommandSurface {
     event_count: usize,
     content_len: usize,
     data: RichCommandData,
-    list_state: ListState,
+    command_list_state: ListState,
+    output_list_state: ListState,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,7 +416,7 @@ fn rich_header_navigation_range(
     if navigation.visual {
         return (proxy_body && !navigation.ranges.is_empty()).then(|| 0..title.len());
     }
-    if navigation.head.is_none() || navigation.cursor_claimed.get() {
+    if !proxy_body || navigation.head.is_none() || navigation.cursor_claimed.get() {
         return None;
     }
     let end = title.chars().next().map(char::len_utf8)?;
@@ -825,6 +827,64 @@ fn logical_offset_for_rendered_index(
     logical_fragment.start + rendered_index.min(logical_fragment.len())
 }
 
+fn rich_cursor_index_for_fragment(
+    navigation: Option<&RichNavigationPaint>,
+    logical_fragment: &Range<usize>,
+) -> Option<usize> {
+    let cursor = navigation?.cursor_range()?;
+    let start = cursor.start.max(logical_fragment.start);
+    let end = cursor.end.min(logical_fragment.end);
+    (start < end).then_some(start - logical_fragment.start)
+}
+
+/// Ask every containing List to reveal the exact painted cursor line. Nested
+/// lists consume the request to reveal the row locally, then forward it to the
+/// transcript list once it is inside their own viewport.
+fn rich_cursor_autoscroll_marker(
+    layout: gpui::TextLayout,
+    rendered_index: usize,
+    color: gpui::Hsla,
+) -> AnyElement {
+    canvas(
+        move |bounds, window, _| {
+            let cursor_position = layout
+                .position_for_index(rendered_index)
+                .unwrap_or(bounds.origin);
+            let cursor_y = cursor_position
+                .y
+                .max(bounds.top())
+                .min(bounds.bottom() - px(1.));
+            window.request_autoscroll(Bounds::from_corners(
+                point(bounds.left(), cursor_y),
+                point(
+                    bounds.right(),
+                    (cursor_y + layout.line_height()).min(bounds.bottom()),
+                ),
+            ));
+
+            let text = layout.text();
+            let next_index = text
+                .get(rendered_index..)
+                .and_then(|text| text.chars().next())
+                .map_or(rendered_index, |character| {
+                    rendered_index + character.len_utf8()
+                });
+            let cursor_width = layout
+                .position_for_index(next_index)
+                .filter(|end| end.y == cursor_position.y)
+                .map_or(px(8.), |end| (end.x - cursor_position.x).max(px(2.)));
+            gpui::fill(
+                Bounds::new(cursor_position, size(cursor_width, layout.line_height())),
+                color,
+            )
+        },
+        |_, cursor, window, _| window.paint_quad(cursor),
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
 fn rich_transcript_entry_placement(
     cursor_initialized: bool,
     current_item: Option<usize>,
@@ -849,6 +909,11 @@ fn rich_clickable_styled_text(
     let layout = styled.layout().clone();
     div()
         .id(id)
+        // A transcript row is a placement surface, not merely a run of
+        // glyphs. Clicking after short output or within wrapped-line padding
+        // should still place the cursor at the nearest byte on that row.
+        .w_full()
+        .min_h(px(20.))
         .min_w_0()
         .on_click(move |event, window, cx| {
             let rendered_index = match layout.index_for_position(event.position()) {
@@ -864,6 +929,22 @@ fn rich_clickable_styled_text(
                     this.focus_mode = FocusMode::Buffer;
                     this.transcript_cursor_initialized = true;
                     this.list_state.pause_following_tail();
+                    // The clicked glyph is already visible. A command row can
+                    // wrap to many viewport heights, so revealing the whole
+                    // virtual row here would immediately scroll the exact
+                    // click target away. Preserve this cursor as the nested
+                    // surface's already-revealed position; keyboard motions
+                    // still take the ordinary row/line reveal path.
+                    if let Some(item_key) = this
+                        .model
+                        .items
+                        .get(item_index)
+                        .filter(|item| item.kind == model::TranscriptKind::Command)
+                        .map(|item| item.key.clone())
+                        && let Some(state) = this.rich_nested_scrolls.get_mut(&item_key)
+                    {
+                        state.last_cursor = Some(body_offset);
+                    }
                     this.transcript_editor.update(cx, |editor, cx| {
                         editor.set_cursor_in_item(item_index, body_offset, window, cx);
                     });
@@ -1001,6 +1082,15 @@ fn rich_item_body_paints_navigation(item: &TranscriptItem) -> bool {
         model::TranscriptKind::Image => image_caption_for_display(item).is_some(),
         _ => !item.content.is_empty(),
     }
+}
+
+/// Virtual lists render their row closures during layout, after the card header
+/// has already been constructed. Their cursor claim is therefore deferred even
+/// though every logical command/output glyph has a visible owner.
+fn rich_item_defers_navigation_claim(item: &TranscriptItem) -> bool {
+    item.expanded
+        && item.kind == model::TranscriptKind::Command
+        && item.command_transcript().is_some()
 }
 
 fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
@@ -1287,18 +1377,18 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
     ));
     let mut rows = command_line_ranges(&command)
         .enumerate()
-        .map(|(line_index, source_range)| RichCommandRow::Text {
+        .map(|(line_index, source_range)| RichCommandRow {
             source: RichCommandSource::Command,
             source_range,
             line_index,
         })
         .collect::<Vec<_>>();
+    let command_row_count = rows.len();
     if !output.is_empty() {
-        rows.push(RichCommandRow::Divider);
         rows.extend(
             command_line_ranges(&output)
                 .enumerate()
-                .map(|(line_index, source_range)| RichCommandRow::Text {
+                .map(|(line_index, source_range)| RichCommandRow {
                     source: RichCommandSource::Output,
                     source_range,
                     line_index,
@@ -1309,26 +1399,16 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
         command,
         output,
         rows: rows.into(),
+        command_row_count,
     })
 }
 
-fn rich_command_row_logical_range(
-    data: &RichCommandData,
-    row: &RichCommandRow,
-) -> Option<Range<usize>> {
-    let RichCommandRow::Text {
-        source,
-        source_range,
-        ..
-    } = row
-    else {
-        return None;
-    };
-    let base = match source {
+fn rich_command_row_logical_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
+    let base = match row.source {
         RichCommandSource::Command => 0,
         RichCommandSource::Output => data.command.len() + usize::from(!data.command.is_empty()),
     };
-    Some(base + source_range.start..base + source_range.end)
+    base + row.source_range.start..base + row.source_range.end
 }
 
 fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> usize {
@@ -1843,6 +1923,18 @@ fn append_rich_navigation_fragment(output: &mut String, fragment: &str) {
 fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> String {
     let mut output = String::new();
     match item.kind {
+        model::TranscriptKind::User
+        | model::TranscriptKind::Agent
+        | model::TranscriptKind::Plan
+            if !item.status.as_deref().is_some_and(|status| {
+                matches!(
+                    status,
+                    "streaming" | "running" | "inProgress" | "in_progress"
+                )
+            }) =>
+        {
+            return model::rich_markdown_navigation_text(&item.content);
+        }
         model::TranscriptKind::Reasoning => {
             for step in reasoning_steps(&item.content) {
                 append_rich_navigation_fragment(&mut output, &step);
@@ -2508,7 +2600,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> Option<(RichCommandData, ListState)> {
+    ) -> Option<(RichCommandData, ListState, ListState)> {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -2519,25 +2611,49 @@ impl HarnessApp {
 
         if needs_rebuild {
             let data = rich_command_data(item)?;
-            let row_count = data.rows.len();
+            let command_row_count = data.command_row_count;
+            let output_row_count = data.rows.len().saturating_sub(command_row_count);
             let state = self
                 .rich_nested_scrolls
                 .entry(item.key.clone())
                 .or_default();
-            let list_state = state
-                .command
-                .as_ref()
-                .map(|surface| surface.list_state.clone())
-                .unwrap_or_else(|| ListState::new(row_count, ListAlignment::Top, px(240.)));
-            list_state.set_diagnostics_name(format!("command:{}", item.key));
-            if list_state.item_count() != row_count {
-                list_state.splice(0..list_state.item_count(), row_count);
+            let command_list_state = state.command.as_ref().map_or_else(
+                || {
+                    // Commands are normally only a handful of logical lines. Measure
+                    // all of them once so wrapped lines contribute their exact height
+                    // to the bottom boundary before the user starts scrolling.
+                    ListState::new(command_row_count, ListAlignment::Top, px(120.)).measure_all()
+                },
+                |surface| surface.command_list_state.clone(),
+            );
+            let output_list_state = state.command.as_ref().map_or_else(
+                || {
+                    // Output can contain hundreds of thousands of lines, so eagerly
+                    // measuring it would defeat virtualization. A one-line height
+                    // estimate makes every unseen row scroll-reachable; the list
+                    // replaces estimates with exact wrapped heights as rows appear.
+                    ListState::new(output_row_count, ListAlignment::Top, px(240.))
+                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                },
+                |surface| surface.output_list_state.clone(),
+            );
+            command_list_state.set_diagnostics_name(format!("command-input:{}", item.key));
+            output_list_state.set_diagnostics_name(format!("command-output:{}", item.key));
+            if command_list_state.item_count() != command_row_count {
+                command_list_state.splice(0..command_list_state.item_count(), command_row_count);
+            }
+            if output_list_state.item_count() != output_row_count {
+                output_list_state.splice(0..output_list_state.item_count(), output_row_count);
+                output_list_state
+                    .clone()
+                    .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT));
             }
             state.command = Some(RichCommandSurface {
                 event_count: item.event_count,
                 content_len: item.content.len(),
                 data,
-                list_state,
+                command_list_state,
+                output_list_state,
             });
         }
 
@@ -2553,17 +2669,25 @@ impl HarnessApp {
                 .rows
                 .iter()
                 .enumerate()
-                .filter_map(|(index, row)| {
-                    rich_command_row_logical_range(&surface.data, row).map(|range| (index, range))
-                })
+                .map(|(index, row)| (index, rich_command_row_logical_range(&surface.data, row)))
                 .find(|(_, range)| range.contains(&cursor) || range.end == cursor)
                 .map(|(index, _)| index);
             if let Some(row) = row {
-                surface.list_state.scroll_to_reveal_item(row);
+                if row < surface.data.command_row_count {
+                    surface.command_list_state.scroll_to_reveal_item(row);
+                } else {
+                    surface
+                        .output_list_state
+                        .scroll_to_reveal_item(row - surface.data.command_row_count);
+                }
             }
         }
         state.last_cursor = cursor;
-        Some((surface.data.clone(), surface.list_state.clone()))
+        Some((
+            surface.data.clone(),
+            surface.command_list_state.clone(),
+            surface.output_list_state.clone(),
+        ))
     }
 
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
@@ -2586,6 +2710,41 @@ impl HarnessApp {
             visual: snapshot.visual,
             cursor_claimed: Rc::new(Cell::new(false)),
         })
+    }
+
+    fn reveal_rich_navigation_item(&mut self, item_index: usize, body_offset: usize) {
+        let Some(item) = self.model.items.get(item_index) else {
+            return;
+        };
+        if item.kind != model::TranscriptKind::Command {
+            self.list_state.scroll_to_reveal_item(item_index);
+            return;
+        }
+
+        let viewport = self.list_state.viewport_bounds();
+        let item_is_visible = self
+            .list_state
+            .bounds_for_item(item_index)
+            .is_some_and(|bounds| bounds.intersects(&viewport));
+        if item_is_visible {
+            // The cursor-line marker in the selected nested row will perform
+            // exact inner-then-outer autoscroll during prepaint. Revealing the
+            // entire tall card here would instead align its bottom and can move
+            // a command cursor out of view.
+            return;
+        }
+
+        let cursor_is_in_command = rich_command_data(item).is_none_or(|data| {
+            body_offset < data.command.len() + usize::from(!data.command.is_empty())
+        });
+        if cursor_is_in_command {
+            self.list_state.scroll_to(gpui::ListOffset {
+                item_ix: item_index,
+                offset_in_item: px(0.),
+            });
+        } else {
+            self.list_state.scroll_to_reveal_item(item_index);
+        }
     }
 
     /// Update a mounted Markdown message without invalidating HarnessApp.
@@ -2724,6 +2883,7 @@ impl HarnessApp {
                     .items
                     .iter()
                     .find_map(|item| item.head.map(|_| item.item_index));
+                let body_offset = snapshot.items.iter().find_map(|item| item.head);
                 let rich_selection_changed = !this.buffer_view
                     && rich_vim_experiment()
                     && this.rich_navigation_selection.as_ref() != Some(&snapshot);
@@ -2750,7 +2910,10 @@ impl HarnessApp {
                     this.selected_item = item_index;
                     if !this.buffer_view && rich_vim_experiment() {
                         this.list_state.pause_following_tail();
-                        this.list_state.scroll_to_reveal_item(item_index);
+                        this.reveal_rich_navigation_item(
+                            item_index,
+                            body_offset.unwrap_or_default(),
+                        );
                     }
                     if changed || (rich_selection_changed && !local_markdown_repaint) {
                         cx.notify();
@@ -6242,12 +6405,9 @@ impl HarnessApp {
                     .track_scroll(&binding.handle)
                     .children(rows)
                     .custom_scrollbars(
-                        Scrollbars::always_visible(ScrollAxes::Both)
+                        Scrollbars::new(ScrollAxes::Both)
                             .id(("rich-diff-scrollbar", index))
-                            .with_track_along(
-                                ScrollAxes::Both,
-                                colors.border_variant.opacity(0.24),
-                            )
+                            .with_thumb_color(colors.text_muted.opacity(0.5))
                             .tracked_scroll_handle(&binding.handle),
                         window,
                         cx,
@@ -6647,12 +6807,9 @@ impl HarnessApp {
                     .track_scroll(&binding.handle)
                     .children(rows)
                     .custom_scrollbars(
-                        Scrollbars::always_visible(ScrollAxes::Both)
+                        Scrollbars::new(ScrollAxes::Both)
                             .id(("file-change-scrollbar", index))
-                            .with_track_along(
-                                ScrollAxes::Both,
-                                colors.border_variant.opacity(0.24),
-                            )
+                            .with_thumb_color(colors.text_muted.opacity(0.5))
                             .tracked_scroll_handle(&binding.handle),
                         window,
                         cx,
@@ -6779,9 +6936,9 @@ impl HarnessApp {
             .text_color(colors.text)
             .children(rows)
             .custom_scrollbars(
-                Scrollbars::always_visible(ScrollAxes::Vertical)
+                Scrollbars::new(ScrollAxes::Vertical)
                     .id(("terminal-scrollbar", index))
-                    .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -6922,9 +7079,9 @@ impl HarnessApp {
             .track_scroll(&binding.handle)
             .children(rows)
             .custom_scrollbars(
-                Scrollbars::always_visible(ScrollAxes::Vertical)
+                Scrollbars::new(ScrollAxes::Vertical)
                     .id(("activity-scrollbar", index))
-                    .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -6964,94 +7121,154 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (data, list_state) = self.rich_command_surface(item, navigation)?;
+        let (data, command_list_state, output_list_state) =
+            self.rich_command_surface(item, navigation)?;
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
-        let render_data = data.clone();
-        let row_colors = colors.clone();
-        let rows = list(list_state.clone(), move |row_index, _, cx| {
-            let row = &render_data.rows[row_index];
-            match row {
-                RichCommandRow::Divider => div()
-                    .w_full()
-                    .h(px(9.))
-                    .my_1()
-                    .border_t_1()
-                    .border_color(row_colors.border_variant)
-                    .into_any_element(),
-                RichCommandRow::Text {
-                    source,
-                    source_range,
-                    line_index,
-                } => {
-                    let source_text = match source {
-                        RichCommandSource::Command => &render_data.command,
-                        RichCommandSource::Output => &render_data.output,
-                    };
-                    let line = &source_text[source_range.clone()];
-                    let logical_range = rich_command_row_logical_range(&render_data, row)
-                        .expect("command text row has a logical range");
-                    let base_highlights = match source {
-                        RichCommandSource::Command => shell_highlights(line, cx),
-                        RichCommandSource::Output => Vec::new(),
-                    };
-                    let highlighted = navigation_searchable_styled_text(
-                        line.to_owned(),
-                        base_highlights,
-                        search.as_ref(),
-                        navigation.as_ref(),
-                        logical_range.clone(),
-                        cx,
-                    );
-                    let id = match source {
-                        RichCommandSource::Command => {
-                            format!("rich-command-text:{index}:{line_index}")
-                        }
-                        RichCommandSource::Output => {
-                            format!("rich-command-output:{index}:{line_index}")
-                        }
-                    };
-                    let clickable = rich_clickable_styled_text(
-                        id,
-                        highlighted,
-                        index,
-                        logical_range,
-                        Some(owner.clone()),
-                    );
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .min_h(px(20.))
-                        .whitespace_normal()
-                        .child(clickable)
-                        .into_any_element()
-                }
-            }
+        let command_data = data.clone();
+        let command_search = search.clone();
+        let command_navigation = navigation.clone();
+        let command_owner = owner.clone();
+        let command_rows = list(command_list_state.clone(), move |row_index, _, cx| {
+            let row = &command_data.rows[row_index];
+            let line = &command_data.command[row.source_range.clone()];
+            let logical_range = rich_command_row_logical_range(&command_data, row);
+            let highlighted = navigation_searchable_styled_text(
+                line.to_owned(),
+                shell_highlights(line, cx),
+                command_search.as_ref(),
+                command_navigation.as_ref(),
+                logical_range.clone(),
+                cx,
+            );
+            let cursor_marker =
+                rich_cursor_index_for_fragment(command_navigation.as_ref(), &logical_range).map(
+                    |rendered_index| {
+                        rich_cursor_autoscroll_marker(
+                            highlighted.layout().clone(),
+                            rendered_index,
+                            cx.theme().players().local().cursor.opacity(0.55),
+                        )
+                    },
+                );
+            let clickable = rich_clickable_styled_text(
+                format!("rich-command-text:{index}:{}", row.line_index),
+                highlighted,
+                index,
+                logical_range,
+                Some(command_owner.clone()),
+            );
+            div()
+                .w_full()
+                .min_w_0()
+                .min_h(px(20.))
+                .relative()
+                .whitespace_normal()
+                .child(clickable)
+                .when_some(cursor_marker, |this, marker| this.child(marker))
+                .into_any_element()
+        })
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT));
+
+        let output_data = data.clone();
+        let output_search = search.clone();
+        let output_navigation = navigation.clone();
+        let output_owner = owner.clone();
+        let output_row_offset = data.command_row_count;
+        let output_rows = list(output_list_state.clone(), move |row_index, _, cx| {
+            let row = &output_data.rows[output_row_offset + row_index];
+            let line = &output_data.output[row.source_range.clone()];
+            let logical_range = rich_command_row_logical_range(&output_data, row);
+            let highlighted = navigation_searchable_styled_text(
+                line.to_owned(),
+                Vec::new(),
+                output_search.as_ref(),
+                output_navigation.as_ref(),
+                logical_range.clone(),
+                cx,
+            );
+            let cursor_marker =
+                rich_cursor_index_for_fragment(output_navigation.as_ref(), &logical_range).map(
+                    |rendered_index| {
+                        rich_cursor_autoscroll_marker(
+                            highlighted.layout().clone(),
+                            rendered_index,
+                            cx.theme().players().local().cursor.opacity(0.55),
+                        )
+                    },
+                );
+            let clickable = rich_clickable_styled_text(
+                format!("rich-command-output:{index}:{}", row.line_index),
+                highlighted,
+                index,
+                logical_range,
+                Some(output_owner.clone()),
+            );
+            div()
+                .w_full()
+                .min_w_0()
+                .min_h(px(20.))
+                .relative()
+                .whitespace_normal()
+                .child(clickable)
+                .when_some(cursor_marker, |this, marker| this.child(marker))
+                .into_any_element()
         })
         .with_sizing_behavior(ListSizingBehavior::Infer)
         .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
+
+        let command_region = div()
+            .id(("command-input-scroll", index))
+            .w_full()
+            .min_w_0()
+            .relative()
+            .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT))
+            .child(command_rows)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .id(("command-input-scrollbar", index))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .tracked_scroll_handle(&command_list_state),
+                window,
+                cx,
+            );
+
+        let output_region = (!data.output.is_empty()).then(|| {
+            div()
+                .id(("command-output-scroll", index))
+                .w_full()
+                .min_w_0()
+                .relative()
+                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .mt_2()
+                .pt_2()
+                .child(output_rows)
+                .custom_scrollbars(
+                    Scrollbars::new(ScrollAxes::Vertical)
+                        .id(("command-output-scrollbar", index))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .tracked_scroll_handle(&output_list_state),
+                    window,
+                    cx,
+                )
+        });
+
         Some(
             div()
                 .id(("command-output", index))
                 .w_full()
                 .min_w_0()
-                .relative()
-                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
                 .font_buffer(cx)
                 .text_ui_sm(cx)
                 .line_height(relative(1.45))
                 .text_color(colors.text)
-                .child(rows)
-                .custom_scrollbars(
-                    Scrollbars::always_visible(ScrollAxes::Vertical)
-                        .id(("command-scrollbar", index))
-                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
-                        .tracked_scroll_handle(&list_state),
-                    window,
-                    cx,
-                )
+                .child(command_region)
+                .when_some(output_region, |this, output| this.child(output))
                 .into_any_element(),
         )
     }
@@ -7324,9 +7541,9 @@ impl HarnessApp {
                 .track_scroll(&binding.handle)
                 .children(visible_results)
                 .custom_scrollbars(
-                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                    Scrollbars::new(ScrollAxes::Vertical)
                         .id(("web-results-scrollbar", index))
-                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
                         .tracked_scroll_handle(&binding.handle),
                     window,
                     cx,
@@ -8158,9 +8375,7 @@ impl HarnessApp {
             let mut element = MarkdownElement::new(markdown, style);
             if rich_vim_experiment() {
                 let source = item.content.clone();
-                let logical = self
-                    .model
-                    .item_projection(index)
+                let logical = rich_navigation_item_projection(&self.model, index)
                     .map(|projection| projection.body_text().to_owned())
                     .unwrap_or_else(|| source.clone());
                 let owner = cx.weak_entity();
@@ -8271,9 +8486,10 @@ impl HarnessApp {
         // a renderer deliberately has no glyph for a protocol-only offset,
         // keep Vim visible on the header instead of mounting a second,
         // progressively expanded copy of the body.
-        let body_left_navigation_unclaimed = rich_navigation
-            .as_ref()
-            .is_some_and(|navigation| !navigation.cursor_claimed.get());
+        let body_left_navigation_unclaimed = !rich_item_defers_navigation_claim(&item)
+            && rich_navigation
+                .as_ref()
+                .is_some_and(|navigation| !navigation.cursor_claimed.get());
         let header_cursor_range = rich_header_navigation_range(
             &header_title,
             rich_navigation.as_ref(),
@@ -8578,9 +8794,9 @@ impl Render for HarnessApp {
                     .min_h_0(),
                 )
                 .custom_scrollbars(
-                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                    Scrollbars::new(ScrollAxes::Vertical)
                         .id("task-list-scrollbar")
-                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
                         .tracked_scroll_handle(&task_list_state),
                     window,
                     cx,
@@ -8616,9 +8832,9 @@ impl Render for HarnessApp {
                     .overflow_hidden(),
                 )
                 .custom_scrollbars(
-                    Scrollbars::always_visible(ScrollAxes::Vertical)
+                    Scrollbars::new(ScrollAxes::Vertical)
                         .id("rich-transcript-scrollbar")
-                        .with_track_along(ScrollAxes::Vertical, colors.border_variant.opacity(0.24))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
                         .tracked_scroll_handle(&list_state),
                     window,
                     cx,
@@ -10194,6 +10410,70 @@ mod tests {
     }
 
     #[test]
+    fn rich_vim_markdown_offsets_remain_aligned_after_link_and_fenced_code() {
+        let source = "I updated [discord-canary.desktop](/home/smt/.local/share/applications/discord-canary.desktop) to inject:\n\n```text\nXDG_SESSION_TYPE=wayland\n```\n\nOne more restart.";
+        let logical = model::rich_markdown_navigation_text(source);
+
+        for needle in ["XDG_SESSION_TYPE", "wayland", "One more", "restart"] {
+            let source_offset = source.find(needle).unwrap();
+            let logical_offset = logical.find(needle).unwrap();
+            assert_eq!(
+                markdown_logical_offset_for_source(&logical, source, source_offset),
+                logical_offset,
+                "source to logical mapping diverged at {needle}"
+            );
+            assert_eq!(
+                markdown_source_offset_for_logical(&logical, source, logical_offset),
+                source_offset,
+                "logical to source mapping diverged at {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_command_cursor_marker_uses_the_exact_utf8_glyph_in_each_surface() {
+        let command = "/usr/bin/bash -lc 'printf café'";
+        let output = "ok\nfinished";
+        let body = format!("{command}\n{output}");
+        let cursor = body.find("é").unwrap();
+        let navigation = RichNavigationPaint {
+            body_text: body.clone().into(),
+            ranges: Vec::new(),
+            head: Some(cursor),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert_eq!(
+            rich_cursor_index_for_fragment(Some(&navigation), &(0..command.len())),
+            Some(cursor),
+            "the explicit painted cursor must retain its UTF-8 byte position in command text"
+        );
+        assert_eq!(
+            rich_cursor_index_for_fragment(Some(&navigation), &(command.len() + 1..body.len())),
+            None,
+            "only the surface containing the cursor may paint it"
+        );
+
+        let output_cursor = body.find("finished").unwrap() + "fin".len();
+        let output_navigation = RichNavigationPaint {
+            body_text: body.into(),
+            ranges: Vec::new(),
+            head: Some(output_cursor),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            rich_cursor_index_for_fragment(
+                Some(&output_navigation),
+                &(command.len() + 1..command.len() + 1 + output.len())
+            ),
+            Some(output_cursor - command.len() - 1),
+            "output cursor paint must be relative to the output row"
+        );
+    }
+
+    #[test]
     fn rich_navigation_fragments_preserve_order_and_skip_ornaments() {
         let navigation = RichNavigationPaint {
             body_text: "same\nvisible body\nsame".into(),
@@ -10233,6 +10513,11 @@ mod tests {
             command.body_text(),
             "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
         );
+        assert!(
+            rich_item_defers_navigation_claim(&replay.items[5]),
+            "virtual command rows must own the cursor after header construction"
+        );
+        assert!(!rich_item_defers_navigation_claim(&replay.items[4]));
 
         let project = |kind, content: &str, raw: Value| {
             let mut model = TranscriptModel::default();
@@ -10307,24 +10592,18 @@ mod tests {
         assert_eq!(&*data.command, "cargo check -p harness_app");
         assert!(data.output.starts_with("Finished replay frame 5"));
         assert!(!data.output.ends_with('\n'));
-        assert!(matches!(data.rows.get(1), Some(RichCommandRow::Divider)));
+        assert_eq!(data.command_row_count, 1);
+        assert_eq!(data.rows.len(), 2);
+        assert!(matches!(data.rows[0].source, RichCommandSource::Command));
+        assert!(matches!(data.rows[1].source, RichCommandSource::Output));
 
         for row in data.rows.iter() {
-            let RichCommandRow::Text {
-                source,
-                source_range,
-                ..
-            } = row
-            else {
-                assert!(rich_command_row_logical_range(&data, row).is_none());
-                continue;
-            };
-            let source_text = match source {
+            let source_text = match row.source {
                 RichCommandSource::Command => &data.command,
                 RichCommandSource::Output => &data.output,
             };
-            let logical_range = rich_command_row_logical_range(&data, row).unwrap();
-            assert_eq!(&body[logical_range], &source_text[source_range.clone()]);
+            let logical_range = rich_command_row_logical_range(&data, row);
+            assert_eq!(&body[logical_range], &source_text[row.source_range.clone()]);
         }
     }
 
@@ -10484,6 +10763,20 @@ mod tests {
             rich_header_navigation_range("Command", Some(&navigation), true),
             None
         );
+
+        let visible_body = RichNavigationPaint {
+            body_text: "visible body".into(),
+            ranges: Vec::new(),
+            head: Some(3),
+            visual: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            rich_header_navigation_range("Command", Some(&visible_body), false),
+            None,
+            "a visible virtual body claims its cursor later during list layout"
+        );
+        assert!(!visible_body.cursor_claimed.get());
 
         let unicode = RichNavigationPaint {
             body_text: "hidden body".into(),

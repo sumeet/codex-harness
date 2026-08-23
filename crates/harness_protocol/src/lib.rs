@@ -513,7 +513,10 @@ fn ensure_line_break(text: &mut String) {
     }
 }
 
-fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
+fn selectable_markdown_text_with_link_destinations(
+    source: &str,
+    include_link_destinations: bool,
+) -> SelectableBodyProjection {
     let options = MarkdownOptions::ENABLE_STRIKETHROUGH
         | MarkdownOptions::ENABLE_TABLES
         | MarkdownOptions::ENABLE_TASKLISTS
@@ -602,6 +605,7 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
             }
             MarkdownEvent::End(TagEnd::Link) | MarkdownEvent::End(TagEnd::Image) => {
                 if let Some((destination, label_start, image)) = destinations.pop()
+                    && include_link_destinations
                     && !destination.is_empty()
                     && !output[label_start..].contains(&destination)
                 {
@@ -708,6 +712,19 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
         text: output,
         semantic_spans,
     })
+}
+
+fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
+    selectable_markdown_text_with_link_destinations(source, true)
+}
+
+/// Plain-text coordinate space for a Rich Markdown surface. Link destinations
+/// are intentionally absent because the Rich renderer paints only their
+/// labels; retaining hidden destination bytes makes native cursor motion and
+/// mouse placement diverge after the first link.
+pub fn rich_markdown_navigation_text(source: &str) -> String {
+    let source = normalize_buffer_line_endings(source.to_owned());
+    selectable_markdown_text_with_link_destinations(&source, false).text
 }
 
 fn selectable_transcript_body(
@@ -5219,6 +5236,16 @@ mod tests {
         assert_eq!(
             semantic_text(TranscriptSemanticStyle::Link),
             ["Zed (https://zed.dev)"]
+        );
+    }
+
+    #[test]
+    fn rich_markdown_navigation_omits_unpainted_link_destinations() {
+        let source = "I updated [discord-canary.desktop](/home/smt/.local/share/applications/discord-canary.desktop) to inject:\n\n```text\nXDG_SESSION_TYPE=wayland\n```\n\nOne more restart.";
+
+        assert_eq!(
+            rich_markdown_navigation_text(source),
+            "I updated discord-canary.desktop to inject:\nXDG_SESSION_TYPE=wayland\nOne more restart."
         );
     }
 
