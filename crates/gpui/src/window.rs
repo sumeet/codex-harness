@@ -10,17 +10,17 @@ use crate::{
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
     Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
-    WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
-    transparent_black,
+    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, NestedScrollCoordinator, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, ScrollNodeId, ScrollNodeRequest,
+    Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, px, rems, size, transparent_black,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1161,6 +1161,7 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    nested_scroll: NestedScrollCoordinator,
     /// Set by a nested scroll surface when an in-flight precise gesture has
     /// reached its bound. Only then may an ancestor that did not receive the
     /// gesture's `Started` event adopt the remaining gesture. This is reset
@@ -1853,6 +1854,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            nested_scroll: NestedScrollCoordinator::default(),
             scroll_chain_allowed: false,
             modifiers,
             capslock,
@@ -2786,6 +2788,59 @@ impl Window {
     /// to an ancestor at its bound.
     pub fn scroll_chain_allowed(&self) -> bool {
         self.scroll_chain_allowed
+    }
+
+    pub(crate) fn request_coordinated_scroll(
+        &mut self,
+        node: ScrollNodeId,
+        under_pointer: bool,
+    ) -> ScrollNodeRequest {
+        self.nested_scroll.request(node, under_pointer)
+    }
+
+    pub(crate) fn report_coordinated_scroll(
+        &mut self,
+        node: ScrollNodeId,
+        requested: Point<Pixels>,
+        applied: Point<Pixels>,
+        boundary_confirmed: bool,
+    ) {
+        self.nested_scroll.report_consumed_with_boundary(
+            node,
+            requested,
+            applied,
+            boundary_confirmed,
+        );
+    }
+
+    pub(crate) fn coordinated_scroll_claimed(&self) -> bool {
+        self.nested_scroll.event_claimed()
+    }
+
+    pub(crate) fn dispatch_coordinated_momentum(
+        &mut self,
+        owner: ScrollNodeId,
+        delta: Point<Pixels>,
+        cx: &mut App,
+    ) -> Point<Pixels> {
+        if !self.nested_scroll.begin_momentum_dispatch(owner, delta) {
+            return Point::default();
+        }
+        let event = crate::ScrollWheelEvent {
+            position: self.mouse_position,
+            event_time: None,
+            delta: crate::ScrollDelta::Pixels(delta),
+            modifiers: self.modifiers,
+            touch_phase: crate::TouchPhase::Moved,
+            synthesize_momentum: false,
+        };
+        self.dispatch_mouse_event(&event, cx);
+        self.nested_scroll.take_completed_applied()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_nested_scroll_policy_for_test(&mut self, policy: crate::NestedScrollPolicy) {
+        self.nested_scroll.set_policy(policy);
     }
 
     /// Captures the pointer for the given hitbox. While captured, all mouse move and mouse up
@@ -5145,6 +5200,20 @@ impl Window {
             self.reset_cursor_style(cx);
         }
 
+        if let Some(event) = event.downcast_ref::<crate::ScrollWheelEvent>()
+            && !self.nested_scroll.dispatch_active()
+        {
+            let now = event
+                .event_time
+                .unwrap_or_else(|| cx.background_executor().now());
+            self.nested_scroll.begin_dispatch(
+                event,
+                event.delta.pixel_delta(self.line_height()),
+                now,
+                self.scale_factor,
+            );
+        }
+
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {
             self.handle_inspector_mouse_event(event, cx);
@@ -5176,6 +5245,10 @@ impl Window {
         }
 
         self.rendered_frame.mouse_listeners = mouse_listeners;
+
+        if event.is::<crate::ScrollWheelEvent>() {
+            self.nested_scroll.finish_dispatch();
+        }
 
         if cx.has_active_drag() {
             if event.is::<MouseMoveEvent>() {

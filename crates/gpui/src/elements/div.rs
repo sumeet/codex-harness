@@ -23,9 +23,9 @@ use crate::{
     KeyboardClickEvent, KineticScroll, LayoutId, ModifiersChangedEvent, MouseButton,
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PinchEvent, Pixels, Point, Render,
-    ScrollDelta, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
-    TooltipId, TouchPhase, Visibility, Window, WindowControlArea, point, px,
-    schedule_kinetic_scroll_frame, size,
+    ScrollDelta, ScrollNodeId, ScrollNodeRequest, ScrollWheelEvent, SharedString, Size, Style,
+    StyleRefinement, Styled, Task, TooltipId, TouchPhase, Visibility, Window, WindowControlArea,
+    point, px, schedule_kinetic_scroll_frame, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -111,45 +111,29 @@ fn apply_div_scroll_delta(
 }
 
 fn schedule_div_kinetic_scroll(
-    scroll_offset: Rc<RefCell<Point<Pixels>>>,
     scroll_kinetics: Rc<RefCell<DivScrollKinetics>>,
+    scroll_node_id: ScrollNodeId,
     generation: u64,
-    current_view: EntityId,
     window: &mut Window,
 ) {
     schedule_kinetic_scroll_frame(window, move |now, window, cx| {
         let tuning = div_scroll_tuning(cx);
-        let Some((step, max_offset, overflow)) = ({
+        let Some(step) = ({
             let mut scroll_kinetics = scroll_kinetics.borrow_mut();
-            let step = scroll_kinetics
+            scroll_kinetics
                 .kinetic_scroll
-                .frame_at(generation, now, tuning);
-            step.map(|step| (step, scroll_kinetics.max_offset, scroll_kinetics.overflow))
+                .frame_at(generation, now, tuning)
         }) else {
             return;
         };
-        let consumed = apply_div_scroll_delta(
-            &mut scroll_offset.borrow_mut(),
-            step.delta,
-            max_offset,
-            overflow,
-        );
-        if !consumed.is_zero() {
-            cx.notify(current_view);
-        }
+        let consumed = window.dispatch_coordinated_momentum(scroll_node_id, step.delta, cx);
         let continues = step.continues
             && scroll_kinetics
                 .borrow_mut()
                 .kinetic_scroll
                 .consume(generation, step.delta, consumed);
         if continues {
-            schedule_div_kinetic_scroll(
-                scroll_offset,
-                scroll_kinetics,
-                generation,
-                current_view,
-                window,
-            );
+            schedule_div_kinetic_scroll(scroll_kinetics, scroll_node_id, generation, window);
         }
     });
 }
@@ -2825,6 +2809,9 @@ impl Interactivity {
         for listener in self.scroll_wheel_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                if phase == DispatchPhase::Bubble && window.coordinated_scroll_claimed() {
+                    return;
+                }
                 listener(event, phase, &hitbox, window, cx);
             })
         }
@@ -3324,14 +3311,18 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let scroll_node_id = scroll_kinetics
+                .as_ref()
+                .map(|state| ScrollNodeId(Rc::as_ptr(state) as usize))
+                .unwrap_or_else(|| ScrollNodeId(Rc::as_ptr(&scroll_offset) as usize));
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
-                    let synthesize_momentum = div_event_synthesizes_momentum(event);
-                    let animation_now = cx.background_executor().now();
-                    let now = event.event_time.unwrap_or(animation_now);
-                    let tuning = div_scroll_tuning(cx);
-
-                    if event.touch_phase == TouchPhase::Cancelled {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let under_pointer = hitbox.should_handle_scroll(window);
+                match window.request_coordinated_scroll(scroll_node_id, under_pointer) {
+                    ScrollNodeRequest::None => {}
+                    ScrollNodeRequest::Cancel => {
                         if let Some(ongoing_scroll) = &ongoing_scroll {
                             let mut delta = event.delta.pixel_delta(line_height);
                             ongoing_scroll
@@ -3341,32 +3332,12 @@ impl Interactivity {
                         if let Some(scroll_kinetics) = &scroll_kinetics {
                             scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
                         }
-                        return;
                     }
-
-                    if let Some(scroll_kinetics) = &scroll_kinetics {
-                        if synthesize_momentum {
-                            if event.touch_phase == TouchPhase::Started {
-                                scroll_kinetics.borrow_mut().kinetic_scroll.begin_at(now);
-                            } else if !scroll_kinetics.borrow().kinetic_scroll.is_recording() {
-                                // Precise gestures are latched to the surface
-                                // that consumed their Started event. A nested
-                                // surface that later moves beneath the fixed
-                                // pointer must not steal the gesture. It may
-                                // adopt only when its child explicitly offers
-                                // edge chaining for this event.
-                                if window.scroll_chain_allowed() {
-                                    scroll_kinetics.borrow_mut().kinetic_scroll.begin_at(now);
-                                } else {
-                                    return;
-                                }
-                            }
-                        } else {
-                            scroll_kinetics.borrow_mut().kinetic_scroll.cancel();
-                        }
-                    }
-
-                    if event.is_lifecycle_only() {
+                    ScrollNodeRequest::Finish => {
+                        let synthesize_momentum = div_event_synthesizes_momentum(event);
+                        let animation_now = cx.background_executor().now();
+                        let now = event.event_time.unwrap_or(animation_now);
+                        let tuning = div_scroll_tuning(cx);
                         if let Some(ongoing_scroll) = &ongoing_scroll {
                             let mut delta = event.delta.pixel_delta(line_height);
                             ongoing_scroll
@@ -3382,81 +3353,115 @@ impl Interactivity {
                                 .finish_at(now, animation_now, tuning)
                         {
                             schedule_div_kinetic_scroll(
-                                scroll_offset.clone(),
                                 scroll_kinetics.clone(),
+                                scroll_node_id,
                                 generation,
-                                current_view,
                                 window,
                             );
                         }
-                        return;
                     }
-                    let mut delta = event.delta.pixel_delta(line_height);
-
-                    if restrict_scroll_to_axis
-                        && event.delta.precise()
-                        && let Some(ongoing_scroll) = &ongoing_scroll
-                    {
-                        ongoing_scroll
-                            .borrow_mut()
-                            .filter(&mut delta, event.touch_phase);
-                    }
-
-                    let requested = div_scroll_delta(
-                        delta,
-                        overflow,
-                        allow_concurrent_scroll,
-                        restrict_scroll_to_axis,
-                    );
-                    let max_offset = scroll_kinetics
-                        .as_ref()
-                        .map(|state| state.borrow().max_offset)
-                        .unwrap_or_default();
-                    let consumed = apply_div_scroll_delta(
-                        &mut scroll_offset.borrow_mut(),
-                        requested,
-                        max_offset,
-                        overflow,
-                    );
-                    if !consumed.is_zero() {
-                        cx.notify(current_view);
-                        cx.stop_propagation();
-                    }
-
-                    let generation = if synthesize_momentum {
-                        scroll_kinetics.as_ref().and_then(|scroll_kinetics| {
-                            let mut scroll_kinetics = scroll_kinetics.borrow_mut();
-                            if consumed.is_zero() {
-                                scroll_kinetics.kinetic_scroll.cancel();
-                                window.allow_scroll_chain();
-                            } else {
-                                scroll_kinetics
-                                    .kinetic_scroll
-                                    .record_movement_at(consumed, now);
-                            }
-                            (event.touch_phase == TouchPhase::Ended)
-                                .then(|| {
-                                    scroll_kinetics.kinetic_scroll.finish_at(
-                                        now,
-                                        animation_now,
-                                        tuning,
-                                    )
-                                })
-                                .flatten()
-                        })
-                    } else {
-                        None
-                    };
-                    if let (Some(generation), Some(scroll_kinetics)) =
-                        (generation, scroll_kinetics.as_ref())
-                    {
-                        schedule_div_kinetic_scroll(
-                            scroll_offset.clone(),
-                            scroll_kinetics.clone(),
-                            generation,
-                            current_view,
-                            window,
+                    ScrollNodeRequest::Momentum(delta) => {
+                        let requested = div_scroll_delta(
+                            delta,
+                            overflow,
+                            allow_concurrent_scroll,
+                            restrict_scroll_to_axis,
                         );
+                        let max_offset = scroll_kinetics
+                            .as_ref()
+                            .map(|state| state.borrow().max_offset)
+                            .unwrap_or_default();
+                        let consumed = apply_div_scroll_delta(
+                            &mut scroll_offset.borrow_mut(),
+                            requested,
+                            max_offset,
+                            overflow,
+                        );
+                        window.report_coordinated_scroll(scroll_node_id, delta, consumed, true);
+                        if !consumed.is_zero() {
+                            cx.notify(current_view);
+                        }
+                    }
+                    ScrollNodeRequest::Scroll(mut delta) => {
+                        let coordinated_delta = delta;
+                        let synthesize_momentum = div_event_synthesizes_momentum(event);
+                        let animation_now = cx.background_executor().now();
+                        let now = event.event_time.unwrap_or(animation_now);
+                        let tuning = div_scroll_tuning(cx);
+                        if restrict_scroll_to_axis
+                            && event.delta.precise()
+                            && let Some(ongoing_scroll) = &ongoing_scroll
+                        {
+                            ongoing_scroll
+                                .borrow_mut()
+                                .filter(&mut delta, event.touch_phase);
+                        }
+                        let requested = div_scroll_delta(
+                            delta,
+                            overflow,
+                            allow_concurrent_scroll,
+                            restrict_scroll_to_axis,
+                        );
+                        if let Some(scroll_kinetics) = &scroll_kinetics {
+                            let mut scroll_kinetics = scroll_kinetics.borrow_mut();
+                            if synthesize_momentum {
+                                if !scroll_kinetics.kinetic_scroll.is_recording() {
+                                    scroll_kinetics.kinetic_scroll.begin_at(now);
+                                }
+                            } else {
+                                scroll_kinetics.kinetic_scroll.cancel();
+                            }
+                        }
+                        let max_offset = scroll_kinetics
+                            .as_ref()
+                            .map(|state| state.borrow().max_offset)
+                            .unwrap_or_default();
+                        let consumed = apply_div_scroll_delta(
+                            &mut scroll_offset.borrow_mut(),
+                            requested,
+                            max_offset,
+                            overflow,
+                        );
+                        window.report_coordinated_scroll(
+                            scroll_node_id,
+                            coordinated_delta,
+                            consumed,
+                            true,
+                        );
+                        if !consumed.is_zero() {
+                            cx.notify(current_view);
+                        }
+                        let generation = if synthesize_momentum {
+                            scroll_kinetics.as_ref().and_then(|scroll_kinetics| {
+                                let mut scroll_kinetics = scroll_kinetics.borrow_mut();
+                                if !consumed.is_zero() {
+                                    scroll_kinetics
+                                        .kinetic_scroll
+                                        .record_movement_at(consumed, now);
+                                }
+                                (event.touch_phase == TouchPhase::Ended)
+                                    .then(|| {
+                                        scroll_kinetics.kinetic_scroll.finish_at(
+                                            now,
+                                            animation_now,
+                                            tuning,
+                                        )
+                                    })
+                                    .flatten()
+                            })
+                        } else {
+                            None
+                        };
+                        if let (Some(generation), Some(scroll_kinetics)) =
+                            (generation, scroll_kinetics.as_ref())
+                        {
+                            schedule_div_kinetic_scroll(
+                                scroll_kinetics.clone(),
+                                scroll_node_id,
+                                generation,
+                                window,
+                            );
+                        }
                     }
                 }
             });

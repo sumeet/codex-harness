@@ -10,9 +10,9 @@
 use crate::{
     AnyElement, App, AvailableSpace, Bounds, ContentMask, DispatchPhase, Edges, Element, EntityId,
     FocusHandle, GestureTuning, GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId,
-    IntoElement, IsZero, KineticScroll, Overflow, Pixels, Point, ScrollDelta, ScrollWheelEvent,
-    Size, Style, StyleRefinement, Styled, TouchPhase, Window, point, px,
-    schedule_kinetic_scroll_frame, size,
+    IntoElement, IsZero, KineticScroll, Overflow, Pixels, Point, ScrollDelta, ScrollNodeId,
+    ScrollNodeRequest, ScrollWheelEvent, Size, Style, StyleRefinement, Styled, TouchPhase, Window,
+    point, px, schedule_kinetic_scroll_frame, size,
 };
 use collections::VecDeque;
 use refineable::Refineable as _;
@@ -32,6 +32,14 @@ const SLOW_LIST_ITEM_THRESHOLD: Duration = Duration::from_millis(4);
 fn slow_list_diagnostics() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         std::env::var_os("GPUI_SLOW_LIST_DIAGNOSTICS")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+    });
+    *ENABLED
+}
+
+fn nested_scroll_diagnostics() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var_os("GPUI_NESTED_SCROLL_TRACE")
             .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
     });
     *ENABLED
@@ -89,30 +97,28 @@ fn list_event_synthesizes_momentum(event: &ScrollWheelEvent) -> bool {
 
 fn schedule_list_kinetic_scroll(
     list_state: ListState,
+    scroll_node_id: ScrollNodeId,
     generation: u64,
-    current_view: EntityId,
     window: &mut Window,
 ) {
     schedule_kinetic_scroll_frame(window, move |now, window, cx| {
         let tuning = kinetic_scroll_tuning(cx);
-        let continues = {
+        let step = {
             let state = &mut *list_state.0.borrow_mut();
             let Some(step) = state.kinetic_scroll.frame_at(generation, now, tuning) else {
                 return;
             };
-            let Some(height) = state.last_layout_bounds.map(|bounds| bounds.size.height) else {
-                state.kinetic_scroll.cancel();
-                return;
-            };
-            let scroll_top = state.logical_scroll_top();
-            let consumed = state.scroll(&scroll_top, height, step.delta, current_view, window, cx);
-            step.continues
-                && state
-                    .kinetic_scroll
-                    .consume(generation, step.delta, consumed)
+            step
         };
+        let consumed = window.dispatch_coordinated_momentum(scroll_node_id, step.delta, cx);
+        let continues = step.continues
+            && list_state
+                .0
+                .borrow_mut()
+                .kinetic_scroll
+                .consume(generation, step.delta, consumed);
         if continues {
-            schedule_list_kinetic_scroll(list_state, generation, current_view, window);
+            schedule_list_kinetic_scroll(list_state, scroll_node_id, generation, window);
         }
     });
 }
@@ -133,6 +139,7 @@ struct StateInner {
     last_padding: Option<Edges<Pixels>>,
     items: SumTree<ListItem>,
     logical_scroll_top: Option<ListOffset>,
+    last_layout_scroll_top: Option<ListOffset>,
     alignment: ListAlignment,
     overdraw: Pixels,
     reset: bool,
@@ -143,6 +150,11 @@ struct StateInner {
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
     kinetic_scroll: KineticScroll,
+}
+
+struct ListScrollResult {
+    applied: Point<Pixels>,
+    boundary_confirmed: bool,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -388,6 +400,7 @@ impl ListState {
             last_padding: None,
             items: SumTree::default(),
             logical_scroll_top: None,
+            last_layout_scroll_top: None,
             alignment,
             overdraw,
             scroll_handler: None,
@@ -436,6 +449,7 @@ impl ListState {
             state.reset = true;
             state.measuring_behavior.reset();
             state.logical_scroll_top = None;
+            state.last_layout_scroll_top = None;
             state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
             state.kinetic_scroll.cancel();
@@ -470,6 +484,7 @@ impl ListState {
         let mut tree = SumTree::default();
         tree.extend(new_items, ());
         state.items = tree;
+        state.last_layout_scroll_top = None;
     }
 
     /// Remeasure all items while preserving proportional scroll position.
@@ -550,6 +565,7 @@ impl ListState {
             new_items
         };
         state.items = new_items;
+        state.last_layout_scroll_top = None;
         state.measuring_behavior.reset();
     }
 
@@ -612,6 +628,7 @@ impl ListState {
         new_items.append(old_items.suffix(), ());
         drop(old_items);
         state.items = new_items;
+        state.last_layout_scroll_top = None;
 
         if let Some(ListOffset {
             item_ix,
@@ -931,6 +948,17 @@ impl ListState {
 }
 
 impl StateInner {
+    fn boundary_is_confirmed(&self, delta: Point<Pixels>) -> bool {
+        if delta.y >= px(0.) {
+            return true;
+        }
+
+        let summary = self.items.summary();
+        !summary.has_unknown_height
+            && (summary.unrendered_count == 0
+                || self.last_layout_scroll_top == Some(self.logical_scroll_top()))
+    }
+
     /// Re-anchor a pending scroll adjustment from a remeasure onto a newly set
     /// scroll position, so it clamps to the remeasured item's new height on
     /// the next layout instead of reverting the scroll.
@@ -986,28 +1014,31 @@ impl StateInner {
 
     fn scroll(
         &mut self,
-        scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
-    ) -> Point<Pixels> {
+    ) -> ListScrollResult {
         // Drop scroll events after a reset, since we can't calculate
         // the new logical scroll top without the item heights
         if self.reset {
-            return Point::default();
+            return ListScrollResult {
+                applied: Point::default(),
+                boundary_confirmed: false,
+            };
         }
 
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
         let previous_scroll_top = self.scroll_top(&self.logical_scroll_top());
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
+        let new_scroll_top = (previous_scroll_top - delta.y).max(px(0.)).min(scroll_max);
         if new_scroll_top == previous_scroll_top {
-            return Point::default();
+            return ListScrollResult {
+                applied: Point::default(),
+                boundary_confirmed: self.boundary_is_confirmed(delta),
+            };
         }
 
         if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
@@ -1051,7 +1082,10 @@ impl StateInner {
         }
 
         cx.notify(current_view);
-        point(px(0.), previous_scroll_top - new_scroll_top)
+        ListScrollResult {
+            applied: point(px(0.), previous_scroll_top - new_scroll_top),
+            boundary_confirmed: self.boundary_is_confirmed(delta),
+        }
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1577,7 +1611,7 @@ impl std::fmt::Debug for ListItem {
 
 /// An offset into the list's items, in terms of the item index and the number
 /// of pixels off the top left of the item.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ListOffset {
     /// The index of an item in the list
     pub item_ix: usize,
@@ -1696,7 +1730,7 @@ impl Element for List {
         {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
-                    size_hint: None,
+                    size_hint: item.size_hint(),
                     focus_handle: item.focus_handle(),
                 }),
                 (),
@@ -1722,6 +1756,7 @@ impl Element for List {
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
+        state.last_layout_scroll_top = Some(layout.scroll_top);
         let result = ListPrepaintState { hitbox, layout };
         window.record_prepaint_component(
             crate::PrepaintComponent::List,
@@ -1749,42 +1784,32 @@ impl Element for List {
         // div-based scroll containers.
         let list_state = self.state.clone();
         let height = bounds.size.height;
-        let scroll_top = prepaint.layout.scroll_top;
         let hitbox_id = prepaint.hitbox.id;
-        let mut accumulated_scroll_delta = ScrollDelta::default();
+        let scroll_node_id = ScrollNodeId(Rc::as_ptr(&list_state.0) as usize);
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-            if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                let synthesize_momentum = list_event_synthesizes_momentum(event);
-                let tuning = kinetic_scroll_tuning(cx);
-                let animation_now = cx.background_executor().now();
-                let now = event.event_time.unwrap_or(animation_now);
-
-                if event.touch_phase == TouchPhase::Cancelled {
-                    list_state.0.borrow_mut().kinetic_scroll.cancel();
-                    return;
-                }
-                if synthesize_momentum {
-                    if event.touch_phase == TouchPhase::Started {
-                        accumulated_scroll_delta = ScrollDelta::default();
-                        list_state.0.borrow_mut().kinetic_scroll.begin_at(now);
-                    } else if !list_state.0.borrow().kinetic_scroll.is_recording() {
-                        if window.scroll_chain_allowed() {
-                            accumulated_scroll_delta = ScrollDelta::default();
-                            list_state.0.borrow_mut().kinetic_scroll.begin_at(now);
-                        } else {
-                            // A precise gesture belongs to the surface that
-                            // consumed its Started event. Do not let a list
-                            // that later moves under the pointer steal it.
-                            return;
-                        }
-                    }
-                } else {
+            if phase != DispatchPhase::Bubble {
+                return;
+            }
+            let under_pointer = hitbox_id.should_handle_scroll(window);
+            let request = window.request_coordinated_scroll(scroll_node_id, under_pointer);
+            if nested_scroll_diagnostics() {
+                let state = list_state.0.borrow();
+                eprintln!(
+                    "nested-scroll list={} node={scroll_node_id:?} under_pointer={under_pointer} phase={:?} request={request:?}",
+                    state.diagnostics_name.as_deref().unwrap_or("unnamed"),
+                    event.touch_phase,
+                );
+            }
+            match request {
+                ScrollNodeRequest::None => {}
+                ScrollNodeRequest::Cancel => {
                     list_state.0.borrow_mut().kinetic_scroll.cancel();
                 }
-
-                if event.is_lifecycle_only() {
-                    if synthesize_momentum
-                        && event.touch_phase == TouchPhase::Ended
+                ScrollNodeRequest::Finish => {
+                    let tuning = kinetic_scroll_tuning(cx);
+                    let animation_now = cx.background_executor().now();
+                    let now = event.event_time.unwrap_or(animation_now);
+                    if list_event_synthesizes_momentum(event)
                         && let Some(generation) = list_state
                             .0
                             .borrow_mut()
@@ -1793,44 +1818,87 @@ impl Element for List {
                     {
                         schedule_list_kinetic_scroll(
                             list_state.clone(),
+                            scroll_node_id,
                             generation,
-                            current_view,
                             window,
                         );
                     }
-                    return;
                 }
-
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
-                let generation = {
-                    let state = &mut *list_state.0.borrow_mut();
-                    let consumed =
-                        state.scroll(&scroll_top, height, pixel_delta, current_view, window, cx);
-                    if !consumed.is_zero() {
-                        cx.stop_propagation();
-                    }
-                    if synthesize_momentum {
-                        if consumed.is_zero() {
-                            state.kinetic_scroll.cancel();
-                            window.allow_scroll_chain();
-                        } else {
-                            state
-                                .kinetic_scroll
-                                .record_movement_at(point(px(0.), consumed.y), now);
-                        }
-                    }
-                    (synthesize_momentum && event.touch_phase == TouchPhase::Ended)
-                        .then(|| state.kinetic_scroll.finish_at(now, animation_now, tuning))
-                        .flatten()
-                };
-                if let Some(generation) = generation {
-                    schedule_list_kinetic_scroll(
-                        list_state.clone(),
-                        generation,
+                ScrollNodeRequest::Momentum(pixel_delta) => {
+                    let result = list_state.0.borrow_mut().scroll(
+                        height,
+                        pixel_delta,
                         current_view,
                         window,
+                        cx,
                     );
+                    window.report_coordinated_scroll(
+                        scroll_node_id,
+                        pixel_delta,
+                        result.applied,
+                        result.boundary_confirmed,
+                    );
+                }
+                ScrollNodeRequest::Scroll(pixel_delta) => {
+                    let synthesize_momentum = list_event_synthesizes_momentum(event);
+                    let tuning = kinetic_scroll_tuning(cx);
+                    let animation_now = cx.background_executor().now();
+                    let now = event.event_time.unwrap_or(animation_now);
+                    let mut state = list_state.0.borrow_mut();
+                    if synthesize_momentum {
+                        if !state.kinetic_scroll.is_recording() {
+                            state.kinetic_scroll.begin_at(now);
+                        }
+                    } else {
+                        state.kinetic_scroll.cancel();
+                    }
+                    let result = state.scroll(height, pixel_delta, current_view, window, cx);
+                    if nested_scroll_diagnostics() {
+                        let summary = state.items.summary();
+                        let padding = state.last_padding.unwrap_or_default();
+                        let maximum =
+                            (summary.height + padding.top + padding.bottom - height).max(px(0.));
+                        let logical = state.logical_scroll_top();
+                        eprintln!(
+                            "nested-scroll applied list={} requested_y={} consumed_y={} remainder_y={} boundary_confirmed={} logical={}:{} content_height={} viewport_height={} maximum={} rendered={} unrendered={}",
+                            state.diagnostics_name.as_deref().unwrap_or("unnamed"),
+                            pixel_delta.y.as_f32(),
+                            result.applied.y.as_f32(),
+                            (pixel_delta.y - result.applied.y).as_f32(),
+                            result.boundary_confirmed,
+                            logical.item_ix,
+                            logical.offset_in_item.as_f32(),
+                            summary.height.as_f32(),
+                            height.as_f32(),
+                            maximum.as_f32(),
+                            summary.rendered_count,
+                            summary.unrendered_count,
+                        );
+                    }
+                    window.report_coordinated_scroll(
+                        scroll_node_id,
+                        pixel_delta,
+                        result.applied,
+                        result.boundary_confirmed,
+                    );
+                    if synthesize_momentum && !result.applied.is_zero() {
+                        state
+                            .kinetic_scroll
+                            .record_movement_at(point(px(0.), result.applied.y), now);
+                    }
+                    let generation = (synthesize_momentum
+                        && event.touch_phase == TouchPhase::Ended)
+                        .then(|| state.kinetic_scroll.finish_at(now, animation_now, tuning))
+                        .flatten();
+                    drop(state);
+                    if let Some(generation) = generation {
+                        schedule_list_kinetic_scroll(
+                            list_state.clone(),
+                            scroll_node_id,
+                            generation,
+                            window,
+                        );
+                    }
                 }
             }
         });
@@ -2409,14 +2477,254 @@ mod test {
         assert_eq!(list_state.logical_scroll_top().offset_in_item, px(0.));
 
         cx.simulate_event(movement(-1_000., TouchPhase::Moved));
+        let outer_after_boundary = list_state.logical_scroll_top();
+        assert!(
+            outer_after_boundary.item_ix > 2 || outer_after_boundary.offset_in_item > px(0.),
+            "continuous-outward policy applies the child's exact boundary remainder to its parent"
+        );
         cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
             view.into_any_element()
         });
-        cx.simulate_event(movement(-10., TouchPhase::Moved));
+        let before_next_event = list_state.logical_scroll_top();
+        let child_at_boundary = inner_handle.offset();
+        cx.simulate_event(movement(10., TouchPhase::Moved));
+        assert_ne!(
+            list_state.logical_scroll_top(),
+            before_next_event,
+            "direction reversal stays with the outward parent owner"
+        );
+        assert_eq!(inner_handle.offset(), child_at_boundary);
+    }
+
+    #[gpui::test]
+    fn virtualized_wrapped_child_confirms_its_boundary_before_handing_off(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let outer = ListState::new(20, crate::ListAlignment::Top, px(400.)).measure_all();
+        let inner = ListState::new(100, crate::ListAlignment::Top, px(240.))
+            .with_uniform_item_height(px(20.));
+
+        struct TestView {
+            outer: ListState,
+            inner: ListState,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.outer.clone(), move |index, _, _| {
+                    if index == 0 {
+                        list(inner.clone(), |_, _, _| {
+                            div().h(px(40.)).w_full().into_any()
+                        })
+                        .with_sizing_behavior(crate::ListSizingBehavior::Infer)
+                        .max_h(px(280.))
+                        .into_any()
+                    } else {
+                        div().h(px(40.)).w_full().into_any()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                outer: outer.clone(),
+                inner: inner.clone(),
+            })
+        });
+        let viewport = size(px(600.), px(400.));
+        cx.draw(point(px(0.), px(0.)), viewport, |_, _| {
+            view.clone().into_any_element()
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(300.), px(140.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+            touch_phase: TouchPhase::Started,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+
         assert_eq!(
-            list_state.logical_scroll_top().offset_in_item,
-            px(10.),
-            "once the owning child reaches its edge, its ancestor adopts the gesture"
+            outer.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "an estimated virtual boundary must not eject the gesture into the parent"
+        );
+        cx.draw(point(px(0.), px(0.)), viewport, |_, _| {
+            view.clone().into_any_element()
+        });
+        assert_eq!(
+            inner.is_scrolled_to_end(),
+            Some(false),
+            "measuring wrapped rows should expose the content hidden beyond the estimate"
+        );
+
+        for _ in 0..16 {
+            if inner.is_scrolled_to_end() == Some(true) {
+                break;
+            }
+            cx.simulate_event(ScrollWheelEvent {
+                position: point(px(300.), px(140.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+                touch_phase: TouchPhase::Moved,
+                synthesize_momentum: true,
+                ..Default::default()
+            });
+            assert_eq!(
+                outer.logical_scroll_top(),
+                crate::ListOffset::default(),
+                "the parent must remain fixed while wrapped child rows are still being measured"
+            );
+            cx.draw(point(px(0.), px(0.)), viewport, |_, _| {
+                view.clone().into_any_element()
+            });
+        }
+        assert_eq!(inner.is_scrolled_to_end(), Some(true));
+        let final_row = inner
+            .bounds_for_item(99)
+            .expect("the final row should be rendered at the confirmed boundary");
+        assert!(final_row.bottom() <= px(280.));
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(300.), px(140.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-20.))),
+            touch_phase: TouchPhase::Moved,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+        assert_ne!(
+            outer.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "only a boundary confirmed by layout may hand the gesture to the parent"
+        );
+    }
+
+    #[gpui::test]
+    fn virtualized_child_with_unknown_heights_does_not_hand_off_at_an_apparent_boundary(
+        cx: &mut TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        let outer = ListState::new(20, crate::ListAlignment::Top, px(400.)).measure_all();
+        let inner = ListState::new(100, crate::ListAlignment::Top, px(240.));
+
+        struct TestView {
+            outer: ListState,
+            inner: ListState,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.outer.clone(), move |index, _, _| {
+                    if index == 0 {
+                        list(inner.clone(), |_, _, _| {
+                            div().h(px(40.)).w_full().into_any()
+                        })
+                        .h(px(280.))
+                        .into_any()
+                    } else {
+                        div().h(px(40.)).w_full().into_any()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                outer: outer.clone(),
+                inner: inner.clone(),
+            })
+        });
+        let viewport = size(px(600.), px(400.));
+        cx.draw(point(px(0.), px(0.)), viewport, |_, _| {
+            view.clone().into_any_element()
+        });
+
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(300.), px(140.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-10_000.))),
+            touch_phase: TouchPhase::Started,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            outer.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "unknown row heights must not make an estimated child boundary eject the gesture"
+        );
+        assert_ne!(
+            inner.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "the nested list should consume the gesture while its boundary is provisional"
+        );
+    }
+
+    #[gpui::test]
+    fn sticky_nested_div_requires_a_new_gesture_before_the_parent_moves(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            window.set_nested_scroll_policy_for_test(crate::NestedScrollPolicy::StickyVisibleOwner);
+        });
+        let list_state = ListState::new(20, crate::ListAlignment::Top, px(20.)).measure_all();
+        let inner_handle = ScrollHandle::new();
+
+        struct TestView {
+            list: ListState,
+            inner: ScrollHandle,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.list.clone(), move |ix, _, _| {
+                    if ix == 0 {
+                        div()
+                            .id("sticky-nested-div")
+                            .h(px(20.))
+                            .w_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&inner)
+                            .child(div().h(px(200.)).w_full().flex_none())
+                            .into_any()
+                    } else {
+                        div().h(px(20.)).w_full().into_any()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                list: list_state.clone(),
+                inner: inner_handle.clone(),
+            })
+        });
+        let movement = |distance, touch_phase| ScrollWheelEvent {
+            position: point(px(50.), px(10.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(distance))),
+            touch_phase,
+            synthesize_momentum: true,
+            ..Default::default()
+        };
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+
+        cx.simulate_event(movement(-10., TouchPhase::Started));
+        assert_eq!(inner_handle.offset().y, px(-10.));
+        cx.simulate_event(movement(-1_000., TouchPhase::Moved));
+        assert_eq!(
+            list_state.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "a visibly moving sticky child discards its boundary remainder"
+        );
+        let child_at_boundary = inner_handle.offset();
+        cx.simulate_event(movement(10., TouchPhase::Moved));
+        assert!(inner_handle.offset().y > child_at_boundary.y);
+        assert_eq!(
+            list_state.logical_scroll_top(),
+            crate::ListOffset::default()
         );
     }
 
