@@ -860,6 +860,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draws_immediately_after_input(&self) -> bool {
         false
     }
+    /// Enqueues synthetic input through the platform callback path.
+    ///
+    /// This is intended for end-to-end performance diagnostics that must
+    /// exercise the same immediate-draw scheduling as physical input. Most
+    /// platform implementations leave this unsupported.
+    #[doc(hidden)]
+    fn enqueue_input_for_diagnostics(&self, _input: PlatformInput) {}
     /// Whether this window reports actual scanout feedback asynchronously.
     fn reports_actual_presentation(&self) -> bool {
         false

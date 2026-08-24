@@ -866,6 +866,9 @@ pub struct FrameDurationSnapshot {
     /// frames, in nanoseconds. Empty on platforms without presentation
     /// feedback.
     pub compositor_refresh_interval_histogram: Histogram<u64>,
+    /// Time from handing a frame to the platform renderer until the
+    /// compositor reports that frame as visible.
+    pub submission_to_present_histogram: Histogram<u64>,
 }
 
 /// A point-in-time snapshot of the input-latency histograms for a window,
@@ -919,6 +922,7 @@ pub struct WindowProfiler {
     input_driven_present_interval_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
     compositor_refresh_interval_histogram: Histogram<u64>,
+    submission_to_present_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
     pending_input_count: u64,
     input_latency_histogram: Histogram<u64>,
@@ -941,6 +945,7 @@ pub struct WindowProfiler {
 #[cfg(feature = "profiler")]
 struct PendingPresentation {
     generation: u64,
+    submitted_at: Instant,
     first_input_at: Option<Instant>,
     input_count: u64,
     drew: bool,
@@ -1010,6 +1015,9 @@ impl WindowProfiler {
             })?,
             compositor_refresh_interval_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create compositor refresh interval histogram: {error}")
+            })?,
+            submission_to_present_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create submission-to-present histogram: {error}")
             })?,
             first_input_at: None,
             pending_input_count: 0,
@@ -1179,6 +1187,11 @@ impl WindowProfiler {
                 presented_at,
                 refresh_interval,
             } => {
+                if let Some(latency) = presented_at.checked_duration_since(pending.submitted_at) {
+                    self.submission_to_present_histogram
+                        .record(latency.as_nanos() as u64)
+                        .ok();
+                }
                 if let Some(discarded) = self.discarded_first_input_at.take() {
                     pending.first_input_at = Some(
                         pending
@@ -1242,6 +1255,7 @@ impl WindowProfiler {
             compositor_refresh_interval_histogram: self
                 .compositor_refresh_interval_histogram
                 .clone(),
+            submission_to_present_histogram: self.submission_to_present_histogram.clone(),
         }
     }
 
@@ -1294,6 +1308,7 @@ impl WindowProfiler {
     ) -> PendingPresentation {
         PendingPresentation {
             generation: self.presentation_generation,
+            submitted_at: Instant::now(),
             first_input_at: self.first_input_at.take(),
             input_count: std::mem::take(&mut self.pending_input_count),
             drew: std::mem::take(&mut self.drew_since_last_present),
@@ -1792,6 +1807,7 @@ mod tests {
         assert_eq!(input.events_per_frame_histogram.len(), 1);
         assert_eq!(input.events_per_frame_histogram.max(), 1);
         assert_eq!(frames.compositor_refresh_interval_histogram.len(), 1);
+        assert_eq!(frames.submission_to_present_histogram.len(), 1);
         assert!(
             frames
                 .compositor_refresh_interval_histogram

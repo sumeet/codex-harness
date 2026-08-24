@@ -13,9 +13,10 @@ use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
     IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState,
-    Render, ScrollHandle, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle,
-    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div,
-    list, point, prelude::*, px, relative, size, uniform_list,
+    Modifiers, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity,
+    Window, WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*,
+    px, relative, size, uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -126,6 +127,9 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
 const PERFORMANCE_J_STEPS: u16 = 240;
+const PERFORMANCE_SCROLL_STEPS: u16 = 360;
+const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
+const PERFORMANCE_SCROLL_SETTLE_DURATION: Duration = Duration::from_millis(1_600);
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 2;
 
@@ -3371,6 +3375,114 @@ impl HarnessApp {
             })
             .detach();
         }
+        if automatic_performance_scroll() {
+            cx.spawn_in(window, async move |this, cx| {
+                let mut active = false;
+                for _ in 0..40 {
+                    active = this
+                        .update_in(cx, |_, window, _| window.is_window_active())
+                        .unwrap_or(false);
+                    if active {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                }
+                if !active {
+                    eprintln!(
+                        "cancelled automatic Harness :perf-scroll run: window stayed inactive"
+                    );
+                    return;
+                }
+
+                if this
+                    .update_in(cx, |this, _, cx| {
+                        this.list_state.pause_following_tail();
+                        this.list_state.scroll_to(gpui::ListOffset {
+                            item_ix: 0,
+                            offset_in_item: px(0.),
+                        });
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor()
+                    // Let startup scrollbar reveal/hide animation finish before
+                    // measuring. Otherwise an unrelated sidebar fade adds
+                    // roughly 48 full-window draws to a three-second scroll.
+                    .timer(PERFORMANCE_SCROLL_SETTLE_DURATION)
+                    .await;
+
+                let position = match this.update_in(cx, |this, window, _| {
+                    this.performance_reporter
+                        .mark_baseline_as(window, ":perf-scroll baseline");
+                    let viewport = this.list_state.viewport_bounds();
+                    point(viewport.origin.x + px(2.), viewport.center().y)
+                }) {
+                    Ok(position) => position,
+                    Err(_) => return,
+                };
+
+                let started_at = Instant::now();
+                for step in 0..PERFORMANCE_SCROLL_STEPS {
+                    let phase = if step == 0 {
+                        TouchPhase::Started
+                    } else {
+                        TouchPhase::Moved
+                    };
+                    if this
+                        .update_in(cx, |_, window, _| {
+                            window.enqueue_platform_input_for_diagnostics(
+                                PlatformInput::ScrollWheel(ScrollWheelEvent {
+                                    position,
+                                    event_time: Some(Instant::now()),
+                                    delta: ScrollDelta::Pixels(point(px(0.), px(-8.))),
+                                    modifiers: Modifiers::default(),
+                                    touch_phase: phase,
+                                    synthesize_momentum: false,
+                                }),
+                            );
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let deadline = started_at + PERFORMANCE_SCROLL_INTERVAL * u32::from(step + 1);
+                    if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                        cx.background_executor().timer(remaining).await;
+                    }
+                }
+                _ = this.update_in(cx, |_, window, _| {
+                    window.enqueue_platform_input_for_diagnostics(PlatformInput::ScrollWheel(
+                        ScrollWheelEvent {
+                            position,
+                            event_time: Some(Instant::now()),
+                            delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                            modifiers: Modifiers::default(),
+                            touch_phase: TouchPhase::Ended,
+                            synthesize_momentum: false,
+                        },
+                    ));
+                });
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                _ = this.update_in(cx, |this, window, _| {
+                    match this.performance_reporter.snapshot_benchmark_report(window) {
+                        Ok(report) => {
+                            eprintln!("completed Harness :perf-scroll run\n{report}")
+                        }
+                        Err(error) => {
+                            eprintln!("failed automatic Harness :perf-scroll report: {error:#}")
+                        }
+                    }
+                });
+            })
+            .detach();
+        }
         if replay_count.is_none() {
             this.connect(cx);
         }
@@ -5783,7 +5895,8 @@ impl HarnessApp {
                 Self::schedule_performance_j_step(generation, window, cx);
             }
             PerformanceJStep::Baseline => {
-                self.performance_reporter.mark_baseline(window);
+                self.performance_reporter
+                    .mark_baseline_as(window, ":perf-j baseline");
                 Self::schedule_performance_j_step(generation, window, cx);
             }
             PerformanceJStep::Dispatch { down } => {
@@ -10755,6 +10868,10 @@ fn replay_count() -> Option<usize> {
 
 fn automatic_performance_j() -> bool {
     std::env::args().any(|argument| argument == "--perf-j")
+}
+
+fn automatic_performance_scroll() -> bool {
+    std::env::args().any(|argument| argument == "--perf-scroll")
 }
 
 enum AutomaticPerformanceCapture {

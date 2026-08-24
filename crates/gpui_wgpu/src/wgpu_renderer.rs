@@ -119,6 +119,9 @@ pub struct WgpuSurfaceConfig {
     /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
     /// blocking in `get_current_texture()` during lifecycle transitions.
     pub preferred_present_mode: Option<wgpu::PresentMode>,
+    /// Maximum number of frames the presentation backend may queue.
+    /// Lower values can reduce latency at the cost of blocking acquisition.
+    pub desired_maximum_frame_latency: Option<u32>,
 }
 
 struct WgpuPipelines {
@@ -420,7 +423,7 @@ impl WgpuRenderer {
                 .preferred_present_mode
                 .filter(|mode| surface_caps.present_modes.contains(mode))
                 .unwrap_or(wgpu::PresentMode::Fifo),
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: config.desired_maximum_frame_latency.unwrap_or(2),
             alpha_mode,
             view_formats: vec![],
         };
@@ -2111,6 +2114,7 @@ impl WgpuRenderer {
             },
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
+            desired_maximum_frame_latency: Some(self.surface_config.desired_maximum_frame_latency),
         };
         let gpu_context = Rc::clone(gpu_context);
         let ctx_ref = gpu_context.borrow();

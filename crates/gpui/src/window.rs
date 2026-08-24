@@ -5191,6 +5191,16 @@ impl Window {
         }
     }
 
+    /// Enqueues synthetic input through the platform's normal input callback.
+    ///
+    /// Unlike [`Self::dispatch_event`], this preserves platform-specific frame
+    /// scheduling such as Wayland's immediate draw after direct manipulation.
+    /// It is only intended for end-to-end performance diagnostics.
+    #[doc(hidden)]
+    pub fn enqueue_platform_input_for_diagnostics(&self, input: PlatformInput) {
+        self.platform_window.enqueue_input_for_diagnostics(input);
+    }
+
     fn promote_external_drag_to_platform(&mut self, event: &PlatformInput, cx: &mut App) {
         let PlatformInput::MouseMove(mouse_move) = event else {
             return;

@@ -13,9 +13,13 @@ pub(crate) struct PerformanceReporter {
 
 impl PerformanceReporter {
     pub(crate) fn mark_baseline(&mut self, window: &mut Window) {
+        self.mark_baseline_as(window, ":perf baseline");
+    }
+
+    pub(crate) fn mark_baseline_as(&mut self, window: &mut Window, label: &'static str) {
         window.begin_performance_measurement();
         self.previous = Some(PerformanceSnapshot::capture(window));
-        self.previous_label = Some(":perf-j baseline");
+        self.previous_label = Some(label);
     }
 
     pub(crate) fn snapshot_report(&mut self, window: &Window) -> Result<String> {
@@ -68,6 +72,7 @@ struct PerformanceSample {
     input_only_editor_prepaint_duration: Histogram<u64>,
     input_driven_input_only_editor_prepaint_duration: Histogram<u64>,
     compositor_refresh_interval: Histogram<u64>,
+    submission_to_present: Histogram<u64>,
     input_to_present: Histogram<u64>,
     input_arrival_interval: Histogram<u64>,
     input_dispatch_duration: Histogram<u64>,
@@ -165,6 +170,11 @@ impl PerformanceSample {
                 previous_frames.map(|snapshot| &snapshot.compositor_refresh_interval_histogram),
                 "compositor refresh interval",
             )?,
+            submission_to_present: histogram_delta(
+                &current.frames.submission_to_present_histogram,
+                previous_frames.map(|snapshot| &snapshot.submission_to_present_histogram),
+                "submission-to-present latency",
+            )?,
             input_to_present: histogram_delta(
                 &current.input.latency_histogram,
                 previous_input.map(|snapshot| &snapshot.latency_histogram),
@@ -229,10 +239,11 @@ impl PerformanceSample {
                 "input-driven input-only editor prepaint total",
                 &self.input_driven_input_only_editor_prepaint_duration,
             ),
-            format_duration_histogram(
+            format_refresh_histogram(
                 "compositor refresh interval",
                 &self.compositor_refresh_interval,
             ),
+            format_duration_histogram("submit→present", &self.submission_to_present),
             format_duration_histogram("input arrival", &self.input_arrival_interval),
             format_duration_histogram("input dispatch", &self.input_dispatch_duration),
             format_duration_histogram("input→present", &self.input_to_present),
@@ -273,6 +284,21 @@ fn format_duration_histogram(label: &str, histogram: &Histogram<u64>) -> String 
         format_milliseconds(histogram.max()),
         count_greater_than(histogram, FRAME_BUDGET_120_HZ_NS),
         count_greater_than(histogram, FRAME_BUDGET_60_HZ_NS),
+    )
+}
+
+fn format_refresh_histogram(label: &str, histogram: &Histogram<u64>) -> String {
+    if histogram.is_empty() {
+        return format!("{label} n=0 p50=— p95=— p99=— max=—");
+    }
+
+    format!(
+        "{label} n={} p50={} p95={} p99={} max={}",
+        histogram.len(),
+        format_milliseconds(histogram.value_at_quantile(0.50)),
+        format_milliseconds(histogram.value_at_quantile(0.95)),
+        format_milliseconds(histogram.value_at_quantile(0.99)),
+        format_milliseconds(histogram.max()),
     )
 }
 
@@ -391,6 +417,7 @@ mod tests {
                 input_driven_present_interval_histogram: histogram(input_intervals),
                 present_interval_histogram: histogram(animation_intervals),
                 compositor_refresh_interval_histogram: histogram(animation_intervals),
+                submission_to_present_histogram: histogram(input_latency),
             },
             input: InputLatencySnapshot {
                 latency_histogram: histogram(input_latency),

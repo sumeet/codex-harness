@@ -547,7 +547,10 @@ impl VisibilityState {
         match behavior {
             ShowBehavior::Always => Self::Visible,
             ShowBehavior::Never => Self::Disabled,
-            ShowBehavior::Autohide => Self::for_show(),
+            // Auto-hide scrollbars should not animate into view merely because
+            // a virtualized row was mounted. Their first real scroll/content
+            // change will reveal them through `should_show_scrollbars`.
+            ShowBehavior::Autohide => Self::Hidden,
         }
     }
 
@@ -1154,7 +1157,11 @@ impl ScrollbarPrepaintState {
         reveal_policy: ScrollbarRevealPolicy,
     ) -> bool {
         let Some(previous) = previous else {
-            return true;
+            // Establish the initial geometry without treating component
+            // creation as user activity. This is especially important for
+            // virtualized transcripts where nested scrollbars mount while the
+            // outer surface is moving.
+            return false;
         };
         let scroll_position_changed = self.thumbs.iter().any(|thumb| {
             self.position
@@ -1702,6 +1709,14 @@ impl<T: ScrollableHandle> IntoElement for ScrollbarElement<T> {
 mod tests {
     use super::*;
     use gpui::point;
+
+    #[test]
+    fn autohide_scrollbars_start_hidden() {
+        assert_eq!(
+            VisibilityState::from_behavior(ShowBehavior::Autohide),
+            VisibilityState::Hidden
+        );
+    }
 
     #[test]
     fn default_reveal_policy_reveals_for_content_changes() {

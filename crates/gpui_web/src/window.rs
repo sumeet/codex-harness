@@ -135,6 +135,7 @@ impl WebWindow {
             },
             transparent: false,
             preferred_present_mode: None,
+            desired_maximum_frame_latency: None,
         };
         let renderer = WgpuRenderer::new_from_surface(context, surface, renderer_config)?;
 

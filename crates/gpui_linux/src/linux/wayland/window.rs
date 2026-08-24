@@ -68,6 +68,21 @@ fn immediate_input_draw_enabled() -> bool {
     *ENABLED
 }
 
+fn preferred_present_mode() -> wgpu::PresentMode {
+    match std::env::var("GPUI_WAYLAND_PRESENT_MODE")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "fifo" => wgpu::PresentMode::Fifo,
+        "fifo-relaxed" => wgpu::PresentMode::FifoRelaxed,
+        "immediate" => wgpu::PresentMode::Immediate,
+        "auto-vsync" => wgpu::PresentMode::AutoVsync,
+        "auto-no-vsync" => wgpu::PresentMode::AutoNoVsync,
+        _ => wgpu::PresentMode::Mailbox,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RawWindow {
     window: *mut c_void,
@@ -580,7 +595,12 @@ impl WaylandWindowState {
                 },
                 transparent: true,
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                preferred_present_mode: Some(preferred_present_mode()),
+                desired_maximum_frame_latency: std::env::var("GPUI_WAYLAND_MAX_FRAME_LATENCY")
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 0)
+                    .or(Some(1)),
             };
             WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
         };
@@ -1481,6 +1501,15 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 impl PlatformWindow for WaylandWindow {
     fn draws_immediately_after_input(&self) -> bool {
         immediate_input_draw_enabled()
+    }
+
+    fn enqueue_input_for_diagnostics(&self, input: PlatformInput) {
+        let state_ptr = self.0.clone();
+        self.borrow()
+            .globals
+            .executor
+            .spawn(async move { state_ptr.handle_input(input) })
+            .detach();
     }
 
     fn bounds(&self) -> Bounds<Pixels> {
