@@ -5,6 +5,23 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 profile=${HARNESS_PROFILE:-release-fast}
 foreground=${HARNESS_FOREGROUND:-0}
+skip_build=${HARNESS_SKIP_BUILD:-0}
+
+case "$skip_build" in
+    0|false|FALSE|no|NO|'')
+        # A launch command should never silently exercise an old executable.
+        # Cargo's incremental freshness check is sub-second when nothing
+        # changed, while any real source change is rebuilt before the GUI
+        # detaches from the caller's terminal.
+        "$script_dir/build-standalone.sh"
+        ;;
+    1|true|TRUE|yes|YES)
+        ;;
+    *)
+        echo "HARNESS_SKIP_BUILD must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 
 case "$profile" in
     dev)
@@ -21,7 +38,7 @@ esac
 
 if [ ! -x "$binary" ]; then
     echo "Harness has not been built for the $profile profile." >&2
-    echo "Run: $script_dir/build-standalone.sh" >&2
+    echo "Run without HARNESS_SKIP_BUILD or invoke: $script_dir/build-standalone.sh" >&2
     exit 1
 fi
 

@@ -39,19 +39,22 @@ build it from the repository root:
 ```sh
 gh repo clone sumeet/codex-harness
 cd codex-harness
-./script/build-standalone.sh
 ./script/run-standalone.sh
 ```
 
-Builds and launches are deliberately separate; launching never invokes Cargo.
-The normal launcher detaches the GUI and writes its output to
+The normal launcher first asks Cargo for an incremental optimized build, then
+detaches the GUI and writes its output to
 `$XDG_STATE_HOME/harness/logs/harness.log` (or
 `~/.local/state/harness/logs/harness.log`):
 
 ```sh
-./script/build-standalone.sh
 ./script/run-standalone.sh
 ```
+
+Cargo's freshness check is normally sub-second when the executable is current,
+and prevents the launcher from silently exercising stale code. Set
+`HARNESS_SKIP_BUILD=1` only when intentionally launching the last successful
+artifact without checking the working tree.
 
 The build wrapper refuses to build when less than 4 GiB of memory is available,
 caps an individual compiler process, and uses eight Cargo workers by default.
@@ -60,7 +63,6 @@ the ordinary run command exercises the interactive build rather than debug
 rendering performance:
 
 ```sh
-./script/build-standalone.sh
 ./script/run-standalone.sh
 ```
 
@@ -70,7 +72,6 @@ profile; assertions, overflow checks, limited line information, backtraces, and
 incremental compilation remain enabled:
 
 ```sh
-HARNESS_PROFILE=dev ./script/build-standalone.sh
 HARNESS_PROFILE=dev ./script/run-standalone.sh
 ```
 
