@@ -43,7 +43,10 @@ cd codex-harness
 ./script/run-standalone.sh
 ```
 
-Builds and launches are deliberately separate; launching never invokes Cargo:
+Builds and launches are deliberately separate; launching never invokes Cargo.
+The normal launcher detaches the GUI and writes its output to
+`$XDG_STATE_HOME/harness/logs/harness.log` (or
+`~/.local/state/harness/logs/harness.log`):
 
 ```sh
 ./script/build-standalone.sh
@@ -51,7 +54,7 @@ Builds and launches are deliberately separate; launching never invokes Cargo:
 ```
 
 The build wrapper refuses to build when less than 4 GiB of memory is available,
-caps an individual compiler process, and uses four Cargo workers by default.
+caps an individual compiler process, and uses eight Cargo workers by default.
 Its default `release-fast` profile is broadly optimized without release LTO, so
 the ordinary run command exercises the interactive build rather than debug
 rendering performance:
@@ -69,6 +72,13 @@ incremental compilation remain enabled:
 ```sh
 HARNESS_PROFILE=dev ./script/build-standalone.sh
 HARNESS_PROFILE=dev ./script/run-standalone.sh
+```
+
+For debugging that intentionally keeps logs and process lifetime attached to
+the terminal, opt into foreground mode:
+
+```sh
+HARNESS_FOREGROUND=1 ./script/run-standalone.sh
 ```
 
 Set `HARNESS_BUILD_JOBS` to override the default worker count on a machine with
