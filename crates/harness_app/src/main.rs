@@ -9,14 +9,16 @@ use std::{
 };
 
 use assets::Assets;
+use base64::Engine as _;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
-    IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState,
-    Modifiers, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity,
-    Window, WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*,
-    px, relative, size, uniform_list,
+    AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity, FocusHandle,
+    Focusable, FollowMode, Image, IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment,
+    ListSizingBehavior, ListState, Modifiers, ObjectFit, PlatformInput, Render, ScrollDelta,
+    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task,
+    TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity, Window, WindowBounds,
+    WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px, relative, size,
+    uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -61,6 +63,7 @@ actions!(
     harness,
     [
         Send,
+        PasteComposer,
         Stop,
         FocusTranscript,
         FocusTasks,
@@ -117,6 +120,9 @@ const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
 const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
+const MAX_COMPOSER_IMAGES: usize = 8;
+const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const COMPOSER_ATTACHMENT_STRIP_HEIGHT: f32 = 62.;
 #[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
@@ -1123,6 +1129,17 @@ fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
     )
 }
 
+fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
+    item.expanded
+        && item.pending_request.is_none()
+        && matches!(
+            item.kind,
+            model::TranscriptKind::Command
+                | model::TranscriptKind::Diff
+                | model::TranscriptKind::FileChange
+        )
+}
+
 fn transcript_item_header_title(item: &TranscriptItem) -> &str {
     item.pending_request
         .as_ref()
@@ -1172,6 +1189,7 @@ fn rich_item_defers_navigation_claim(item: &TranscriptItem) -> bool {
 
 fn item_matches_search_query(item: &TranscriptItem, query: &str) -> bool {
     (transcript_item_shows_header(item)
+        && !expanded_item_uses_content_as_header(item)
         && search_contains(transcript_item_header_title(item), query))
         || search_contains(transcript_item_searchable_body(item), query)
         || item
@@ -2306,6 +2324,41 @@ struct LiveRequestSurface {
     entity: Entity<RequestSurface>,
 }
 
+#[derive(Clone)]
+struct ComposerImageAttachment {
+    id: u64,
+    image: Arc<Image>,
+}
+
+fn composer_is_empty(text: &str, image_count: usize) -> bool {
+    text.trim().is_empty() && image_count == 0
+}
+
+fn composer_prompt_preview(text: &str, image_count: usize) -> String {
+    let mut parts = Vec::with_capacity(image_count.saturating_add(1));
+    if !text.is_empty() {
+        parts.push(text.to_owned());
+    }
+    parts.extend((0..image_count).map(|_| "[Attached image]".to_owned()));
+    parts.join("\n\n")
+}
+
+fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
+    let mut input = Vec::with_capacity(images.len().saturating_add(1));
+    if !text.is_empty() {
+        input.push(json!({"type": "text", "text": text}));
+    }
+    input.extend(images.iter().map(|attachment| {
+        let mime_type = attachment.image.format().mime_type();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(attachment.image.bytes());
+        json!({
+            "type": "image",
+            "url": format!("data:{mime_type};base64,{encoded}")
+        })
+    }));
+    input
+}
+
 fn legacy_request_controls_active(
     request_is_live: bool,
     uses_shared_surface: bool,
@@ -2710,6 +2763,9 @@ struct HarnessApp {
     model: TranscriptModel,
     composer: Entity<LocalEditor>,
     composer_metrics: ComposerRenderMetrics,
+    composer_images: Vec<ComposerImageAttachment>,
+    next_composer_image_id: u64,
+    composer_attachment_error: Option<SharedString>,
     search_editor: Entity<LocalEditor>,
     transcript_editor: Entity<TranscriptEditor>,
     rich_navigation_selection: Option<TranscriptSelectionSnapshot>,
@@ -3271,6 +3327,9 @@ impl HarnessApp {
             model,
             composer,
             composer_metrics,
+            composer_images: Vec::new(),
+            next_composer_image_id: 0,
+            composer_attachment_error: None,
             search_editor,
             transcript_editor,
             rich_navigation_selection: None,
@@ -4901,18 +4960,77 @@ impl HarnessApp {
         self.focus_composer(window, cx);
     }
 
+    fn paste_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_mode != FocusMode::Composer {
+            return;
+        }
+        let Some(clipboard) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        let mut added = 0;
+        let mut error = None;
+        let mut saw_image = false;
+        for entry in clipboard.entries() {
+            let ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
+            saw_image = true;
+            if image.bytes().is_empty() {
+                continue;
+            }
+            if image.bytes().len() > MAX_COMPOSER_IMAGE_BYTES {
+                error = Some("Pasted image is larger than 20 MB".into());
+                continue;
+            }
+            if self.composer_images.len() >= MAX_COMPOSER_IMAGES {
+                error = Some("A prompt can contain up to 8 pasted images".into());
+                break;
+            }
+
+            self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
+            self.composer_images.push(ComposerImageAttachment {
+                id: self.next_composer_image_id,
+                image: Arc::new(image.clone()),
+            });
+            added += 1;
+        }
+
+        if saw_image {
+            self.composer_attachment_error = error;
+            if added > 0 || self.composer_attachment_error.is_some() {
+                cx.notify();
+            }
+        } else {
+            self.composer
+                .update(cx, |editor, cx| editor.paste_item(&clipboard, window, cx));
+        }
+    }
+
+    fn remove_composer_image(&mut self, id: u64, cx: &mut Context<Self>) {
+        let previous_len = self.composer_images.len();
+        self.composer_images
+            .retain(|attachment| attachment.id != id);
+        if self.composer_images.len() != previous_len {
+            self.composer_attachment_error = None;
+            cx.notify();
+        }
+    }
+
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).text(cx);
         let text = text.trim().to_string();
         if composer_send_blocked(
-            text.is_empty(),
+            composer_is_empty(&text, self.composer_images.len()),
             self.loading_thread,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         ) {
             return;
         }
-        let (index, key) = self.model.push_local_user(text.clone());
+        let input = composer_app_server_input(&text, &self.composer_images);
+        let preview = composer_prompt_preview(&text, self.composer_images.len());
+        let (index, key) = self.model.push_local_user(preview);
         self.list_state.splice(index..index, 1);
         self.selected_item = index;
         self.list_state.set_follow_mode(FollowMode::Tail);
@@ -4930,6 +5048,8 @@ impl HarnessApp {
         }
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.composer_images.clear();
+        self.composer_attachment_error = None;
 
         if self.replay_count.is_some() {
             self.model.set_status_for_key(&key, "replay");
@@ -4946,7 +5066,6 @@ impl HarnessApp {
         };
         let existing_thread_id = self.selected_thread_id.clone();
         let cwd = self.cwd.clone();
-        let input = vec![json!({"type": "text", "text": text})];
         self.request_task = cx.spawn(async move |this, cx| {
             let result = async {
                 let thread_id = match existing_thread_id {
@@ -6302,25 +6421,29 @@ impl HarnessApp {
             cx.notify();
             return;
         }
-        if let Some(item) = self.model.items.get_mut(self.selected_item) {
-            if !item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning {
-                return;
-            }
-            if item.content.trim().is_empty() {
-                return;
-            }
-            item.expanded = !item.expanded;
-            let item_key = item.key.clone();
-            let collapsed = !item.expanded;
-            self.list_state
-                .splice(self.selected_item..self.selected_item + 1, 1);
-            if rich_vim_experiment() {
-                self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_item_collapsed(&item_key, collapsed, window, cx);
-                });
-            }
-            cx.notify();
+        self.toggle_item_at(self.selected_item, window, cx);
+    }
+
+    fn toggle_item_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.model.items.get_mut(index) else {
+            return;
+        };
+        if (!item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning)
+            || item.content.trim().is_empty()
+        {
+            return;
         }
+
+        item.expanded = !item.expanded;
+        let item_key = item.key.clone();
+        let collapsed = !item.expanded;
+        self.list_state.splice(index..index + 1, 1);
+        if rich_vim_experiment() {
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.set_item_collapsed(&item_key, collapsed, window, cx);
+            });
+        }
+        cx.notify();
     }
 
     fn toggle_selected_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6944,11 +7067,11 @@ impl HarnessApp {
                 );
                 div()
                     .w_full()
-                    .min_h(px(22.))
-                    .px_2()
-                    .py_0p5()
+                    .h(px(20.))
+                    .px_1()
                     .flex()
-                    .gap_2()
+                    .items_center()
+                    .gap_1()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
                     .bg(if tone == DiffLineTone::Addition {
@@ -7025,8 +7148,8 @@ impl HarnessApp {
                 rows.push(
                     div()
                         .w_full()
-                        .h(px(9.))
-                        .mt_1()
+                        .h(px(5.))
+                        .mt_0p5()
                         .border_t_1()
                         .border_color(colors.border_variant)
                         .into_any_element(),
@@ -7062,9 +7185,10 @@ impl HarnessApp {
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .gap_1()
+                    .h(px(20.))
+                    .px_1()
+                    .when(section_index == 0 && file_count == 1, |this| this.pr_5())
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
@@ -7135,6 +7259,7 @@ impl HarnessApp {
                         .items_center()
                         .gap_2()
                         .px_2()
+                        .pr_5()
                         .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
@@ -7244,8 +7369,8 @@ impl HarnessApp {
                     .flex()
                     .flex_col()
                     .when(section_index > 0, |this| {
-                        this.mt_1()
-                            .pt_2()
+                        this.mt_0p5()
+                            .pt_0p5()
                             .border_t_1()
                             .border_color(colors.border_variant)
                     })
@@ -7255,9 +7380,10 @@ impl HarnessApp {
                             .min_w_0()
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
+                            .gap_1()
+                            .h(px(20.))
+                            .px_1()
+                            .when(section_index == 0 && file_count == 1, |this| this.pr_5())
                             .border_b_1()
                             .border_color(colors.border_variant)
                             .bg(colors.editor_subheader_background.opacity(0.72))
@@ -7320,7 +7446,7 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_0p5()
             .when(file_count > 1, |this| {
                 this.child(
                     div()
@@ -7329,6 +7455,7 @@ impl HarnessApp {
                         .items_center()
                         .gap_2()
                         .px_2()
+                        .pr_5()
                         .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
@@ -7412,12 +7539,16 @@ impl HarnessApp {
                 };
                 div()
                     .w_full()
-                    .h(px(26.))
+                    .h(px(20.))
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_2()
+                    .gap_1()
+                    .px_1()
+                    .when(
+                        row_index == 0 && row_data.presentations.len() == 1,
+                        |this| this.pr_5(),
+                    )
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
@@ -7509,11 +7640,11 @@ impl HarnessApp {
                 );
                 div()
                     .w_full()
-                    .h(px(26.))
-                    .px_2()
+                    .h(px(20.))
+                    .px_1()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
                     .relative()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
@@ -7651,6 +7782,7 @@ impl HarnessApp {
                         .items_center()
                         .gap_2()
                         .px_2()
+                        .pr_5()
                         .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
@@ -8042,14 +8174,30 @@ impl HarnessApp {
                 logical_range,
                 Some(command_owner.clone()),
             );
+            let first_command_row = row.line_index == 0;
+            let command_text = div()
+                .min_w_0()
+                .flex_1()
+                .relative()
+                .whitespace_normal()
+                .child(clickable)
+                .when_some(cursor_marker, |this, marker| this.child(marker));
             div()
                 .w_full()
                 .min_w_0()
                 .min_h(px(20.))
-                .relative()
-                .whitespace_normal()
-                .child(clickable)
-                .when_some(cursor_marker, |this, marker| this.child(marker))
+                .flex()
+                .items_start()
+                .when(first_command_row, |this| {
+                    this.pr_5().child(
+                        div()
+                            .w(px(16.))
+                            .flex_none()
+                            .text_color(cx.theme().colors().text_accent)
+                            .child("$"),
+                    )
+                })
+                .child(command_text)
                 .into_any_element()
         })
         .with_sizing_behavior(ListSizingBehavior::Infer)
@@ -8127,8 +8275,8 @@ impl HarnessApp {
                 .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
                 .border_t_1()
                 .border_color(colors.border_variant)
-                .mt_2()
-                .pt_2()
+                .mt_1()
+                .pt_1()
                 .child(output_rows)
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
@@ -8147,7 +8295,7 @@ impl HarnessApp {
                 .min_w_0()
                 .font_buffer(cx)
                 .text_ui_sm(cx)
-                .line_height(relative(1.45))
+                .line_height(relative(1.35))
                 .text_color(colors.text)
                 .child(command_region)
                 .when_some(output_region, |this, output| this.child(output))
@@ -8253,11 +8401,21 @@ impl HarnessApp {
                     div()
                         .w_full()
                         .min_w_0()
+                        .pr_5()
+                        .flex()
+                        .items_start()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
-                        .line_height(relative(1.45))
+                        .line_height(relative(1.35))
                         .whitespace_normal()
-                        .child(clickable_command),
+                        .child(
+                            div()
+                                .w(px(16.))
+                                .flex_none()
+                                .text_color(colors.text_accent)
+                                .child("$"),
+                        )
+                        .child(div().min_w_0().flex_1().child(clickable_command)),
                 )
                 .when(!displayed_output.is_empty(), |this| {
                     this.child(
@@ -8267,14 +8425,14 @@ impl HarnessApp {
                             .min_w_0()
                             .border_t_1()
                             .border_color(colors.border_variant)
-                            .mt_2()
-                            .pt_2()
+                            .mt_1()
+                            .pt_1()
                             .flex()
                             .flex_col()
                             .gap_1()
                             .font_buffer(cx)
                             .text_ui_sm(cx)
-                            .line_height(relative(1.45))
+                            .line_height(relative(1.35))
                             .text_color(colors.text)
                             .whitespace_normal()
                             .child(clickable_output),
@@ -9206,6 +9364,8 @@ impl HarnessApp {
         let header_title = transcript_item_header_title(&item).to_owned();
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = transcript_item_shows_header(&item);
+        let headerless_expanded = show_header && expanded_item_uses_content_as_header(&item);
+        let render_header = show_header && !headerless_expanded;
         let disclosure_weak = cx.weak_entity();
         let is_disclosure = has_collapsible_content
             && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
@@ -9378,7 +9538,7 @@ impl HarnessApp {
             })
         };
 
-        let header_search = show_header.then_some(rich_search.as_ref()).flatten();
+        let header_search = render_header.then_some(rich_search.as_ref()).flatten();
         // Every expanded Rich structured body is complete and scrollable. If
         // a renderer deliberately has no glyph for a protocol-only offset,
         // keep Vim visible on the header instead of mounting a second,
@@ -9387,11 +9547,15 @@ impl HarnessApp {
             && rich_navigation
                 .as_ref()
                 .is_some_and(|navigation| !navigation.cursor_claimed.get());
-        let header_cursor_range = rich_header_navigation_range(
-            &header_title,
-            rich_navigation.as_ref(),
-            !rich_item_body_paints_navigation(&item) || body_left_navigation_unclaimed,
-        );
+        let header_cursor_range = render_header
+            .then(|| {
+                rich_header_navigation_range(
+                    &header_title,
+                    rich_navigation.as_ref(),
+                    !rich_item_body_paints_navigation(&item) || body_left_navigation_unclaimed,
+                )
+            })
+            .flatten();
         let header_highlights = header_cursor_range
             .map(|range| {
                 vec![(
@@ -9417,7 +9581,8 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .items_center()
-            .gap_2()
+            .h(px(20.))
+            .gap_1()
             .child(
                 Icon::new(icon)
                     .size(IconSize::Small)
@@ -9453,26 +9618,36 @@ impl HarnessApp {
                 this.cursor_pointer()
                     .on_click(move |_, window, cx| {
                         disclosure_weak
-                            .update(cx, |this, cx| {
-                                if let Some(item) = this.model.items.get_mut(index) {
-                                    item.expanded = !item.expanded;
-                                    let item_key = item.key.clone();
-                                    let collapsed = !item.expanded;
-                                    this.list_state.splice(index..index + 1, 1);
-                                    if rich_vim_experiment() {
-                                        this.transcript_editor.update(cx, |editor, cx| {
-                                            editor.set_item_collapsed(
-                                                &item_key, collapsed, window, cx,
-                                            );
-                                        });
-                                    }
-                                    cx.notify();
-                                }
-                            })
+                            .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
                             .ok();
                     })
                     .child(Disclosure::new(("item-disclosure", index), item.expanded))
             });
+
+        let floating_disclosure = (headerless_expanded && is_disclosure).then(|| {
+            let disclosure_weak = cx.weak_entity();
+            div()
+                .id(("item-floating-disclosure", index))
+                .absolute()
+                .top(px(1.))
+                .right(px(1.))
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .bg(colors.editor_background.opacity(0.88))
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    disclosure_weak
+                        .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                        .ok();
+                })
+                .child(Disclosure::new(
+                    ("item-floating-disclosure-icon", index),
+                    true,
+                ))
+        });
 
         let raw = raw_visible.then(|| {
             let content =
@@ -9532,18 +9707,19 @@ impl HarnessApp {
         } else {
             div()
                 .w_full()
+                .relative()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_0p5()
                 .when(!compact_trace, |this| {
                     this.rounded_sm()
                         .border_1()
                         .border_color(colors.border_variant)
                         .px_2()
-                        .py_1()
+                        .py_0p5()
                 })
-                .when(compact_trace, |this| this.px_1().py_1())
-                .child(header)
+                .when(compact_trace, |this| this.px_1().py_0p5())
+                .when(render_header, |this| this.child(header))
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(request_surface, |this, surface| this.child(surface))
                 .when_some(body, |this, body| this.child(body))
@@ -9564,6 +9740,9 @@ impl HarnessApp {
                             .children(choice_buttons),
                     )
                 })
+                .when_some(floating_disclosure, |this, disclosure| {
+                    this.child(disclosure)
+                })
                 .into_any_element()
         };
 
@@ -9573,8 +9752,8 @@ impl HarnessApp {
             .px(if narrow { px(10.) } else { px(18.) })
             .py(if compact_trace {
                 px(3.)
-            } else if narrow && !narrative {
-                px(6.)
+            } else if !narrative {
+                if narrow { px(4.) } else { px(5.) }
             } else {
                 px(8.)
             })
@@ -9640,14 +9819,20 @@ impl Render for HarnessApp {
             self.composer.read(cx).typography_profile(),
         );
         self.composer_metrics = composer_metrics;
-        let composer_empty = composer_metrics.empty;
+        let composer_empty = composer_is_empty(&composer_text, self.composer_images.len());
         let send_blocked = composer_send_blocked(
             composer_empty,
             self.loading_thread,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         );
-        let composer_height = composer_metrics.height;
+        let composer_height = composer_metrics.height
+            + if self.composer_images.is_empty() {
+                0.
+            } else {
+                COMPOSER_ATTACHMENT_STRIP_HEIGHT
+            };
+        let composer_images = self.composer_images.clone();
         let turn_active = self.model.current_turn_id.is_some();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
@@ -9801,7 +9986,9 @@ impl Render for HarnessApp {
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
         let composer_status: Option<(SharedString, Color)> =
-            if let Some(status) = self.performance_status.clone() {
+            if let Some(error) = self.composer_attachment_error.clone() {
+                Some((error, Color::Warning))
+            } else if let Some(status) = self.performance_status.clone() {
                 Some((status, Color::Muted))
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
@@ -9824,6 +10011,9 @@ impl Render for HarnessApp {
             .text_color(colors.text)
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
+            .on_action(cx.listener(|this, _: &PasteComposer, window, cx| {
+                this.paste_composer(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &Stop, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
                 this.focus_transcript(window, cx)
@@ -10141,6 +10331,70 @@ impl Render for HarnessApp {
                             .bg(colors.editor_background)
                             .flex()
                             .flex_col()
+                            .when(!composer_images.is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .id("composer-attachments")
+                                        .h(px(COMPOSER_ATTACHMENT_STRIP_HEIGHT))
+                                        .flex_none()
+                                        .px_3()
+                                        .pt_2()
+                                        .pb_1()
+                                        .flex()
+                                        .overflow_x_scroll()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(composer_images.into_iter().map(
+                                            |attachment| {
+                                                let attachment_id = attachment.id;
+                                                div()
+                                                    .id(("composer-image", attachment_id))
+                                                    .relative()
+                                                    .size(px(52.))
+                                                    .flex_none()
+                                                    .overflow_hidden()
+                                                    .rounded_sm()
+                                                    .border_1()
+                                                    .border_color(colors.border_variant)
+                                                    .bg(colors.element_background)
+                                                    .child(
+                                                        gpui::img(attachment.image)
+                                                            .size_full()
+                                                            .object_fit(ObjectFit::Cover),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .absolute()
+                                                            .top(px(2.))
+                                                            .right(px(2.))
+                                                            .rounded_sm()
+                                                            .bg(colors.editor_background)
+                                                            .child(
+                                                                IconButton::new(
+                                                                    (
+                                                                        "remove-composer-image",
+                                                                        attachment_id,
+                                                                    ),
+                                                                    IconName::Close,
+                                                                )
+                                                                .shape(IconButtonShape::Square)
+                                                                .size(ButtonSize::Compact)
+                                                                .style(ButtonStyle::Subtle)
+                                                                .aria_label("Remove attached image")
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.remove_composer_image(
+                                                                            attachment_id,
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                )),
+                                                            ),
+                                                    )
+                                            },
+                                        )),
+                                )
+                            })
                             .child(
                                 div()
                                     .min_h(px(48.))
@@ -11178,6 +11432,16 @@ fn thread_load_diagnostics_enabled() -> bool {
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-p", OpenActionPalette, Some("Harness")),
+        KeyBinding::new(
+            "ctrl-shift-v",
+            PasteComposer,
+            Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "shift-insert",
+            PasteComposer,
+            Some("HarnessComposer && Editor"),
+        ),
         KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
         KeyBinding::new(
@@ -11536,6 +11800,22 @@ mod tests {
             ),
             "Zed Docs\nhttps://zed.dev/docs\nFast editor"
         );
+    }
+
+    #[test]
+    fn expanded_command_and_diff_cards_let_content_replace_generic_headers() {
+        let mut replay = TranscriptModel::replay(6);
+        let diff = &mut replay.items[4];
+        assert!(expanded_item_uses_content_as_header(diff));
+        diff.expanded = false;
+        assert!(!expanded_item_uses_content_as_header(diff));
+
+        let command = &replay.items[5];
+        assert!(expanded_item_uses_content_as_header(command));
+        assert!(!item_matches_search_query(command, "Command"));
+
+        replay.items[5].expanded = false;
+        assert!(item_matches_search_query(&replay.items[5], "Command"));
     }
 
     #[test]
@@ -13310,6 +13590,32 @@ mod tests {
         assert!(composer_send_blocked(false, false, true, true));
         assert!(composer_send_blocked(false, false, false, false));
         assert!(!composer_send_blocked(false, false, false, true));
+    }
+
+    #[test]
+    fn pasted_images_make_an_empty_text_draft_sendable() {
+        assert!(composer_is_empty("   ", 0));
+        assert!(!composer_is_empty("   ", 1));
+        assert!(!composer_is_empty("describe this", 0));
+    }
+
+    #[test]
+    fn composer_images_become_multimodal_app_server_input() {
+        let images = vec![ComposerImageAttachment {
+            id: 7,
+            image: Arc::new(Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3])),
+        }];
+
+        let input = composer_app_server_input("what is this?", &images);
+        assert_eq!(input[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(
+            input[1],
+            json!({"type": "image", "url": "data:image/png;base64,AQID"})
+        );
+        assert_eq!(
+            composer_prompt_preview("what is this?", images.len()),
+            "what is this?\n\n[Attached image]"
+        );
     }
 
     #[test]

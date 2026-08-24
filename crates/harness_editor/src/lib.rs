@@ -19,10 +19,10 @@ use editor::{
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext as _, Context, Edges, Entity, EventEmitter, FocusHandle, Focusable,
-    Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, IntoElement, KeyBinding,
-    KeyContext, Pixels, Render, SharedString, TextStyle, TextStyleRefinement, WeakEntity, Window,
-    div, point, prelude::*, px,
+    AnyView, App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter,
+    FocusHandle, Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla,
+    IntoElement, KeyBinding, KeyContext, Pixels, Render, SharedString, TextStyle,
+    TextStyleRefinement, WeakEntity, Window, div, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -211,6 +211,16 @@ impl LocalEditor {
         self.editor.update(cx, |editor, cx| {
             editor.set_text(text.to_string(), window, cx)
         });
+    }
+
+    pub fn paste_item(
+        &mut self,
+        item: &ClipboardItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor
+            .update(cx, |editor, cx| editor.paste_item(item, window, cx));
     }
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {

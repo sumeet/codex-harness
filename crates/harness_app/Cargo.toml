@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 assets.workspace = true
+base64.workspace = true
 codex_app_server_client.workspace = true
 command_palette_core.workspace = true
 command_palette_hooks.workspace = true

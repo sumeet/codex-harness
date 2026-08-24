@@ -8328,6 +8328,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assets",
+ "base64 0.22.1",
  "codex_app_server_client",
  "command_palette_core",
  "command_palette_hooks",
