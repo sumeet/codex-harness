@@ -8339,6 +8339,7 @@ dependencies = [
  "harness_editor",
  "harness_protocol",
  "hdrhistogram",
+ "image",
  "log",
  "markdown",
  "release_channel",

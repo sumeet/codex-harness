@@ -3427,10 +3427,13 @@ fn web_search_title(raw: &Value) -> String {
 }
 
 fn render_user_content(content: &Value) -> String {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
+    let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
+    let image_count = blocks
+        .iter()
+        .filter(|block| matches!(string_at(block, "/type"), Some("localImage" | "image")))
+        .count();
+    let rendered = blocks
+        .iter()
         .filter_map(|block| match string_at(block, "/type") {
             Some("text") => string_at(block, "/text").map(ToOwned::to_owned),
             // Images retain their semantic source separately so Rich mode can
@@ -3445,7 +3448,43 @@ fn render_user_content(content: &Value) -> String {
             _ => Some(pretty_json(block)),
         })
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    strip_structured_image_labels(&rendered, image_count)
+}
+
+fn strip_structured_image_labels(content: &str, image_count: usize) -> String {
+    if image_count == 0 {
+        return content.to_owned();
+    }
+
+    content
+        .lines()
+        .filter_map(|line| {
+            let leading_whitespace_len = line.len() - line.trim_start().len();
+            let trimmed = &line[leading_whitespace_len..];
+            let Some(suffix) = trimmed.strip_prefix("[Image #") else {
+                return Some(line.to_owned());
+            };
+            let Some(marker_end) = suffix.find(']') else {
+                return Some(line.to_owned());
+            };
+            let Ok(image_number) = suffix[..marker_end].parse::<usize>() else {
+                return Some(line.to_owned());
+            };
+            if image_number == 0 || image_number > image_count {
+                return Some(line.to_owned());
+            }
+
+            let remainder = suffix[marker_end + 1..].trim_start();
+            (!remainder.is_empty()).then(|| {
+                let mut visible = String::with_capacity(leading_whitespace_len + remainder.len());
+                visible.push_str(&line[..leading_whitespace_len]);
+                visible.push_str(remainder);
+                visible
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn user_image_sources_from_value(content: &Value) -> Vec<UserImageSource> {
@@ -6036,6 +6075,31 @@ mod tests {
         assert!(model.user_image_sources(&local_key).is_empty());
         assert!(!model.item_indices.contains_key(&local_key));
         assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+    }
+
+    #[test]
+    fn structured_images_render_without_transport_labels() {
+        let content = json!([
+            {"type": "image", "url": "data:image/png;base64,AQID"},
+            {"type": "text", "text": "[Image #1] what is this?\nkeep this line"}
+        ]);
+
+        assert_eq!(
+            render_user_content(&content),
+            "what is this?\nkeep this line"
+        );
+        assert_eq!(
+            strip_structured_image_labels("[Image #2] literal reference", 1),
+            "[Image #2] literal reference"
+        );
+        assert_eq!(
+            strip_structured_image_labels("[Image #1]\ncaption", 1),
+            "caption"
+        );
+        assert_eq!(
+            strip_structured_image_labels("[Image #1] literal text", 0),
+            "[Image #1] literal text"
+        );
     }
 
     #[test]

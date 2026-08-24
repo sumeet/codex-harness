@@ -137,6 +137,7 @@ const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
 const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
+const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 48.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -382,7 +383,6 @@ enum RichFileChangeRow {
         line_index: usize,
         source_range: Range<usize>,
         logical_range: Range<usize>,
-        unified: bool,
         tone: DiffLineTone,
         old_line: Option<usize>,
         new_line: Option<usize>,
@@ -1880,6 +1880,35 @@ fn diff_line_numbers(
     }
 }
 
+fn compact_diff_line_number(
+    tone: DiffLineTone,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+) -> Option<usize> {
+    match tone {
+        DiffLineTone::Deletion => old_line.or(new_line),
+        DiffLineTone::Addition | DiffLineTone::Normal | DiffLineTone::Hunk => new_line.or(old_line),
+    }
+}
+
+fn render_compact_diff_line_number(
+    tone: DiffLineTone,
+    old_line: Option<usize>,
+    new_line: Option<usize>,
+) -> gpui::Div {
+    div()
+        .w(px(RICH_DIFF_LINE_NUMBER_WIDTH))
+        .flex_none()
+        .flex()
+        .justify_end()
+        .overflow_hidden()
+        .child(
+            compact_diff_line_number(tone, old_line, new_line)
+                .map(|line| line.to_string())
+                .unwrap_or_default(),
+        )
+}
+
 fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
     let presentations = file_change_presentations(&item.content);
     let (total_additions, total_deletions) = presentations.iter().map(file_change_counts).fold(
@@ -1935,7 +1964,6 @@ fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
                 line_index,
                 source_range,
                 logical_range,
-                unified,
                 tone,
                 old_line: displayed_old_line,
                 new_line: displayed_new_line,
@@ -2392,6 +2420,12 @@ struct ComposerImageAttachment {
     image: Arc<Image>,
 }
 
+#[derive(Clone)]
+struct UserImagePreview {
+    source: ImageSource,
+    dimensions: Option<(u32, u32)>,
+}
+
 fn composer_is_empty(text: &str, image_count: usize) -> bool {
     text.trim().is_empty() && image_count == 0
 }
@@ -2416,12 +2450,35 @@ fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> 
     input
 }
 
-fn transcript_user_image_source(source: &model::UserImageSource) -> Option<ImageSource> {
+fn image_dimensions(bytes: &[u8], format: ImageFormat) -> Option<(u32, u32)> {
+    let format = match format {
+        ImageFormat::Png => image::ImageFormat::Png,
+        ImageFormat::Jpeg => image::ImageFormat::Jpeg,
+        ImageFormat::Webp => image::ImageFormat::WebP,
+        ImageFormat::Gif => image::ImageFormat::Gif,
+        ImageFormat::Svg => return None,
+        ImageFormat::Bmp => image::ImageFormat::Bmp,
+        ImageFormat::Tiff => image::ImageFormat::Tiff,
+        ImageFormat::Ico => image::ImageFormat::Ico,
+        ImageFormat::Pnm => image::ImageFormat::Pnm,
+    };
+    image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_dimensions()
+        .ok()
+}
+
+fn transcript_user_image_source(source: &model::UserImageSource) -> Option<UserImagePreview> {
     match source {
-        model::UserImageSource::LocalPath(path) => Some(PathBuf::from(path).into()),
+        model::UserImageSource::LocalPath(path) => Some(UserImagePreview {
+            source: PathBuf::from(path).into(),
+            dimensions: image::image_dimensions(path).ok(),
+        }),
         model::UserImageSource::Url(url) => {
             if !url.starts_with("data:") {
-                return Some(url.clone().into());
+                return Some(UserImagePreview {
+                    source: url.clone().into(),
+                    dimensions: None,
+                });
             }
             let data_url = url.strip_prefix("data:")?;
             let (mime_info, encoded) = data_url.split_once(',')?;
@@ -2433,9 +2490,29 @@ fn transcript_user_image_source(source: &model::UserImageSource) -> Option<Image
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .ok()?;
-            Some(Arc::new(Image::from_bytes(format, bytes)).into())
+            let dimensions = image_dimensions(&bytes, format);
+            Some(UserImagePreview {
+                source: Arc::new(Image::from_bytes(format, bytes)).into(),
+                dimensions,
+            })
         }
     }
+}
+
+fn user_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    const MAX_WIDTH: f32 = 384.;
+    const MAX_HEIGHT: f32 = 220.;
+    const FALLBACK_WIDTH: f32 = 320.;
+    const FALLBACK_HEIGHT: f32 = 180.;
+
+    let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return (FALLBACK_WIDTH, FALLBACK_HEIGHT);
+    };
+    let scale = (MAX_WIDTH / width as f32)
+        .min(MAX_HEIGHT / height as f32)
+        .min(1.);
+    (width as f32 * scale, height as f32 * scale)
 }
 
 fn legacy_request_controls_active(
@@ -2886,7 +2963,8 @@ struct HarnessApp {
     performance_status_generation: u64,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
-    user_image_previews: HashMap<String, Vec<ImageSource>>,
+    user_image_previews: HashMap<String, Vec<UserImagePreview>>,
+    expanded_user_image: Option<ImageSource>,
     hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
     rich_nested_scrolls: HashMap<String, RichNestedScrollState>,
     list_state: ListState,
@@ -3463,6 +3541,7 @@ impl HarnessApp {
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
             user_image_previews: HashMap::default(),
+            expanded_user_image: None,
             hybrid_surfaces: HashMap::default(),
             rich_nested_scrolls: HashMap::default(),
             sidebar_open: true,
@@ -7224,28 +7303,12 @@ impl HarnessApp {
                         colors.text
                     })
                     .child(
-                        div()
-                            .w(if unified { px(54.) } else { px(28.) })
-                            .flex_none()
-                            .flex()
-                            .gap_1()
-                            .text_color(colors.text_muted)
-                            .when(unified, |this| {
-                                this.child(
-                                    div().w(px(24.)).flex().justify_end().child(
-                                        displayed_old_line
-                                            .map(|line| line.to_string())
-                                            .unwrap_or_default(),
-                                    ),
-                                )
-                            })
-                            .child(
-                                div().w(px(24.)).flex().justify_end().child(
-                                    displayed_new_line
-                                        .map(|line| line.to_string())
-                                        .unwrap_or_default(),
-                                ),
-                            ),
+                        render_compact_diff_line_number(
+                            tone,
+                            displayed_old_line,
+                            displayed_new_line,
+                        )
+                        .text_color(colors.text_muted),
                     )
                     .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
                     .into_any_element()
@@ -7707,7 +7770,6 @@ impl HarnessApp {
                 line_index,
                 source_range,
                 logical_range,
-                unified,
                 tone,
                 old_line,
                 new_line,
@@ -7765,22 +7827,8 @@ impl HarnessApp {
                         colors.text
                     })
                     .child(
-                        div()
-                            .w(if *unified { px(54.) } else { px(28.) })
-                            .flex_none()
-                            .flex()
-                            .gap_1()
-                            .text_color(colors.text_muted)
-                            .when(*unified, |this| {
-                                this.child(div().w(px(24.)).flex().justify_end().child(
-                                    old_line.map(|line| line.to_string()).unwrap_or_default(),
-                                ))
-                            })
-                            .child(
-                                div().w(px(24.)).flex().justify_end().child(
-                                    new_line.map(|line| line.to_string()).unwrap_or_default(),
-                                ),
-                            ),
+                        render_compact_diff_line_number(*tone, *old_line, *new_line)
+                            .text_color(colors.text_muted),
                     )
                     .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
                     .when_some(cursor_marker, |this, marker| this.child(marker))
@@ -8842,27 +8890,40 @@ impl HarnessApp {
     }
 
     fn render_user_image_previews(
-        previews: Vec<ImageSource>,
+        item_key: String,
+        previews: Vec<UserImagePreview>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         div()
-            .w_full()
             .min_w_0()
             .flex()
             .flex_wrap()
+            .items_start()
             .gap_2()
-            .children(previews.into_iter().enumerate().map(|(index, source)| {
-                gpui::img(source)
-                    .id(("user-image-preview", index))
-                    .h_auto()
-                    .max_w_96()
-                    .max_h(px(220.))
-                    .object_fit(ObjectFit::ScaleDown)
+            .children(previews.into_iter().enumerate().map(|(index, preview)| {
+                let expanded_source = preview.source.clone();
+                let (width, height) = user_image_preview_size(preview.dimensions);
+                div()
+                    .id(format!("user-image-preview:{item_key}:{index}"))
+                    .w(px(width))
+                    .h(px(height))
+                    .flex_none()
+                    .overflow_hidden()
                     .rounded_sm()
                     .border_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_background)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expanded_user_image = Some(expanded_source.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        gpui::img(preview.source)
+                            .size_full()
+                            .object_fit(ObjectFit::ScaleDown),
+                    )
             }))
             .into_any_element()
     }
@@ -9676,7 +9737,7 @@ impl HarnessApp {
             .then(|| self.user_image_previews.get(&item.key).cloned())
             .flatten()
             .filter(|previews| !previews.is_empty())
-            .map(|previews| Self::render_user_image_previews(previews, cx));
+            .map(|previews| Self::render_user_image_previews(item.key.clone(), previews, cx));
 
         let header_search = render_header.then_some(rich_search.as_ref()).flatten();
         // Every expanded Rich structured body is complete and scrollable. If
@@ -9802,7 +9863,10 @@ impl HarnessApp {
         });
 
         let content = if narrative {
-            div()
+            let has_user_text = item.kind != model::TranscriptKind::User
+                || !item.content.trim().is_empty()
+                || raw_visible;
+            let narrative_panel = div()
                 .w_full()
                 .flex()
                 .flex_col()
@@ -9836,9 +9900,21 @@ impl HarnessApp {
                 })
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
-                .when_some(user_image_previews, |this, previews| this.child(previews))
                 .when_some(raw, |this, raw| this.child(raw))
-                .into_any_element()
+                .into_any_element();
+
+            if item.kind == model::TranscriptKind::User && user_image_previews.is_some() {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(has_user_text, |this| this.child(narrative_panel))
+                    .when_some(user_image_previews, |this, previews| this.child(previews))
+                    .into_any_element()
+            } else {
+                narrative_panel
+            }
         } else {
             div()
                 .w_full()
@@ -9972,6 +10048,7 @@ impl Render for HarnessApp {
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
+        let expanded_user_image = self.expanded_user_image.clone();
         let task_body = if self.replay_count.is_some() {
             div()
                 .flex_1()
@@ -10696,6 +10773,67 @@ impl Render for HarnessApp {
                                 .child(command_palette),
                         ),
                 ))
+            })
+            .when_some(expanded_user_image, |this, image| {
+                this.child(
+                    deferred(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .p_6()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(gpui::black().opacity(0.78))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.expanded_user_image = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .relative()
+                                    .w(relative(0.94))
+                                    .h(relative(0.9))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        gpui::img(image)
+                                            .size_full()
+                                            .object_fit(ObjectFit::ScaleDown),
+                                    )
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .top_0()
+                                            .right_0()
+                                            .rounded_sm()
+                                            .bg(colors.editor_background.opacity(0.9))
+                                            .child(
+                                                IconButton::new(
+                                                    "close-user-image-preview",
+                                                    IconName::Close,
+                                                )
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Default)
+                                                .style(ButtonStyle::Subtle)
+                                                .aria_label("Close image preview")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.expanded_user_image = None;
+                                                    cx.notify();
+                                                })),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .with_priority(2),
+                )
             })
     }
 }
@@ -13182,6 +13320,18 @@ mod tests {
             ),
             (Some(30), None)
         );
+        assert_eq!(
+            compact_diff_line_number(DiffLineTone::Normal, Some(29), Some(29)),
+            Some(29)
+        );
+        assert_eq!(
+            compact_diff_line_number(DiffLineTone::Addition, None, Some(30)),
+            Some(30)
+        );
+        assert_eq!(
+            compact_diff_line_number(DiffLineTone::Deletion, Some(30), None),
+            Some(30)
+        );
     }
 
     #[test]
@@ -13845,11 +13995,25 @@ mod tests {
             "data:image/png;base64,AQID".into(),
         ));
 
-        let Some(ImageSource::Image(image)) = source else {
+        let Some(UserImagePreview {
+            source: ImageSource::Image(image),
+            dimensions,
+        }) = source
+        else {
             panic!("expected a decoded GPUI image");
         };
         assert_eq!(image.format(), ImageFormat::Png);
         assert_eq!(image.bytes(), &[1, 2, 3]);
+        assert_eq!(dimensions, None);
+    }
+
+    #[test]
+    fn user_image_preview_hugs_the_bitmap_aspect_ratio() {
+        let wide = user_image_preview_size(Some((1522, 667)));
+        assert_eq!(wide.0, 384.);
+        assert!((wide.1 - 168.284).abs() < 0.001);
+        assert_eq!(user_image_preview_size(Some((100, 80))), (100., 80.));
+        assert_eq!(user_image_preview_size(None), (320., 180.));
     }
 
     #[test]
