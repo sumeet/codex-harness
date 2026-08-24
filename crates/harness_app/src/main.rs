@@ -648,7 +648,6 @@ fn search_query_is_case_sensitive(query: &str) -> bool {
 }
 
 fn search_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
-    let query = query.trim();
     if query.is_empty() || limit == 0 {
         return Vec::new();
     }
@@ -664,7 +663,6 @@ fn search_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<
 
 fn folded_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
     let folded_query = query
-        .trim()
         .chars()
         .flat_map(char::to_lowercase)
         .collect::<Vec<_>>();
@@ -769,11 +767,18 @@ fn searchable_styled_text(
     cx: &App,
 ) -> StyledText {
     let highlights = if let Some(search) = search {
+        let colors = cx.theme().colors();
         compose_search_highlights(
             base,
             &search.ranges_for(&text),
-            cx.theme().colors().search_match_background,
-            cx.theme().colors().search_active_match_background,
+            // Keep committed matches legible after the command line closes
+            // (`hlsearch`) without introducing a Harness-only palette.
+            colors
+                .search_match_background
+                .blend(colors.text_accent.opacity(0.12)),
+            colors
+                .search_active_match_background
+                .blend(colors.text_accent.opacity(0.18)),
         )
     } else {
         base
@@ -3148,6 +3153,27 @@ impl HarnessApp {
                     this.composer_metrics = next;
                     cx.notify();
                 }
+            },
+        )
+        .detach();
+        cx.subscribe_in(
+            &search_editor,
+            window,
+            |this, editor, _: &LocalEditorChanged, window, cx| match this.vim_command_line {
+                Some(VimCommandLine::Search { backwards })
+                    if this.search_visible && this.search_returns_to_buffer =>
+                {
+                    let query = editor.read(cx).text(cx);
+                    this.transcript_editor.update(cx, |editor, cx| {
+                        editor.preview_search(&query, backwards, window, cx);
+                    });
+                    this.sync_native_search_state(cx);
+                    cx.notify();
+                }
+                Some(VimCommandLine::Ex) if this.command_line_error.take().is_some() => {
+                    cx.notify();
+                }
+                _ => {}
             },
         )
         .detach();
@@ -6370,6 +6396,10 @@ impl HarnessApp {
         self.search_visible = true;
         self.search_highlights_visible = !self.search_query.is_empty();
         self.focus_mode = FocusMode::Search;
+        if self.search_returns_to_buffer {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.begin_search_preview(cx));
+        }
         self.search_editor
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.search_editor.focus_handle(cx).focus(window, cx);
@@ -6416,9 +6446,10 @@ impl HarnessApp {
             self.commit_ex_command(window, cx);
             return;
         }
-        let next_query = self.search_editor.read(cx).text(cx).trim().to_string();
+        let next_query = self.search_editor.read(cx).text(cx);
+        let repeat_previous = next_query.is_empty();
         if !next_query.is_empty() {
-            self.search_query = next_query;
+            self.search_query.clone_from(&next_query);
         }
         self.search_highlights_visible = !self.search_query.is_empty();
         if self.search_returns_to_buffer {
@@ -6426,8 +6457,16 @@ impl HarnessApp {
             self.vim_command_line = None;
             self.command_line_error = None;
             self.focus_mode = FocusMode::Buffer;
+            let query = self.search_query.clone();
+            let backwards = self.buffer_search_backwards;
             self.transcript_editor.update(cx, |editor, cx| {
-                editor.search(&self.search_query, self.buffer_search_backwards, window, cx);
+                if repeat_previous {
+                    editor.commit_search_preview();
+                    editor.search(&query, backwards, window, cx);
+                } else {
+                    editor.preview_search(&query, backwards, window, cx);
+                    editor.commit_search_preview();
+                }
             });
             self.sync_native_search_state(cx);
             self.transcript_editor.focus_handle(cx).focus(window, cx);
@@ -6507,6 +6546,13 @@ impl HarnessApp {
     }
 
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.vim_command_line, Some(VimCommandLine::Search { .. }))
+            && self.search_returns_to_buffer
+        {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.cancel_search_preview(window, cx));
+            self.sync_native_search_state(cx);
+        }
         self.search_visible = false;
         self.vim_command_line = None;
         self.command_line_error = None;
@@ -10113,14 +10159,16 @@ impl Render for HarnessApp {
                                     .when(self.search_visible, |this| {
                                         this.key_context("HarnessSearch")
                                             .child(
-                                                Label::new(command_line_prompt)
-                                                    .size(LabelSize::Small)
-                                                    .color(Color::Default),
-                                            )
-                                            .child(
                                                 div()
                                                     .flex_1()
                                                     .min_w_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .child(
+                                                        Label::new(command_line_prompt)
+                                                            .size(LabelSize::Small)
+                                                            .color(Color::Default),
+                                                    )
                                                     .child(self.search_editor.clone()),
                                             )
                                             .when_some(
@@ -12366,6 +12414,10 @@ mod tests {
                 .is_some()
         );
         assert!(search_match_byte_ranges("semantic needle", "Semantic Needle", 1).is_empty());
+        assert_eq!(
+            search_match_byte_ranges("needle · needle ", "needle ", 8),
+            vec![0..7, 10..17]
+        );
     }
 
     #[test]

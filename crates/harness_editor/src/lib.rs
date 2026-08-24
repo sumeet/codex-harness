@@ -302,6 +302,7 @@ pub struct TranscriptEditor {
     diff_highlights_dirty: bool,
     semantic_highlights_dirty: bool,
     search: TranscriptSearchState,
+    search_preview: Option<TranscriptSearchPreview>,
     follow_tail: bool,
     last_selection_head: Option<Anchor>,
     pending_tail_intent: Option<PendingTailIntent>,
@@ -546,7 +547,7 @@ struct DiffAdditionRows;
 struct DiffDeletionRows;
 struct DiffGutterInlayHighlight;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TranscriptSearchState {
     query: String,
     backwards: bool,
@@ -558,6 +559,12 @@ struct TranscriptSearchState {
     // by the Editor and is changed only by explicit match navigation.
     active_match: Option<Range<Anchor>>,
     highlights_dirty: bool,
+}
+
+#[derive(Clone)]
+struct TranscriptSearchPreview {
+    origin: Anchor,
+    previous: TranscriptSearchState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2100,6 +2107,7 @@ impl TranscriptEditor {
             diff_highlights_dirty: true,
             semantic_highlights_dirty: true,
             search: TranscriptSearchState::default(),
+            search_preview: None,
             follow_tail: false,
             last_selection_head: None,
             pending_tail_intent: None,
@@ -3794,9 +3802,15 @@ impl TranscriptEditor {
                             &anchors,
                             move |index, theme| {
                                 if active_match_index == Some(*index) {
-                                    theme.colors().search_active_match_background
+                                    theme
+                                        .colors()
+                                        .search_active_match_background
+                                        .blend(theme.colors().text_accent.opacity(0.18))
                                 } else {
-                                    theme.colors().search_match_background
+                                    theme
+                                        .colors()
+                                        .search_match_background
+                                        .blend(theme.colors().text_accent.opacity(0.12))
                                 }
                             },
                             cx,
@@ -4254,6 +4268,103 @@ impl TranscriptEditor {
         }
     }
 
+    /// Freeze the real Vim cursor and prior search state for one `/` or `?`
+    /// command-line transaction. Incremental updates always search from this
+    /// anchor, so editing the pattern cannot walk forward through the document.
+    pub fn begin_search_preview(&mut self, cx: &mut Context<Self>) {
+        if self.search_preview.is_some() {
+            return;
+        }
+        let origin = self.editor.update(cx, |editor, _| {
+            editor.selections.newest_anchor().head().clone()
+        });
+        self.search_preview = Some(TranscriptSearchPreview {
+            origin,
+            previous: self.search.clone(),
+        });
+    }
+
+    fn restore_search_preview_origin(
+        &mut self,
+        origin: &Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = self.buffer.read(cx).text();
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = origin.to_offset(&snapshot).0;
+            let point = offset_to_point(&text, offset);
+            editor.change_selections(
+                SelectionEffects::default().from_search(true),
+                window,
+                cx,
+                |selections| selections.select_ranges([point..point]),
+            );
+        });
+    }
+
+    /// Apply `incsearch` from the frozen command-line origin. An empty pattern
+    /// restores the prior search and cursor; a missing match also leaves the
+    /// cursor at the origin while retaining the candidate pattern.
+    pub fn preview_search(
+        &mut self,
+        query: &str,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.begin_search_preview(cx);
+        let preview = self
+            .search_preview
+            .as_ref()
+            .expect("search preview was initialized")
+            .clone();
+        if query.is_empty() {
+            self.search = preview.previous;
+            self.search.highlights_dirty = true;
+            self.restore_search_preview_origin(&preview.origin, window, cx);
+            self.refresh_viewport_decorations(cx);
+            return false;
+        }
+
+        self.search.query.clear();
+        self.search.query.push_str(query);
+        self.search.backwards = backwards;
+        self.search.case_sensitive = search_query_is_case_sensitive(query);
+        self.search.whole_word = false;
+        self.search.highlights_visible = true;
+        self.search.active_match = None;
+        self.search.highlights_dirty = true;
+        let origin_offset = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            preview.origin.to_offset(&snapshot).0
+        });
+        let matched = self.move_search_from_offset(origin_offset, backwards, window, cx);
+        if !matched {
+            self.restore_search_preview_origin(&preview.origin, window, cx);
+        }
+        matched
+    }
+
+    /// Accept the current incremental result as the persistent Vim search.
+    pub fn commit_search_preview(&mut self) {
+        self.search_preview = None;
+    }
+
+    /// Abort incremental search, restoring both the original cursor and the
+    /// previous persistent pattern/highlight visibility.
+    pub fn cancel_search_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = self.search_preview.take() else {
+            return;
+        };
+        self.search = preview.previous;
+        self.search.highlights_dirty = true;
+        self.restore_search_preview_origin(&preview.origin, window, cx);
+        self.refresh_viewport_decorations(cx);
+        self.schedule_viewport_refresh(window, cx);
+    }
+
     /// Persist a transcript query and repaint its viewport-local matches without
     /// moving or replacing the Editor's Vim selection.
     pub fn set_search_query(&mut self, query: &str, backwards: bool, cx: &mut Context<Self>) {
@@ -4282,6 +4393,7 @@ impl TranscriptEditor {
     /// Clear native match decoration without touching the cursor, visual
     /// selection, registers, or selectable transcript text.
     pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search_preview = None;
         self.search = TranscriptSearchState::default();
         self.editor.update(cx, |editor, cx| {
             editor.clear_background_highlights(HighlightKey::BufferSearchHighlights, cx);
