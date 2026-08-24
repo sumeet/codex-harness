@@ -4578,6 +4578,27 @@ impl HarnessApp {
             if thread_load_diagnostics_enabled() {
                 eprintln!("thread-load cache-hit thread={thread_id}");
             }
+        } else {
+            match self.model.restore_persisted_transcript(&thread_id) {
+                Ok(restored) if restored > 0 => {
+                    mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
+                    self.mark_all_image_surfaces_dirty();
+                    self.list_state.splice(0..0, restored);
+                    self.selected_item = restored.saturating_sub(1);
+                    self.list_state.set_follow_mode(FollowMode::Tail);
+                    drop(self.sync_transcript_document(cx));
+                    if thread_load_diagnostics_enabled() {
+                        eprintln!(
+                            "thread-load disk-cache-hit thread={thread_id} items={restored} total_ms={:.1}",
+                            load_started_at
+                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("could not restore cached task {thread_id}: {error}"),
+            }
         }
         cx.notify();
 
@@ -4717,14 +4738,23 @@ impl HarnessApp {
         let persisted_elapsed = persisted_started_at.elapsed();
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         if thread_load_diagnostics_enabled() {
-            for (index, item) in self.model.items.iter().enumerate() {
-                eprintln!(
-                    "transcript-item item={index} kind={:?} content_bytes={} events={}",
-                    item.kind,
-                    item.content.len(),
-                    item.event_count,
-                );
-            }
+            let content_bytes = self
+                .model
+                .items
+                .iter()
+                .map(|item| item.content.len())
+                .sum::<usize>();
+            let largest_item_bytes = self
+                .model
+                .items
+                .iter()
+                .map(|item| item.content.len())
+                .max()
+                .unwrap_or_default();
+            eprintln!(
+                "transcript-items count={} content_bytes={content_bytes} largest_item_bytes={largest_item_bytes}",
+                self.model.items.len(),
+            );
         }
         self.markdown_cache.clear();
         self.rich_nested_scrolls.clear();
@@ -4747,14 +4777,20 @@ impl HarnessApp {
                 .update(cx, |editor, cx| editor.reveal_tail(cx));
         }
         cx.notify();
+        let cache_started_at = Instant::now();
+        if let Err(error) = self.model.persist_transcript(&thread.id) {
+            log::warn!("could not cache task {}: {error}", thread.id);
+        }
+        let cache_elapsed = cache_started_at.elapsed();
         if thread_load_diagnostics_enabled() {
             eprintln!(
-                "thread-load model thread={} items={} model_ms={:.1} persisted_ms={:.1} document_ms={:.1} total_ms={:.1}",
+                "thread-load model thread={} items={} model_ms={:.1} merge_ms={:.1} document_ms={:.1} cache_write_ms={:.1} total_ms={:.1}",
                 thread.id,
                 self.model.items.len(),
                 model_elapsed.as_secs_f64() * 1_000.,
                 persisted_elapsed.as_secs_f64() * 1_000.,
                 document_elapsed.as_secs_f64() * 1_000.,
+                cache_elapsed.as_secs_f64() * 1_000.,
                 load_started_at.elapsed().as_secs_f64() * 1_000.,
             );
         }

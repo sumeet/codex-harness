@@ -1374,21 +1374,35 @@ impl TranscriptModel {
     }
 
     pub fn merge_persisted_transcript(&mut self, thread_id: &str) -> anyhow::Result<usize> {
-        let path = transcript_snapshot_path(thread_id)?;
-        let serialized = match fs::read(path) {
-            Ok(serialized) => serialized,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(error) => return Err(error.into()),
-        };
-        let snapshot: PersistedTranscript = serde_json::from_slice(&serialized)?;
-        if snapshot.version != SNAPSHOT_VERSION || snapshot.thread_id != thread_id {
+        let Some(snapshot) = read_persisted_transcript(thread_id)? else {
             return Ok(0);
-        }
+        };
         let fresh = std::mem::take(&mut self.items);
         let (items, restored) = merge_snapshot_items(fresh, snapshot.items);
         self.items = items;
         self.rebuild_item_indices();
         Ok(restored)
+    }
+
+    /// Restores a previously rendered transcript before the authoritative
+    /// app-server snapshot arrives. Callers must still refresh from the server;
+    /// this cache exists only to make revisiting large threads immediate.
+    pub fn restore_persisted_transcript(&mut self, thread_id: &str) -> anyhow::Result<usize> {
+        let Some(snapshot) = read_persisted_transcript(thread_id)? else {
+            return Ok(0);
+        };
+        Ok(self.restore_persisted_snapshot(snapshot))
+    }
+
+    fn restore_persisted_snapshot(&mut self, snapshot: PersistedTranscript) -> usize {
+        self.clear();
+        self.items = snapshot
+            .items
+            .into_iter()
+            .filter(|item| !originates_from_raw_response(item))
+            .collect();
+        self.rebuild_item_indices();
+        self.items.len()
     }
 
     pub fn push_local_user(&mut self, content: String) -> (usize, String) {
@@ -2182,6 +2196,20 @@ fn transcript_snapshot_path(thread_id: &str) -> anyhow::Result<PathBuf> {
         .join("harness")
         .join("transcripts")
         .join(format!("{thread_id}.json")))
+}
+
+fn read_persisted_transcript(thread_id: &str) -> anyhow::Result<Option<PersistedTranscript>> {
+    let path = transcript_snapshot_path(thread_id)?;
+    let serialized = match fs::read(path) {
+        Ok(serialized) => serialized,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot: PersistedTranscript = serde_json::from_slice(&serialized)?;
+    if snapshot.version != SNAPSHOT_VERSION || snapshot.thread_id != thread_id {
+        return Ok(None);
+    }
+    Ok(Some(snapshot))
 }
 
 fn item_for_snapshot(item: &TranscriptItem) -> TranscriptItem {
@@ -4697,6 +4725,42 @@ mod tests {
                 .iter()
                 .all(|item| !item.content.contains("const r ="))
         );
+    }
+
+    #[test]
+    fn warm_snapshot_replaces_the_model_and_rebuilds_item_lookup() {
+        let user = replay_item(0, TranscriptKind::User, "You", "cached prompt", json!(null));
+        let agent = replay_item(
+            2,
+            TranscriptKind::Agent,
+            "Codex",
+            "cached answer",
+            json!(null),
+        );
+        let wrapper = replay_item(
+            1,
+            TranscriptKind::Tool,
+            "Tool · Exec",
+            "legacy wrapper",
+            json!({"type": "custom_tool_call_output"}),
+        );
+        let user_key = user.key.clone();
+        let agent_key = agent.key.clone();
+        let snapshot = PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            items: vec![user, wrapper, agent],
+        };
+        let mut model = TranscriptModel::replay(5);
+
+        let restored = model.restore_persisted_snapshot(snapshot);
+
+        assert_eq!(restored, 2);
+        assert_eq!(model.items.len(), 2);
+        assert_eq!(model.items[0].content, "cached prompt");
+        assert_eq!(model.items[1].content, "cached answer");
+        assert_eq!(model.item_indices.get(&user_key), Some(&0));
+        assert_eq!(model.item_indices.get(&agent_key), Some(&1));
     }
 
     #[test]

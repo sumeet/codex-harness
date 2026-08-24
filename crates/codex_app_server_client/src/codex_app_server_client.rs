@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_process::{Child, Command};
@@ -204,15 +204,35 @@ impl Client {
         let reader_outbound = outbound_tx.clone();
         let reader_task = smol::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next().await {
-                let incoming = match line {
-                    Ok(line) => decode_line(&line),
+            let trace = app_server_trace_enabled();
+            loop {
+                let read_started_at = trace.then(Instant::now);
+                let Some(line) = lines.next().await else {
+                    break;
+                };
+                let read_elapsed = read_started_at.map(|started_at| started_at.elapsed());
+                let (incoming, line_bytes, decode_elapsed) = match line {
+                    Ok(line) => {
+                        let line_bytes = line.len();
+                        let decode_started_at = trace.then(Instant::now);
+                        let incoming = decode_line(&line);
+                        let decode_elapsed =
+                            decode_started_at.map(|started_at| started_at.elapsed());
+                        (incoming, line_bytes, decode_elapsed)
+                    }
                     Err(error) => {
                         let reason = format!("failed to read from app-server: {error}");
                         disconnect(&reader_pending, &reader_events, reason).await;
                         return;
                     }
                 };
+                if let (Some(read_elapsed), Some(decode_elapsed)) = (read_elapsed, decode_elapsed) {
+                    eprintln!(
+                        "app-server-line bytes={line_bytes} wait_read_ms={:.1} decode_ms={:.1}",
+                        read_elapsed.as_secs_f64() * 1_000.,
+                        decode_elapsed.as_secs_f64() * 1_000.,
+                    );
+                }
 
                 let incoming = match incoming {
                     Ok(incoming) => incoming,
@@ -589,6 +609,11 @@ fn decode_line(line: &str) -> Result<Incoming, Error> {
             "expected a request, response, or notification".into(),
         )),
     }
+}
+
+fn app_server_trace_enabled() -> bool {
+    std::env::var_os("CODEX_APP_SERVER_CLIENT_TRACE")
+        .is_some_and(|value| !value.is_empty() && value != OsStr::new("0"))
 }
 
 fn parse_rpc_error(value: &Value) -> Result<RpcError, Error> {
