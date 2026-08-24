@@ -57,11 +57,16 @@ impl PerformanceSnapshot {
 struct PerformanceSample {
     frame_request_interval: Histogram<u64>,
     draw_duration: Histogram<u64>,
+    input_driven_draw_duration: Histogram<u64>,
     platform_present_duration: Histogram<u64>,
     prepaint_duration: Histogram<u64>,
+    input_driven_prepaint_duration: Histogram<u64>,
     paint_duration: Histogram<u64>,
+    input_driven_paint_duration: Histogram<u64>,
     list_prepaint_duration: Histogram<u64>,
+    input_driven_list_prepaint_duration: Histogram<u64>,
     input_only_editor_prepaint_duration: Histogram<u64>,
+    input_driven_input_only_editor_prepaint_duration: Histogram<u64>,
     input_to_present: Histogram<u64>,
     input_arrival_interval: Histogram<u64>,
     input_dispatch_duration: Histogram<u64>,
@@ -98,6 +103,11 @@ impl PerformanceSample {
                 previous_frames.map(|snapshot| &snapshot.draw_duration_histogram),
                 "draw duration",
             )?,
+            input_driven_draw_duration: histogram_delta(
+                &current.frames.input_driven_draw_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.input_driven_draw_duration_histogram),
+                "input-driven draw duration",
+            )?,
             platform_present_duration: histogram_delta(
                 &current.frames.platform_present_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.platform_present_duration_histogram),
@@ -108,21 +118,46 @@ impl PerformanceSample {
                 previous_frames.map(|snapshot| &snapshot.prepaint_duration_histogram),
                 "prepaint duration",
             )?,
+            input_driven_prepaint_duration: histogram_delta(
+                &current.frames.input_driven_prepaint_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.input_driven_prepaint_duration_histogram),
+                "input-driven prepaint duration",
+            )?,
             paint_duration: histogram_delta(
                 &current.frames.paint_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.paint_duration_histogram),
                 "paint duration",
+            )?,
+            input_driven_paint_duration: histogram_delta(
+                &current.frames.input_driven_paint_duration_histogram,
+                previous_frames.map(|snapshot| &snapshot.input_driven_paint_duration_histogram),
+                "input-driven paint duration",
             )?,
             list_prepaint_duration: histogram_delta(
                 &current.frames.list_prepaint_duration_histogram,
                 previous_frames.map(|snapshot| &snapshot.list_prepaint_duration_histogram),
                 "list prepaint duration",
             )?,
+            input_driven_list_prepaint_duration: histogram_delta(
+                &current.frames.input_driven_list_prepaint_duration_histogram,
+                previous_frames
+                    .map(|snapshot| &snapshot.input_driven_list_prepaint_duration_histogram),
+                "input-driven list prepaint duration",
+            )?,
             input_only_editor_prepaint_duration: histogram_delta(
                 &current.frames.input_only_editor_prepaint_duration_histogram,
                 previous_frames
                     .map(|snapshot| &snapshot.input_only_editor_prepaint_duration_histogram),
                 "input-only editor prepaint duration",
+            )?,
+            input_driven_input_only_editor_prepaint_duration: histogram_delta(
+                &current
+                    .frames
+                    .input_driven_input_only_editor_prepaint_duration_histogram,
+                previous_frames.map(|snapshot| {
+                    &snapshot.input_driven_input_only_editor_prepaint_duration_histogram
+                }),
+                "input-driven input-only editor prepaint duration",
             )?,
             input_to_present: histogram_delta(
                 &current.input.latency_histogram,
@@ -166,13 +201,27 @@ impl PerformanceSample {
             format!("Harness performance ({period})"),
             format_duration_histogram("platform frame callback", &self.frame_request_interval),
             format_duration_histogram("draw", &self.draw_duration),
+            format_duration_histogram("input-driven draw", &self.input_driven_draw_duration),
             format_duration_histogram("platform draw/submit", &self.platform_present_duration),
             format_duration_histogram("prepaint", &self.prepaint_duration),
+            format_duration_histogram(
+                "input-driven prepaint",
+                &self.input_driven_prepaint_duration,
+            ),
             format_duration_histogram("paint", &self.paint_duration),
+            format_duration_histogram("input-driven paint", &self.input_driven_paint_duration),
             format_duration_histogram("list prepaint", &self.list_prepaint_duration),
+            format_duration_histogram(
+                "input-driven dominant list prepaint",
+                &self.input_driven_list_prepaint_duration,
+            ),
             format_duration_histogram(
                 "input-only editor prepaint",
                 &self.input_only_editor_prepaint_duration,
+            ),
+            format_duration_histogram(
+                "input-driven input-only editor prepaint total",
+                &self.input_driven_input_only_editor_prepaint_duration,
             ),
             format_duration_histogram("input arrival", &self.input_arrival_interval),
             format_duration_histogram("input dispatch", &self.input_dispatch_duration),
@@ -319,11 +368,16 @@ mod tests {
             frames: FrameDurationSnapshot {
                 frame_request_interval_histogram: histogram(animation_intervals),
                 draw_duration_histogram: histogram(draws),
+                input_driven_draw_duration_histogram: histogram(draws),
                 platform_present_duration_histogram: histogram(draws),
                 prepaint_duration_histogram: histogram(draws),
+                input_driven_prepaint_duration_histogram: histogram(draws),
                 paint_duration_histogram: histogram(draws),
+                input_driven_paint_duration_histogram: histogram(draws),
                 list_prepaint_duration_histogram: histogram(draws),
+                input_driven_list_prepaint_duration_histogram: histogram(draws),
                 input_only_editor_prepaint_duration_histogram: histogram(draws),
+                input_driven_input_only_editor_prepaint_duration_histogram: histogram(draws),
                 input_driven_present_interval_histogram: histogram(input_intervals),
                 present_interval_histogram: histogram(animation_intervals),
             },

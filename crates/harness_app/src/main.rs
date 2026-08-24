@@ -13,9 +13,9 @@ use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, Context, Entity, FocusHandle, Focusable, FollowMode,
     IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState,
-    Render, ScrollHandle, SharedString, StyledText, Task, UpdateGlobal, WeakEntity, Window,
-    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
-    relative, size,
+    Render, ScrollHandle, ScrollStrategy, SharedString, StyledText, Task, UniformListScrollHandle,
+    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div,
+    list, point, prelude::*, px, relative, size, uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -124,6 +124,7 @@ const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
 const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 140.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
+const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 2;
@@ -336,7 +337,6 @@ struct RichCommandSurface {
 
 #[derive(Clone)]
 enum RichFileChangeRow {
-    Separator,
     Header {
         section_index: usize,
         logical_range: Range<usize>,
@@ -356,7 +356,6 @@ enum RichFileChangeRow {
 impl RichFileChangeRow {
     fn logical_range(&self) -> Option<&Range<usize>> {
         match self {
-            Self::Separator => None,
             Self::Header { logical_range, .. } | Self::Line { logical_range, .. } => {
                 Some(logical_range)
             }
@@ -376,7 +375,7 @@ struct RichFileChangeSurface {
     event_count: usize,
     content_len: usize,
     data: RichFileChangeData,
-    list_state: ListState,
+    list_state: UniformListScrollHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1787,7 +1786,6 @@ fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
 
     for (section_index, presentation) in presentations.iter().enumerate() {
         if section_index > 0 {
-            rows.push(RichFileChangeRow::Separator);
             logical_cursor += 1;
         }
 
@@ -2436,6 +2434,26 @@ fn slow_list_diagnostics() -> bool {
     *ENABLED
 }
 
+fn slow_list_item_threshold() -> Duration {
+    static THRESHOLD: LazyLock<Duration> = LazyLock::new(|| {
+        std::env::var("GPUI_SLOW_LIST_THRESHOLD_MS")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.)
+            .map(|milliseconds| Duration::from_secs_f64(milliseconds / 1_000.))
+            .unwrap_or(Duration::from_millis(4))
+    });
+    *THRESHOLD
+}
+
+fn vim_search_available(buffer_view: bool, rich_vim_enabled: bool) -> bool {
+    buffer_view || rich_vim_enabled
+}
+
+fn search_uses_native_editor(buffer_view: bool, focus_mode: FocusMode) -> bool {
+    buffer_view && focus_mode == FocusMode::Buffer
+}
+
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
     if selectable_rich_command_experiment() && item.kind == model::TranscriptKind::Command {
         return false;
@@ -2664,6 +2682,7 @@ struct HarnessApp {
     active_search_match: usize,
     search_navigation_generation: u64,
     search_returns_to_buffer: bool,
+    search_return_focus: FocusMode,
     buffer_search_backwards: bool,
     request_answers: HashMap<String, HashMap<String, Vec<String>>>,
     request_editors: HashMap<String, Entity<LocalEditor>>,
@@ -2686,7 +2705,7 @@ struct HarnessApp {
     hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
     rich_nested_scrolls: HashMap<String, RichNestedScrollState>,
     list_state: ListState,
-    task_list_state: ListState,
+    task_list_state: UniformListScrollHandle,
     sidebar_open: bool,
     sidebar_user_override: bool,
     server_task: Task<()>,
@@ -2842,7 +2861,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> (RichFileChangeData, ListState, ScrollHandle) {
+    ) -> (RichFileChangeData, UniformListScrollHandle, ScrollHandle) {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -2853,12 +2872,10 @@ impl HarnessApp {
 
         if needs_rebuild {
             let data = rich_file_change_data(item);
-            // Infer the card height from row hints after measuring only its
-            // first file header. Outer-list overdraw can then size an
-            // offscreen card without shaping every row in the nested body.
-            let list_state = ListState::new(data.rows.len(), ListAlignment::Top, px(1.))
-                .with_uniform_item_height(px(22.));
-            list_state.set_diagnostics_name(format!("file-change:{}", item.key));
+            // Diff rows are deliberately single-line. A uniform list avoids
+            // remeasuring the same visible rows every time the outer
+            // transcript moves while retaining virtualization for huge diffs.
+            let list_state = UniformListScrollHandle::new();
             let state = self
                 .rich_nested_scrolls
                 .entry(item.key.clone())
@@ -2893,7 +2910,9 @@ impl HarnessApp {
                     .is_some_and(|range| !range.is_empty() && cursor <= range.start)
             });
             if let Some(row) = exact.or(next) {
-                surface.list_state.scroll_to_reveal_item(row);
+                surface
+                    .list_state
+                    .scroll_to_item(row, ScrollStrategy::Nearest);
             }
         }
         state.last_cursor = cursor;
@@ -3154,8 +3173,7 @@ impl HarnessApp {
         let list_state = ListState::new(model.items.len(), ListAlignment::Top, px(0.));
         list_state.set_diagnostics_name("transcript");
         list_state.set_follow_mode(FollowMode::Tail);
-        let task_list_state = ListState::new(0, ListAlignment::Top, px(54.));
-        task_list_state.set_diagnostics_name("tasks");
+        let task_list_state = UniformListScrollHandle::new();
         let transcript_focus = cx.focus_handle();
         if start_in_text_view {
             transcript_editor.focus_handle(cx).focus(window, cx);
@@ -3204,6 +3222,7 @@ impl HarnessApp {
             active_search_match: 0,
             search_navigation_generation: 0,
             search_returns_to_buffer: false,
+            search_return_focus: FocusMode::Transcript,
             buffer_search_backwards: false,
             request_answers: HashMap::default(),
             request_editors: HashMap::default(),
@@ -3355,10 +3374,8 @@ impl HarnessApp {
                 Ok((client, threads)) => {
                     if this
                         .update(cx, |this, cx| {
-                            let old_len = this.threads.len();
                             this.client = Some(client.clone());
                             this.threads = threads;
-                            this.task_list_state.splice(0..old_len, this.threads.len());
                             this.connecting = false;
                             this.reconnect_attempts = 0;
                             this.error = None;
@@ -3703,6 +3720,12 @@ impl HarnessApp {
     }
 
     fn sync_hybrid_surfaces(&mut self, cx: &mut Context<Self>) {
+        // Rich mode does not use editor replacement surfaces. Its normal
+        // scroll-frame render path should not scan the entire transcript just
+        // to rediscover that there is nothing to synchronize.
+        if !self.buffer_view && self.hybrid_surfaces.is_empty() {
+            return;
+        }
         let candidates = self
             .model
             .items
@@ -3756,6 +3779,9 @@ impl HarnessApp {
 
     fn sync_request_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let dirty = std::mem::take(&mut self.dirty_request_surfaces);
+        if dirty.is_empty() {
+            return;
+        }
         let composer_empty = self.composer.read(cx).text(cx).trim().is_empty();
         let focus_mode = self.focus_mode;
         let mut auto_focus_request: Option<(usize, String)> = None;
@@ -4154,9 +4180,7 @@ impl HarnessApp {
                     this.connecting = false;
                     match result {
                         Ok(response) => {
-                            let old_len = this.threads.len();
                             this.threads = response.data;
-                            this.task_list_state.splice(0..old_len, this.threads.len());
                             this.error = None;
                         }
                         Err(error) => {
@@ -4231,9 +4255,7 @@ impl HarnessApp {
                                 .threads
                                 .get(this.selected_task)
                                 .map(|thread| thread.id.clone());
-                            let old_len = this.threads.len();
                             this.threads = response.data;
-                            this.task_list_state.splice(0..old_len, this.threads.len());
                             this.selected_task = selected_task_id
                                 .as_deref()
                                 .and_then(|selected_id| {
@@ -5873,7 +5895,7 @@ impl HarnessApp {
         if !self.threads.is_empty() {
             self.selected_task = self.selected_task.min(self.threads.len() - 1);
             self.task_list_state
-                .scroll_to_reveal_item(self.selected_task);
+                .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
@@ -5953,7 +5975,7 @@ impl HarnessApp {
             .saturating_add_signed(delta)
             .min(self.threads.len() - 1);
         self.task_list_state
-            .scroll_to_reveal_item(self.selected_task);
+            .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -6103,10 +6125,10 @@ impl HarnessApp {
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_returns_to_buffer = self.focus_mode == FocusMode::Buffer;
-        if !self.search_returns_to_buffer {
-            self.buffer_search_backwards = false;
-        }
+        self.search_return_focus = self.focus_mode;
+        self.search_returns_to_buffer =
+            search_uses_native_editor(self.buffer_view, self.focus_mode);
+        self.buffer_search_backwards = false;
         self.search_visible = true;
         self.focus_mode = FocusMode::Search;
         self.search_editor.update(cx, |editor, cx| {
@@ -6117,11 +6139,21 @@ impl HarnessApp {
     }
 
     fn open_buffer_search(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.buffer_view {
+        if !vim_search_available(self.buffer_view, rich_vim_experiment()) {
             return;
         }
-        self.buffer_search_backwards = backwards;
         self.open_search(window, cx);
+        self.buffer_search_backwards = backwards;
+    }
+
+    fn restore_search_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_return_focus == FocusMode::Buffer {
+            self.focus_mode = FocusMode::Buffer;
+            self.transcript_editor.focus_handle(cx).focus(window, cx);
+        } else {
+            self.focus_mode = FocusMode::Transcript;
+            self.transcript_focus.focus(window, cx);
+        }
     }
 
     fn commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6138,15 +6170,20 @@ impl HarnessApp {
         }
         self.rebuild_search_matches();
         if !self.search_matches.is_empty() {
-            self.active_search_match = self
-                .search_matches
-                .iter()
-                .position(|index| *index >= self.selected_item)
-                .unwrap_or(0);
+            self.active_search_match = if self.buffer_search_backwards {
+                self.search_matches
+                    .iter()
+                    .rposition(|index| *index <= self.selected_item)
+                    .unwrap_or(self.search_matches.len() - 1)
+            } else {
+                self.search_matches
+                    .iter()
+                    .position(|index| *index >= self.selected_item)
+                    .unwrap_or(0)
+            };
             self.jump_to_search_match(cx);
         }
-        self.focus_mode = FocusMode::Transcript;
-        self.transcript_focus.focus(window, cx);
+        self.restore_search_focus(window, cx);
         cx.notify();
     }
 
@@ -6163,7 +6200,8 @@ impl HarnessApp {
         self.search_query.clear();
         self.search_matches.clear();
         self.active_search_match = 0;
-        self.focus_transcript(window, cx);
+        self.restore_search_focus(window, cx);
+        cx.notify();
     }
 
     fn rebuild_search_matches(&mut self) {
@@ -6926,6 +6964,199 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_rich_file_change_row(
+        row_data: &RichFileChangeData,
+        row_index: usize,
+        index: usize,
+        search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
+        owner: &WeakEntity<HarnessApp>,
+        cx: &mut App,
+    ) -> AnyElement {
+        let row = &row_data.rows[row_index];
+        match row {
+            RichFileChangeRow::Header {
+                section_index,
+                logical_range,
+            } => {
+                let presentation = &row_data.presentations[*section_index];
+                let colors = cx.theme().colors();
+                let (additions, deletions) = file_change_counts(presentation);
+                let highlighted_path = navigation_searchable_styled_text(
+                    presentation.path.clone(),
+                    Vec::new(),
+                    search,
+                    navigation,
+                    logical_range.clone(),
+                    cx,
+                );
+                let clickable_path = rich_clickable_styled_text(
+                    format!("rich-file-change-path:{index}:{section_index}"),
+                    highlighted_path,
+                    index,
+                    logical_range.clone(),
+                    Some(owner.clone()),
+                );
+                let operation_color = match presentation.operation.as_str() {
+                    "Added" => Color::Success,
+                    "Deleted" => Color::Error,
+                    "Modified" | "Moved" => Color::Accent,
+                    _ => Color::Muted,
+                };
+                let operation_text_color = match operation_color {
+                    Color::Success => cx.theme().status().success,
+                    Color::Error => cx.theme().status().error,
+                    Color::Accent => colors.text_accent,
+                    _ => colors.text_muted,
+                };
+                div()
+                    .w_full()
+                    .h(px(26.))
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_subheader_background.opacity(0.72))
+                    .child(
+                        Icon::new(IconName::File)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .font_buffer(cx)
+                            .text_ui_sm(cx)
+                            .truncate()
+                            .child(clickable_path),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(additions > 0 || deletions > 0, |this| {
+                                this.child(
+                                    DiffStat::new(
+                                        format!("file-change-stat:{index}:{section_index}"),
+                                        additions,
+                                        deletions,
+                                    )
+                                    .label_size(LabelSize::XSmall)
+                                    .tooltip(format!(
+                                        "{additions} lines added, {deletions} lines removed"
+                                    )),
+                                )
+                            })
+                            .when(additions == 0 && deletions == 0, |this| {
+                                let operation = searchable_styled_text(
+                                    presentation.operation.clone(),
+                                    Vec::new(),
+                                    search,
+                                    cx,
+                                );
+                                this.child(
+                                    div()
+                                        .text_ui_xs(cx)
+                                        .text_color(operation_text_color)
+                                        .child(operation),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            RichFileChangeRow::Line {
+                section_index,
+                line_index,
+                source_range,
+                logical_range,
+                unified,
+                tone,
+                old_line,
+                new_line,
+            } => {
+                let colors = cx.theme().colors();
+                let line = &row_data.presentations[*section_index].content[source_range.clone()];
+                let highlighted_line = navigation_searchable_styled_text(
+                    line.to_owned(),
+                    Vec::new(),
+                    search,
+                    navigation,
+                    logical_range.clone(),
+                    cx,
+                );
+                let cursor_marker = rich_cursor_index_for_fragment(navigation, logical_range).map(
+                    |rendered_index| {
+                        rich_cursor_autoscroll_marker(
+                            highlighted_line.layout().clone(),
+                            rendered_index,
+                            cx.theme().players().local().cursor.opacity(0.55),
+                        )
+                    },
+                );
+                let clickable_line = rich_clickable_styled_text(
+                    format!("rich-file-change-line:{index}:{section_index}:{line_index}"),
+                    highlighted_line,
+                    index,
+                    logical_range.clone(),
+                    Some(owner.clone()),
+                );
+                div()
+                    .w_full()
+                    .h(px(26.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .relative()
+                    .font_buffer(cx)
+                    .text_ui_sm(cx)
+                    .bg(if *tone == DiffLineTone::Addition {
+                        colors.version_control_added.opacity(0.12)
+                    } else if *tone == DiffLineTone::Deletion {
+                        colors.version_control_deleted.opacity(0.12)
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .text_color(if *tone == DiffLineTone::Addition {
+                        colors.version_control_added
+                    } else if *tone == DiffLineTone::Deletion {
+                        colors.version_control_deleted
+                    } else if *tone == DiffLineTone::Hunk {
+                        colors.text_accent
+                    } else {
+                        colors.text
+                    })
+                    .child(
+                        div()
+                            .w(if *unified { px(54.) } else { px(28.) })
+                            .flex_none()
+                            .flex()
+                            .gap_1()
+                            .text_color(colors.text_muted)
+                            .when(*unified, |this| {
+                                this.child(div().w(px(24.)).flex().justify_end().child(
+                                    old_line.map(|line| line.to_string()).unwrap_or_default(),
+                                ))
+                            })
+                            .child(
+                                div().w(px(24.)).flex().justify_end().child(
+                                    new_line.map(|line| line.to_string()).unwrap_or_default(),
+                                ),
+                            ),
+                    )
+                    .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
+                    .when_some(cursor_marker, |this, marker| this.child(marker))
+                    .into_any_element()
+            }
+        }
+    }
+
     fn render_file_change(
         &mut self,
         item: &TranscriptItem,
@@ -6940,216 +7171,71 @@ impl HarnessApp {
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
-        let row_data = data.clone();
-        let row_owner = owner.clone();
-        let rows = list(list_state.clone(), move |row_index, _, cx| {
-            let row = &row_data.rows[row_index];
-            match row {
-                RichFileChangeRow::Separator => div()
-                    .w_full()
-                    .h(px(9.))
-                    .mt_1()
-                    .border_t_1()
-                    .border_color(cx.theme().colors().border_variant)
-                    .into_any_element(),
-                RichFileChangeRow::Header {
-                    section_index,
-                    logical_range,
-                } => {
-                    let presentation = &row_data.presentations[*section_index];
-                    let colors = cx.theme().colors();
-                    let (additions, deletions) = file_change_counts(presentation);
-                    let highlighted_path = navigation_searchable_styled_text(
-                        presentation.path.clone(),
-                        Vec::new(),
-                        search.as_ref(),
-                        navigation.as_ref(),
-                        logical_range.clone(),
-                        cx,
-                    );
-                    let clickable_path = rich_clickable_styled_text(
-                        format!("rich-file-change-path:{index}:{section_index}"),
-                        highlighted_path,
-                        index,
-                        logical_range.clone(),
-                        Some(row_owner.clone()),
-                    );
-                    let operation_color = match presentation.operation.as_str() {
-                        "Added" => Color::Success,
-                        "Deleted" => Color::Error,
-                        "Modified" | "Moved" => Color::Accent,
-                        _ => Color::Muted,
-                    };
-                    let operation_text_color = match operation_color {
-                        Color::Success => cx.theme().status().success,
-                        Color::Error => cx.theme().status().error,
-                        Color::Accent => colors.text_accent,
-                        _ => colors.text_muted,
-                    };
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.editor_subheader_background.opacity(0.72))
-                        .child(
-                            Icon::new(IconName::File)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .font_buffer(cx)
-                                .text_ui_sm(cx)
-                                .truncate()
-                                .child(clickable_path),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .when(additions > 0 || deletions > 0, |this| {
-                                    this.child(
-                                        DiffStat::new(
-                                            format!("file-change-stat:{index}:{section_index}"),
-                                            additions,
-                                            deletions,
-                                        )
-                                        .label_size(LabelSize::XSmall)
-                                        .tooltip(format!(
-                                            "{additions} lines added, {deletions} lines removed"
-                                        )),
-                                    )
-                                })
-                                .when(additions == 0 && deletions == 0, |this| {
-                                    let operation = searchable_styled_text(
-                                        presentation.operation.clone(),
-                                        Vec::new(),
-                                        search.as_ref(),
-                                        cx,
-                                    );
-                                    this.child(
-                                        div()
-                                            .text_ui_xs(cx)
-                                            .text_color(operation_text_color)
-                                            .child(operation),
-                                    )
-                                }),
-                        )
-                        .into_any_element()
-                }
-                RichFileChangeRow::Line {
-                    section_index,
-                    line_index,
-                    source_range,
-                    logical_range,
-                    unified,
-                    tone,
-                    old_line,
-                    new_line,
-                } => {
-                    let colors = cx.theme().colors();
-                    let line =
-                        &row_data.presentations[*section_index].content[source_range.clone()];
-                    let highlighted_line = navigation_searchable_styled_text(
-                        line.to_owned(),
-                        Vec::new(),
-                        search.as_ref(),
-                        navigation.as_ref(),
-                        logical_range.clone(),
-                        cx,
-                    );
-                    let cursor_marker =
-                        rich_cursor_index_for_fragment(navigation.as_ref(), logical_range).map(
-                            |rendered_index| {
-                                rich_cursor_autoscroll_marker(
-                                    highlighted_line.layout().clone(),
-                                    rendered_index,
-                                    cx.theme().players().local().cursor.opacity(0.55),
-                                )
-                            },
-                        );
-                    let clickable_line = rich_clickable_styled_text(
-                        format!("rich-file-change-line:{index}:{section_index}:{line_index}"),
-                        highlighted_line,
-                        index,
-                        logical_range.clone(),
-                        Some(row_owner.clone()),
-                    );
-                    div()
-                        .w_full()
-                        .min_h(px(22.))
-                        .px_2()
-                        .py_0p5()
-                        .flex()
-                        .gap_2()
-                        .relative()
-                        .font_buffer(cx)
-                        .text_ui_sm(cx)
-                        .bg(if *tone == DiffLineTone::Addition {
-                            colors.version_control_added.opacity(0.12)
-                        } else if *tone == DiffLineTone::Deletion {
-                            colors.version_control_deleted.opacity(0.12)
-                        } else {
-                            gpui::transparent_black()
-                        })
-                        .text_color(if *tone == DiffLineTone::Addition {
-                            colors.version_control_added
-                        } else if *tone == DiffLineTone::Deletion {
-                            colors.version_control_deleted
-                        } else if *tone == DiffLineTone::Hunk {
-                            colors.text_accent
-                        } else {
-                            colors.text
-                        })
-                        .child(
-                            div()
-                                .w(if *unified { px(54.) } else { px(28.) })
-                                .flex_none()
-                                .flex()
-                                .gap_1()
-                                .text_color(colors.text_muted)
-                                .when(*unified, |this| {
-                                    this.child(div().w(px(24.)).flex().justify_end().child(
-                                        old_line.map(|line| line.to_string()).unwrap_or_default(),
-                                    ))
-                                })
-                                .child(div().w(px(24.)).flex().justify_end().child(
-                                    new_line.map(|line| line.to_string()).unwrap_or_default(),
-                                )),
-                        )
-                        .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
-                        .when_some(cursor_marker, |this, marker| this.child(marker))
-                        .into_any_element()
-                }
-            }
-        })
-        .with_sizing_behavior(ListSizingBehavior::Infer)
-        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
 
-        let vertical_region = div()
-            .w_full()
-            .min_w_0()
-            .relative()
-            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-            .child(rows)
-            .custom_scrollbars(
-                Scrollbars::new(ScrollAxes::Vertical)
-                    .id(("file-change-vertical-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
-                    .tracked_scroll_handle(&list_state),
-                window,
-                cx,
-            );
+        let vertical_region = if data.rows.len() <= RICH_DIRECT_FILE_CHANGE_MAX_ROWS {
+            let rows = (0..data.rows.len())
+                .map(|row_index| {
+                    Self::render_rich_file_change_row(
+                        &data,
+                        row_index,
+                        index,
+                        search.as_ref(),
+                        navigation.as_ref(),
+                        &owner,
+                        cx,
+                    )
+                })
+                .collect::<Vec<_>>();
+            div()
+                .w_full()
+                .min_w_0()
+                .relative()
+                .children(rows)
+                .into_any_element()
+        } else {
+            let row_data = data.clone();
+            let row_owner = owner.clone();
+            let row_search = search.clone();
+            let row_navigation = navigation.clone();
+            let row_count = row_data.rows.len();
+            let rows = uniform_list(
+                ("file-change-rows", index),
+                row_count,
+                move |range, _, cx| {
+                    range
+                        .map(|row_index| {
+                            Self::render_rich_file_change_row(
+                                &row_data,
+                                row_index,
+                                index,
+                                row_search.as_ref(),
+                                row_navigation.as_ref(),
+                                &row_owner,
+                                cx,
+                            )
+                        })
+                        .collect()
+                },
+            )
+            .track_scroll(&list_state)
+            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
+
+            div()
+                .w_full()
+                .min_w_0()
+                .relative()
+                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                .child(rows)
+                .custom_scrollbars(
+                    Scrollbars::new(ScrollAxes::Vertical)
+                        .id(("file-change-vertical-scrollbar", index))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .tracked_scroll_handle(&list_state),
+                    window,
+                    cx,
+                )
+                .into_any_element()
+        };
         div()
             .id(("file-change-output", index))
             .w_full()
@@ -8591,7 +8677,7 @@ impl HarnessApp {
         let item = self.model.items[index].clone();
         if let Some(started_at) = clone_started_at {
             let elapsed = started_at.elapsed();
-            if elapsed >= Duration::from_millis(4) {
+            if elapsed >= slow_list_item_threshold() {
                 eprintln!(
                     "slow-transcript phase=clone item={index} kind={:?} content_bytes={} elapsed_ms={:.2}",
                     item.kind,
@@ -9095,7 +9181,7 @@ impl HarnessApp {
             .into_any_element();
         if let Some(started_at) = render_started_at {
             let elapsed = started_at.elapsed();
-            if elapsed >= Duration::from_millis(4) {
+            if elapsed >= slow_list_item_threshold() {
                 eprintln!(
                     "slow-transcript phase=construct item={index} kind={:?} content_bytes={} elapsed_ms={:.2}",
                     item.kind,
@@ -9181,10 +9267,14 @@ impl Render for HarnessApp {
                 .flex()
                 .flex_col()
                 .child(
-                    list(
-                        task_list_state.clone(),
-                        cx.processor(|this, index, _, cx| this.render_task(index, cx)),
+                    uniform_list(
+                        "tasks",
+                        self.threads.len(),
+                        cx.processor(|this, range: Range<usize>, _, cx| {
+                            range.map(|index| this.render_task(index, cx)).collect()
+                        }),
                     )
+                    .track_scroll(&task_list_state)
                     .flex_1()
                     .min_h_0(),
                 )
@@ -9389,7 +9479,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &GoTop, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = 0;
-                    this.task_list_state.scroll_to(gpui::ListOffset::default());
+                    this.task_list_state.scroll_to_item(0, ScrollStrategy::Top);
                 } else {
                     this.selected_item = 0;
                     this.list_state.scroll_to(gpui::ListOffset::default());
@@ -9399,7 +9489,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &GoBottom, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = this.threads.len().saturating_sub(1);
-                    this.task_list_state.scroll_to_end();
+                    this.task_list_state.scroll_to_bottom();
                 } else {
                     this.selected_item = this.model.items.len().saturating_sub(1);
                     this.list_state.set_follow_mode(FollowMode::Tail);
@@ -10754,6 +10844,11 @@ fn load_harness_keymaps(cx: &mut App) {
             CloseSearch,
             Some("HarnessTranscript && HarnessSearchVisible"),
         ),
+        KeyBinding::new(
+            "escape",
+            CloseSearch,
+            Some("HarnessBuffer && HarnessSearchVisible"),
+        ),
         KeyBinding::new("j", MoveDown, Some("HarnessRequest && !Editor")),
         KeyBinding::new("k", MoveUp, Some("HarnessRequest && !Editor")),
         KeyBinding::new("h", MoveLeft, Some("HarnessRequest && !Editor")),
@@ -10801,6 +10896,14 @@ mod tests {
         assert_eq!(cache.take("a").unwrap().updated_at, 1);
         cache.insert(cached_thread("c", 2));
         assert_eq!(cache.take("c").unwrap().updated_at, 2);
+    }
+
+    #[test]
+    fn vim_slash_search_routes_to_the_visible_rich_search_surface() {
+        assert!(vim_search_available(false, true));
+        assert!(!search_uses_native_editor(false, FocusMode::Buffer));
+        assert!(search_uses_native_editor(true, FocusMode::Buffer));
+        assert!(!vim_search_available(false, false));
     }
 
     #[test]
