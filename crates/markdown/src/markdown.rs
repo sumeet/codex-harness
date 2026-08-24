@@ -2782,6 +2782,8 @@ impl Element for MarkdownElement {
                             builder.push_div(div().pl_2p5(), range, markdown_end);
                         }
                         MarkdownTag::Item => {
+                            let marker_range =
+                                list_item_marker_source_range(parsed_markdown.source(), range);
                             let bullet =
                                 if let Some((task_range, MarkdownEvent::TaskListMarker(checked))) =
                                     parsed_markdown.events.get(index.saturating_add(1))
@@ -2816,11 +2818,26 @@ impl Element for MarkdownElement {
                                         } else {
                                             checkbox.visualization_only(true).into_any_element()
                                         };
-                                    builder.wrap_source_replacement(task_range.clone(), checkbox)
+                                    let replacement_range = marker_range
+                                        .map(|marker_range| marker_range.start..task_range.end)
+                                        .unwrap_or_else(|| task_range.clone());
+                                    builder.wrap_source_replacement(replacement_range, checkbox)
                                 } else if let Some(bullet_index) = builder.next_bullet_index() {
-                                    div().child(format!("{}.", bullet_index)).into_any_element()
+                                    let bullet = div()
+                                        .child(format!("{}.", bullet_index))
+                                        .into_any_element();
+                                    if let Some(marker_range) = marker_range {
+                                        builder.wrap_source_replacement(marker_range, bullet)
+                                    } else {
+                                        bullet
+                                    }
                                 } else {
-                                    div().child("•").into_any_element()
+                                    let bullet = div().child("•").into_any_element();
+                                    if let Some(marker_range) = marker_range {
+                                        builder.wrap_source_replacement(marker_range, bullet)
+                                    } else {
+                                        bullet
+                                    }
                                 };
                             self.push_markdown_list_item(&mut builder, bullet, range, markdown_end);
                         }
@@ -4205,6 +4222,55 @@ impl RenderedLine {
 struct SourceMapping {
     rendered_index: usize,
     source_index: usize,
+}
+
+/// Return the source bytes visually replaced by a rendered list marker.
+///
+/// Pulldown-cmark exposes a range for the complete list item but no separate
+/// event for its `- ` / `1. ` prefix. Markdown renders that prefix as a flex
+/// child outside the text layout, so the bytes otherwise have no cursor,
+/// selection, or hit-test geometry. Keep the parser-independent extraction
+/// deliberately small and CommonMark-shaped: up to the first marker and its
+/// following horizontal whitespace on the item's opening source line.
+fn list_item_marker_source_range(source: &str, item: &Range<usize>) -> Option<Range<usize>> {
+    let start = item.start.min(source.len());
+    let end = item.end.min(source.len());
+    let line_end = source[start..end]
+        .find('\n')
+        .map_or(end, |offset| start + offset);
+    let bytes = source[start..line_end].as_bytes();
+    let mut cursor = 0;
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+
+    match bytes.get(cursor).copied() {
+        Some(b'-' | b'+' | b'*') => cursor += 1,
+        Some(byte) if byte.is_ascii_digit() => {
+            let digits_start = cursor;
+            while bytes.get(cursor).is_some_and(|byte| byte.is_ascii_digit())
+                && cursor - digits_start < 9
+            {
+                cursor += 1;
+            }
+            if !matches!(bytes.get(cursor), Some(b'.' | b')')) {
+                return None;
+            }
+            cursor += 1;
+        }
+        _ => return None,
+    }
+
+    if bytes
+        .get(cursor)
+        .is_some_and(|byte| !matches!(byte, b' ' | b'\t'))
+    {
+        return None;
+    }
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    Some(start..start + cursor)
 }
 
 fn source_range_for_rendered(
@@ -6470,21 +6536,26 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_task_checkboxes_own_source_geometry_for_rich_vim(cx: &mut TestAppContext) {
+    fn test_task_checkboxes_own_list_prefix_source_geometry_for_rich_vim(cx: &mut TestAppContext) {
         let source = "- [x] first\n- [ ] second";
         let rendered = render_markdown(source, cx);
         let marker_ranges = [
             source.find("[x]").unwrap()..source.find("[x]").unwrap() + 3,
             source.find("[ ]").unwrap()..source.find("[ ]").unwrap() + 3,
         ];
+        let replacement_ranges = [
+            0..marker_ranges[0].end,
+            source.find("- [ ]").unwrap()..marker_ranges[1].end,
+        ];
 
-        assert_eq!(rendered.source_replacements.len(), marker_ranges.len());
-        for (replacement, marker_range) in rendered
+        assert_eq!(rendered.source_replacements.len(), replacement_ranges.len());
+        for ((replacement, replacement_range), marker_range) in rendered
             .source_replacements
             .iter()
+            .zip(replacement_ranges.iter())
             .zip(marker_ranges.iter())
         {
-            assert_eq!(&replacement.source_range, marker_range);
+            assert_eq!(&replacement.source_range, replacement_range);
             let replacement_bounds = replacement
                 .bounds
                 .get()
@@ -6509,8 +6580,8 @@ mod tests {
             );
             assert_eq!(
                 rendered.source_index_for_position(replacement_bounds.center()),
-                Ok(marker_range.start),
-                "clicking a checkbox should place the source cursor on its marker"
+                Ok(replacement_range.start),
+                "clicking a checkbox should place the source cursor on its list prefix"
             );
         }
 
@@ -6521,6 +6592,48 @@ mod tests {
             assert!(
                 block_bounds.contains(&(row, replacement_bounds)),
                 "Visual Block row {row} should visibly select its checkbox"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn test_plain_list_markers_own_source_geometry_for_rich_vim(cx: &mut TestAppContext) {
+        let source = "1. first\n2. second\n\n- third";
+        let rendered = render_markdown(source, cx);
+        let expected = [
+            0..3,
+            source.find("2. ").unwrap()..source.find("2. ").unwrap() + 3,
+            source.find("- ").unwrap()..source.find("- ").unwrap() + 2,
+        ];
+
+        assert_eq!(rendered.source_replacements.len(), expected.len());
+        for (replacement, marker_range) in rendered.source_replacements.iter().zip(expected.iter())
+        {
+            assert_eq!(&replacement.source_range, marker_range);
+            let marker_bounds = replacement
+                .bounds
+                .get()
+                .expect("list marker should record its painted bounds");
+            assert!(
+                marker_bounds.size.width > Pixels::ZERO && marker_bounds.size.height > Pixels::ZERO
+            );
+            for source_index in marker_range.clone() {
+                assert_eq!(
+                    rendered.cursor_bounds_for_source_index(source, source_index),
+                    Some(marker_bounds),
+                    "source byte {source_index} should paint on its visible list marker"
+                );
+            }
+            assert!(
+                rendered
+                    .bounds_for_source_range(marker_range.clone())
+                    .contains(&marker_bounds),
+                "Visual selection over {marker_range:?} should include the list marker"
+            );
+            assert_eq!(
+                rendered.source_index_for_position(marker_bounds.center()),
+                Ok(marker_range.start),
+                "clicking a list marker should enter its source range"
             );
         }
     }

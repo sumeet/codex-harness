@@ -2585,7 +2585,8 @@ fn search_uses_native_editor(
     focus_mode: FocusMode,
     rich_vim_enabled: bool,
 ) -> bool {
-    (buffer_view || rich_vim_enabled) && focus_mode == FocusMode::Buffer
+    (buffer_view || rich_vim_enabled)
+        && matches!(focus_mode, FocusMode::Buffer | FocusMode::Transcript)
 }
 
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
@@ -8139,10 +8140,32 @@ impl HarnessApp {
             list(command_list_state.clone(), move |row_index, _, cx| {
                 let row = &command_data.rows[row_index];
                 let line = &command_data.command[row.source_range.clone()];
-                let logical_range = rich_command_row_logical_range(&command_data, row);
+                let first_command_row = row.line_index == 0;
+                let logical_range = rich_command_row_navigation_range(&command_data, row);
+                let (rendered_line, base_highlights) = if first_command_row {
+                    let mut highlights = vec![(
+                        0..1,
+                        gpui::HighlightStyle {
+                            color: Some(cx.theme().colors().text_accent),
+                            ..Default::default()
+                        },
+                    )];
+                    highlights.extend(shell_highlights(line, cx).into_iter().map(
+                        |(range, style)| {
+                            (
+                                range.start + model::COMMAND_PROMPT.len()
+                                    ..range.end + model::COMMAND_PROMPT.len(),
+                                style,
+                            )
+                        },
+                    ));
+                    (format!("{}{line}", model::COMMAND_PROMPT), highlights)
+                } else {
+                    (line.to_owned(), shell_highlights(line, cx))
+                };
                 let highlighted = navigation_searchable_styled_text(
-                    line.to_owned(),
-                    shell_highlights(line, cx),
+                    rendered_line,
+                    base_highlights,
                     command_search.as_ref(),
                     command_navigation.as_ref(),
                     logical_range.clone(),
@@ -8164,63 +8187,15 @@ impl HarnessApp {
                     logical_range,
                     Some(command_owner.clone()),
                 );
-                let first_command_row = row.line_index == 0;
-                let prompt = first_command_row.then(|| {
-                    let prompt_range = 0..model::COMMAND_PROMPT.len();
-                    let highlighted_prompt = navigation_searchable_styled_text(
-                        model::COMMAND_PROMPT.to_owned(),
-                        vec![(
-                            0..1,
-                            gpui::HighlightStyle {
-                                color: Some(cx.theme().colors().text_accent),
-                                ..Default::default()
-                            },
-                        )],
-                        command_search.as_ref(),
-                        command_navigation.as_ref(),
-                        prompt_range.clone(),
-                        cx,
-                    );
-                    let prompt_cursor =
-                        rich_cursor_index_for_fragment(command_navigation.as_ref(), &prompt_range)
-                            .map(|rendered_index| {
-                                rich_cursor_autoscroll_marker(
-                                    highlighted_prompt.layout().clone(),
-                                    rendered_index,
-                                    cx.theme().players().local().cursor.opacity(0.55),
-                                )
-                            });
-                    let clickable_prompt = rich_clickable_styled_text(
-                        format!("rich-command-prompt:{index}"),
-                        highlighted_prompt,
-                        index,
-                        prompt_range,
-                        Some(command_owner.clone()),
-                    );
-                    div()
-                        .w(px(RICH_CARD_LEADING_WIDTH))
-                        .flex_none()
-                        .relative()
-                        .child(clickable_prompt)
-                        .when_some(prompt_cursor, |this, marker| this.child(marker))
-                });
-                let command_text = div()
-                    .min_w_0()
-                    .flex_1()
-                    .relative()
-                    .whitespace_normal()
-                    .child(clickable)
-                    .when_some(cursor_marker, |this, marker| this.child(marker));
                 div()
                     .w_full()
                     .min_w_0()
                     .min_h(px(20.))
-                    .flex()
-                    .items_start()
-                    .gap_1()
+                    .relative()
+                    .whitespace_normal()
                     .when(first_command_row, |this| this.pr_5())
-                    .when_some(prompt, |this, prompt| this.child(prompt))
-                    .child(command_text)
+                    .child(clickable)
+                    .when_some(cursor_marker, |this, marker| this.child(marker))
                     .into_any_element()
             })
             .with_sizing_behavior(ListSizingBehavior::Infer)
@@ -8370,23 +8345,36 @@ impl HarnessApp {
             output_limits.bytes,
         )
         .content;
-        let command_start = navigation
-            .and_then(|navigation| navigation.body_text.find(command_text))
-            .unwrap_or(0);
+        let command_start = 0;
         // The ellipsis is presentation chrome, not a Vim byte. Keep its
         // clickable/highlight range clamped to the actual command prefix so a
         // long preview cannot spill into the output's logical row.
-        let command_end = command_start + visible_command_source_len;
-        let output_start = navigation
-            .and_then(|navigation| {
-                navigation.body_text[command_start.min(navigation.body_text.len())..]
-                    .find(&displayed_output)
-                    .map(|offset| command_start + offset)
-            })
-            .unwrap_or(command_end);
+        let command_end = model::COMMAND_PROMPT.len() + visible_command_source_len;
+        let output_start = model::COMMAND_PROMPT.len()
+            + command_text.len()
+            + usize::from(!command_text.is_empty() && !displayed_output.is_empty());
+        let displayed_command = format!("{}{displayed_command}", model::COMMAND_PROMPT);
+        let mut command_highlights = vec![(
+            0..1,
+            gpui::HighlightStyle {
+                color: Some(colors.text_accent),
+                ..Default::default()
+            },
+        )];
+        command_highlights.extend(
+            shell_highlights(&displayed_command[model::COMMAND_PROMPT.len()..], cx)
+                .into_iter()
+                .map(|(range, style)| {
+                    (
+                        range.start + model::COMMAND_PROMPT.len()
+                            ..range.end + model::COMMAND_PROMPT.len(),
+                        style,
+                    )
+                }),
+        );
         let highlighted_command = navigation_searchable_styled_text(
-            displayed_command.clone(),
-            shell_highlights(&displayed_command, cx),
+            displayed_command,
+            command_highlights,
             search,
             navigation,
             command_start..command_end,
@@ -8399,28 +8387,6 @@ impl HarnessApp {
             navigation,
             output_start..output_start + displayed_output.len(),
             cx,
-        );
-        let prompt_range = 0..model::COMMAND_PROMPT.len();
-        let highlighted_prompt = navigation_searchable_styled_text(
-            model::COMMAND_PROMPT.to_owned(),
-            vec![(
-                0..1,
-                gpui::HighlightStyle {
-                    color: Some(colors.text_accent),
-                    ..Default::default()
-                },
-            )],
-            search,
-            navigation,
-            prompt_range.clone(),
-            cx,
-        );
-        let clickable_prompt = rich_clickable_styled_text(
-            format!("rich-command-prompt:{index}"),
-            highlighted_prompt,
-            index,
-            prompt_range,
-            owner.clone(),
         );
         let clickable_command = rich_clickable_styled_text(
             format!("rich-command-text:{index}"),
@@ -8447,20 +8413,11 @@ impl HarnessApp {
                         .w_full()
                         .min_w_0()
                         .pr_5()
-                        .flex()
-                        .items_start()
-                        .gap_1()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
                         .line_height(relative(1.35))
                         .whitespace_normal()
-                        .child(
-                            div()
-                                .w(px(RICH_CARD_LEADING_WIDTH))
-                                .flex_none()
-                                .child(clickable_prompt),
-                        )
-                        .child(div().min_w_0().flex_1().child(clickable_command)),
+                        .child(clickable_command),
                 )
                 .when(!displayed_output.is_empty(), |this| {
                     this.child(
@@ -11652,12 +11609,13 @@ mod tests {
     fn vim_slash_search_uses_the_native_editor_in_rich_and_text_views() {
         assert!(vim_search_available(false, true));
         assert!(search_uses_native_editor(false, FocusMode::Buffer, true));
-        assert!(search_uses_native_editor(true, FocusMode::Buffer, false));
-        assert!(!search_uses_native_editor(
+        assert!(search_uses_native_editor(
             false,
             FocusMode::Transcript,
             true
         ));
+        assert!(search_uses_native_editor(true, FocusMode::Buffer, false));
+        assert!(!search_uses_native_editor(false, FocusMode::Composer, true));
         assert!(!vim_search_available(false, false));
     }
 
