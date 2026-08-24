@@ -22,7 +22,7 @@ pub use actions::{ActionStatistics, ActionTiming, take_action_stats};
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "profiler")]
-use crate::{Action, App, WindowId};
+use crate::{Action, App, PlatformPresentation, WindowId};
 use crate::{SharedString, TasksIncluded};
 
 #[cfg(feature = "profiler")]
@@ -862,6 +862,10 @@ pub struct FrameDurationSnapshot {
     /// Histogram of intervals between consecutively presented frames while the
     /// window was animating, in nanoseconds.
     pub present_interval_histogram: Histogram<u64>,
+    /// Refresh intervals reported by the compositor for actually presented
+    /// frames, in nanoseconds. Empty on platforms without presentation
+    /// feedback.
+    pub compositor_refresh_interval_histogram: Histogram<u64>,
 }
 
 /// A point-in-time snapshot of the input-latency histograms for a window,
@@ -914,6 +918,7 @@ pub struct WindowProfiler {
     current_input_only_editor_prepaint_duration: Duration,
     input_driven_present_interval_histogram: Histogram<u64>,
     present_interval_histogram: Histogram<u64>,
+    compositor_refresh_interval_histogram: Histogram<u64>,
     first_input_at: Option<Instant>,
     pending_input_count: u64,
     input_latency_histogram: Histogram<u64>,
@@ -927,6 +932,20 @@ pub struct WindowProfiler {
     last_present_at: Option<Instant>,
     animating_at_last_present: bool,
     drew_since_last_present: bool,
+    presentation_generation: u64,
+    pending_presentations: VecDeque<PendingPresentation>,
+    discarded_first_input_at: Option<Instant>,
+    discarded_input_count: u64,
+}
+
+#[cfg(feature = "profiler")]
+struct PendingPresentation {
+    generation: u64,
+    first_input_at: Option<Instant>,
+    input_count: u64,
+    drew: bool,
+    window_active: bool,
+    next_frame_scheduled: bool,
 }
 
 #[cfg(feature = "profiler")]
@@ -989,6 +1008,9 @@ impl WindowProfiler {
             present_interval_histogram: Histogram::new(3).map_err(|error| {
                 anyhow::anyhow!("Failed to create present interval histogram: {error}")
             })?,
+            compositor_refresh_interval_histogram: Histogram::new(3).map_err(|error| {
+                anyhow::anyhow!("Failed to create compositor refresh interval histogram: {error}")
+            })?,
             first_input_at: None,
             pending_input_count: 0,
             input_latency_histogram: Histogram::new(3).map_err(|error| {
@@ -1010,6 +1032,10 @@ impl WindowProfiler {
             last_present_at: None,
             animating_at_last_present: false,
             drew_since_last_present: false,
+            presentation_generation: 0,
+            pending_presentations: VecDeque::new(),
+            discarded_first_input_at: None,
+            discarded_input_count: 0,
         })
     }
 
@@ -1119,6 +1145,60 @@ impl WindowProfiler {
         self.record_present_at(Instant::now(), window_active, next_frame_scheduled);
     }
 
+    /// Records a frame submission whose actual presentation will be reported
+    /// asynchronously by the platform.
+    pub fn record_submission(&mut self, window_active: bool, next_frame_scheduled: bool) {
+        let pending = self.take_pending_presentation(window_active, next_frame_scheduled);
+        self.pending_presentations.push_back(pending);
+    }
+
+    /// Resolves the oldest submitted frame from platform presentation
+    /// feedback. Discarded frames carry their input provenance forward so the
+    /// next visible frame measures from the earliest superseded input.
+    pub fn record_presentation_feedback(&mut self, feedback: PlatformPresentation) {
+        let Some(mut pending) = self.pending_presentations.pop_front() else {
+            return;
+        };
+        if pending.generation != self.presentation_generation {
+            return;
+        }
+
+        match feedback {
+            PlatformPresentation::Discarded => {
+                if let Some(first_input_at) = pending.first_input_at {
+                    self.discarded_first_input_at = Some(
+                        self.discarded_first_input_at
+                            .map_or(first_input_at, |discarded| discarded.min(first_input_at)),
+                    );
+                }
+                self.discarded_input_count = self
+                    .discarded_input_count
+                    .saturating_add(pending.input_count);
+            }
+            PlatformPresentation::Presented {
+                presented_at,
+                refresh_interval,
+            } => {
+                if let Some(discarded) = self.discarded_first_input_at.take() {
+                    pending.first_input_at = Some(
+                        pending
+                            .first_input_at
+                            .map_or(discarded, |submitted| submitted.min(discarded)),
+                    );
+                }
+                pending.input_count = pending
+                    .input_count
+                    .saturating_add(std::mem::take(&mut self.discarded_input_count));
+                if let Some(refresh_interval) = refresh_interval {
+                    self.compositor_refresh_interval_histogram
+                        .record(refresh_interval.as_nanos() as u64)
+                        .ok();
+                }
+                self.record_pending_presentation_at(pending, presented_at);
+            }
+        }
+    }
+
     /// Returns a snapshot of the current input-latency histograms.
     pub fn input_latency_snapshot(&self) -> InputLatencySnapshot {
         InputLatencySnapshot {
@@ -1159,6 +1239,9 @@ impl WindowProfiler {
                 .input_driven_present_interval_histogram
                 .clone(),
             present_interval_histogram: self.present_interval_histogram.clone(),
+            compositor_refresh_interval_histogram: self
+                .compositor_refresh_interval_histogram
+                .clone(),
         }
     }
 
@@ -1167,8 +1250,11 @@ impl WindowProfiler {
     /// cleared so the first sample after the boundary cannot span preparation
     /// work from before the caller's histogram snapshot.
     pub fn begin_measurement(&mut self) {
+        self.presentation_generation = self.presentation_generation.wrapping_add(1);
         self.first_input_at = None;
         self.pending_input_count = 0;
+        self.discarded_first_input_at = None;
+        self.discarded_input_count = 0;
         self.last_frame_request_at = None;
         self.last_invalidating_input_at = None;
         self.last_input_driven_present_at = None;
@@ -1197,19 +1283,45 @@ impl WindowProfiler {
         window_active: bool,
         next_frame_scheduled: bool,
     ) {
-        let input_driven = self.pending_input_count > 0;
-        if let Some(first_input_at) = self.first_input_at.take() {
-            let latency_nanos = presented_at.duration_since(first_input_at).as_nanos() as u64;
-            self.input_latency_histogram.record(latency_nanos).ok();
+        let pending = self.take_pending_presentation(window_active, next_frame_scheduled);
+        self.record_pending_presentation_at(pending, presented_at);
+    }
+
+    fn take_pending_presentation(
+        &mut self,
+        window_active: bool,
+        next_frame_scheduled: bool,
+    ) -> PendingPresentation {
+        PendingPresentation {
+            generation: self.presentation_generation,
+            first_input_at: self.first_input_at.take(),
+            input_count: std::mem::take(&mut self.pending_input_count),
+            drew: std::mem::take(&mut self.drew_since_last_present),
+            window_active,
+            next_frame_scheduled,
         }
-        if self.pending_input_count > 0 {
-            self.events_per_frame_histogram
-                .record(self.pending_input_count)
+    }
+
+    fn record_pending_presentation_at(
+        &mut self,
+        pending: PendingPresentation,
+        presented_at: Instant,
+    ) {
+        let input_driven = pending.input_count > 0;
+        if let Some(first_input_at) = pending.first_input_at
+            && let Some(latency) = presented_at.checked_duration_since(first_input_at)
+        {
+            self.input_latency_histogram
+                .record(latency.as_nanos() as u64)
                 .ok();
-            self.pending_input_count = 0;
+        }
+        if pending.input_count > 0 {
+            self.events_per_frame_histogram
+                .record(pending.input_count)
+                .ok();
         }
 
-        if !std::mem::take(&mut self.drew_since_last_present) {
+        if !pending.drew {
             return;
         }
 
@@ -1229,7 +1341,7 @@ impl WindowProfiler {
             self.last_input_driven_present_at = None;
         }
 
-        let animation_interval = if self.animating_at_last_present && window_active {
+        let animation_interval = if self.animating_at_last_present && pending.window_active {
             self.last_present_at
                 .map(|last_present_at| presented_at.duration_since(last_present_at))
         } else {
@@ -1249,7 +1361,7 @@ impl WindowProfiler {
         }));
 
         self.last_present_at = Some(presented_at);
-        self.animating_at_last_present = next_frame_scheduled && window_active;
+        self.animating_at_last_present = pending.next_frame_scheduled && pending.window_active;
     }
 
     fn record_draw_duration(&mut self, duration: Duration) {
@@ -1646,6 +1758,126 @@ mod tests {
         assert_eq!(snapshot.events_per_frame_histogram.len(), 1);
         assert_eq!(snapshot.events_per_frame_histogram.max(), 2);
         assert_eq!(snapshot.mid_draw_events_dropped, 0);
+    }
+
+    #[test]
+    fn records_input_latency_at_actual_platform_presentation() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(15)).expect("window profiler should initialize");
+        let first_input_at = Instant::now();
+        let presented_at = first_input_at + Duration::from_millis(12);
+        let refresh_interval = Duration::from_nanos(8_333_333);
+
+        begin_input_at(&mut window_profiler, first_input_at);
+        window_profiler.end_input_at(true, first_input_at + Duration::from_micros(200));
+        window_profiler.record_draw_duration(Duration::from_millis(2));
+        window_profiler.record_submission(true, false);
+
+        assert!(
+            window_profiler
+                .input_latency_snapshot()
+                .latency_histogram
+                .is_empty()
+        );
+
+        window_profiler.record_presentation_feedback(PlatformPresentation::Presented {
+            presented_at,
+            refresh_interval: Some(refresh_interval),
+        });
+
+        let input = window_profiler.input_latency_snapshot();
+        let frames = window_profiler.frame_duration_snapshot();
+        assert_eq!(input.latency_histogram.len(), 1);
+        assert!(input.latency_histogram.max() >= Duration::from_millis(12).as_nanos() as u64);
+        assert_eq!(input.events_per_frame_histogram.len(), 1);
+        assert_eq!(input.events_per_frame_histogram.max(), 1);
+        assert_eq!(frames.compositor_refresh_interval_histogram.len(), 1);
+        assert!(
+            frames
+                .compositor_refresh_interval_histogram
+                .max()
+                .abs_diff(refresh_interval.as_nanos() as u64)
+                < 10_000
+        );
+    }
+
+    #[test]
+    fn discarded_platform_frame_carries_input_to_the_next_visible_frame() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(16)).expect("window profiler should initialize");
+        let first_input_at = Instant::now();
+
+        begin_input_at(&mut window_profiler, first_input_at);
+        window_profiler.end_input_at(true, first_input_at + Duration::from_micros(200));
+        window_profiler.record_draw_duration(Duration::from_millis(2));
+        window_profiler.record_submission(true, false);
+
+        let second_input_at = first_input_at + Duration::from_millis(3);
+        begin_input_at(&mut window_profiler, second_input_at);
+        window_profiler.end_input_at(true, second_input_at + Duration::from_micros(200));
+        window_profiler.record_draw_duration(Duration::from_millis(2));
+        window_profiler.record_submission(true, false);
+
+        window_profiler.record_presentation_feedback(PlatformPresentation::Discarded);
+        assert!(
+            window_profiler
+                .input_latency_snapshot()
+                .latency_histogram
+                .is_empty()
+        );
+
+        window_profiler.record_presentation_feedback(PlatformPresentation::Presented {
+            presented_at: first_input_at + Duration::from_millis(20),
+            refresh_interval: None,
+        });
+
+        let input = window_profiler.input_latency_snapshot();
+        assert_eq!(input.latency_histogram.len(), 1);
+        assert!(input.latency_histogram.max() >= Duration::from_millis(20).as_nanos() as u64);
+        assert_eq!(input.events_per_frame_histogram.len(), 1);
+        assert_eq!(input.events_per_frame_histogram.max(), 2);
+    }
+
+    #[test]
+    fn measurement_boundary_ignores_older_in_flight_presentations() {
+        let mut window_profiler =
+            WindowProfiler::new(WindowId::from(17)).expect("window profiler should initialize");
+        let start = Instant::now();
+
+        begin_input_at(&mut window_profiler, start);
+        window_profiler.end_input_at(true, start + Duration::from_micros(100));
+        window_profiler.record_draw_duration(Duration::from_millis(2));
+        window_profiler.record_submission(true, false);
+
+        window_profiler.begin_measurement();
+
+        let measured_input_at = start + Duration::from_millis(10);
+        begin_input_at(&mut window_profiler, measured_input_at);
+        window_profiler.end_input_at(true, measured_input_at + Duration::from_micros(100));
+        window_profiler.record_draw_duration(Duration::from_millis(2));
+        window_profiler.record_submission(true, false);
+
+        window_profiler.record_presentation_feedback(PlatformPresentation::Presented {
+            presented_at: start + Duration::from_millis(12),
+            refresh_interval: Some(Duration::from_nanos(8_333_333)),
+        });
+        assert!(
+            window_profiler
+                .input_latency_snapshot()
+                .latency_histogram
+                .is_empty()
+        );
+
+        window_profiler.record_presentation_feedback(PlatformPresentation::Presented {
+            presented_at: start + Duration::from_millis(18),
+            refresh_interval: Some(Duration::from_nanos(8_333_333)),
+        });
+
+        let input = window_profiler.input_latency_snapshot();
+        let frames = window_profiler.frame_duration_snapshot();
+        assert_eq!(input.latency_histogram.len(), 1);
+        assert!(input.latency_histogram.max() >= Duration::from_millis(8).as_nanos() as u64);
+        assert_eq!(frames.compositor_refresh_interval_histogram.len(), 1);
     }
 
     #[test]

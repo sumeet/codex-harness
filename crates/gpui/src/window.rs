@@ -1527,6 +1527,21 @@ impl Window {
                 });
             }
         }));
+        #[cfg(feature = "profiler")]
+        if platform_window.reports_actual_presentation() {
+            platform_window.on_presentation(Box::new({
+                let mut cx = cx.to_async();
+                move |feedback| {
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window
+                                .window_profiler
+                                .record_presentation_feedback(feedback);
+                        })
+                        .log_err();
+                }
+            }));
+        }
         platform_window.on_request_frame(Box::new({
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
@@ -3045,10 +3060,15 @@ impl Window {
         {
             self.window_profiler
                 .record_platform_present_duration(platform_present_started_at.elapsed());
-            self.window_profiler.record_present(
-                self.active.get(),
-                !self.next_frame_callbacks.borrow().is_empty(),
-            );
+            let window_active = self.active.get();
+            let next_frame_scheduled = !self.next_frame_callbacks.borrow().is_empty();
+            if self.platform_window.reports_actual_presentation() {
+                self.window_profiler
+                    .record_submission(window_active, next_frame_scheduled);
+            } else {
+                self.window_profiler
+                    .record_present(window_active, next_frame_scheduled);
+            }
         }
         self.needs_present.set(false);
         profiling::finish_frame!();

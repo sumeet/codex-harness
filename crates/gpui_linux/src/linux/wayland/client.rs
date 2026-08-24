@@ -40,6 +40,7 @@ use wayland_client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -99,8 +100,9 @@ use gpui::{
     FileDragPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, KeyUpEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
-    PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    PlatformKeyboardLayout, PlatformPresentation, PlatformWindow, Point, ScrollDelta,
+    ScrollWheelEvent, SharedString, Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams,
+    point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -181,11 +183,45 @@ struct PointerAxisEventClock(Option<PointerAxisTimebase>);
 // Gesture velocity only depends on differences between these timestamps, and
 // momentum integration has a separate dispatch clock.
 const POINTER_AXIS_SOURCE_CLOCK_HEADROOM: Duration = Duration::from_secs(60 * 60);
+const PRESENTATION_CLOCK_MAX_SKEW: Duration = Duration::from_secs(5);
 
 fn pointer_axis_source_epoch(received_at: Instant) -> Instant {
     received_at
         .checked_sub(POINTER_AXIS_SOURCE_CLOCK_HEADROOM)
         .unwrap_or(received_at)
+}
+
+fn presentation_timestamp_to_instant(
+    clock_id: Option<libc::clockid_t>,
+    seconds: u64,
+    nanoseconds: u32,
+    received_at: Instant,
+) -> Instant {
+    let Some(clock_id) = clock_id else {
+        return received_at;
+    };
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` points to a valid timespec and the compositor supplied a
+    // POSIX clock ID through wp_presentation.clock_id.
+    if unsafe { libc::clock_gettime(clock_id, &mut now) } != 0 {
+        return received_at;
+    }
+
+    let event_nanos = i128::from(seconds) * 1_000_000_000 + i128::from(nanoseconds);
+    let now_nanos = i128::from(now.tv_sec) * 1_000_000_000 + i128::from(now.tv_nsec);
+    let delta = event_nanos - now_nanos;
+    let magnitude = Duration::from_nanos(delta.unsigned_abs().min(u128::from(u64::MAX)) as u64);
+    if magnitude > PRESENTATION_CLOCK_MAX_SKEW {
+        return received_at;
+    }
+    if delta >= 0 {
+        received_at.checked_add(magnitude).unwrap_or(received_at)
+    } else {
+        received_at.checked_sub(magnitude).unwrap_or(received_at)
+    }
 }
 
 impl PointerAxisEventClock {
@@ -405,6 +441,7 @@ pub struct Globals {
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
     pub executor: ForegroundExecutor,
 }
 
@@ -447,6 +484,7 @@ impl Globals {
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
+            presentation: globals.bind(&qh, 1..=2, ()).ok(),
             executor,
             qh,
         }
@@ -523,6 +561,7 @@ pub(crate) struct WaylandClientState {
     pointer_axis_frame: PointerAxisFrame,
     pointer_axis_sequence: PointerAxisSequence,
     pointer_axis_event_clock: PointerAxisEventClock,
+    presentation_clock_id: Option<libc::clockid_t>,
     vertical_modifier: f32,
     horizontal_modifier: f32,
     enter_token: Option<()>,
@@ -1076,6 +1115,7 @@ impl WaylandClient {
             pointer_axis_frame: PointerAxisFrame::default(),
             pointer_axis_sequence: PointerAxisSequence::default(),
             pointer_axis_event_clock: PointerAxisEventClock::default(),
+            presentation_clock_id: None,
             vertical_modifier: -1.0,
             horizontal_modifier: -1.0,
             button_pressed: None,
@@ -1536,6 +1576,67 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
             wl_registry::Event::GlobalRemove { name: _ } => {
                 // TODO: handle global removal
             }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            this.get_client().borrow_mut().presentation_clock_id = Some(clk_id as libc::clockid_t);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let received_at = Instant::now();
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let clock_id = state.presentation_clock_id;
+        let Some(window) = get_window(&mut state, surface_id) else {
+            return;
+        };
+        drop(state);
+
+        match event {
+            wp_presentation_feedback::Event::Presented {
+                tv_sec_hi,
+                tv_sec_lo,
+                tv_nsec,
+                refresh,
+                ..
+            } => {
+                let seconds = (u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo);
+                let presented_at =
+                    presentation_timestamp_to_instant(clock_id, seconds, tv_nsec, received_at);
+                window.presentation_feedback(PlatformPresentation::Presented {
+                    presented_at,
+                    refresh_interval: (refresh > 0)
+                        .then(|| Duration::from_nanos(u64::from(refresh))),
+                });
+            }
+            wp_presentation_feedback::Event::Discarded => {
+                window.presentation_feedback(PlatformPresentation::Discarded);
+            }
+            wp_presentation_feedback::Event::SyncOutput { .. } => {}
             _ => {}
         }
     }

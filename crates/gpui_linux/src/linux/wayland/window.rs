@@ -34,9 +34,9 @@ use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
     Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    PlatformPresentation, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -46,6 +46,7 @@ use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
 #[derive(Default)]
 pub(crate) struct Callbacks {
     request_frame: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    presentation: Option<Box<dyn FnMut(PlatformPresentation)>>,
     input: Option<Box<dyn FnMut(gpui::PlatformInput) -> gpui::DispatchEventResult>>,
     active_status_change: Option<Box<dyn FnMut(bool)>>,
     hover_status_change: Option<Box<dyn FnMut(bool)>>,
@@ -807,6 +808,12 @@ impl WaylandWindowStatePtr {
 
     pub fn surface(&self) -> wl_surface::WlSurface {
         self.state.borrow().surface.clone()
+    }
+
+    pub fn presentation_feedback(&self, feedback: PlatformPresentation) {
+        if let Some(callback) = self.callbacks.borrow_mut().presentation.as_mut() {
+            callback(feedback);
+        }
     }
 
     pub fn toplevel(&self) -> Option<xdg_toplevel::XdgToplevel> {
@@ -1709,6 +1716,14 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().fullscreen
     }
 
+    fn reports_actual_presentation(&self) -> bool {
+        self.borrow().globals.presentation.is_some()
+    }
+
+    fn on_presentation(&self, callback: Box<dyn FnMut(PlatformPresentation)>) {
+        self.0.callbacks.borrow_mut().presentation = Some(callback);
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1755,6 +1770,10 @@ impl PlatformWindow for WaylandWindow {
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
 
+        if let Some(presentation) = state.globals.presentation.as_ref() {
+            presentation.feedback(&state.surface, &state.globals.qh, state.surface.id());
+        }
+
         if state.renderer.device_lost() {
             let raw_window = RawWindow {
                 window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
@@ -1776,7 +1795,6 @@ impl PlatformWindow for WaylandWindow {
             state.force_render_after_recovery = true;
             return;
         }
-
         state.renderer_presented = state.renderer.draw(scene);
 
         if state.renderer.needs_redraw() {

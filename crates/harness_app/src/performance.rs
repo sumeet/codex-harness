@@ -67,6 +67,7 @@ struct PerformanceSample {
     input_driven_list_prepaint_duration: Histogram<u64>,
     input_only_editor_prepaint_duration: Histogram<u64>,
     input_driven_input_only_editor_prepaint_duration: Histogram<u64>,
+    compositor_refresh_interval: Histogram<u64>,
     input_to_present: Histogram<u64>,
     input_arrival_interval: Histogram<u64>,
     input_dispatch_duration: Histogram<u64>,
@@ -159,6 +160,11 @@ impl PerformanceSample {
                 }),
                 "input-driven input-only editor prepaint duration",
             )?,
+            compositor_refresh_interval: histogram_delta(
+                &current.frames.compositor_refresh_interval_histogram,
+                previous_frames.map(|snapshot| &snapshot.compositor_refresh_interval_histogram),
+                "compositor refresh interval",
+            )?,
             input_to_present: histogram_delta(
                 &current.input.latency_histogram,
                 previous_input.map(|snapshot| &snapshot.latency_histogram),
@@ -222,6 +228,10 @@ impl PerformanceSample {
             format_duration_histogram(
                 "input-driven input-only editor prepaint total",
                 &self.input_driven_input_only_editor_prepaint_duration,
+            ),
+            format_duration_histogram(
+                "compositor refresh interval",
+                &self.compositor_refresh_interval,
             ),
             format_duration_histogram("input arrival", &self.input_arrival_interval),
             format_duration_histogram("input dispatch", &self.input_dispatch_duration),
@@ -380,6 +390,7 @@ mod tests {
                 input_driven_input_only_editor_prepaint_duration_histogram: histogram(draws),
                 input_driven_present_interval_histogram: histogram(input_intervals),
                 present_interval_histogram: histogram(animation_intervals),
+                compositor_refresh_interval_histogram: histogram(animation_intervals),
             },
             input: InputLatencySnapshot {
                 latency_histogram: histogram(input_latency),

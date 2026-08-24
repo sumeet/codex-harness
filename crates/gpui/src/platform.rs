@@ -800,6 +800,23 @@ pub enum TextInputStateChange {
     ContentChanged,
 }
 
+/// Feedback from a platform that can report whether a submitted frame was
+/// actually scanned out. Most platforms still use GPUI's synchronous submit
+/// timestamp; Wayland supplies this through the presentation-time protocol.
+#[derive(Debug, Copy, Clone)]
+pub enum PlatformPresentation {
+    /// The submitted frame became visible at the reported presentation-clock
+    /// timestamp. `refresh_interval` is the compositor's current prediction.
+    Presented {
+        /// The instant at which the compositor reports that the frame became visible.
+        presented_at: Instant,
+        /// The compositor's predicted interval until the next presentation.
+        refresh_interval: Option<Duration>,
+    },
+    /// The submitted frame was superseded before it became visible.
+    Discarded,
+}
+
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn bounds(&self) -> Bounds<Pixels>;
@@ -843,6 +860,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn draws_immediately_after_input(&self) -> bool {
         false
     }
+    /// Whether this window reports actual scanout feedback asynchronously.
+    fn reports_actual_presentation(&self) -> bool {
+        false
+    }
+    /// Installs the actual-presentation callback when supported by the
+    /// platform. Unsupported platforms retain submit-time accounting.
+    fn on_presentation(&self, _callback: Box<dyn FnMut(PlatformPresentation)>) {}
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>);
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> DispatchEventResult>);
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>);
