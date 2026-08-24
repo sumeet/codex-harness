@@ -487,6 +487,21 @@ pub struct TranscriptSelectionSnapshot {
     pub items: Vec<TranscriptItemSelection>,
 }
 
+/// Occurrence-level search state owned by the same Buffer and selection that
+/// power Vim navigation. Rich transcript rendering consumes this summary so
+/// its counter, active card, and painted cursor cannot drift onto a separate
+/// item-level search model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscriptSearchSnapshot {
+    pub query: String,
+    pub highlights_visible: bool,
+    pub match_count: usize,
+    pub active_match_index: Option<usize>,
+    pub active_item_index: Option<usize>,
+    pub active_body_offset: Option<usize>,
+    pub matching_item_indices: Vec<usize>,
+}
+
 fn linewise_selection_rows(start: Point, end: Point) -> RangeInclusive<u32> {
     // A range ending at column zero owns the preceding newline, not the next
     // row. This is the same boundary rule used by Vim's linewise yank path.
@@ -1487,10 +1502,7 @@ fn transcript_icon(kind: TranscriptKind) -> IconName {
     }
 }
 
-fn transcript_icon_color(kind: TranscriptKind, selected: bool) -> Color {
-    if selected {
-        return Color::Accent;
-    }
+fn transcript_icon_color(kind: TranscriptKind) -> Color {
     match kind {
         TranscriptKind::Error => Color::Error,
         TranscriptKind::User | TranscriptKind::Agent => Color::Default,
@@ -1775,7 +1787,7 @@ fn native_header_block(
             let collapsed = transcript.upgrade().is_some_and(|transcript| {
                 transcript.read(cx.app).collapsed_items.contains(&item_key)
             });
-            let icon_color = transcript_icon_color(kind, cx.selected);
+            let icon_color = transcript_icon_color(kind);
             let colors = cx.theme().colors();
             let card = transcript_kind_is_card(kind);
             let background = if card || !cx.selected {
@@ -1805,11 +1817,7 @@ fn native_header_block(
                     this.child(
                         Label::new(label.clone())
                             .size(LabelSize::XSmall)
-                            .color(if cx.selected {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            })
+                            .color(Color::Muted)
                             .truncate(),
                     )
                 });
@@ -4293,6 +4301,69 @@ impl TranscriptEditor {
 
     pub fn search_query(&self) -> Option<&str> {
         (!self.search.query.is_empty()).then_some(self.search.query.as_str())
+    }
+
+    /// Summarize every occurrence for Rich rendering without retaining a
+    /// second searchable document. The query and active range still live in
+    /// `TranscriptSearchState`; this method only projects them into semantic
+    /// item coordinates after an explicit search/navigation operation.
+    pub fn search_snapshot(&self, cx: &mut App) -> Option<TranscriptSearchSnapshot> {
+        if self.search.query.is_empty() {
+            return None;
+        }
+        let text = self.buffer.read(cx).text();
+        let matches = literal_match_ranges_with_options(
+            &text,
+            &self.search.query,
+            0,
+            text.len(),
+            self.search.case_sensitive,
+            self.search.whole_word,
+        );
+        let active_range = self.search.active_match.as_ref().map(|range| {
+            self.editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+            })
+        });
+        let active_match_index = active_range.as_ref().and_then(|active| {
+            matches
+                .iter()
+                .position(|candidate| candidate.start == active.start)
+        });
+        let active_segment = active_range
+            .as_ref()
+            .and_then(|active| segment_position_at_offset(&self.segments, active.start))
+            .and_then(|position| self.segments.get(position));
+        let active_item_index = active_segment.map(|segment| segment.item_index);
+        let active_body_offset =
+            active_segment
+                .zip(active_range.as_ref())
+                .map(|(segment, active)| {
+                    active
+                        .start
+                        .saturating_sub(segment.body_range.start)
+                        .min(segment.body_range.len())
+                });
+        let matching_item_indices = matches
+            .iter()
+            .filter_map(|range| {
+                segment_position_at_offset(&self.segments, range.start)
+                    .and_then(|position| self.segments.get(position))
+                    .map(|segment| segment.item_index)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        Some(TranscriptSearchSnapshot {
+            query: self.search.query.clone(),
+            highlights_visible: self.search.highlights_visible,
+            match_count: matches.len(),
+            active_match_index,
+            active_item_index,
+            active_body_offset,
+            matching_item_indices,
+        })
     }
 
     /// Repeat in the original `/` or `?` direction. `reverse` implements Vim's

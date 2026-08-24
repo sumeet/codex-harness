@@ -81,6 +81,7 @@ actions!(
         RefreshTasks,
         ToggleSidebar,
         OpenSearch,
+        OpenActionPalette,
         CommitSearch,
         CloseSearch,
         ClearSearchHighlights,
@@ -280,8 +281,8 @@ struct SearchTextRanges {
 #[derive(Clone)]
 struct RichSearchPaint {
     query: SharedString,
-    active_item: bool,
-    active_claimed: Rc<Cell<bool>>,
+    active_ordinal: Option<usize>,
+    seen_ranges: Rc<Cell<usize>>,
     remaining_ranges: Rc<Cell<usize>>,
 }
 
@@ -613,11 +614,11 @@ fn markdown_logical_offset_for_source(logical: &str, source: &str, requested: us
 }
 
 impl RichSearchPaint {
-    fn new(query: impl Into<SharedString>, active_item: bool) -> Self {
+    fn new(query: impl Into<SharedString>, active_ordinal: Option<usize>) -> Self {
         Self {
             query: query.into(),
-            active_item,
-            active_claimed: Rc::new(Cell::new(false)),
+            active_ordinal,
+            seen_ranges: Rc::new(Cell::new(0)),
             remaining_ranges: Rc::new(Cell::new(RICH_SEARCH_HIGHLIGHT_LIMIT)),
         }
     }
@@ -632,11 +633,12 @@ impl RichSearchPaint {
         ranges.truncate(remaining);
         self.remaining_ranges
             .set(remaining.saturating_sub(ranges.len()));
-        let active =
-            (self.active_item && !ranges.is_empty() && !self.active_claimed.get()).then(|| {
-                self.active_claimed.set(true);
-                0
-            });
+        let first_ordinal = self.seen_ranges.get();
+        let active = self.active_ordinal.and_then(|active| {
+            (first_ordinal <= active && active < first_ordinal + ranges.len())
+                .then(|| active - first_ordinal)
+        });
+        self.seen_ranges.set(first_ordinal + ranges.len());
         SearchTextRanges { ranges, active }
     }
 }
@@ -2242,6 +2244,22 @@ enum FocusMode {
     Buffer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VimCommandLine {
+    Search { backwards: bool },
+    Ex,
+}
+
+impl VimCommandLine {
+    fn prompt(self) -> &'static str {
+        match self {
+            Self::Search { backwards: false } => "/",
+            Self::Search { backwards: true } => "?",
+            Self::Ex => ":",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum RequestReply {
     Result(Value),
@@ -2470,8 +2488,12 @@ fn vim_search_available(buffer_view: bool, rich_vim_enabled: bool) -> bool {
     buffer_view || rich_vim_enabled
 }
 
-fn search_uses_native_editor(buffer_view: bool, focus_mode: FocusMode) -> bool {
-    buffer_view && focus_mode == FocusMode::Buffer
+fn search_uses_native_editor(
+    buffer_view: bool,
+    focus_mode: FocusMode,
+    rich_vim_enabled: bool,
+) -> bool {
+    (buffer_view || rich_vim_enabled) && focus_mode == FocusMode::Buffer
 }
 
 fn item_uses_hybrid_surface(item: &TranscriptItem) -> bool {
@@ -2697,10 +2719,15 @@ struct HarnessApp {
     raw_visible: HashSet<String>,
     markdown_cache: HashMap<String, CachedMarkdown>,
     search_visible: bool,
+    vim_command_line: Option<VimCommandLine>,
+    command_line_error: Option<SharedString>,
     search_highlights_visible: bool,
     search_query: String,
     search_matches: Vec<usize>,
     active_search_match: usize,
+    search_match_count: usize,
+    active_search_item: Option<usize>,
+    active_search_body_offset: Option<usize>,
     search_navigation_generation: u64,
     search_returns_to_buffer: bool,
     search_return_focus: FocusMode,
@@ -3082,8 +3109,7 @@ impl HarnessApp {
             composer_available_width(f32::from(window.viewport_size().width), true, false),
             composer.read(cx).typography_profile(),
         );
-        let search_editor =
-            cx.new(|cx| LocalEditor::plain_single_line("Search transcript…", window, cx));
+        let search_editor = cx.new(|cx| LocalEditor::plain_single_line("", window, cx));
         let transcript_editor = cx.new(|cx| TranscriptEditor::read_only(window, cx));
         cx.on_focus_in(
             &transcript_editor.focus_handle(cx),
@@ -3238,10 +3264,15 @@ impl HarnessApp {
             raw_visible: HashSet::default(),
             markdown_cache: HashMap::default(),
             search_visible: false,
+            vim_command_line: None,
+            command_line_error: None,
             search_highlights_visible: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
+            search_match_count: 0,
+            active_search_item: None,
+            active_search_body_offset: None,
             search_navigation_generation: 0,
             search_returns_to_buffer: false,
             search_return_focus: FocusMode::Transcript,
@@ -3710,7 +3741,7 @@ impl HarnessApp {
             }
             self.refresh_threads(cx);
         }
-        if !self.search_query.is_empty() {
+        if !self.search_query.is_empty() && !self.search_returns_to_buffer {
             self.update_search_matches_for_changes(old_len, &dirty_items);
         }
         if document_changed && (self.buffer_view || rich_vim_experiment()) {
@@ -4531,7 +4562,7 @@ impl HarnessApp {
                         .min(self.model.items.len().saturating_sub(1))
                 })
         };
-        if !self.search_query.is_empty() {
+        if !self.search_query.is_empty() && !self.search_returns_to_buffer {
             if outcome.reset {
                 self.rebuild_search_matches();
             } else {
@@ -5555,7 +5586,7 @@ impl HarnessApp {
             }
         }
         self.buffer_view = false;
-        self.search_returns_to_buffer = false;
+        self.search_returns_to_buffer = rich_vim_experiment() && !self.search_query.is_empty();
         if rich_vim_experiment() {
             self.transcript_editor
                 .update(cx, |editor, cx| editor.set_input_only(true, cx));
@@ -5624,10 +5655,15 @@ impl HarnessApp {
         }
 
         self.search_visible = false;
+        self.vim_command_line = None;
+        self.command_line_error = None;
         self.search_highlights_visible = false;
         self.search_query.clear();
         self.search_matches.clear();
         self.active_search_match = 0;
+        self.search_match_count = 0;
+        self.active_search_item = None;
+        self.active_search_body_offset = None;
         self.search_returns_to_buffer = false;
         self.buffer_search_backwards = false;
         let should_follow_tail = self.list_state.is_following_tail()
@@ -6321,10 +6357,16 @@ impl HarnessApp {
     }
 
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_vim_search(false, window, cx);
+    }
+
+    fn open_vim_search(&mut self, backwards: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.search_return_focus = self.focus_mode;
         self.search_returns_to_buffer =
-            search_uses_native_editor(self.buffer_view, self.focus_mode);
-        self.buffer_search_backwards = false;
+            search_uses_native_editor(self.buffer_view, self.focus_mode, rich_vim_experiment());
+        self.buffer_search_backwards = backwards;
+        self.vim_command_line = Some(VimCommandLine::Search { backwards });
+        self.command_line_error = None;
         self.search_visible = true;
         self.search_highlights_visible = !self.search_query.is_empty();
         self.focus_mode = FocusMode::Search;
@@ -6338,8 +6380,25 @@ impl HarnessApp {
         if !vim_search_available(self.buffer_view, rich_vim_experiment()) {
             return;
         }
-        self.open_search(window, cx);
-        self.buffer_search_backwards = backwards;
+        self.open_vim_search(backwards, window, cx);
+    }
+
+    fn open_ex_command(
+        &mut self,
+        initial_query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_return_focus = self.focus_mode;
+        self.vim_command_line = Some(VimCommandLine::Ex);
+        self.command_line_error = None;
+        self.search_visible = true;
+        self.focus_mode = FocusMode::Search;
+        self.search_editor.update(cx, |editor, cx| {
+            editor.set_text(initial_query.trim_start_matches(':'), window, cx)
+        });
+        self.search_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
     }
 
     fn restore_search_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6353,6 +6412,10 @@ impl HarnessApp {
     }
 
     fn commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.vim_command_line == Some(VimCommandLine::Ex) {
+            self.commit_ex_command(window, cx);
+            return;
+        }
         let next_query = self.search_editor.read(cx).text(cx).trim().to_string();
         if !next_query.is_empty() {
             self.search_query = next_query;
@@ -6360,10 +6423,13 @@ impl HarnessApp {
         self.search_highlights_visible = !self.search_query.is_empty();
         if self.search_returns_to_buffer {
             self.search_visible = false;
+            self.vim_command_line = None;
+            self.command_line_error = None;
             self.focus_mode = FocusMode::Buffer;
             self.transcript_editor.update(cx, |editor, cx| {
                 editor.search(&self.search_query, self.buffer_search_backwards, window, cx);
             });
+            self.sync_native_search_state(cx);
             self.transcript_editor.focus_handle(cx).focus(window, cx);
             cx.notify();
             return;
@@ -6383,33 +6449,103 @@ impl HarnessApp {
             };
             self.jump_to_search_match(cx);
         }
+        self.search_visible = false;
+        self.vim_command_line = None;
+        self.command_line_error = None;
         self.restore_search_focus(window, cx);
         cx.notify();
     }
 
-    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_visible = false;
-        self.search_highlights_visible = false;
-        if self.search_returns_to_buffer {
-            self.transcript_editor
-                .update(cx, |editor, cx| editor.hide_search_highlights(cx));
-            self.focus_mode = FocusMode::Buffer;
-            self.transcript_editor.focus_handle(cx).focus(window, cx);
+    fn commit_ex_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let query = self.search_editor.read(cx).text(cx);
+        let command = query.trim().trim_start_matches(':');
+        let supported = matches!(
+            command,
+            "new"
+                | "enew"
+                | "text"
+                | "rich"
+                | "mono"
+                | "reading"
+                | "perf"
+                | "perf-j"
+                | "compose"
+                | "tasks"
+                | "stop"
+                | "noh"
+                | "nohl"
+                | "nohlsearch"
+        );
+        if !supported {
+            self.command_line_error = Some(format!("Not an editor command: {command}").into());
             cx.notify();
             return;
         }
+
+        self.search_visible = false;
+        self.vim_command_line = None;
+        self.command_line_error = None;
+        self.restore_search_focus(window, cx);
+        match command {
+            "new" | "enew" => self.new_task(window, cx),
+            "text" => self.show_text_transcript(window, cx),
+            "rich" => self.show_rich_transcript(window, cx),
+            "mono" => {
+                self.use_transcript_typography(TranscriptTypographyProfile::Buffer, window, cx)
+            }
+            "reading" => {
+                self.use_transcript_typography(TranscriptTypographyProfile::Reading, window, cx)
+            }
+            "perf" => self.copy_performance_report(window, cx),
+            "perf-j" => self.run_performance_j(window, cx),
+            "compose" => self.focus_composer(window, cx),
+            "tasks" => self.toggle_sidebar(window, cx),
+            "stop" => self.stop(cx),
+            "noh" | "nohl" | "nohlsearch" => self.clear_search_highlights(cx),
+            _ => unreachable!("supported Ex command was not dispatched"),
+        }
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_visible = false;
+        self.vim_command_line = None;
+        self.command_line_error = None;
         self.restore_search_focus(window, cx);
         cx.notify();
     }
 
     fn clear_search_highlights(&mut self, cx: &mut Context<Self>) {
         self.search_visible = false;
+        self.vim_command_line = None;
+        self.command_line_error = None;
         self.search_highlights_visible = false;
         if self.search_returns_to_buffer {
             self.transcript_editor
                 .update(cx, |editor, cx| editor.hide_search_highlights(cx));
         }
         cx.notify();
+    }
+
+    fn sync_native_search_state(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self
+            .transcript_editor
+            .update(cx, |editor, cx| editor.search_snapshot(cx));
+        let Some(snapshot) = snapshot else {
+            self.search_matches.clear();
+            self.search_match_count = 0;
+            self.active_search_match = 0;
+            self.active_search_item = None;
+            self.active_search_body_offset = None;
+            return;
+        };
+        self.search_query = snapshot.query;
+        self.search_highlights_visible = snapshot.highlights_visible;
+        self.search_matches = snapshot.matching_item_indices;
+        self.search_match_count = snapshot.match_count;
+        self.active_search_match = snapshot.active_match_index.unwrap_or(0);
+        self.active_search_item = snapshot.active_item_index;
+        self.active_search_body_offset = snapshot.active_body_offset;
+        self.search_navigation_generation = self.search_navigation_generation.wrapping_add(1);
     }
 
     fn rebuild_search_matches(&mut self) {
@@ -6427,6 +6563,9 @@ impl HarnessApp {
         self.active_search_match = self
             .active_search_match
             .min(self.search_matches.len().saturating_sub(1));
+        self.search_match_count = self.search_matches.len();
+        self.active_search_item = self.search_matches.get(self.active_search_match).copied();
+        self.active_search_body_offset = None;
     }
 
     fn update_search_matches_for_changes(&mut self, old_len: usize, dirty_items: &[usize]) {
@@ -6434,6 +6573,9 @@ impl HarnessApp {
         if query.is_empty() {
             self.search_matches.clear();
             self.active_search_match = 0;
+            self.search_match_count = 0;
+            self.active_search_item = None;
+            self.active_search_body_offset = None;
             return;
         }
 
@@ -6463,11 +6605,16 @@ impl HarnessApp {
                     .partition_point(|index| *index < self.selected_item)
                     .min(self.search_matches.len().saturating_sub(1))
             });
+        self.search_match_count = self.search_matches.len();
+        self.active_search_item = self.search_matches.get(self.active_search_match).copied();
+        self.active_search_body_offset = None;
     }
 
     fn jump_to_search_match(&mut self, cx: &mut Context<Self>) {
         if let Some(index) = self.search_matches.get(self.active_search_match).copied() {
             self.selected_item = index;
+            self.active_search_item = Some(index);
+            self.active_search_body_offset = None;
             self.search_navigation_generation = self.search_navigation_generation.wrapping_add(1);
             self.list_state.pause_following_tail();
             self.list_state.scroll_to_reveal_item(index);
@@ -6480,6 +6627,7 @@ impl HarnessApp {
             self.transcript_editor.update(cx, |editor, cx| {
                 editor.repeat_search(delta < 0, window, cx);
             });
+            self.sync_native_search_state(cx);
             cx.notify();
             return;
         }
@@ -8897,10 +9045,6 @@ impl HarnessApp {
             return div().into_any_element();
         }
         let rich_navigation = self.rich_navigation_for_item(index);
-        let cursor = matches!(
-            self.focus_mode,
-            FocusMode::Transcript | FocusMode::Request | FocusMode::Approval | FocusMode::Buffer
-        ) && index == self.selected_item;
         let visual = !rich_vim_experiment()
             && self.visual_anchor.is_some_and(|anchor| {
                 (anchor.min(self.selected_item)..=anchor.max(self.selected_item)).contains(&index)
@@ -8950,11 +9094,30 @@ impl HarnessApp {
         );
         let streaming = item.status.as_deref() == Some("streaming");
         let search_item_position = self.search_matches.binary_search(&index).ok();
-        let active_search_item = search_item_position == Some(self.active_search_match);
+        let active_search_item = self.active_search_item == Some(index);
+        let active_search_ordinal = active_search_item
+            .then(|| {
+                self.active_search_body_offset
+                    .and_then(|active_offset| {
+                        rich_navigation_item_projection(&self.model, index).and_then(|projection| {
+                            search_match_byte_ranges(
+                                projection.body_text(),
+                                &self.search_query,
+                                RICH_SEARCH_HIGHLIGHT_LIMIT,
+                            )
+                            .iter()
+                            .position(|range| range.start == active_offset)
+                        })
+                    })
+                    // The legacy non-Editor path only knows the matching card.
+                    // Preserve its previous first-occurrence emphasis there.
+                    .or_else(|| (!self.search_returns_to_buffer).then_some(0))
+            })
+            .flatten();
         let rich_search = (self.search_highlights_visible
             && !self.search_query.trim().is_empty()
             && search_item_position.is_some())
-        .then(|| RichSearchPaint::new(self.search_query.clone(), active_search_item));
+        .then(|| RichSearchPaint::new(self.search_query.clone(), active_search_ordinal));
         let icon = icon_for_kind(item.kind);
         let user_input = (legacy_request_controls && has_user_input)
             .then(|| self.render_user_input_request(index, &item, window, cx));
@@ -9212,7 +9375,7 @@ impl HarnessApp {
             .child(
                 Icon::new(icon)
                     .size(IconSize::Small)
-                    .color(transcript_icon_color(item.kind, cursor)),
+                    .color(transcript_icon_color(item.kind)),
             )
             .child(
                 div()
@@ -9220,11 +9383,7 @@ impl HarnessApp {
                     .min_w_0()
                     .truncate()
                     .text_ui_sm(cx)
-                    .text_color(if cursor {
-                        colors.text
-                    } else {
-                        colors.text_muted
-                    })
+                    .text_color(colors.text_muted)
                     .child(highlighted_header_title),
             )
             .when_some(
@@ -9564,19 +9723,37 @@ impl Render for HarnessApp {
                 })
                 .into_any_element()
         };
-        let search_status = if self.search_returns_to_buffer {
-            "Enter to jump".to_string()
-        } else if self.search_query.is_empty() {
-            "Enter to search".to_string()
-        } else if self.search_matches.is_empty() {
-            "No matches".to_string()
-        } else {
-            format!(
-                "{} / {}",
-                self.active_search_match + 1,
-                self.search_matches.len()
-            )
+        let command_line_input = self
+            .search_visible
+            .then(|| self.search_editor.read(cx).text(cx));
+        let command_line_status: Option<(SharedString, Color)> = match self.vim_command_line {
+            Some(VimCommandLine::Ex) => self
+                .command_line_error
+                .clone()
+                .map(|error| (error, Color::Error)),
+            Some(VimCommandLine::Search { .. })
+                if command_line_input.as_deref() != Some(self.search_query.as_str()) =>
+            {
+                None
+            }
+            Some(VimCommandLine::Search { .. }) if self.search_match_count == 0 => {
+                (!self.search_query.is_empty()).then(|| ("No matches".into(), Color::Muted))
+            }
+            Some(VimCommandLine::Search { .. }) => Some((
+                format!(
+                    "{} / {}",
+                    self.active_search_match.saturating_add(1),
+                    self.search_match_count
+                )
+                .into(),
+                Color::Muted,
+            )),
+            None => None,
         };
+        let command_line_prompt = self
+            .vim_command_line
+            .map(VimCommandLine::prompt)
+            .unwrap_or_default();
         let composer_status: Option<(SharedString, Color)> =
             if let Some(status) = self.performance_status.clone() {
                 Some((status, Color::Muted))
@@ -9678,10 +9855,13 @@ impl Render for HarnessApp {
                 }),
             )
             .on_action(cx.listener(|this, _: &ToggleCommandPalette, window, cx| {
-                this.open_command_palette("", window, cx)
+                this.open_ex_command("", window, cx)
             }))
             .on_action(cx.listener(|this, action: &OpenWithQuery, window, cx| {
-                this.open_command_palette(&action.query, window, cx)
+                this.open_ex_command(&action.query, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &OpenActionPalette, window, cx| {
+                this.open_command_palette("", window, cx)
             }))
             .on_action(cx.listener(|this, _: &GoTop, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
@@ -9726,7 +9906,7 @@ impl Render for HarnessApp {
                 this.move_search_match(-1, window, cx)
             }))
             .on_action(cx.listener(|this, action: &VimWordNext, window, cx| {
-                if !this.buffer_view {
+                if !vim_search_available(this.buffer_view, rich_vim_experiment()) {
                     cx.propagate();
                     return;
                 }
@@ -9739,10 +9919,12 @@ impl Render for HarnessApp {
                         cx,
                     );
                 });
+                this.search_returns_to_buffer = true;
+                this.sync_native_search_state(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, action: &VimWordPrevious, window, cx| {
-                if !this.buffer_view {
+                if !vim_search_available(this.buffer_view, rich_vim_experiment()) {
                     cx.propagate();
                     return;
                 }
@@ -9755,6 +9937,8 @@ impl Render for HarnessApp {
                         cx,
                     );
                 });
+                this.search_returns_to_buffer = true;
+                this.sync_native_search_state(cx);
                 cx.notify();
             }))
             .on_action(
@@ -9863,62 +10047,6 @@ impl Render for HarnessApp {
                     .flex()
                     .flex_col()
                     .relative()
-                    .when(self.search_visible, |this| {
-                        this.child(
-                            div()
-                                .key_context("HarnessSearch")
-                                .h(px(42.))
-                                .flex_none()
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(colors.border)
-                                .bg(colors.toolbar_background)
-                                .child(
-                                    Icon::new(IconName::MagnifyingGlass)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .child(div().flex_1().min_w_0().child(self.search_editor.clone()))
-                                .child(
-                                    Label::new(search_status)
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    IconButton::new("previous-search-match", IconName::ArrowUp)
-                                        .shape(IconButtonShape::Square)
-                                        .size(ButtonSize::Default)
-                                        .style(ButtonStyle::Subtle)
-                                        .aria_label("Previous match")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.move_search_match(-1, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("next-search-match", IconName::ArrowDown)
-                                        .shape(IconButtonShape::Square)
-                                        .size(ButtonSize::Default)
-                                        .style(ButtonStyle::Subtle)
-                                        .aria_label("Next match")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.move_search_match(1, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    IconButton::new("close-search", IconName::Close)
-                                        .shape(IconButtonShape::Square)
-                                        .size(ButtonSize::Default)
-                                        .style(ButtonStyle::Subtle)
-                                        .aria_label("Close search")
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.close_search(window, cx)
-                                        })),
-                                ),
-                        )
-                    })
                     .when_some(self.error.clone(), |this, error| {
                         this.child(
                             div()
@@ -9982,55 +10110,91 @@ impl Render for HarnessApp {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(self.mode_indicator.clone())
-                                    .when_some(composer_status, |this, (status, color)| {
-                                        this.child(
-                                            Label::new(status).size(LabelSize::XSmall).color(color),
-                                        )
+                                    .when(self.search_visible, |this| {
+                                        this.key_context("HarnessSearch")
+                                            .child(
+                                                Label::new(command_line_prompt)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Default),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .child(self.search_editor.clone()),
+                                            )
+                                            .when_some(
+                                                command_line_status,
+                                                |this, (status, color)| {
+                                                    this.child(
+                                                        Label::new(status)
+                                                            .size(LabelSize::XSmall)
+                                                            .color(color),
+                                                    )
+                                                },
+                                            )
                                     })
-                                    .child(div().flex_1())
-                                    .when(turn_active, |this| {
-                                        this.child(
-                                            IconButton::new("stop-turn", IconName::Stop)
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Default)
-                                                .icon_color(Color::Error)
-                                                .style(ButtonStyle::Tinted(TintColor::Error))
-                                                .aria_label("Stop turn")
-                                                .on_click(
-                                                    cx.listener(|this, _, _, cx| this.stop(cx)),
-                                                ),
-                                        )
-                                    })
-                                    .when(!turn_active, |this| {
-                                        this.child(
-                                            IconButton::new("send-turn", IconName::Send)
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Default)
-                                                .style(ButtonStyle::Filled)
-                                                .disabled(send_blocked)
-                                                .icon_color(if send_blocked {
-                                                    Color::Muted
-                                                } else {
-                                                    Color::Accent
-                                                })
-                                                .aria_label(if self.loading_thread {
-                                                    "Wait for task history to finish loading"
-                                                } else if self.thread_read_only_reason.is_some() {
-                                                    "This task is open read-only"
-                                                } else if self.client.is_none()
-                                                    && self.replay_count.is_none()
-                                                {
-                                                    "Reconnect to Codex before sending"
-                                                } else if composer_empty {
-                                                    "Type a prompt to send"
-                                                } else {
-                                                    "Send prompt"
-                                                })
-                                                .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.send(window, cx)
-                                                })),
-                                        )
+                                    .when(!self.search_visible, |this| {
+                                        this.child(self.mode_indicator.clone())
+                                            .when_some(
+                                                composer_status,
+                                                |this, (status, color)| {
+                                                    this.child(
+                                                        Label::new(status)
+                                                            .size(LabelSize::XSmall)
+                                                            .color(color),
+                                                    )
+                                                },
+                                            )
+                                            .child(div().flex_1())
+                                            .when(turn_active, |this| {
+                                                this.child(
+                                                    IconButton::new("stop-turn", IconName::Stop)
+                                                        .shape(IconButtonShape::Square)
+                                                        .size(ButtonSize::Default)
+                                                        .icon_color(Color::Error)
+                                                        .style(ButtonStyle::Tinted(TintColor::Error))
+                                                        .aria_label("Stop turn")
+                                                        .on_click(cx.listener(
+                                                            |this, _, _, cx| this.stop(cx),
+                                                        )),
+                                                )
+                                            })
+                                            .when(!turn_active, |this| {
+                                                this.child(
+                                                    IconButton::new("send-turn", IconName::Send)
+                                                        .shape(IconButtonShape::Square)
+                                                        .size(ButtonSize::Default)
+                                                        .style(ButtonStyle::Filled)
+                                                        .disabled(send_blocked)
+                                                        .icon_color(if send_blocked {
+                                                            Color::Muted
+                                                        } else {
+                                                            Color::Accent
+                                                        })
+                                                        .aria_label(if self.loading_thread {
+                                                            "Wait for task history to finish loading"
+                                                        } else if self
+                                                            .thread_read_only_reason
+                                                            .is_some()
+                                                        {
+                                                            "This task is open read-only"
+                                                        } else if self.client.is_none()
+                                                            && self.replay_count.is_none()
+                                                        {
+                                                            "Reconnect to Codex before sending"
+                                                        } else if composer_empty {
+                                                            "Type a prompt to send"
+                                                        } else {
+                                                            "Send prompt"
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.send(window, cx)
+                                                            },
+                                                        )),
+                                                )
+                                            })
                                     }),
                             ),
                     )
@@ -10816,10 +10980,7 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
     }
 }
 
-fn transcript_icon_color(kind: model::TranscriptKind, selected: bool) -> Color {
-    if selected {
-        return Color::Accent;
-    }
+fn transcript_icon_color(kind: model::TranscriptKind) -> Color {
     match kind {
         model::TranscriptKind::Error => Color::Error,
         model::TranscriptKind::Approval => Color::Warning,
@@ -10968,6 +11129,7 @@ fn thread_load_diagnostics_enabled() -> bool {
 
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("ctrl-shift-p", OpenActionPalette, Some("Harness")),
         KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
         KeyBinding::new(
@@ -11117,10 +11279,15 @@ mod tests {
     }
 
     #[test]
-    fn vim_slash_search_routes_to_the_visible_rich_search_surface() {
+    fn vim_slash_search_uses_the_native_editor_in_rich_and_text_views() {
         assert!(vim_search_available(false, true));
-        assert!(!search_uses_native_editor(false, FocusMode::Buffer));
-        assert!(search_uses_native_editor(true, FocusMode::Buffer));
+        assert!(search_uses_native_editor(false, FocusMode::Buffer, true));
+        assert!(search_uses_native_editor(true, FocusMode::Buffer, false));
+        assert!(!search_uses_native_editor(
+            false,
+            FocusMode::Transcript,
+            true
+        ));
         assert!(!vim_search_available(false, false));
     }
 
@@ -11780,20 +11947,16 @@ mod tests {
     #[test]
     fn transcript_chrome_uses_semantic_tones_only_when_they_add_information() {
         assert_eq!(
-            transcript_icon_color(model::TranscriptKind::FileChange, false),
+            transcript_icon_color(model::TranscriptKind::FileChange),
             Color::Modified
         );
         assert_eq!(
-            transcript_icon_color(model::TranscriptKind::Error, false),
+            transcript_icon_color(model::TranscriptKind::Error),
             Color::Error
         );
         assert_eq!(
-            transcript_icon_color(model::TranscriptKind::Command, false),
+            transcript_icon_color(model::TranscriptKind::Command),
             Color::Muted
-        );
-        assert_eq!(
-            transcript_icon_color(model::TranscriptKind::Error, true),
-            Color::Accent
         );
         assert_eq!(transcript_status_color("failed"), Color::Error);
         assert_eq!(transcript_status_color("waiting"), Color::Warning);
@@ -12207,7 +12370,7 @@ mod tests {
 
     #[test]
     fn rich_search_range_budget_is_bounded_across_card_fragments() {
-        let paint = RichSearchPaint::new("needle", true);
+        let paint = RichSearchPaint::new("needle", Some(0));
         let first = paint.ranges_for(&"needle ".repeat(100));
         let second = paint.ranges_for(&"needle ".repeat(100));
 
