@@ -23,6 +23,9 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
+        if self.editor_is_read_only(cx) {
+            return;
+        }
         self.update_editor(cx, |vim, editor, cx| {
             let text_layout_details = editor.text_layout_details(window, cx);
             editor.transact(window, cx, |editor, window, cx| {
@@ -104,6 +107,9 @@ impl Vim {
         cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
+        if self.editor_is_read_only(cx) {
+            return;
+        }
         self.update_editor(cx, |vim, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);

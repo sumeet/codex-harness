@@ -323,6 +323,7 @@ struct RichNavigationPaint {
     ranges: Vec<Range<usize>>,
     head: Option<usize>,
     visual: bool,
+    linewise: bool,
     cursor_claimed: Rc<Cell<bool>>,
 }
 
@@ -420,7 +421,28 @@ struct RichMarkdownNavigationPaint {
 
 impl RichNavigationPaint {
     fn cursor_range(&self) -> Option<Range<usize>> {
-        let mut head = self.head?.min(self.body_text.len());
+        let raw_head = self.head?.min(self.body_text.len());
+        let mut head = if self.visual && self.linewise {
+            self.ranges
+                .iter()
+                .find(|range| range.start <= raw_head && raw_head <= range.end)
+                .and_then(|range| {
+                    if raw_head <= range.start {
+                        Some(range.start)
+                    } else if raw_head >= range.end {
+                        self.body_text[..range.end.min(self.body_text.len())]
+                            .char_indices()
+                            .rev()
+                            .find(|(_, character)| !matches!(character, '\r' | '\n'))
+                            .map(|(start, _)| start)
+                    } else {
+                        Some(raw_head)
+                    }
+                })
+                .unwrap_or(raw_head)
+        } else {
+            raw_head
+        };
         while !self.body_text.is_char_boundary(head) {
             head = head.saturating_sub(1);
         }
@@ -3080,6 +3102,7 @@ impl HarnessApp {
             ranges: item.ranges.clone(),
             head: item.head,
             visual: snapshot.visual,
+            linewise: snapshot.linewise,
             cursor_claimed: Rc::new(Cell::new(false)),
         })
     }
@@ -3162,6 +3185,7 @@ impl HarnessApp {
             ranges: selection.ranges.clone(),
             head: selection.head,
             visual: snapshot.visual,
+            linewise: snapshot.linewise,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let next_navigation = Some(navigation.markdown_source_navigation(&source));
@@ -11681,6 +11705,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(cursor),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -11704,6 +11729,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(output_cursor),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
@@ -11723,6 +11749,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(0),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let mut cursor = 0;
@@ -11932,6 +11959,7 @@ mod tests {
             ranges: vec![2..4, 8..10],
             head: Some(9),
             visual: true,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -11946,12 +11974,41 @@ mod tests {
     }
 
     #[test]
+    fn rich_visual_cursor_stays_on_the_selected_line_at_an_exclusive_head() {
+        let body = "$ command\"\nUTC";
+        let selected_line_end = body.find('\n').unwrap() + 1;
+        let quote = body.rfind('"').unwrap();
+        let navigation = RichNavigationPaint {
+            body_text: body.into(),
+            ranges: vec![0..selected_line_end],
+            // Zed represents a forward linewise selection at the exclusive
+            // beginning of the next line. Rich paint must not expose that
+            // internal endpoint as a cursor on `U`.
+            head: Some(selected_line_end),
+            visual: true,
+            linewise: true,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert_eq!(navigation.cursor_range(), Some(quote..quote + 1));
+        assert_eq!(
+            rich_cursor_index_for_fragment(Some(&navigation), &(0..selected_line_end)),
+            Some(quote)
+        );
+        assert_eq!(
+            rich_cursor_index_for_fragment(Some(&navigation), &(selected_line_end..body.len())),
+            None
+        );
+    }
+
+    #[test]
     fn rich_navigation_cursor_crosses_newlines_and_hidden_furniture_once() {
         let navigation = RichNavigationPaint {
             body_text: "alpha\n<hidden>beta\ngamma".into(),
             ranges: Vec::new(),
             head: Some(7),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -11964,6 +12021,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(5),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert!(navigation_ranges_for_fragment(&navigation, 0..5).is_empty());
@@ -11996,6 +12054,7 @@ mod tests {
                 ranges: Vec::new(),
                 head: Some(head),
                 visual: false,
+                linewise: false,
                 cursor_claimed: Rc::new(Cell::new(false)),
             };
             let owners = visible_fragments
@@ -12015,6 +12074,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(3),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -12033,6 +12093,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(3),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
@@ -12047,6 +12108,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(3),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
@@ -12059,6 +12121,7 @@ mod tests {
             ranges: vec![2..7],
             head: Some(6),
             visual: true,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
@@ -12129,6 +12192,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(0),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let mut logical_cursor = 0;
@@ -12152,6 +12216,7 @@ mod tests {
             ranges: vec![0..content_range.start + 2],
             head: Some(content_range.start + 1),
             visual: true,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         assert_eq!(
@@ -12173,6 +12238,7 @@ mod tests {
             ranges: vec![1..3, 7..9],
             head: Some(8),
             visual: true,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -12194,6 +12260,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(head),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
 
@@ -12207,6 +12274,7 @@ mod tests {
             ranges: Vec::new(),
             head: Some(logical.len()),
             visual: false,
+            linewise: false,
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let paint = navigation.markdown_source_navigation(source);

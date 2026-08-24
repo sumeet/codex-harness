@@ -630,6 +630,9 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<TransactionId> {
+        if self.editor_is_read_only(cx) {
+            return None;
+        }
         self.store_visual_marks(window, cx);
         let transaction_id = self.update_editor(cx, |vim, editor, cx| {
             let mut original_columns: HashMap<_, _> = Default::default();

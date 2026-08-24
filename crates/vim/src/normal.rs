@@ -1606,6 +1606,19 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_read_only_delete_and_change_leave_the_cursor_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut cx = VimTestContext::new(cx, true).await;
+        cx.set_state("1. ˇI recognized the number", Mode::Normal);
+        cx.update_editor(|editor, _window, _cx| editor.set_read_only(true));
+
+        cx.simulate_keystrokes("x x d w c w");
+
+        cx.assert_state("1. ˇI recognized the number", Mode::Normal);
+    }
+
+    #[gpui::test]
     async fn test_delete_left(cx: &mut gpui::TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await;
         cx.simulate_at_each_offset("shift-x", "ˇTˇeˇsˇt")

@@ -21,6 +21,9 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editor_is_read_only(cx) {
+            return;
+        }
         // Some motions ignore failure when switching to normal mode
         let mut motion_kind = if matches!(
             motion,
@@ -116,6 +119,9 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.editor_is_read_only(cx) {
+            return;
+        }
         let mut objects_found = false;
         self.update_editor(cx, |vim, editor, cx| {
             // We are swapping to insert mode anyway. Just set the line end clipping behavior now

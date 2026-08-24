@@ -1723,6 +1723,11 @@ impl Vim {
         Some(editor.update(cx, |editor, cx| update(self, editor, cx)))
     }
 
+    fn editor_is_read_only(&mut self, cx: &mut Context<Self>) -> bool {
+        self.update_editor(cx, |_, editor, cx| editor.read_only(cx))
+            .unwrap_or(true)
+    }
+
     #[cfg(any(feature = "workspace-integration", test))]
     fn editor_selections(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Vec<Range<Anchor>> {
         self.update_editor(cx, |_, editor, _| {
