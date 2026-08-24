@@ -1139,14 +1139,20 @@ pub struct ThreadRefreshOutcome {
     pub reset: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserImageSource {
+    Url(String),
+    LocalPath(String),
+}
+
 #[derive(Default)]
 pub struct TranscriptModel {
     pub items: Vec<TranscriptItem>,
     item_indices: HashMap<String, usize>,
+    user_image_sources: HashMap<String, Vec<UserImageSource>>,
     pub raw_events: Vec<RawEvent>,
     pub telemetry: SessionTelemetry,
     pub current_turn_id: Option<String>,
-    local_message_id: usize,
     next_raw_sequence: usize,
     pub dropped_raw_events: usize,
 }
@@ -1178,6 +1184,7 @@ impl TranscriptModel {
     pub fn clear(&mut self) {
         self.items.clear();
         self.item_indices.clear();
+        self.user_image_sources.clear();
         self.raw_events.clear();
         self.telemetry = SessionTelemetry::default();
         self.next_raw_sequence = 0;
@@ -1290,7 +1297,8 @@ impl TranscriptModel {
         let old_len = self.items.len();
         let mut fresh = Self::default();
         fresh.load_thread(thread);
-        let mut fresh_items = fresh.items;
+        let mut fresh_items = std::mem::take(&mut fresh.items);
+        let fresh_user_image_sources = std::mem::take(&mut fresh.user_image_sources);
         let new_len = fresh_items.len();
         let prefix_compatible = old_len <= new_len
             && self
@@ -1311,6 +1319,7 @@ impl TranscriptModel {
                 }
             }
             self.items = fresh_items;
+            self.user_image_sources = fresh_user_image_sources;
             self.rebuild_item_indices();
             return ThreadRefreshOutcome {
                 dirty: (0..new_len).collect(),
@@ -1336,6 +1345,7 @@ impl TranscriptModel {
             dirty.insert(index);
         }
         self.items.extend(appended);
+        self.user_image_sources = fresh_user_image_sources;
         self.rebuild_item_indices();
 
         ThreadRefreshOutcome {
@@ -1411,22 +1421,40 @@ impl TranscriptModel {
         self.items.len()
     }
 
-    pub fn push_local_user(&mut self, content: String) -> (usize, String) {
-        self.local_message_id += 1;
-        let key = format!("local-user:{}", self.local_message_id);
+    pub fn push_local_user(
+        &mut self,
+        client_user_message_id: &str,
+        content: String,
+        content_blocks: &[Value],
+    ) -> (usize, String) {
+        let key = local_user_key(client_user_message_id);
+        let image_sources = user_image_sources_from_blocks(content_blocks);
         let index = self.push_without_splice(TranscriptItem {
             key: key.clone(),
             protocol_id: None,
             kind: TranscriptKind::User,
             title: "You".into(),
             status: Some("sending".into()),
-            raw: json!([{"type": "text", "text": content}]),
+            raw: json!({
+                "content": content,
+                "imageCount": image_sources.len(),
+            }),
             content,
             event_count: 1,
             expanded: true,
             pending_request: None,
         });
+        if !image_sources.is_empty() {
+            self.user_image_sources.insert(key.clone(), image_sources);
+        }
         (index, key)
+    }
+
+    pub fn user_image_sources(&self, item_key: &str) -> &[UserImageSource] {
+        self.user_image_sources
+            .get(item_key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     pub fn set_status_for_key(&mut self, key: &str, status: &str) -> Option<usize> {
@@ -2029,6 +2057,9 @@ impl TranscriptModel {
         let protocol_id = string_at(&value, "/id")
             .unwrap_or("unknown-item")
             .to_string();
+        let incoming_user_image_sources = (string_at(&value, "/type") == Some("userMessage"))
+            .then(|| user_image_sources_from_value(value.get("content").unwrap_or(&Value::Null)))
+            .unwrap_or_default();
         let is_reasoning = string_at(&value, "/type") == Some("reasoning");
         if is_reasoning && let Some(turn_id) = turn_id {
             let aggregate_key = format!("turn-reasoning:{turn_id}");
@@ -2058,21 +2089,48 @@ impl TranscriptModel {
             item.expanded = expanded;
             item.pending_request = pending_request;
             self.items[index] = item;
+            if self.items[index].kind == TranscriptKind::User {
+                if incoming_user_image_sources.is_empty() {
+                    self.user_image_sources.remove(&protocol_id);
+                } else {
+                    self.user_image_sources
+                        .insert(protocol_id.clone(), incoming_user_image_sources);
+                }
+            }
             return Some(index);
         }
 
+        let client_user_message_id = string_at(&value, "/clientId").map(ToOwned::to_owned);
         let item = item_from_protocol(value, completed);
         if item.kind == TranscriptKind::User
-            && let Some(index) = self.items.iter().rposition(|candidate| {
-                candidate.key.starts_with("local-user:") && candidate.content == item.content
-            })
+            && let Some(index) = client_user_message_id
+                .as_deref()
+                .and_then(|client_id| self.item_indices.get(&local_user_key(client_id)).copied())
+                .or_else(|| {
+                    self.items.iter().rposition(|candidate| {
+                        candidate.key.starts_with("local-user:")
+                            && optimistic_user_content_matches(&candidate.content, &item.content)
+                    })
+                })
         {
-            self.item_indices.remove(&self.items[index].key);
+            let optimistic_key = self.items[index].key.clone();
+            self.item_indices.remove(&optimistic_key);
+            self.user_image_sources.remove(&optimistic_key);
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
+            if !incoming_user_image_sources.is_empty() {
+                self.user_image_sources
+                    .insert(self.items[index].key.clone(), incoming_user_image_sources);
+            }
             return Some(index);
         }
-        Some(self.push_without_splice(item))
+        let item_key = item.key.clone();
+        let index = self.push_without_splice(item);
+        if !incoming_user_image_sources.is_empty() {
+            self.user_image_sources
+                .insert(item_key, incoming_user_image_sources);
+        }
+        Some(index)
     }
 
     fn upsert_generated(
@@ -2135,6 +2193,28 @@ impl TranscriptModel {
             payload: bounded_raw_payload(payload),
         });
     }
+}
+
+fn local_user_key(client_user_message_id: &str) -> String {
+    format!("local-user:{client_user_message_id}")
+}
+
+fn optimistic_user_content_matches(local: &str, authoritative: &str) -> bool {
+    fn normalized(content: &str) -> String {
+        content
+            .lines()
+            .filter_map(|line| match line.trim() {
+                "[Attached image]" | "Attached image" => None,
+                "[Attached audio]" => Some("Attached audio"),
+                _ => Some(line),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    normalized(local) == normalized(authoritative)
 }
 
 fn bounded_raw_payload(mut payload: Value) -> Value {
@@ -3353,10 +3433,11 @@ fn render_user_content(content: &Value) -> String {
         .flatten()
         .filter_map(|block| match string_at(block, "/type") {
             Some("text") => string_at(block, "/text").map(ToOwned::to_owned),
-            Some("localImage") => {
-                string_at(block, "/path").map(|path| format!("Attached image: {path}"))
-            }
-            Some("image") => Some("Attached image".into()),
+            // Images retain their semantic source separately so Rich mode can
+            // paint the attachment itself. A fabricated text placeholder
+            // would duplicate the visual and makes optimistic reconciliation
+            // depend on presentation wording.
+            Some("localImage") | Some("image") => None,
             Some("localAudio") | Some("audio") => Some("Attached audio".into()),
             Some("mention") | Some("skill") => {
                 string_at(block, "/path").map(|path| format!("Mention: {path}"))
@@ -3365,6 +3446,29 @@ fn render_user_content(content: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn user_image_sources_from_value(content: &Value) -> Vec<UserImageSource> {
+    content
+        .as_array()
+        .map(Vec::as_slice)
+        .map(user_image_sources_from_blocks)
+        .unwrap_or_default()
+}
+
+fn user_image_sources_from_blocks(content: &[Value]) -> Vec<UserImageSource> {
+    content
+        .iter()
+        .filter_map(|block| match string_at(block, "/type") {
+            Some("image") => {
+                string_at(block, "/url").map(|url| UserImageSource::Url(url.to_owned()))
+            }
+            Some("localImage") => {
+                string_at(block, "/path").map(|path| UserImageSource::LocalPath(path.to_owned()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_hook_prompt(fragments: &Value) -> String {
@@ -5883,6 +5987,92 @@ mod tests {
         assert!(model.items.is_empty());
         assert!(model.current_turn_id.is_none());
         assert_eq!(model.raw_events.len(), 2);
+    }
+
+    #[test]
+    fn authoritative_user_message_reconciles_by_client_id_before_content() {
+        let mut model = TranscriptModel::default();
+        let optimistic_blocks = json!([
+            {"type": "text", "text": "local rendering can differ"},
+            {"type": "image", "url": "data:image/png;base64,AQID"}
+        ]);
+        let (_, local_key) = model.push_local_user(
+            "client-message-1",
+            "local rendering can differ".into(),
+            optimistic_blocks.as_array().unwrap(),
+        );
+
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "server-message-1",
+                        "clientId": "client-message-1",
+                        "type": "userMessage",
+                        "content": [
+                            {"type": "text", "text": "canonical rendering"},
+                            {"type": "image", "url": "data:image/png;base64,AQID"}
+                        ]
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, "server-message-1");
+        assert_eq!(
+            model.items[0].protocol_id.as_deref(),
+            Some("server-message-1")
+        );
+        assert_eq!(model.items[0].content, "canonical rendering");
+        assert_eq!(
+            model.user_image_sources("server-message-1"),
+            &[UserImageSource::Url("data:image/png;base64,AQID".into())]
+        );
+        assert!(model.user_image_sources(&local_key).is_empty());
+        assert!(!model.item_indices.contains_key(&local_key));
+        assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+    }
+
+    #[test]
+    fn legacy_user_message_reconciliation_normalizes_attachment_placeholders() {
+        let mut model = TranscriptModel::default();
+        let optimistic_blocks = json!([
+            {"type": "text", "text": "describe this"},
+            {"type": "image", "url": "data:image/png;base64,AQID"}
+        ]);
+        model.push_local_user(
+            "client-message-without-echo",
+            "describe this\n\n[Attached image]".into(),
+            optimistic_blocks.as_array().unwrap(),
+        );
+
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "legacy-server-message",
+                        "clientId": null,
+                        "type": "userMessage",
+                        "content": [
+                            {"type": "text", "text": "describe this"},
+                            {"type": "image", "url": "data:image/png;base64,AQID"}
+                        ]
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, "legacy-server-message");
     }
 
     #[test]

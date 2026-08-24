@@ -2,7 +2,7 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -13,12 +13,12 @@ use base64::Engine as _;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity, FocusHandle,
-    Focusable, FollowMode, Image, IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment,
-    ListSizingBehavior, ListState, Modifiers, ObjectFit, PlatformInput, Render, ScrollDelta,
-    ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task,
-    TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity, Window, WindowBounds,
-    WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px, relative, size,
-    uniform_list,
+    Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding, KeyContext,
+    Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, ObjectFit, PlatformInput,
+    Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledImage,
+    StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity, Window,
+    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
+    relative, size, uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -40,6 +40,7 @@ use ui::{
     ScrollAxes, Scrollbars, SelectableButton, ThreadItem, TintColor, Toggleable, WithScrollbar,
     right_click_menu,
 };
+use uuid::Uuid;
 
 mod image_surface;
 mod palette;
@@ -2395,13 +2396,8 @@ fn composer_is_empty(text: &str, image_count: usize) -> bool {
     text.trim().is_empty() && image_count == 0
 }
 
-fn composer_prompt_preview(text: &str, image_count: usize) -> String {
-    let mut parts = Vec::with_capacity(image_count.saturating_add(1));
-    if !text.is_empty() {
-        parts.push(text.to_owned());
-    }
-    parts.extend((0..image_count).map(|_| "[Attached image]".to_owned()));
-    parts.join("\n\n")
+fn composer_prompt_preview(text: &str) -> String {
+    text.to_owned()
 }
 
 fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
@@ -2418,6 +2414,28 @@ fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> 
         })
     }));
     input
+}
+
+fn transcript_user_image_source(source: &model::UserImageSource) -> Option<ImageSource> {
+    match source {
+        model::UserImageSource::LocalPath(path) => Some(PathBuf::from(path).into()),
+        model::UserImageSource::Url(url) => {
+            if !url.starts_with("data:") {
+                return Some(url.clone().into());
+            }
+            let data_url = url.strip_prefix("data:")?;
+            let (mime_info, encoded) = data_url.split_once(',')?;
+            let (mime_type, encoding) = mime_info.split_once(';')?;
+            if encoding != "base64" {
+                return None;
+            }
+            let format = ImageFormat::from_mime_type(mime_type)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)).into())
+        }
+    }
 }
 
 fn legacy_request_controls_active(
@@ -2868,6 +2886,7 @@ struct HarnessApp {
     performance_status_generation: u64,
     dirty_image_surfaces: HashSet<String>,
     image_surfaces: HashMap<String, Entity<ImageSurface>>,
+    user_image_previews: HashMap<String, Vec<ImageSource>>,
     hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
     rich_nested_scrolls: HashMap<String, RichNestedScrollState>,
     list_state: ListState,
@@ -3352,7 +3371,11 @@ impl HarnessApp {
         let dirty_image_surfaces = model
             .items
             .iter()
-            .filter(|item| item.kind == model::TranscriptKind::Image)
+            .filter(|item| {
+                item.kind == model::TranscriptKind::Image
+                    || (item.kind == model::TranscriptKind::User
+                        && !model.user_image_sources(&item.key).is_empty())
+            })
             .map(|item| item.key.clone())
             .collect();
         // The list measures one boundary sentinel just outside the viewport,
@@ -3439,6 +3462,7 @@ impl HarnessApp {
             performance_status_generation: 0,
             dirty_image_surfaces,
             image_surfaces: HashMap::default(),
+            user_image_previews: HashMap::default(),
             hybrid_surfaces: HashMap::default(),
             rich_nested_scrolls: HashMap::default(),
             sidebar_open: true,
@@ -3988,7 +4012,10 @@ impl HarnessApp {
                 continue;
             };
             if item.kind == model::TranscriptKind::Image
+                || (item.kind == model::TranscriptKind::User
+                    && !self.model.user_image_sources(&item.key).is_empty())
                 || self.image_surfaces.contains_key(&item.key)
+                || self.user_image_previews.contains_key(&item.key)
             {
                 self.dirty_image_surfaces.insert(item.key.clone());
             }
@@ -3997,20 +4024,57 @@ impl HarnessApp {
 
     fn mark_all_image_surfaces_dirty(&mut self) {
         let keys = image_surface_keys_to_sync(
-            self.image_surfaces.keys().cloned(),
+            self.image_surfaces
+                .keys()
+                .chain(self.user_image_previews.keys())
+                .cloned(),
             self.model
                 .items
                 .iter()
-                .filter(|item| item.kind == model::TranscriptKind::Image)
+                .filter(|item| {
+                    item.kind == model::TranscriptKind::Image
+                        || (item.kind == model::TranscriptKind::User
+                            && !self.model.user_image_sources(&item.key).is_empty())
+                })
                 .map(|item| item.key.clone()),
         );
         self.dirty_image_surfaces.extend(keys);
     }
 
     fn sync_image_surfaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let active_user_image_keys = self
+            .model
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == model::TranscriptKind::User
+                    && !self.model.user_image_sources(&item.key).is_empty()
+            })
+            .map(|item| item.key.as_str())
+            .collect::<HashSet<_>>();
+        self.user_image_previews
+            .retain(|key, _| active_user_image_keys.contains(key.as_str()));
+
         let dirty = std::mem::take(&mut self.dirty_image_surfaces);
         for item_key in dirty {
             let item = self.model.items.iter().find(|item| item.key == item_key);
+            let item_is_user = item.is_some_and(|item| item.kind == model::TranscriptKind::User);
+            if item_is_user {
+                let previews = self
+                    .model
+                    .user_image_sources(&item_key)
+                    .iter()
+                    .filter_map(transcript_user_image_source)
+                    .collect::<Vec<_>>();
+                if previews.is_empty() {
+                    self.user_image_previews.remove(&item_key);
+                } else {
+                    self.user_image_previews.insert(item_key.clone(), previews);
+                }
+            } else {
+                self.user_image_previews.remove(&item_key);
+            }
+
             let item_is_image = item.is_some_and(|item| item.kind == model::TranscriptKind::Image);
             let surface_exists = self.image_surfaces.contains_key(&item_key);
 
@@ -5088,8 +5152,12 @@ impl HarnessApp {
             return;
         }
         let input = composer_app_server_input(&text, &self.composer_images);
-        let preview = composer_prompt_preview(&text, self.composer_images.len());
-        let (index, key) = self.model.push_local_user(preview);
+        let preview = composer_prompt_preview(&text);
+        let client_user_message_id = Uuid::new_v4().to_string();
+        let (index, key) = self
+            .model
+            .push_local_user(&client_user_message_id, preview, &input);
+        self.dirty_image_surfaces.insert(key.clone());
         self.list_state.splice(index..index, 1);
         self.selected_item = index;
         self.list_state.set_follow_mode(FollowMode::Tail);
@@ -5131,7 +5199,13 @@ impl HarnessApp {
                     Some(thread_id) => thread_id,
                     None => client.start_thread(&cwd).await?.id,
                 };
-                let response = client.start_turn(&thread_id, Value::Array(input)).await?;
+                let response = client
+                    .start_turn_with_client_user_message_id(
+                        &thread_id,
+                        Value::Array(input),
+                        Some(&client_user_message_id),
+                    )
+                    .await?;
                 anyhow::Ok((thread_id, response))
             }
             .await;
@@ -8767,6 +8841,32 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_user_image_previews(
+        previews: Vec<ImageSource>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(previews.into_iter().enumerate().map(|(index, source)| {
+                gpui::img(source)
+                    .id(("user-image-preview", index))
+                    .h_auto()
+                    .max_w_96()
+                    .max_h(px(220.))
+                    .object_fit(ObjectFit::ScaleDown)
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.editor_background)
+            }))
+            .into_any_element()
+    }
+
     fn render_pending_request_summary(
         item: &TranscriptItem,
         request_is_live: bool,
@@ -9572,6 +9672,11 @@ impl HarnessApp {
                 ),
             })
         };
+        let user_image_previews = (item.kind == model::TranscriptKind::User)
+            .then(|| self.user_image_previews.get(&item.key).cloned())
+            .flatten()
+            .filter(|previews| !previews.is_empty())
+            .map(|previews| Self::render_user_image_previews(previews, cx));
 
         let header_search = render_header.then_some(rich_search.as_ref()).flatten();
         // Every expanded Rich structured body is complete and scrollable. If
@@ -9731,6 +9836,7 @@ impl HarnessApp {
                 })
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
+                .when_some(user_image_previews, |this, previews| this.child(previews))
                 .when_some(raw, |this, raw| this.child(raw))
                 .into_any_element()
         } else {
@@ -13730,10 +13836,20 @@ mod tests {
             input[1],
             json!({"type": "image", "url": "data:image/png;base64,AQID"})
         );
-        assert_eq!(
-            composer_prompt_preview("what is this?", images.len()),
-            "what is this?\n\n[Attached image]"
-        );
+        assert_eq!(composer_prompt_preview("what is this?"), "what is this?");
+    }
+
+    #[test]
+    fn transcript_data_images_decode_into_cached_gpui_images() {
+        let source = transcript_user_image_source(&model::UserImageSource::Url(
+            "data:image/png;base64,AQID".into(),
+        ));
+
+        let Some(ImageSource::Image(image)) = source else {
+            panic!("expected a decoded GPUI image");
+        };
+        assert_eq!(image.format(), ImageFormat::Png);
+        assert_eq!(image.bytes(), &[1, 2, 3]);
     }
 
     #[test]

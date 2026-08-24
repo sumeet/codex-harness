@@ -8348,6 +8348,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "ui",
+ "uuid",
  "zed_actions",
 ]
 

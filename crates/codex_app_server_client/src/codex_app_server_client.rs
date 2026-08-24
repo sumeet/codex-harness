@@ -424,12 +424,19 @@ impl Client {
     }
 
     pub async fn start_turn(&self, thread_id: &str, input: Value) -> Result<Value, Error> {
+        self.start_turn_with_client_user_message_id(thread_id, input, None)
+            .await
+    }
+
+    pub async fn start_turn_with_client_user_message_id(
+        &self,
+        thread_id: &str,
+        input: Value,
+        client_user_message_id: Option<&str>,
+    ) -> Result<Value, Error> {
         self.request(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": input,
-            }),
+            turn_start_params(thread_id, input, client_user_message_id),
         )
         .await
     }
@@ -497,6 +504,17 @@ impl Client {
             .await
             .map_err(|_| Error::TransportClosed)
     }
+}
+
+fn turn_start_params(thread_id: &str, input: Value, client_user_message_id: Option<&str>) -> Value {
+    let mut params = json!({
+        "threadId": thread_id,
+        "input": input,
+    });
+    if let Some(client_user_message_id) = client_user_message_id {
+        params["clientUserMessageId"] = client_user_message_id.into();
+    }
+    params
 }
 
 fn decode_thread_response(response: Value) -> Result<CodexThread, Error> {
@@ -682,6 +700,26 @@ mod tests {
                 method: "turn/started".into(),
                 params: json!({ "id": "turn_1" }),
             }
+        );
+    }
+
+    #[test]
+    fn turn_start_carries_the_optimistic_user_message_id() {
+        assert_eq!(
+            turn_start_params(
+                "thread-1",
+                json!([{"type": "text", "text": "hello"}]),
+                Some("client-message-1"),
+            ),
+            json!({
+                "threadId": "thread-1",
+                "clientUserMessageId": "client-message-1",
+                "input": [{"type": "text", "text": "hello"}],
+            })
+        );
+        assert_eq!(
+            turn_start_params("thread-1", json!([]), None),
+            json!({"threadId": "thread-1", "input": []})
         );
     }
 
