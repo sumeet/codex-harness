@@ -537,6 +537,7 @@ struct TranscriptSearchState {
     backwards: bool,
     case_sensitive: bool,
     whole_word: bool,
+    highlights_visible: bool,
     // MultiBuffer anchors follow streaming edits while byte offsets do not.
     // The highlights remain decorations; Vim's actual selection stays owned
     // by the Editor and is changed only by explicit match navigation.
@@ -1200,6 +1201,10 @@ fn visible_shell_semantic_highlights(
 /// Return overlapping default search matches in one already bounded window.
 /// The production helper below also carries the case and keyword-boundary
 /// policy used by Vim word search.
+fn search_query_is_case_sensitive(query: &str) -> bool {
+    query.chars().any(char::is_uppercase)
+}
+
 #[cfg(test)]
 fn literal_match_ranges(text: &str, query: &str, base_offset: usize) -> Vec<Range<usize>> {
     literal_match_ranges_with_options(
@@ -3269,8 +3274,9 @@ impl TranscriptEditor {
         });
         let search_case_sensitive = self.search.case_sensitive;
         let search_whole_word = self.search.whole_word;
+        let search_highlights_visible = self.search.highlights_visible;
         let search_highlights = rebuild_search_highlights.then(|| {
-            if self.search.query.is_empty() {
+            if self.search.query.is_empty() || !search_highlights_visible {
                 None
             } else {
                 let buffer = self.buffer.read(cx);
@@ -4247,11 +4253,15 @@ impl TranscriptEditor {
             self.clear_search(cx);
             return;
         }
-        let query_changed =
-            self.search.query != query || self.search.case_sensitive || self.search.whole_word;
+        let case_sensitive = search_query_is_case_sensitive(query);
+        let query_changed = self.search.query != query
+            || self.search.case_sensitive != case_sensitive
+            || self.search.whole_word
+            || !self.search.highlights_visible;
         self.search.backwards = backwards;
-        self.search.case_sensitive = false;
+        self.search.case_sensitive = case_sensitive;
         self.search.whole_word = false;
+        self.search.highlights_visible = true;
         if query_changed {
             self.search.query.clear();
             self.search.query.push_str(query);
@@ -4270,6 +4280,17 @@ impl TranscriptEditor {
         });
     }
 
+    /// Hide match decoration while retaining the last pattern and direction so
+    /// `n`/`N` can repeat it, matching Vim's `:nohlsearch` behavior.
+    pub fn hide_search_highlights(&mut self, cx: &mut Context<Self>) {
+        if !self.search.highlights_visible {
+            return;
+        }
+        self.search.highlights_visible = false;
+        self.search.highlights_dirty = true;
+        self.refresh_viewport_decorations(cx);
+    }
+
     pub fn search_query(&self) -> Option<&str> {
         (!self.search.query.is_empty()).then_some(self.search.query.as_str())
     }
@@ -4282,6 +4303,8 @@ impl TranscriptEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.search.highlights_visible = true;
+        self.search.highlights_dirty = true;
         let backwards = repeated_search_backwards(self.search.backwards, reverse);
         self.move_search_in_direction(backwards, window, cx)
     }
@@ -4299,11 +4322,15 @@ impl TranscriptEditor {
             self.clear_search(cx);
             return false;
         }
-        let query_changed =
-            self.search.query != query || self.search.case_sensitive || self.search.whole_word;
+        let case_sensitive = search_query_is_case_sensitive(query);
+        let query_changed = self.search.query != query
+            || self.search.case_sensitive != case_sensitive
+            || self.search.whole_word
+            || !self.search.highlights_visible;
         self.search.backwards = backwards;
-        self.search.case_sensitive = false;
+        self.search.case_sensitive = case_sensitive;
         self.search.whole_word = false;
+        self.search.highlights_visible = true;
         if query_changed {
             self.search.query.clear();
             self.search.query.push_str(query);
@@ -4338,6 +4365,7 @@ impl TranscriptEditor {
         self.search.backwards = backwards;
         self.search.case_sensitive = case_sensitive;
         self.search.whole_word = !partial_word;
+        self.search.highlights_visible = true;
         self.search.active_match = None;
         self.search.highlights_dirty = true;
         self.move_search_from_offset(word_range.start, backwards, window, cx)
@@ -4823,6 +4851,13 @@ mod tests {
             highlighted_text(&text, &literal_match_ranges(window, "café", prefix.len())),
             vec!["café"]
         );
+    }
+
+    #[test]
+    fn transcript_slash_search_uses_smart_case() {
+        assert!(!search_query_is_case_sensitive("needle"));
+        assert!(search_query_is_case_sensitive("Needle"));
+        assert!(search_query_is_case_sensitive("İ"));
     }
 
     #[test]

@@ -395,6 +395,7 @@ fn harness_alias(query: &str) -> Option<String> {
         "compose" => Some("harness: focus composer".into()),
         "tasks" => Some("harness: toggle sidebar".into()),
         "stop" => Some("harness: stop".into()),
+        "noh" | "nohl" | "nohlsearch" => Some("harness: clear search highlights".into()),
         _ => None,
     }
 }
@@ -432,6 +433,14 @@ mod tests {
         );
         assert_eq!(harness_alias("w"), None);
         assert_eq!(harness_alias("q"), None);
+        assert_eq!(
+            harness_alias(":noh").as_deref(),
+            Some("harness: clear search highlights")
+        );
+        assert_eq!(
+            harness_alias("nohlsearch").as_deref(),
+            Some("harness: clear search highlights")
+        );
     }
 
     #[test]

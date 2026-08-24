@@ -83,6 +83,7 @@ actions!(
         OpenSearch,
         CommitSearch,
         CloseSearch,
+        ClearSearchHighlights,
         NextMatch,
         PreviousMatch,
         MoveLeft,
@@ -622,7 +623,7 @@ impl RichSearchPaint {
     }
 
     fn ranges_for(&self, text: &str) -> SearchTextRanges {
-        let ranges = folded_match_byte_ranges(text, &self.query, self.remaining_ranges.get());
+        let ranges = search_match_byte_ranges(text, &self.query, self.remaining_ranges.get());
         self.decorate_ranges(ranges)
     }
 
@@ -638,6 +639,25 @@ impl RichSearchPaint {
             });
         SearchTextRanges { ranges, active }
     }
+}
+
+fn search_query_is_case_sensitive(query: &str) -> bool {
+    query.chars().any(char::is_uppercase)
+}
+
+fn search_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
+    let query = query.trim();
+    if query.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    if search_query_is_case_sensitive(query) {
+        return text
+            .match_indices(query)
+            .take(limit)
+            .map(|(start, matched)| start..start + matched.len())
+            .collect();
+    }
+    folded_match_byte_ranges(text, query, limit)
 }
 
 fn folded_match_byte_ranges(text: &str, query: &str, limit: usize) -> Vec<Range<usize>> {
@@ -1015,8 +1035,8 @@ fn search_context_snippet(
     query: &str,
     max_chars: usize,
 ) -> Option<SearchContextSnippet> {
-    let folded_query = query.trim().to_lowercase();
-    if folded_query.is_empty() || max_chars == 0 {
+    let query = query.trim();
+    if query.is_empty() || max_chars == 0 {
         return None;
     }
 
@@ -1025,7 +1045,7 @@ fn search_context_snippet(
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let Some(source_range) = folded_match_byte_ranges(line, &folded_query, 1).pop() else {
+        let Some(source_range) = search_match_byte_ranges(line, query, 1).pop() else {
             continue;
         };
         let matched = &line[source_range.clone()];
@@ -1143,31 +1163,27 @@ fn rich_item_defers_navigation_claim(item: &TranscriptItem) -> bool {
         && item.command_transcript().is_some()
 }
 
-fn item_matches_folded_query(item: &TranscriptItem, folded_query: &str) -> bool {
+fn item_matches_search_query(item: &TranscriptItem, query: &str) -> bool {
     (transcript_item_shows_header(item)
-        && transcript_item_header_title(item)
-            .to_lowercase()
-            .contains(folded_query))
-        || transcript_item_searchable_body(item)
-            .to_lowercase()
-            .contains(folded_query)
+        && search_contains(transcript_item_header_title(item), query))
+        || search_contains(transcript_item_searchable_body(item), query)
         || item
             .display_status()
-            .is_some_and(|status| status.to_lowercase().contains(folded_query))
+            .is_some_and(|status| search_contains(status, query))
         || (item.kind == model::TranscriptKind::Web
             && web_search_presentation(&item.raw)
                 .results
                 .iter()
                 .any(|result| {
-                    result.title.to_lowercase().contains(folded_query)
+                    search_contains(&result.title, query)
                         || result
                             .url
                             .as_deref()
-                            .is_some_and(|url| url.to_lowercase().contains(folded_query))
+                            .is_some_and(|url| search_contains(url, query))
                         || result
                             .snippet
                             .as_deref()
-                            .is_some_and(|snippet| snippet.to_lowercase().contains(folded_query))
+                            .is_some_and(|snippet| search_contains(snippet, query))
                 }))
 }
 
@@ -1854,8 +1870,8 @@ fn rich_search_match_needs_context(item: &TranscriptItem, expansion: OutputExpan
     !item.expanded
 }
 
-fn folded_contains(text: &str, query: &str) -> bool {
-    !folded_match_byte_ranges(text, query, 1).is_empty()
+fn search_contains(text: &str, query: &str) -> bool {
+    !search_match_byte_ranges(text, query, 1).is_empty()
 }
 
 /// Whether the active Rich card already paints the matching text. Search
@@ -1867,39 +1883,39 @@ fn rich_search_query_is_visible(
     query: &str,
 ) -> bool {
     if (transcript_item_shows_header(item)
-        && folded_contains(transcript_item_header_title(item), query))
+        && search_contains(transcript_item_header_title(item), query))
         || item
             .display_status()
-            .is_some_and(|status| folded_contains(status, query))
+            .is_some_and(|status| search_contains(status, query))
     {
         return true;
     }
     if !item.expanded {
         return item.kind == model::TranscriptKind::Reasoning
-            && folded_contains(&compact_reasoning_preview(&item.content), query);
+            && search_contains(&compact_reasoning_preview(&item.content), query);
     }
 
     match item.kind {
         model::TranscriptKind::Command => item.command_transcript().is_some_and(|transcript| {
             let command_text = transcript.command.trim_end_matches(['\r', '\n']);
             let output_text = command_output_for_display(&transcript.output);
-            folded_contains(command_text, query) || folded_contains(output_text, query)
+            search_contains(command_text, query) || search_contains(output_text, query)
         }),
         model::TranscriptKind::FileChange => file_change_presentations(&item.content)
             .into_iter()
             .any(|presentation| {
                 let (additions, deletions) = file_change_counts(&presentation);
                 ((additions == 0 && deletions == 0)
-                    && folded_contains(&presentation.operation, query))
-                    || folded_contains(&presentation.path, query)
-                    || folded_contains(&presentation.content, query)
+                    && search_contains(&presentation.operation, query))
+                    || search_contains(&presentation.path, query)
+                    || search_contains(&presentation.content, query)
             }),
         model::TranscriptKind::Diff => {
             diff_file_presentations(&item.content)
                 .into_iter()
                 .any(|presentation| {
-                    folded_contains(&presentation.path, query)
-                        || folded_contains(&presentation.content, query)
+                    search_contains(&presentation.path, query)
+                        || search_contains(&presentation.content, query)
                 })
         }
         model::TranscriptKind::Web => {
@@ -1907,22 +1923,22 @@ fn rich_search_query_is_visible(
                 .results
                 .iter()
                 .any(|result| {
-                    folded_contains(&result.title, query)
+                    search_contains(&result.title, query)
                         || result
                             .url
                             .as_deref()
-                            .is_some_and(|url| folded_contains(url, query))
+                            .is_some_and(|url| search_contains(url, query))
                         || result
                             .snippet
                             .as_deref()
-                            .is_some_and(|snippet| folded_contains(snippet, query))
+                            .is_some_and(|snippet| search_contains(snippet, query))
                 })
         }
         model::TranscriptKind::Tool
         | model::TranscriptKind::Subagent
-        | model::TranscriptKind::Review => folded_contains(&item.content, query),
-        kind if kind.is_structured() => folded_contains(&item.content, query),
-        _ => folded_contains(transcript_item_searchable_body(item), query),
+        | model::TranscriptKind::Review => search_contains(&item.content, query),
+        kind if kind.is_structured() => search_contains(&item.content, query),
+        _ => search_contains(transcript_item_searchable_body(item), query),
     }
 }
 
@@ -2681,6 +2697,7 @@ struct HarnessApp {
     raw_visible: HashSet<String>,
     markdown_cache: HashMap<String, CachedMarkdown>,
     search_visible: bool,
+    search_highlights_visible: bool,
     search_query: String,
     search_matches: Vec<usize>,
     active_search_match: usize,
@@ -3221,6 +3238,7 @@ impl HarnessApp {
             raw_visible: HashSet::default(),
             markdown_cache: HashMap::default(),
             search_visible: false,
+            search_highlights_visible: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
@@ -5606,6 +5624,7 @@ impl HarnessApp {
         }
 
         self.search_visible = false;
+        self.search_highlights_visible = false;
         self.search_query.clear();
         self.search_matches.clear();
         self.active_search_match = 0;
@@ -6307,10 +6326,10 @@ impl HarnessApp {
             search_uses_native_editor(self.buffer_view, self.focus_mode);
         self.buffer_search_backwards = false;
         self.search_visible = true;
+        self.search_highlights_visible = !self.search_query.is_empty();
         self.focus_mode = FocusMode::Search;
-        self.search_editor.update(cx, |editor, cx| {
-            editor.set_text(self.search_query.clone(), window, cx)
-        });
+        self.search_editor
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.search_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -6334,7 +6353,11 @@ impl HarnessApp {
     }
 
     fn commit_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_query = self.search_editor.read(cx).text(cx).trim().to_string();
+        let next_query = self.search_editor.read(cx).text(cx).trim().to_string();
+        if !next_query.is_empty() {
+            self.search_query = next_query;
+        }
+        self.search_highlights_visible = !self.search_query.is_empty();
         if self.search_returns_to_buffer {
             self.search_visible = false;
             self.focus_mode = FocusMode::Buffer;
@@ -6366,23 +6389,31 @@ impl HarnessApp {
 
     fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_visible = false;
+        self.search_highlights_visible = false;
         if self.search_returns_to_buffer {
             self.transcript_editor
-                .update(cx, |editor, cx| editor.clear_search(cx));
+                .update(cx, |editor, cx| editor.hide_search_highlights(cx));
             self.focus_mode = FocusMode::Buffer;
             self.transcript_editor.focus_handle(cx).focus(window, cx);
             cx.notify();
             return;
         }
-        self.search_query.clear();
-        self.search_matches.clear();
-        self.active_search_match = 0;
         self.restore_search_focus(window, cx);
         cx.notify();
     }
 
+    fn clear_search_highlights(&mut self, cx: &mut Context<Self>) {
+        self.search_visible = false;
+        self.search_highlights_visible = false;
+        if self.search_returns_to_buffer {
+            self.transcript_editor
+                .update(cx, |editor, cx| editor.hide_search_highlights(cx));
+        }
+        cx.notify();
+    }
+
     fn rebuild_search_matches(&mut self) {
-        let query = self.search_query.to_lowercase();
+        let query = self.search_query.trim();
         self.search_matches = if query.is_empty() {
             Vec::new()
         } else {
@@ -6390,9 +6421,7 @@ impl HarnessApp {
                 .items
                 .iter()
                 .enumerate()
-                .filter_map(|(index, item)| {
-                    item_matches_folded_query(item, &query).then_some(index)
-                })
+                .filter_map(|(index, item)| item_matches_search_query(item, query).then_some(index))
                 .collect()
         };
         self.active_search_match = self
@@ -6401,7 +6430,7 @@ impl HarnessApp {
     }
 
     fn update_search_matches_for_changes(&mut self, old_len: usize, dirty_items: &[usize]) {
-        let query = self.search_query.to_lowercase();
+        let query = self.search_query.trim();
         if query.is_empty() {
             self.search_matches.clear();
             self.active_search_match = 0;
@@ -6423,7 +6452,7 @@ impl HarnessApp {
             reconcile_sorted_search_match(
                 &mut self.search_matches,
                 index,
-                item_matches_folded_query(item, &query),
+                item_matches_search_query(item, query),
             );
         }
 
@@ -6457,6 +6486,7 @@ impl HarnessApp {
         if self.search_matches.is_empty() {
             return;
         }
+        self.search_highlights_visible = true;
         let len = self.search_matches.len();
         self.active_search_match = if delta < 0 {
             self.active_search_match.checked_sub(1).unwrap_or(len - 1)
@@ -6633,7 +6663,7 @@ impl HarnessApp {
             if cached.search_query.as_deref() != Some(search.query.as_ref()) {
                 cached.search_query = Some(search.query.to_string());
                 cached.search_ranges =
-                    folded_match_byte_ranges(source, &search.query, RICH_SEARCH_HIGHLIGHT_LIMIT);
+                    search_match_byte_ranges(source, &search.query, RICH_SEARCH_HIGHLIGHT_LIMIT);
             }
             search.decorate_ranges(cached.search_ranges.clone())
         } else {
@@ -8921,7 +8951,7 @@ impl HarnessApp {
         let streaming = item.status.as_deref() == Some("streaming");
         let search_item_position = self.search_matches.binary_search(&index).ok();
         let active_search_item = search_item_position == Some(self.active_search_match);
-        let rich_search = (self.search_visible
+        let rich_search = (self.search_highlights_visible
             && !self.search_query.trim().is_empty()
             && search_item_position.is_some())
         .then(|| RichSearchPaint::new(self.search_query.clone(), active_search_item));
@@ -8971,9 +9001,9 @@ impl HarnessApp {
         let is_disclosure = has_collapsible_content
             && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
         let raw_search_visible = raw_visible
-            && self.search_visible
-            && folded_contains(&item.raw.to_string(), &self.search_query);
-        let search_context = (self.search_visible
+            && self.search_highlights_visible
+            && search_contains(&item.raw.to_string(), &self.search_query);
+        let search_context = (self.search_highlights_visible
             && active_search_item
             && is_disclosure
             && rich_search_match_needs_context(&item, OutputExpansion::Preview)
@@ -9015,7 +9045,7 @@ impl HarnessApp {
                 &item.content,
                 rich_search.as_ref(),
                 rich_navigation.as_ref(),
-                (active_search_item && self.search_visible)
+                (active_search_item && self.search_highlights_visible)
                     .then_some(self.search_navigation_generation),
                 cx,
             )
@@ -9733,6 +9763,9 @@ impl Render for HarnessApp {
             .on_action(
                 cx.listener(|this, _: &CloseSearch, window, cx| this.close_search(window, cx)),
             )
+            .on_action(cx.listener(|this, _: &ClearSearchHighlights, _, cx| {
+                this.clear_search_highlights(cx)
+            }))
             .on_action(
                 cx.listener(|this, _: &NextMatch, window, cx| {
                     this.move_search_match(1, window, cx)
@@ -12009,14 +12042,14 @@ mod tests {
         };
 
         assert_eq!(image_caption_for_display(&item), None);
-        assert!(!item_matches_folded_query(&item, "/tmp/preview.png"));
+        assert!(!item_matches_search_query(&item, "/tmp/preview.png"));
 
         item.content = "/tmp/preview.png\n\nRevised prompt\nA detailed scene".into();
         assert_eq!(
             image_caption_for_display(&item),
             Some("/tmp/preview.png\n\nRevised prompt\nA detailed scene")
         );
-        assert!(item_matches_folded_query(&item, "detailed scene"));
+        assert!(item_matches_search_query(&item, "detailed scene"));
     }
 
     #[test]
@@ -12152,6 +12185,27 @@ mod tests {
     }
 
     #[test]
+    fn rich_search_uses_smart_case() {
+        let text = "I can inspect it, and i can repeat it";
+        assert_eq!(search_match_byte_ranges(text, "I", 8), vec![0..1]);
+        assert_eq!(
+            search_match_byte_ranges(text, "i", 8),
+            vec![0..1, 6..7, 14..15, 22..23, 35..36]
+        );
+        assert!(
+            search_match_byte_ranges("Semantic Needle", "semantic needle", 1)
+                .first()
+                .is_some()
+        );
+        assert!(
+            search_match_byte_ranges("Semantic Needle", "Semantic Needle", 1)
+                .first()
+                .is_some()
+        );
+        assert!(search_match_byte_ranges("semantic needle", "Semantic Needle", 1).is_empty());
+    }
+
+    #[test]
     fn rich_search_range_budget_is_bounded_across_card_fragments() {
         let paint = RichSearchPaint::new("needle", true);
         let first = paint.ranges_for(&"needle ".repeat(100));
@@ -12254,8 +12308,8 @@ mod tests {
             pending_request: None,
         };
 
-        assert!(item_matches_folded_query(&item, "semantic needle"));
-        assert!(item_matches_folded_query(&item, "waiting for results"));
+        assert!(item_matches_search_query(&item, "semantic needle"));
+        assert!(item_matches_search_query(&item, "waiting for results"));
         let snippet = item_search_context_snippet(&item, "semantic needle", 72).unwrap();
         assert_eq!(&snippet.text[snippet.match_range], "Semantic Needle");
     }
@@ -12275,8 +12329,8 @@ mod tests {
             pending_request: None,
         };
 
-        assert!(!item_matches_folded_query(&item, "codex"));
-        assert!(item_matches_folded_query(&item, "unrelated"));
+        assert!(!item_matches_search_query(&item, "codex"));
+        assert!(item_matches_search_query(&item, "unrelated"));
     }
 
     #[test]

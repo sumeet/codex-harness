@@ -3284,8 +3284,10 @@ impl Element for MarkdownElement {
         });
 
         self.paint_mouse_listeners(hitbox, &rendered_markdown.text, window, cx);
-        rendered_markdown.element.paint(window, cx);
+        // Search matches are backgrounds, so paint them before glyphs. Painting
+        // these quads afterwards punches opaque holes through matched text.
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
+        rendered_markdown.element.paint(window, cx);
         self.paint_selection(&rendered_markdown.text, window, cx);
         self.paint_external_cursor(&rendered_markdown.text, bounds, window, cx);
     }
