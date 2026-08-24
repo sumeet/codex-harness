@@ -2184,6 +2184,24 @@ impl TranscriptEditor {
     /// of Editor layout; this is only a shared logical-offset contract.
     pub fn selection_snapshot(&self, cx: &mut App) -> TranscriptSelectionSnapshot {
         let (selections, linewise, head, reversed) = self.editor.update(cx, |editor, cx| {
+            let newest_anchor = editor.selections.newest_anchor();
+            if editor.selections.count() == 1
+                && !editor.selections.line_mode()
+                && newest_anchor.start == newest_anchor.end
+            {
+                // Normal mode is overwhelmingly the hot path. Resolving one
+                // cursor only needs the buffer snapshot; constructing an
+                // Editor display snapshot here traverses soft-wrap state for
+                // the entire transcript before every j/k motion.
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                return (
+                    Vec::new(),
+                    false,
+                    newest_anchor.head().to_offset(&snapshot).0,
+                    false,
+                );
+            }
+
             let display_snapshot = editor.display_snapshot(cx);
             let snapshot = display_snapshot.buffer_snapshot();
             let newest = editor
@@ -2225,9 +2243,29 @@ impl TranscriptEditor {
         });
         let visual = selections.iter().any(|selection| !selection.is_empty());
         let head_segment_position = segment_position_at_offset(&self.segments, head);
+        let mut candidate_segment_positions = BTreeSet::new();
+        if let Some(head_segment_position) = head_segment_position {
+            candidate_segment_positions.insert(head_segment_position);
+        }
+        for selection in selections.iter().filter(|selection| !selection.is_empty()) {
+            let first = self
+                .segments
+                .partition_point(|segment| segment.body_range.end <= selection.start);
+            for (segment_position, segment) in self.segments.iter().enumerate().skip(first) {
+                if selection.end <= segment.body_range.start {
+                    break;
+                }
+                if selection.start < segment.body_range.end
+                    && segment.body_range.start < selection.end
+                {
+                    candidate_segment_positions.insert(segment_position);
+                }
+            }
+        }
         let mut items = Vec::new();
 
-        for (segment_position, segment) in self.segments.iter().enumerate() {
+        for segment_position in candidate_segment_positions {
+            let segment = &self.segments[segment_position];
             let body = segment.body_range.clone();
             let ranges = selections
                 .iter()

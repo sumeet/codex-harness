@@ -3343,6 +3343,34 @@ impl HarnessApp {
             }
             None => {}
         }
+        if automatic_performance_j() {
+            cx.spawn_in(window, async move |this, cx| {
+                // The compositor's keyboard-enter event can arrive after the
+                // first application defer. Wait for it so the
+                // benchmark is not accidentally measured through GPUI's
+                // deliberate 30 Hz inactive-window throttle.
+                let mut active = false;
+                for _ in 0..40 {
+                    active = this
+                        .update_in(cx, |_, window, _| window.is_window_active())
+                        .unwrap_or(false);
+                    if active {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_millis(50))
+                        .await;
+                }
+                if !active {
+                    eprintln!("cancelled automatic Harness :perf-j run: window stayed inactive");
+                    return;
+                }
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.run_performance_j(window, cx);
+                });
+            })
+            .detach();
+        }
         if replay_count.is_none() {
             this.connect(cx);
         }
@@ -10723,6 +10751,10 @@ fn replay_count() -> Option<usize> {
     std::env::var("HARNESS_REPLAY_ITEMS")
         .ok()
         .and_then(|count| count.parse().ok())
+}
+
+fn automatic_performance_j() -> bool {
+    std::env::args().any(|argument| argument == "--perf-j")
 }
 
 enum AutomaticPerformanceCapture {
