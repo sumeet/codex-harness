@@ -149,6 +149,7 @@ impl LocalEditor {
             let mut editor = Editor::auto_height(3, 12, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             editor.set_use_modal_editing(true);
+            editor.register_addon(ComposerKeyContextAddon);
             if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
                 buffer.update(cx, |buffer, cx| {
                     buffer.set_language_registry(language_registry);
@@ -389,6 +390,22 @@ struct TranscriptKeyContextAddon;
 impl Addon for TranscriptKeyContextAddon {
     fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
         key_context.add("HarnessBuffer");
+    }
+
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Marks only Harness's composer Editor in its intrinsic key context.
+///
+/// A focused Editor installs its own window key context, so the host view's
+/// parent context is not available to bindings such as image paste and send.
+struct ComposerKeyContextAddon;
+
+impl Addon for ComposerKeyContextAddon {
+    fn extend_key_context(&self, key_context: &mut KeyContext, _: &App) {
+        key_context.add("HarnessComposer");
     }
 
     fn to_any(&self) -> &dyn std::any::Any {
@@ -4723,6 +4740,12 @@ mod tests {
             .expect("the source guard must inspect production code only");
         assert!(transcript_source.contains("Editor::for_local_buffer(buffer, window, cx)"));
         assert!(!transcript_source.contains("Editor::for_buffer(buffer, None, window, cx)"));
+        let composer_constructor = transcript_source
+            .split_once("pub fn modal_composer(")
+            .and_then(|(_, after)| after.split_once("pub fn plain_single_line("))
+            .map(|(constructor, _)| constructor)
+            .expect("the modal composer constructor must remain independently auditable");
+        assert!(composer_constructor.contains("register_addon(ComposerKeyContextAddon)"));
 
         let yank_source = include_str!("../../vim/src/normal/yank.rs");
         let yank_method = yank_source
