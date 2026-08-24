@@ -159,6 +159,8 @@ pub struct CommandTranscript {
     pub output: String,
 }
 
+pub const COMMAND_PROMPT: &str = "$ ";
+
 #[derive(Deserialize, Serialize)]
 struct PersistedTranscript {
     version: u32,
@@ -760,11 +762,15 @@ fn selectable_transcript_body(
             let command = normalize_buffer_line_endings(command.command)
                 .trim_end_matches(['\r', '\n'])
                 .to_owned();
-            let mut text = command.clone();
+            let mut text = if command.is_empty() {
+                String::new()
+            } else {
+                format!("{COMMAND_PROMPT}{command}")
+            };
             let mut semantic_spans = Vec::new();
             if !command.is_empty() {
                 semantic_spans.push(TranscriptSemanticSpan {
-                    range: 0..command.len(),
+                    range: 0..text.len(),
                     style: TranscriptSemanticStyle::CommandInvocation,
                 });
             }
@@ -4580,19 +4586,19 @@ mod tests {
         let projection = model.item_projection(0).unwrap();
         assert_eq!(
             projection.body_text(),
-            "printf '%s' \"hello\"\nhello",
-            "the navigation document must not retain the unpainted blank separator"
+            "$ printf '%s' \"hello\"\nhello",
+            "the navigation document must retain painted prompt text but not the unpainted blank separator"
         );
         let body_start = projection.segment.body_range.start;
         assert_eq!(
             projection.segment.semantic_spans,
             [
                 TranscriptSemanticSpan {
-                    range: body_start..body_start + 19,
+                    range: body_start..body_start + 21,
                     style: TranscriptSemanticStyle::CommandInvocation,
                 },
                 TranscriptSemanticSpan {
-                    range: body_start + 20..body_start + 25,
+                    range: body_start + 22..body_start + 27,
                     style: TranscriptSemanticStyle::CommandOutput,
                 },
             ]

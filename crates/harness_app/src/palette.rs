@@ -124,6 +124,7 @@ pub(crate) fn init(cx: &mut App) {
         GpuiKeyBinding::new("tab", MoveDown, Some("HarnessPalette")),
         GpuiKeyBinding::new("enter", Confirm, Some("HarnessPalette")),
         GpuiKeyBinding::new("escape", Dismiss, Some("HarnessPalette")),
+        GpuiKeyBinding::new("ctrl-[", Dismiss, Some("HarnessPalette")),
         GpuiKeyBinding::new("ctrl-c", Dismiss, Some("HarnessPalette")),
     ]);
 }

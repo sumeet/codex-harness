@@ -133,6 +133,8 @@ const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
 const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 140.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
+const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
+const RICH_CARD_LEADING_WIDTH: f32 = 16.;
 const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
@@ -140,6 +142,26 @@ const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
 const PERFORMANCE_SCROLL_SETTLE_DURATION: Duration = Duration::from_millis(1_600);
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 2;
+
+fn rich_card_identity_row() -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .h(px(RICH_CARD_IDENTITY_ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .gap_1()
+}
+
+fn rich_card_identity_icon(icon: IconName, size: IconSize, color: Color) -> gpui::Div {
+    div()
+        .w(px(RICH_CARD_LEADING_WIDTH))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(Icon::new(icon).size(size).color(color))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PerformanceJPhase {
@@ -1495,11 +1517,23 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
 }
 
 fn rich_command_row_logical_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
+    let prompt_len = usize::from(!data.command.is_empty()) * model::COMMAND_PROMPT.len();
     let base = match row.source {
-        RichCommandSource::Command => 0,
-        RichCommandSource::Output => data.command.len() + usize::from(!data.command.is_empty()),
+        RichCommandSource::Command => prompt_len,
+        RichCommandSource::Output => {
+            prompt_len + data.command.len() + usize::from(!data.command.is_empty())
+        }
     };
     base + row.source_range.start..base + row.source_range.end
+}
+
+fn rich_command_row_navigation_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
+    let range = rich_command_row_logical_range(data, row);
+    if matches!(row.source, RichCommandSource::Command) && row.line_index == 0 {
+        0..range.end
+    } else {
+        range
+    }
 }
 
 fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> usize {
@@ -2632,13 +2666,8 @@ impl Render for HybridStructuredSurface {
             .flatten();
         let item_key = self.item.key.clone();
         let owner = self.owner.clone();
-        let header = div()
+        let header = rich_card_identity_row()
             .id(format!("hybrid-structured-header:{}", self.item.key))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
             .cursor_pointer()
             .on_click(move |_, _, cx| {
                 owner
@@ -2655,11 +2684,11 @@ impl Render for HybridStructuredSurface {
                     })
                     .ok();
             })
-            .child(
-                Icon::new(icon_for_kind(self.item.kind))
-                    .size(IconSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(rich_card_identity_icon(
+                icon_for_kind(self.item.kind),
+                IconSize::Small,
+                Color::Muted,
+            ))
             .child(
                 div()
                     .min_w_0()
@@ -2945,7 +2974,7 @@ impl HarnessApp {
                 .rows
                 .iter()
                 .enumerate()
-                .map(|(index, row)| (index, rich_command_row_logical_range(&surface.data, row)))
+                .map(|(index, row)| (index, rich_command_row_navigation_range(&surface.data, row)))
                 .find(|(_, range)| range.contains(&cursor) || range.end == cursor)
                 .map(|(index, _)| index);
             if let Some(row) = row {
@@ -7180,23 +7209,16 @@ impl HarnessApp {
             );
             row_ranges.push(Some(path_range));
             rows.push(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .h(px(20.))
-                    .px_1()
+                rich_card_identity_row()
                     .when(section_index == 0 && file_count == 1, |this| this.pr_5())
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
-                    .child(
-                        Icon::new(IconName::File)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(rich_card_identity_icon(
+                        IconName::File,
+                        IconSize::XSmall,
+                        Color::Muted,
+                    ))
                     .child(
                         div()
                             .min_w_0()
@@ -7253,14 +7275,8 @@ impl HarnessApp {
             .flex_col()
             .when(file_count > 1, |this| {
                 this.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
+                    rich_card_identity_row()
                         .pr_5()
-                        .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
                         .child(
@@ -7375,23 +7391,16 @@ impl HarnessApp {
                             .border_color(colors.border_variant)
                     })
                     .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .h(px(20.))
-                            .px_1()
+                        rich_card_identity_row()
                             .when(section_index == 0 && file_count == 1, |this| this.pr_5())
                             .border_b_1()
                             .border_color(colors.border_variant)
                             .bg(colors.editor_subheader_background.opacity(0.72))
-                            .child(
-                                Icon::new(IconName::File)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Muted),
-                            )
+                            .child(rich_card_identity_icon(
+                                IconName::File,
+                                IconSize::XSmall,
+                                Color::Muted,
+                            ))
                             .child(
                                 div()
                                     .min_w_0()
@@ -7449,14 +7458,8 @@ impl HarnessApp {
             .gap_0p5()
             .when(file_count > 1, |this| {
                 this.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
+                    rich_card_identity_row()
                         .pr_5()
-                        .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
                         .child(
@@ -7537,14 +7540,7 @@ impl HarnessApp {
                     Color::Accent => colors.text_accent,
                     _ => colors.text_muted,
                 };
-                div()
-                    .w_full()
-                    .h(px(20.))
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .px_1()
+                rich_card_identity_row()
                     .when(
                         row_index == 0 && row_data.presentations.len() == 1,
                         |this| this.pr_5(),
@@ -7552,11 +7548,11 @@ impl HarnessApp {
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
-                    .child(
-                        Icon::new(IconName::File)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
+                    .child(rich_card_identity_icon(
+                        IconName::File,
+                        IconSize::XSmall,
+                        Color::Muted,
+                    ))
                     .child(
                         div()
                             .min_w_0()
@@ -7776,14 +7772,8 @@ impl HarnessApp {
             .flex_col()
             .when(data.presentations.len() > 1, |this| {
                 this.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
+                    rich_card_identity_row()
                         .pr_5()
-                        .pb_1()
                         .border_b_1()
                         .border_color(colors.border_variant)
                         .child(
@@ -8145,63 +8135,96 @@ impl HarnessApp {
         let command_search = search.clone();
         let command_navigation = navigation.clone();
         let command_owner = owner.clone();
-        let command_rows = list(command_list_state.clone(), move |row_index, _, cx| {
-            let row = &command_data.rows[row_index];
-            let line = &command_data.command[row.source_range.clone()];
-            let logical_range = rich_command_row_logical_range(&command_data, row);
-            let highlighted = navigation_searchable_styled_text(
-                line.to_owned(),
-                shell_highlights(line, cx),
-                command_search.as_ref(),
-                command_navigation.as_ref(),
-                logical_range.clone(),
-                cx,
-            );
-            let cursor_marker =
-                rich_cursor_index_for_fragment(command_navigation.as_ref(), &logical_range).map(
-                    |rendered_index| {
-                        rich_cursor_autoscroll_marker(
-                            highlighted.layout().clone(),
-                            rendered_index,
-                            cx.theme().players().local().cursor.opacity(0.55),
-                        )
-                    },
+        let command_rows =
+            list(command_list_state.clone(), move |row_index, _, cx| {
+                let row = &command_data.rows[row_index];
+                let line = &command_data.command[row.source_range.clone()];
+                let logical_range = rich_command_row_logical_range(&command_data, row);
+                let highlighted = navigation_searchable_styled_text(
+                    line.to_owned(),
+                    shell_highlights(line, cx),
+                    command_search.as_ref(),
+                    command_navigation.as_ref(),
+                    logical_range.clone(),
+                    cx,
                 );
-            let clickable = rich_clickable_styled_text(
-                format!("rich-command-text:{index}:{}", row.line_index),
-                highlighted,
-                index,
-                logical_range,
-                Some(command_owner.clone()),
-            );
-            let first_command_row = row.line_index == 0;
-            let command_text = div()
-                .min_w_0()
-                .flex_1()
-                .relative()
-                .whitespace_normal()
-                .child(clickable)
-                .when_some(cursor_marker, |this, marker| this.child(marker));
-            div()
-                .w_full()
-                .min_w_0()
-                .min_h(px(20.))
-                .flex()
-                .items_start()
-                .when(first_command_row, |this| {
-                    this.pr_5().child(
-                        div()
-                            .w(px(16.))
-                            .flex_none()
-                            .text_color(cx.theme().colors().text_accent)
-                            .child("$"),
-                    )
-                })
-                .child(command_text)
-                .into_any_element()
-        })
-        .with_sizing_behavior(ListSizingBehavior::Infer)
-        .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT));
+                let cursor_marker =
+                    rich_cursor_index_for_fragment(command_navigation.as_ref(), &logical_range)
+                        .map(|rendered_index| {
+                            rich_cursor_autoscroll_marker(
+                                highlighted.layout().clone(),
+                                rendered_index,
+                                cx.theme().players().local().cursor.opacity(0.55),
+                            )
+                        });
+                let clickable = rich_clickable_styled_text(
+                    format!("rich-command-text:{index}:{}", row.line_index),
+                    highlighted,
+                    index,
+                    logical_range,
+                    Some(command_owner.clone()),
+                );
+                let first_command_row = row.line_index == 0;
+                let prompt = first_command_row.then(|| {
+                    let prompt_range = 0..model::COMMAND_PROMPT.len();
+                    let highlighted_prompt = navigation_searchable_styled_text(
+                        model::COMMAND_PROMPT.to_owned(),
+                        vec![(
+                            0..1,
+                            gpui::HighlightStyle {
+                                color: Some(cx.theme().colors().text_accent),
+                                ..Default::default()
+                            },
+                        )],
+                        command_search.as_ref(),
+                        command_navigation.as_ref(),
+                        prompt_range.clone(),
+                        cx,
+                    );
+                    let prompt_cursor =
+                        rich_cursor_index_for_fragment(command_navigation.as_ref(), &prompt_range)
+                            .map(|rendered_index| {
+                                rich_cursor_autoscroll_marker(
+                                    highlighted_prompt.layout().clone(),
+                                    rendered_index,
+                                    cx.theme().players().local().cursor.opacity(0.55),
+                                )
+                            });
+                    let clickable_prompt = rich_clickable_styled_text(
+                        format!("rich-command-prompt:{index}"),
+                        highlighted_prompt,
+                        index,
+                        prompt_range,
+                        Some(command_owner.clone()),
+                    );
+                    div()
+                        .w(px(RICH_CARD_LEADING_WIDTH))
+                        .flex_none()
+                        .relative()
+                        .child(clickable_prompt)
+                        .when_some(prompt_cursor, |this, marker| this.child(marker))
+                });
+                let command_text = div()
+                    .min_w_0()
+                    .flex_1()
+                    .relative()
+                    .whitespace_normal()
+                    .child(clickable)
+                    .when_some(cursor_marker, |this, marker| this.child(marker));
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .min_h(px(20.))
+                    .flex()
+                    .items_start()
+                    .gap_1()
+                    .when(first_command_row, |this| this.pr_5())
+                    .when_some(prompt, |this, prompt| this.child(prompt))
+                    .child(command_text)
+                    .into_any_element()
+            })
+            .with_sizing_behavior(ListSizingBehavior::Infer)
+            .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT));
 
         let output_data = data.clone();
         let output_search = search.clone();
@@ -8377,6 +8400,28 @@ impl HarnessApp {
             output_start..output_start + displayed_output.len(),
             cx,
         );
+        let prompt_range = 0..model::COMMAND_PROMPT.len();
+        let highlighted_prompt = navigation_searchable_styled_text(
+            model::COMMAND_PROMPT.to_owned(),
+            vec![(
+                0..1,
+                gpui::HighlightStyle {
+                    color: Some(colors.text_accent),
+                    ..Default::default()
+                },
+            )],
+            search,
+            navigation,
+            prompt_range.clone(),
+            cx,
+        );
+        let clickable_prompt = rich_clickable_styled_text(
+            format!("rich-command-prompt:{index}"),
+            highlighted_prompt,
+            index,
+            prompt_range,
+            owner.clone(),
+        );
         let clickable_command = rich_clickable_styled_text(
             format!("rich-command-text:{index}"),
             highlighted_command,
@@ -8404,16 +8449,16 @@ impl HarnessApp {
                         .pr_5()
                         .flex()
                         .items_start()
+                        .gap_1()
                         .font_buffer(cx)
                         .text_ui_sm(cx)
                         .line_height(relative(1.35))
                         .whitespace_normal()
                         .child(
                             div()
-                                .w(px(16.))
+                                .w(px(RICH_CARD_LEADING_WIDTH))
                                 .flex_none()
-                                .text_color(colors.text_accent)
-                                .child("$"),
+                                .child(clickable_prompt),
                         )
                         .child(div().min_w_0().flex_1().child(clickable_command)),
                 )
@@ -9575,19 +9620,13 @@ impl HarnessApp {
             .as_ref()
             .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
 
-        let header = div()
+        let header = rich_card_identity_row()
             .id(("item-header", index))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .h(px(20.))
-            .gap_1()
-            .child(
-                Icon::new(icon)
-                    .size(IconSize::Small)
-                    .color(transcript_icon_color(item.kind)),
-            )
+            .child(rich_card_identity_icon(
+                icon,
+                IconSize::Small,
+                transcript_icon_color(item.kind),
+            ))
             .child(
                 div()
                     .flex_1()
@@ -10419,9 +10458,15 @@ impl Render for HarnessApp {
                                                     .flex()
                                                     .items_center()
                                                     .child(
-                                                        Label::new(command_line_prompt)
-                                                            .size(LabelSize::Small)
-                                                            .color(Color::Default),
+                                                        div()
+                                                            .h_full()
+                                                            .flex_none()
+                                                            .flex()
+                                                            .items_center()
+                                                            .font_ui(cx)
+                                                            .text_ui_sm(cx)
+                                                            .text_color(colors.text)
+                                                            .child(command_line_prompt),
                                                     )
                                                     .child(self.search_editor.clone()),
                                             )
@@ -11531,13 +11576,24 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new("ctrl-w l", FocusTranscript, Some("HarnessTasks")),
         KeyBinding::new("enter", CommitSearch, Some("HarnessSearch")),
         KeyBinding::new("escape", CloseSearch, Some("HarnessSearch")),
+        KeyBinding::new("ctrl-[", CloseSearch, Some("HarnessSearch")),
         KeyBinding::new(
             "escape",
             CloseSearch,
             Some("HarnessTranscript && HarnessSearchVisible"),
         ),
         KeyBinding::new(
+            "ctrl-[",
+            CloseSearch,
+            Some("HarnessTranscript && HarnessSearchVisible"),
+        ),
+        KeyBinding::new(
             "escape",
+            CloseSearch,
+            Some("HarnessBuffer && HarnessSearchVisible"),
+        ),
+        KeyBinding::new(
+            "ctrl-[",
             CloseSearch,
             Some("HarnessBuffer && HarnessSearchVisible"),
         ),
@@ -11549,10 +11605,12 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new("i", EditRequest, Some("HarnessRequest && !Editor")),
         KeyBinding::new("ctrl-enter", SubmitRequest, Some("HarnessRequest")),
         KeyBinding::new("escape", ReturnFromRequest, Some("HarnessRequest")),
+        KeyBinding::new("ctrl-[", ReturnFromRequest, Some("HarnessRequest")),
         KeyBinding::new("h", MoveLeft, Some("HarnessApproval")),
         KeyBinding::new("l", MoveRight, Some("HarnessApproval")),
         KeyBinding::new("enter", ChooseApproval, Some("HarnessApproval")),
         KeyBinding::new("escape", ReturnFromRequest, Some("HarnessApproval")),
+        KeyBinding::new("ctrl-[", ReturnFromRequest, Some("HarnessApproval")),
         KeyBinding::new("ctrl-n", NewTask, Some("Harness")),
         KeyBinding::new("ctrl-r", RefreshTasks, Some("HarnessTranscript")),
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("Harness")),
@@ -11656,8 +11714,10 @@ mod tests {
     fn rich_command_cursor_marker_uses_the_exact_utf8_glyph_in_each_surface() {
         let command = "/usr/bin/bash -lc 'printf café'";
         let output = "ok\nfinished";
-        let body = format!("{command}\n{output}");
+        let body = format!("{}{command}\n{output}", model::COMMAND_PROMPT);
         let cursor = body.find("é").unwrap();
+        let command_start = model::COMMAND_PROMPT.len();
+        let output_start = command_start + command.len() + 1;
         let navigation = RichNavigationPaint {
             body_text: body.clone().into(),
             ranges: Vec::new(),
@@ -11667,12 +11727,15 @@ mod tests {
         };
 
         assert_eq!(
-            rich_cursor_index_for_fragment(Some(&navigation), &(0..command.len())),
-            Some(cursor),
+            rich_cursor_index_for_fragment(
+                Some(&navigation),
+                &(command_start..command_start + command.len())
+            ),
+            Some(cursor - command_start),
             "the explicit painted cursor must retain its UTF-8 byte position in command text"
         );
         assert_eq!(
-            rich_cursor_index_for_fragment(Some(&navigation), &(command.len() + 1..body.len())),
+            rich_cursor_index_for_fragment(Some(&navigation), &(output_start..body.len())),
             None,
             "only the surface containing the cursor may paint it"
         );
@@ -11688,9 +11751,9 @@ mod tests {
         assert_eq!(
             rich_cursor_index_for_fragment(
                 Some(&output_navigation),
-                &(command.len() + 1..command.len() + 1 + output.len())
+                &(output_start..output_start + output.len())
             ),
-            Some(output_cursor - command.len() - 1),
+            Some(output_cursor - output_start),
             "output cursor paint must be relative to the output row"
         );
     }
@@ -11733,7 +11796,7 @@ mod tests {
         let command = rich_navigation_item_projection(&replay, 5).unwrap();
         assert_eq!(
             command.body_text(),
-            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+            "$ cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
         );
         assert!(
             rich_item_defers_navigation_claim(&replay.items[5]),
@@ -11834,6 +11897,11 @@ mod tests {
         assert_eq!(data.rows.len(), 2);
         assert!(matches!(data.rows[0].source, RichCommandSource::Command));
         assert!(matches!(data.rows[1].source, RichCommandSource::Output));
+        assert_eq!(&body[..model::COMMAND_PROMPT.len()], model::COMMAND_PROMPT);
+        assert_eq!(
+            rich_command_row_navigation_range(&data, &data.rows[0]),
+            0..model::COMMAND_PROMPT.len() + data.command.len()
+        );
 
         for row in data.rows.iter() {
             let source_text = match row.source {
@@ -11867,7 +11935,7 @@ mod tests {
         assert_eq!(last.body_range.end, document.text.len());
         assert_eq!(
             &document.text[last.body_range.clone()],
-            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+            "$ cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
         );
 
         let previous = &document.segments[document.segments.len() - 2];
