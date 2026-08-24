@@ -429,8 +429,13 @@ impl RichNavigationPaint {
                 .and_then(|range| {
                     if raw_head <= range.start {
                         Some(range.start)
-                    } else if raw_head >= range.end {
-                        self.body_text[..range.end.min(self.body_text.len())]
+                    } else if raw_head >= range.end
+                        || self.body_text[raw_head..]
+                            .chars()
+                            .next()
+                            .is_some_and(|character| matches!(character, '\r' | '\n'))
+                    {
+                        self.body_text[..raw_head.min(range.end).min(self.body_text.len())]
                             .char_indices()
                             .rev()
                             .find(|(_, character)| !matches!(character, '\r' | '\n'))
@@ -11976,29 +11981,33 @@ mod tests {
     #[test]
     fn rich_visual_cursor_stays_on_the_selected_line_at_an_exclusive_head() {
         let body = "$ command\"\nUTC";
-        let selected_line_end = body.find('\n').unwrap() + 1;
+        let newline = body.find('\n').unwrap();
+        let selected_line_end = newline + 1;
         let quote = body.rfind('"').unwrap();
-        let navigation = RichNavigationPaint {
-            body_text: body.into(),
-            ranges: vec![0..selected_line_end],
-            // Zed represents a forward linewise selection at the exclusive
-            // beginning of the next line. Rich paint must not expose that
-            // internal endpoint as a cursor on `U`.
-            head: Some(selected_line_end),
-            visual: true,
-            linewise: true,
-            cursor_claimed: Rc::new(Cell::new(false)),
-        };
+        for head in [newline, selected_line_end] {
+            let navigation = RichNavigationPaint {
+                body_text: body.into(),
+                ranges: vec![0..selected_line_end],
+                // Depending on the native linewise motion, Zed can expose the
+                // head on the selected newline or at the exclusive beginning
+                // of the next line. Neither internal endpoint is a visible
+                // cursor on the following output row.
+                head: Some(head),
+                visual: true,
+                linewise: true,
+                cursor_claimed: Rc::new(Cell::new(false)),
+            };
 
-        assert_eq!(navigation.cursor_range(), Some(quote..quote + 1));
-        assert_eq!(
-            rich_cursor_index_for_fragment(Some(&navigation), &(0..selected_line_end)),
-            Some(quote)
-        );
-        assert_eq!(
-            rich_cursor_index_for_fragment(Some(&navigation), &(selected_line_end..body.len())),
-            None
-        );
+            assert_eq!(navigation.cursor_range(), Some(quote..quote + 1));
+            assert_eq!(
+                rich_cursor_index_for_fragment(Some(&navigation), &(0..selected_line_end)),
+                Some(quote)
+            );
+            assert_eq!(
+                rich_cursor_index_for_fragment(Some(&navigation), &(selected_line_end..body.len())),
+                None
+            );
+        }
     }
 
     #[test]
