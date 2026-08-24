@@ -7776,6 +7776,10 @@ impl HarnessApp {
                 },
             )
             .track_scroll(&list_state)
+            // A nested list has no flex height to fill. Infer its height from
+            // the fixed-height rows so the body is present on the first frame,
+            // then let the cap turn larger diffs into scroll regions.
+            .with_sizing_behavior(ListSizingBehavior::Infer)
             .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
 
             div()
@@ -13116,6 +13120,17 @@ mod tests {
             ]
         );
         assert_eq!((data.total_additions, data.total_deletions), (2, 1));
+
+        let source = include_str!("main.rs");
+        let renderer = source
+            .split_once("fn render_file_change(")
+            .and_then(|(_, after)| after.split_once("fn render_reasoning("))
+            .map(|(renderer, _)| renderer)
+            .expect("file-change renderer must remain independently auditable");
+        assert!(
+            renderer.contains(".with_sizing_behavior(ListSizingBehavior::Infer)"),
+            "virtualized nested diffs must infer a real first-frame height instead of collapsing"
+        );
     }
 
     #[test]
