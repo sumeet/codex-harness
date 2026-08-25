@@ -8,9 +8,9 @@ use gpui::{
     prelude::*,
 };
 use serde_json::Value;
-use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize, prelude::ActiveTheme};
+use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize};
 
-const IMAGE_PREVIEW_ROWS: u32 = 15;
+const IMAGE_PREVIEW_ROWS: u32 = 9;
 const IMAGE_PLACEHOLDER_ROWS: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -142,8 +142,7 @@ fn placeholder(title: impl Into<SharedString>, detail: Option<SharedString>) -> 
 }
 
 impl Render for ImageSurface {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = cx.theme().colors().clone();
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.availability {
             ImageAvailability::Present(path) => {
                 let unreadable_path = path_label(path);
@@ -162,23 +161,14 @@ impl Render for ImageSurface {
             }
         };
 
-        div()
-            .size_full()
-            .min_w_0()
-            .px_3()
-            .py_1()
-            .border_l_2()
-            .border_color(colors.border_variant)
-            .bg(colors.editor_background.opacity(0.24))
-            .child(
-                div()
-                    .size_full()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .rounded_md()
-                    .bg(colors.editor_background)
-                    .child(content),
-            )
+        div().size_full().min_w_0().child(
+            div()
+                .size_full()
+                .min_w_0()
+                .overflow_hidden()
+                .rounded_sm()
+                .child(content),
+        )
     }
 }
 

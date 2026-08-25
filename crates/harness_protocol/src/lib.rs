@@ -3933,8 +3933,15 @@ fn render_plan(params: &Value) -> String {
         for step in steps {
             let status = string_at(step, "/status").unwrap_or("pending");
             let text = string_at(step, "/step").unwrap_or_default();
-            let marker = if status == "completed" { "x" } else { " " };
-            output.push_str(&format!("- [{marker}] {text} ({status})\n"));
+            // Status is structural protocol data, not prose. Markdown's task
+            // marker is the visual status indicator, so repeating the raw
+            // enum after the step produces a second, contradictory UI.
+            let marker = if matches!(status, "completed" | "complete") {
+                "x"
+            } else {
+                " "
+            };
+            output.push_str(&format!("- [{marker}] {text}\n"));
         }
     }
     output

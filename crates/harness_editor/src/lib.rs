@@ -146,7 +146,11 @@ impl LocalEditor {
             (languages.registry.clone(), languages.markdown.clone())
         };
         let editor = cx.new(move |cx| {
-            let mut editor = Editor::auto_height(3, 12, window, cx);
+            // The host reserves room for at most eight visual rows before the
+            // composer becomes internally scrollable. Keeping the Editor's
+            // intrinsic cap identical prevents its caret from painting under
+            // the host-owned Vim/status row.
+            let mut editor = Editor::auto_height(3, 8, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             editor.set_use_modal_editing(true);
             editor.register_addon(ComposerKeyContextAddon);
@@ -211,6 +215,14 @@ impl LocalEditor {
         let text: SharedString = text.into();
         self.editor.update(cx, |editor, cx| {
             editor.set_text(text.to_string(), window, cx)
+        });
+    }
+
+    /// Insert a real Editor newline so composer-specific key bindings retain
+    /// normal undo, indentation, selection, and Vim insert-mode semantics.
+    pub fn insert_newline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            editor.newline(&editor::actions::Newline, window, cx)
         });
     }
 

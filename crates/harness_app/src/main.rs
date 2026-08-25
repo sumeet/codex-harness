@@ -37,8 +37,8 @@ use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
     ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, Icon, IconButton,
     IconButtonShape, IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing,
-    ScrollAxes, Scrollbars, SelectableButton, ThreadItem, TintColor, Toggleable, WithScrollbar,
-    right_click_menu,
+    ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable,
+    WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -64,6 +64,7 @@ actions!(
     harness,
     [
         Send,
+        InsertComposerNewline,
         PasteComposer,
         Stop,
         FocusTranscript,
@@ -132,6 +133,7 @@ const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
 const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
 const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 140.;
+const RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT: f32 = 160.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
@@ -371,6 +373,8 @@ struct RichCommandSurface {
     data: RichCommandData,
     command_list_state: ListState,
     output_list_state: ListState,
+    command_horizontal_handle: ScrollHandle,
+    output_horizontal_handle: ScrollHandle,
 }
 
 #[derive(Clone)]
@@ -3106,7 +3110,13 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> Option<(RichCommandData, ListState, ListState)> {
+    ) -> Option<(
+        RichCommandData,
+        ListState,
+        ListState,
+        ScrollHandle,
+        ScrollHandle,
+    )> {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -3125,20 +3135,21 @@ impl HarnessApp {
                 .or_default();
             let command_list_state = state.command.as_ref().map_or_else(
                 || {
-                    // Commands are normally only a handful of logical lines. Measure
-                    // all of them once so wrapped lines contribute their exact height
-                    // to the bottom boundary before the user starts scrolling.
-                    ListState::new(command_row_count, ListAlignment::Top, px(120.)).measure_all()
+                    // Every command source row is painted as one unwrapped terminal
+                    // line. Horizontal overflow belongs to its own scroll surface,
+                    // so the list can retain exact, fixed-height hit geometry.
+                    ListState::new(command_row_count, ListAlignment::Top, px(120.))
+                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
                 },
                 |surface| surface.command_list_state.clone(),
             );
             let output_list_state = state.command.as_ref().map_or_else(
                 || {
-                    // Output can contain hundreds of thousands of lines, so eagerly
-                    // measuring it would defeat virtualization. A one-line height
-                    // estimate makes every unseen row scroll-reachable; the list
-                    // replaces estimates with exact wrapped heights as rows appear.
-                    ListState::new(output_row_count, ListAlignment::Top, px(240.))
+                    // Completed and streaming terminal output opens at its tail. Each
+                    // logical output row is one unwrapped terminal row; allowing it
+                    // to wrap while retaining a 20px virtual-row estimate made text
+                    // overlap and made click-to-cursor geometry fundamentally wrong.
+                    ListState::new(output_row_count, ListAlignment::Bottom, px(160.))
                         .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
                 },
                 |surface| surface.output_list_state.clone(),
@@ -3160,6 +3171,16 @@ impl HarnessApp {
                 data,
                 command_list_state,
                 output_list_state,
+                command_horizontal_handle: state
+                    .command
+                    .as_ref()
+                    .map(|surface| surface.command_horizontal_handle.clone())
+                    .unwrap_or_default(),
+                output_horizontal_handle: state
+                    .command
+                    .as_ref()
+                    .map(|surface| surface.output_horizontal_handle.clone())
+                    .unwrap_or_default(),
             });
         }
 
@@ -3193,6 +3214,8 @@ impl HarnessApp {
             surface.data.clone(),
             surface.command_list_state.clone(),
             surface.output_list_state.clone(),
+            surface.command_horizontal_handle.clone(),
+            surface.output_horizontal_handle.clone(),
         ))
     }
 
@@ -7403,12 +7426,6 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let presentations = diff_file_presentations(&item.content);
-        let file_count = presentations.len();
-        let (total_additions, total_deletions) = aggregate_diff_counts(
-            presentations
-                .iter()
-                .map(|presentation| presentation.content.as_str()),
-        );
         let owner = cx.weak_entity();
         let mut logical_cursor = 0;
         let mut row_ranges = Vec::new();
@@ -7453,7 +7470,7 @@ impl HarnessApp {
             row_ranges.push(Some(path_range));
             rows.push(
                 rich_card_identity_row()
-                    .when(section_index == 0 && file_count == 1, |this| this.pr_5())
+                    .when(section_index == 0, |this| this.pr_5())
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
@@ -7516,32 +7533,6 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(file_count > 1, |this| {
-                this.child(
-                    rich_card_identity_row()
-                        .pr_5()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .child(
-                            Label::new(format!("{file_count} files"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .when(total_additions > 0 || total_deletions > 0, |this| {
-                            this.child(
-                                DiffStat::new(
-                                    format!("rich-diff-total-stat:{index}"),
-                                    total_additions,
-                                    total_deletions,
-                                )
-                                .label_size(LabelSize::XSmall)
-                                .tooltip(format!(
-                                    "{total_additions} total lines added, {total_deletions} total lines removed"
-                                )),
-                            )
-                        }),
-                )
-            })
             .child(
                 div()
                     .id(("rich-diff-scroll", index))
@@ -7576,12 +7567,6 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let presentations = diff_file_presentations(&item.content);
-        let file_count = presentations.len();
-        let (total_additions, total_deletions) = aggregate_diff_counts(
-            presentations
-                .iter()
-                .map(|presentation| presentation.content.as_str()),
-        );
         let allocations = progressive_file_line_allocations(
             &presentations
                 .iter()
@@ -7635,7 +7620,7 @@ impl HarnessApp {
                     })
                     .child(
                         rich_card_identity_row()
-                            .when(section_index == 0 && file_count == 1, |this| this.pr_5())
+                            .when(section_index == 0, |this| this.pr_5())
                             .border_b_1()
                             .border_color(colors.border_variant)
                             .bg(colors.editor_subheader_background.opacity(0.72))
@@ -7699,32 +7684,6 @@ impl HarnessApp {
             .flex()
             .flex_col()
             .gap_0p5()
-            .when(file_count > 1, |this| {
-                this.child(
-                    rich_card_identity_row()
-                        .pr_5()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .child(
-                            Label::new(format!("{file_count} files"))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .when(total_additions > 0 || total_deletions > 0, |this| {
-                            this.child(
-                                DiffStat::new(
-                                    format!("diff-total-stat:{index}"),
-                                    total_additions,
-                                    total_deletions,
-                                )
-                                .label_size(LabelSize::XSmall)
-                                .tooltip(format!(
-                                    "{total_additions} total lines added, {total_deletions} total lines removed"
-                                )),
-                            )
-                        }),
-                )
-            })
             .children(sections)
             .when_some(toggle, |this, toggle| {
                 this.child(
@@ -7784,10 +7743,7 @@ impl HarnessApp {
                     _ => colors.text_muted,
                 };
                 rich_card_identity_row()
-                    .when(
-                        row_index == 0 && row_data.presentations.len() == 1,
-                        |this| this.pr_5(),
-                    )
+                    .when(row_index == 0, |this| this.pr_5())
                     .border_b_1()
                     .border_color(colors.border_variant)
                     .bg(colors.editor_subheader_background.opacity(0.72))
@@ -8002,36 +7958,6 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(data.presentations.len() > 1, |this| {
-                this.child(
-                    rich_card_identity_row()
-                        .pr_5()
-                        .border_b_1()
-                        .border_color(colors.border_variant)
-                        .child(
-                            Label::new(format!("{} files", data.presentations.len()))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .when(
-                            data.total_additions > 0 || data.total_deletions > 0,
-                            |this| {
-                                this.child(
-                                    DiffStat::new(
-                                        format!("file-change-total-stat:{index}"),
-                                        data.total_additions,
-                                        data.total_deletions,
-                                    )
-                                    .label_size(LabelSize::XSmall)
-                                    .tooltip(format!(
-                                        "{} total lines added, {} total lines removed",
-                                        data.total_additions, data.total_deletions
-                                    )),
-                                )
-                            },
-                        ),
-                )
-            })
             .child(
                 div()
                     .id(("file-change-scroll", index))
@@ -8357,8 +8283,13 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (data, command_list_state, output_list_state) =
-            self.rich_command_surface(item, navigation)?;
+        let (
+            data,
+            command_list_state,
+            output_list_state,
+            command_horizontal_handle,
+            output_horizontal_handle,
+        ) = self.rich_command_surface(item, navigation)?;
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
@@ -8423,7 +8354,7 @@ impl HarnessApp {
                     .min_w_0()
                     .min_h(px(20.))
                     .relative()
-                    .whitespace_normal()
+                    .whitespace_nowrap()
                     .when(first_command_row, |this| this.pr_5())
                     .child(clickable)
                     .when_some(cursor_marker, |this, marker| this.child(marker))
@@ -8471,7 +8402,7 @@ impl HarnessApp {
                 .min_w_0()
                 .min_h(px(20.))
                 .relative()
-                .whitespace_normal()
+                .whitespace_nowrap()
                 .child(clickable)
                 .when_some(cursor_marker, |this, marker| this.child(marker))
                 .into_any_element()
@@ -8479,8 +8410,8 @@ impl HarnessApp {
         .with_sizing_behavior(ListSizingBehavior::Infer)
         .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
 
-        let command_region = div()
-            .id(("command-input-scroll", index))
+        let command_vertical_region = div()
+            .id(("command-input-vertical-scroll", index))
             .w_full()
             .min_w_0()
             .relative()
@@ -8494,24 +8425,55 @@ impl HarnessApp {
                 window,
                 cx,
             );
+        let command_region = div()
+            .id(("command-input-scroll", index))
+            .w_full()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&command_horizontal_handle)
+            .child(command_vertical_region)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Horizontal)
+                    .id(("command-input-horizontal-scrollbar", index))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .tracked_scroll_handle(&command_horizontal_handle),
+                window,
+                cx,
+            );
 
         let output_region = (!data.output.is_empty()).then(|| {
-            div()
-                .id(("command-output-scroll", index))
+            let vertical = div()
+                .id(("command-output-vertical-scroll", index))
                 .w_full()
                 .min_w_0()
                 .relative()
-                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                .border_t_1()
-                .border_color(colors.border_variant)
-                .mt_1()
-                .pt_1()
+                .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT))
                 .child(output_rows)
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
                         .id(("command-output-scrollbar", index))
                         .with_thumb_color(colors.text_muted.opacity(0.5))
                         .tracked_scroll_handle(&output_list_state),
+                    window,
+                    cx,
+                );
+            div()
+                .id(("command-output-scroll", index))
+                .w_full()
+                .min_w_0()
+                .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT))
+                .border_t_1()
+                .border_color(colors.border_variant)
+                .mt_1()
+                .pt_1()
+                .overflow_x_scroll()
+                .track_scroll(&output_horizontal_handle)
+                .child(vertical)
+                .custom_scrollbars(
+                    Scrollbars::new(ScrollAxes::Horizontal)
+                        .id(("command-output-horizontal-scrollbar", index))
+                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .tracked_scroll_handle(&output_horizontal_handle),
                     window,
                     cx,
                 )
@@ -9907,7 +9869,6 @@ impl HarnessApp {
                 .items_center()
                 .justify_center()
                 .rounded_sm()
-                .bg(colors.editor_background.opacity(0.88))
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
                     disclosure_weak
@@ -10299,6 +10260,12 @@ impl Render for HarnessApp {
             .text_color(colors.text)
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
+            .on_action(cx.listener(
+                |this, _: &InsertComposerNewline, window, cx| {
+                    this.composer
+                        .update(cx, |composer, cx| composer.insert_newline(window, cx));
+                },
+            ))
             .on_action(cx.listener(|this, _: &PasteComposer, window, cx| {
                 this.paste_composer(window, cx)
             }))
@@ -10685,7 +10652,10 @@ impl Render for HarnessApp {
                             })
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_h_0()
                                     .min_h(px(48.))
+                                    .overflow_hidden()
                                     .px_3()
                                     .pt_2()
                                     .child(self.composer.clone()),
@@ -10742,14 +10712,36 @@ impl Render for HarnessApp {
                                                     )
                                                 },
                                             )
+                                            .when(turn_active, |this| {
+                                                this.child(
+                                                    div()
+                                                        .flex_none()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .text_color(colors.text_muted)
+                                                        .child(
+                                                            SpinnerLabel::dots()
+                                                                .size(LabelSize::XSmall),
+                                                        )
+                                                        .child(
+                                                            Label::new("Working…")
+                                                                .size(LabelSize::XSmall)
+                                                                .color(Color::Muted),
+                                                        ),
+                                                )
+                                            })
                                             .child(div().flex_1())
                                             .when(turn_active, |this| {
                                                 this.child(
-                                                    IconButton::new("stop-turn", IconName::Stop)
-                                                        .shape(IconButtonShape::Square)
-                                                        .size(ButtonSize::Default)
-                                                        .icon_color(Color::Error)
-                                                        .style(ButtonStyle::Tinted(TintColor::Error))
+                                                    Button::new("stop-turn", "Stop")
+                                                        .size(ButtonSize::Compact)
+                                                        .style(ButtonStyle::Subtle)
+                                                        .start_icon(
+                                                            Icon::new(IconName::Stop)
+                                                                .size(IconSize::XSmall)
+                                                                .color(Color::Error),
+                                                        )
                                                         .aria_label("Stop turn")
                                                         .on_click(cx.listener(
                                                             |this, _, _, cx| this.stop(cx),
@@ -11796,6 +11788,26 @@ fn load_harness_keymaps(cx: &mut App) {
             "shift-insert",
             PasteComposer,
             Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "enter",
+            Send,
+            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "alt-enter",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "ctrl-j",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
         ),
         KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
