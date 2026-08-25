@@ -515,9 +515,44 @@ fn ensure_line_break(text: &mut String) {
     }
 }
 
+fn markdown_item_marker_source_range(source: &str, item: &Range<usize>) -> Option<Range<usize>> {
+    let start = item.start.min(source.len());
+    let end = item.end.min(source.len());
+    let line_end = source[start..end]
+        .find('\n')
+        .map_or(end, |offset| start + offset);
+    let bytes = source[start..line_end].as_bytes();
+    let mut cursor = 0;
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+
+    match bytes.get(cursor).copied() {
+        Some(b'-' | b'+' | b'*') => cursor += 1,
+        Some(byte) if byte.is_ascii_digit() => {
+            let digits_start = cursor;
+            while bytes.get(cursor).is_some_and(|byte| byte.is_ascii_digit())
+                && cursor - digits_start < 9
+            {
+                cursor += 1;
+            }
+            if !matches!(bytes.get(cursor), Some(b'.' | b')')) {
+                return None;
+            }
+            cursor += 1;
+        }
+        _ => return None,
+    }
+    while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    Some(start..start + cursor)
+}
+
 fn selectable_markdown_text_with_link_destinations(
     source: &str,
     include_link_destinations: bool,
+    source_faithful_replacements: bool,
 ) -> SelectableBodyProjection {
     let options = MarkdownOptions::ENABLE_STRIKETHROUGH
         | MarkdownOptions::ENABLE_TABLES
@@ -530,7 +565,7 @@ fn selectable_markdown_text_with_link_destinations(
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut destinations: Vec<(String, usize, bool)> = Vec::new();
 
-    for event in MarkdownParser::new_ext(source, options) {
+    for (event, source_range) in MarkdownParser::new_ext(source, options).into_offset_iter() {
         match event {
             MarkdownEvent::Start(Tag::Heading { .. }) => open_semantic_span(
                 &mut open_semantic_spans,
@@ -558,7 +593,11 @@ fn selectable_markdown_text_with_link_destinations(
             }
             MarkdownEvent::Start(Tag::Item) => {
                 ensure_line_break(&mut output);
-                if let Some(next) = lists.last_mut() {
+                if source_faithful_replacements {
+                    if let Some(marker) = markdown_item_marker_source_range(source, &source_range) {
+                        output.push_str(&source[marker]);
+                    }
+                } else if let Some(next) = lists.last_mut() {
                     match next {
                         Some(number) => {
                             output.push_str(&format!("{number}. "));
@@ -593,7 +632,9 @@ fn selectable_markdown_text_with_link_destinations(
                 destinations.push((dest_url.into_string(), output.len(), false));
             }
             MarkdownEvent::Start(Tag::Image { dest_url, .. }) => {
-                output.push_str("Image: ");
+                if !source_faithful_replacements {
+                    output.push_str("Image: ");
+                }
                 open_semantic_span(
                     &mut open_semantic_spans,
                     TranscriptSemanticStyle::Link,
@@ -671,10 +712,14 @@ fn selectable_markdown_text_with_link_destinations(
                 );
                 ensure_line_break(&mut output);
             }
-            MarkdownEvent::End(TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow) => {
-                ensure_line_break(&mut output)
+            MarkdownEvent::End(
+                TagEnd::Paragraph | TagEnd::Item | TagEnd::TableHead | TagEnd::TableRow,
+            ) => ensure_line_break(&mut output),
+            MarkdownEvent::End(TagEnd::TableCell) => {
+                if !source_faithful_replacements {
+                    output.push('\t');
+                }
             }
-            MarkdownEvent::End(TagEnd::TableCell) => output.push('\t'),
             MarkdownEvent::Code(text) => push_inline_semantic_text(
                 &mut output,
                 &mut semantic_spans,
@@ -686,18 +731,31 @@ fn selectable_markdown_text_with_link_destinations(
             | MarkdownEvent::DisplayMath(text) => output.push_str(&text),
             MarkdownEvent::Html(html) | MarkdownEvent::InlineHtml(html) => output.push_str(&html),
             MarkdownEvent::FootnoteReference(label) => {
-                output.push_str("[^");
-                output.push_str(&label);
-                output.push(']');
+                if source_faithful_replacements {
+                    output.push_str(&source[source_range]);
+                } else {
+                    output.push_str("[^");
+                    output.push_str(&label);
+                    output.push(']');
+                }
             }
             MarkdownEvent::SoftBreak | MarkdownEvent::HardBreak => output.push('\n'),
             MarkdownEvent::Rule => {
                 ensure_line_break(&mut output);
-                output.push_str("────────");
+                if source_faithful_replacements {
+                    output.push_str(source[source_range].trim_end_matches(['\r', '\n']));
+                } else {
+                    output.push_str("────────");
+                }
                 output.push('\n');
             }
             MarkdownEvent::TaskListMarker(checked) => {
-                output.push_str(if checked { "[x] " } else { "[ ] " });
+                if source_faithful_replacements {
+                    output.push_str(&source[source_range]);
+                    output.push(' ');
+                } else {
+                    output.push_str(if checked { "[x] " } else { "[ ] " });
+                }
             }
             MarkdownEvent::Start(_) | MarkdownEvent::End(_) => {}
         }
@@ -717,7 +775,7 @@ fn selectable_markdown_text_with_link_destinations(
 }
 
 fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
-    selectable_markdown_text_with_link_destinations(source, true)
+    selectable_markdown_text_with_link_destinations(source, true, false)
 }
 
 /// Plain-text coordinate space for a Rich Markdown surface. Link destinations
@@ -726,7 +784,7 @@ fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
 /// mouse placement diverge after the first link.
 pub fn rich_markdown_navigation_text(source: &str) -> String {
     let source = normalize_buffer_line_endings(source.to_owned());
-    selectable_markdown_text_with_link_destinations(&source, false).text
+    selectable_markdown_text_with_link_destinations(&source, false, true).text
 }
 
 fn selectable_transcript_body(
@@ -5460,6 +5518,25 @@ mod tests {
             rich_markdown_navigation_text(source),
             "I updated discord-canary.desktop to inject:\nXDG_SESSION_TYPE=wayland\nOne more restart."
         );
+    }
+
+    #[test]
+    fn rich_markdown_navigation_preserves_native_replacement_tokens() {
+        let source = concat!(
+            "before\n\n---\n\n- [X] first\n1) second\n\n",
+            "| left | right |\n| --- | --- |\n| one | two |\n\n",
+            "![alt text](image.png)",
+        );
+        let navigation = rich_markdown_navigation_text(source);
+
+        assert!(navigation.starts_with("before\n---\n- [X] first\n1) second"));
+        assert!(
+            navigation.contains("leftright\nonetwo"),
+            "unexpected navigation projection: {navigation:?}"
+        );
+        assert!(navigation.ends_with("alt text"));
+        assert!(!navigation.contains('\t'));
+        assert!(!navigation.contains("Image: "));
     }
 
     #[test]

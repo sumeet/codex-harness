@@ -137,7 +137,8 @@ const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
 const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
-const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 48.;
+const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 44.;
+const RICH_DIFF_GUTTER_GAP: f32 = 6.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -1613,6 +1614,77 @@ fn diff_header_path(line: &str) -> Option<String> {
         .and_then(normalized_diff_path)
 }
 
+/// Remove indentation shared by every non-empty code row in each unified-diff
+/// hunk. This keeps relative indentation while avoiding large, uninformative
+/// left margins in compact transcript cards. The presentation text itself is
+/// transformed so rendering, Vim navigation, hit testing, search, and copying
+/// all operate on the same bytes.
+fn compact_diff_indentation(content: &str) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut trims = vec![0; lines.len()];
+    let mut hunk_rows = Vec::<(usize, usize)>::new();
+    let mut minimum_indent = None::<usize>;
+
+    let flush_hunk =
+        |rows: &mut Vec<(usize, usize)>, minimum: &mut Option<usize>, trims: &mut [usize]| {
+            let Some(common_indent) = minimum.take() else {
+                rows.clear();
+                return;
+            };
+            if common_indent > 0 {
+                for (line_index, available_indent) in rows.drain(..) {
+                    trims[line_index] = common_indent.min(available_indent);
+                }
+            } else {
+                rows.clear();
+            }
+        };
+
+    let mut in_hunk = false;
+    for (line_index, line) in lines.iter().copied().enumerate() {
+        if line.starts_with("@@") {
+            flush_hunk(&mut hunk_rows, &mut minimum_indent, &mut trims);
+            in_hunk = true;
+            continue;
+        }
+        if !in_hunk || line.starts_with("\\ No newline") {
+            continue;
+        }
+        let Some(marker) = line.as_bytes().first().copied() else {
+            continue;
+        };
+        if !matches!(marker, b'+' | b'-' | b' ') {
+            continue;
+        }
+
+        let body = &line[1..];
+        let indent = body
+            .as_bytes()
+            .iter()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        hunk_rows.push((line_index, indent));
+        if !body[indent..].is_empty() {
+            minimum_indent = Some(minimum_indent.map_or(indent, |minimum| minimum.min(indent)));
+        }
+    }
+    flush_hunk(&mut hunk_rows, &mut minimum_indent, &mut trims);
+
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(line_index, line)| {
+            let trim = trims[line_index];
+            if trim == 0 {
+                line.to_owned()
+            } else {
+                format!("{}{}", &line[..1], &line[1 + trim..])
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn push_diff_file_presentation(
     sections: &mut Vec<DiffFilePresentation>,
     path: Option<String>,
@@ -1629,9 +1701,10 @@ fn push_diff_file_presentation(
                 .iter()
                 .find_map(|line| line.strip_prefix("--- ").and_then(normalized_diff_path))
         });
+    let content = lines.join("\n").trim_end().to_string();
     sections.push(DiffFilePresentation {
         path: path.or(inferred_path).unwrap_or_else(|| "Diff".into()),
-        content: lines.join("\n").trim_end().to_string(),
+        content: compact_diff_indentation(&content),
     });
     lines.clear();
 }
@@ -1741,6 +1814,7 @@ fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
         if let Some((operation, path)) = file_change_summary(line) {
             if let Some(mut presentation) = current.take() {
                 presentation.content = presentation.content.trim_end().to_string();
+                presentation.content = compact_diff_indentation(&presentation.content);
                 presentations.push(presentation);
             }
             current = Some(FileChangePresentation {
@@ -1758,14 +1832,16 @@ fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
 
     if let Some(mut presentation) = current {
         presentation.content = presentation.content.trim_end().to_string();
+        presentation.content = compact_diff_indentation(&presentation.content);
         presentations.push(presentation);
     }
 
     if presentations.is_empty() && !content.trim().is_empty() {
+        let content = content.trim_end();
         presentations.push(FileChangePresentation {
             operation: "Changed".into(),
             path: "File details unavailable".into(),
-            content: content.trim_end().into(),
+            content: compact_diff_indentation(content),
         });
     }
 
@@ -7280,10 +7356,10 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .h(px(20.))
-                    .px_1()
+                    .pr_1()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(RICH_DIFF_GUTTER_GAP))
                     .font_buffer(cx)
                     .text_ui_sm(cx)
                     .bg(if tone == DiffLineTone::Addition {
@@ -7803,10 +7879,10 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .h(px(20.))
-                    .px_1()
+                    .pr_1()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .gap(px(RICH_DIFF_GUTTER_GAP))
                     .relative()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
@@ -11946,6 +12022,46 @@ mod tests {
     }
 
     #[test]
+    fn rich_vim_markdown_replacement_tokens_round_trip_to_their_source() {
+        let source = concat!(
+            "before\n\n---\n\n- [X] after\n\n",
+            "| left | right |\n| --- | --- |\n| one | two |\n\n",
+            "![alt text](image.png)",
+        );
+        let logical = model::rich_markdown_navigation_text(source);
+
+        for token in ["---", "- [X]"] {
+            let logical_start = logical.find(token).unwrap();
+            let source_start = source.find(token).unwrap();
+            for offset in 0..token.len() {
+                assert_eq!(
+                    markdown_source_offset_for_logical(&logical, source, logical_start + offset),
+                    source_start + offset,
+                    "logical byte {offset} of {token:?} must retain its source owner"
+                );
+                assert_eq!(
+                    markdown_logical_offset_for_source(&logical, source, source_start + offset),
+                    logical_start + offset,
+                    "source byte {offset} of {token:?} must retain its logical owner"
+                );
+            }
+        }
+
+        for (logical_offset, character) in logical.char_indices() {
+            if character == '\n' {
+                continue;
+            }
+            let source_offset =
+                markdown_source_offset_for_logical(&logical, source, logical_offset);
+            assert_eq!(
+                source[source_offset..].chars().next(),
+                Some(character),
+                "every navigable glyph must be a source-owned token: {character:?} at {logical_offset}"
+            );
+        }
+    }
+
+    #[test]
     fn rich_command_cursor_marker_uses_the_exact_utf8_glyph_in_each_surface() {
         let command = "/usr/bin/bash -lc 'printf café'";
         let output = "ok\nfinished";
@@ -12719,6 +12835,39 @@ mod tests {
             ),
             (3, 2)
         );
+    }
+
+    #[test]
+    fn unified_diff_compacts_common_indentation_per_hunk() {
+        let presentations = diff_file_presentations(concat!(
+            "diff --git a/src/main.rs b/src/main.rs\n",
+            "index 111..222 100644\n",
+            "--- a/src/main.rs\n",
+            "+++ b/src/main.rs\n",
+            "@@ -10,2 +10,2 @@\n",
+            "         context\n",
+            "-        old\n",
+            "+            new\n",
+            "@@ -30 +30 @@\n",
+            "     second hunk",
+        ));
+
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(
+            presentations[0].content,
+            concat!(
+                "index 111..222 100644\n",
+                "--- a/src/main.rs\n",
+                "+++ b/src/main.rs\n",
+                "@@ -10,2 +10,2 @@\n",
+                " context\n",
+                "-old\n",
+                "+    new\n",
+                "@@ -30 +30 @@\n",
+                " second hunk",
+            )
+        );
+        assert_eq!(diff_content_counts(&presentations[0].content), (1, 1));
     }
 
     #[test]

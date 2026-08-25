@@ -3203,15 +3203,15 @@ impl Element for MarkdownElement {
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
                 }
                 MarkdownEvent::Rule => {
-                    builder.push_div(
+                    let rule = div().w_full().h(px(17.)).flex().items_center().child(
                         div()
+                            .w_full()
                             .border_b_1()
-                            .my_2()
                             .border_color(self.style.rule_color),
-                        range,
-                        markdown_end,
                     );
-                    builder.pop_div()
+                    let rule =
+                        builder.wrap_source_replacement(range.clone(), rule.into_any_element());
+                    builder.push_sourced_element(range.clone(), rule);
                 }
                 MarkdownEvent::SoftBreak if !self.style.soft_break_as_hard_break => {
                     builder.push_soft_break(range.clone());
@@ -6533,6 +6533,41 @@ mod tests {
                 "cursor had empty geometry at source byte {source_index}: {bounds:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn test_horizontal_rule_owns_its_source_geometry(cx: &mut TestAppContext) {
+        let source = "before\n\n---\n\nafter";
+        let rule_start = source.find("---").unwrap();
+        let rendered = render_markdown(source, cx);
+        let replacement = rendered
+            .source_replacements
+            .iter()
+            .find(|replacement| replacement.source_range.contains(&rule_start))
+            .expect("horizontal rule must register visible replacement geometry");
+        let rule_bounds = replacement
+            .bounds
+            .get()
+            .expect("horizontal rule replacement must record its painted bounds");
+
+        assert!(rule_bounds.size.width > px(100.));
+        assert!(rule_bounds.size.height > px(1.));
+        for source_index in rule_start..rule_start + 3 {
+            assert_eq!(
+                rendered.cursor_bounds_for_source_index(source, source_index),
+                Some(rule_bounds),
+                "rule source byte {source_index} must paint on the rule itself"
+            );
+        }
+        assert!(
+            rendered
+                .bounds_for_source_range(rule_start..rule_start + 3)
+                .contains(&rule_bounds)
+        );
+        assert_eq!(
+            rendered.source_index_for_position(rule_bounds.center()),
+            Ok(replacement.source_range.start)
+        );
     }
 
     #[gpui::test]
