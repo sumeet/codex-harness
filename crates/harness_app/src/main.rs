@@ -3596,7 +3596,8 @@ impl HarnessApp {
                     } else {
                         for choice in choices {
                             let model = choice.model.clone();
-                            let is_selected = current_model.as_deref() == Some(choice.model.as_str());
+                            let is_selected =
+                                current_model.as_deref() == Some(choice.model.as_str());
                             let effort = current_effort
                                 .as_ref()
                                 .filter(|effort| choice.efforts.contains(effort))
@@ -3621,27 +3622,26 @@ impl HarnessApp {
                     }
                     menu = menu.separator().header("Thinking effort");
                     if effort_choices.is_empty() {
-                        menu = menu.item(
-                            ContextMenuEntry::new("No thinking controls").disabled(true),
-                        );
+                        menu =
+                            menu.item(ContextMenuEntry::new("No thinking controls").disabled(true));
                     } else {
                         for effort in effort_choices {
                             let selected = current_effort.as_deref() == Some(effort.as_str());
                             menu = menu.item(
                                 ContextMenuEntry::new(reasoning_effort_label(&effort))
-                                .toggleable(IconPosition::End, selected)
-                                .handler({
-                                    let weak = weak.clone();
-                                    move |_, cx| {
-                                        weak.update(cx, |this, cx| {
-                                            this.update_thread_settings(
-                                                json!({ "effort": effort }),
-                                                cx,
-                                            )
-                                        })
-                                        .ok();
-                                    }
-                                }),
+                                    .toggleable(IconPosition::End, selected)
+                                    .handler({
+                                        let weak = weak.clone();
+                                        move |_, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.update_thread_settings(
+                                                    json!({ "effort": effort }),
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                        }
+                                    }),
                             );
                         }
                     }
@@ -6417,8 +6417,7 @@ impl HarnessApp {
             show_submission_optimistically_in_transcript(turn_active),
             window,
             cx,
-        )
-        else {
+        ) else {
             return;
         };
 
@@ -6446,15 +6445,9 @@ impl HarnessApp {
             return;
         };
         let Some(client) = self.client.clone() else {
-            self.model
-                .set_status_for_key(&key, "not connected");
+            self.model.set_status_for_key(&key, "not connected");
             self.error = Some("Codex is not connected yet".into());
-            if let Some(index) = self
-                .model
-                .items
-                .iter()
-                .position(|item| item.key == key)
-            {
+            if let Some(index) = self.model.items.iter().position(|item| item.key == key) {
                 self.list_state.splice(index..index + 1, 1);
             }
             cx.notify();
@@ -6598,11 +6591,9 @@ impl HarnessApp {
     ) {
         let input = submission.input.as_array().cloned().unwrap_or_default();
         let preview = queued_submission_text(&submission.input);
-        let (index, key) = self.model.push_local_user(
-            &submission.client_user_message_id,
-            preview,
-            &input,
-        );
+        let (index, key) =
+            self.model
+                .push_local_user(&submission.client_user_message_id, preview, &input);
         self.model.set_status_for_key(&key, "failed");
         self.dirty_image_surfaces.insert(key);
         self.list_state.splice(index..index, 1);
@@ -6633,9 +6624,7 @@ impl HarnessApp {
                 match result {
                     Ok(response) => {
                         if let Some(queued_entry) = queued_entry.as_ref() {
-                            this.remove_queued_entry_locally(
-                                &queued_entry.client_user_message_id,
-                            );
+                            this.remove_queued_entry_locally(&queued_entry.client_user_message_id);
                         }
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
@@ -12152,6 +12141,33 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
+                    // Turn activity describes the next transcript event, not
+                    // the composer draft. Keep it attached to the transcript
+                    // edge while queue and stop controls remain in the input.
+                    .when(turn_active, |this| {
+                        this.child(
+                            div()
+                                .h(px(30.))
+                                .flex_none()
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .border_t_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.editor_background)
+                                .child(
+                                    SpinnerLabel::dots()
+                                        .size(LabelSize::Small)
+                                        .color(Color::Accent),
+                                )
+                                .child(
+                                    Label::new("Responding…")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
@@ -12322,10 +12338,6 @@ impl Render for HarnessApp {
                                             .child(permission_selector)
                                             .when(turn_active, |this| {
                                                 this.child(
-                                                    SpinnerLabel::dots()
-                                                        .size(LabelSize::XSmall),
-                                                )
-                                                .child(
                                                     Button::new("queue-turn", "Queue")
                                                         .size(ButtonSize::Compact)
                                                         .style(ButtonStyle::Subtle)
