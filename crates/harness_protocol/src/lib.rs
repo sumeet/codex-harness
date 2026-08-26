@@ -269,9 +269,12 @@ impl TranscriptItem {
     /// Raw protocol history remains available even when an empty terminal
     /// reasoning placeholder is omitted from both reading surfaces.
     pub fn is_presentationally_visible(&self) -> bool {
+        let queued_user = self.kind == TranscriptKind::User
+            && matches!(self.status.as_deref(), Some("queueing" | "queued"));
         let visible_trace = self.kind != TranscriptKind::Trace
             || string_at(&self.raw, "/type") == Some("contextCompaction");
-        visible_trace
+        !queued_user
+            && visible_trace
             && (self.kind != TranscriptKind::Reasoning
                 || !self.content.trim().is_empty()
                 || self.pending_request.is_some()
@@ -1680,6 +1683,17 @@ impl TranscriptModel {
     pub fn set_status_for_key(&mut self, key: &str, status: &str) -> Option<usize> {
         let index = self.item_indices.get(key).copied()?;
         self.items[index].status = Some(status.into());
+        Some(index)
+    }
+
+    pub fn remove_item_for_key(&mut self, key: &str) -> Option<usize> {
+        let index = self.item_indices.get(key).copied()?;
+        let item = self.items.remove(index);
+        self.user_image_sources.remove(&item.key);
+        if let Some(protocol_id) = item.protocol_id {
+            self.user_image_sources.remove(&protocol_id);
+        }
+        self.rebuild_item_indices();
         Some(index)
     }
 
@@ -6436,6 +6450,38 @@ mod tests {
         assert!(model.user_image_sources(&local_key).is_empty());
         assert!(!model.item_indices.contains_key(&local_key));
         assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+    }
+
+    #[test]
+    fn queued_optimistic_users_live_in_the_queue_surface_until_sent() {
+        let mut model = TranscriptModel::default();
+        let (_, first_key) = model.push_local_user(
+            "client-message-1",
+            "first queued prompt".into(),
+            &[json!({"type": "text", "text": "first queued prompt"})],
+        );
+        let (_, second_key) = model.push_local_user(
+            "client-message-2",
+            "second queued prompt".into(),
+            &[json!({"type": "text", "text": "second queued prompt"})],
+        );
+
+        model.set_status_for_key(&first_key, "queueing");
+        model.set_status_for_key(&second_key, "queued");
+        assert!(
+            model
+                .items
+                .iter()
+                .all(|item| !item.is_presentationally_visible())
+        );
+
+        model.set_status_for_key(&first_key, "sent");
+        assert!(model.items[0].is_presentationally_visible());
+        assert!(!model.items[1].is_presentationally_visible());
+
+        assert_eq!(model.remove_item_for_key(&second_key), Some(1));
+        assert_eq!(model.items.len(), 1);
+        assert!(!model.item_indices.contains_key(&second_key));
     }
 
     #[test]

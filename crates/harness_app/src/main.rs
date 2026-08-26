@@ -2530,8 +2530,12 @@ struct ComposerSubmission {
     input: Value,
 }
 
+#[derive(Clone, Debug)]
 struct QueuedTurnSubmission {
-    key: String,
+    id: Option<String>,
+    client_user_message_id: String,
+    input: Value,
+    local_item_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2546,6 +2550,87 @@ fn composer_is_empty(text: &str, image_count: usize) -> bool {
 
 fn composer_prompt_preview(text: &str) -> String {
     text.to_owned()
+}
+
+fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
+    Some(QueuedTurnSubmission {
+        id: Some(value.get("id")?.as_str()?.to_owned()),
+        client_user_message_id: value
+            .get("clientUserMessageId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        input: value.get("input").cloned().unwrap_or_else(|| json!([])),
+        local_item_key: None,
+    })
+}
+
+fn queued_submissions_from_response(response: &Value) -> VecDeque<QueuedTurnSubmission> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(queued_submission_from_value)
+        .collect()
+}
+
+fn queued_submission_text(input: &Value) -> String {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("text" | "inputText") => block.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn queued_submission_image_count(input: &Value) -> usize {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("image" | "inputImage")
+            )
+        })
+        .count()
+}
+
+fn queued_submission_images(input: &Value) -> Vec<Arc<Image>> {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            if !matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("image" | "inputImage")
+            ) {
+                return None;
+            }
+            let url = block
+                .get("url")
+                .or_else(|| block.get("imageUrl"))
+                .and_then(Value::as_str)?;
+            let data_url = url.strip_prefix("data:")?;
+            let (mime_info, encoded) = data_url.split_once(',')?;
+            let (mime_type, encoding) = mime_info.split_once(';')?;
+            if encoding != "base64" {
+                return None;
+            }
+            let format = ImageFormat::from_mime_type(mime_type)?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()?;
+            Some(Arc::new(Image::from_bytes(format, bytes)))
+        })
+        .collect()
 }
 
 fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
@@ -3101,6 +3186,8 @@ struct HarnessApp {
     sidebar_user_override: bool,
     turn_start_pending: bool,
     queue_start_pending: bool,
+    queue_refresh_pending: bool,
+    queue_operation_pending: HashSet<String>,
     queued_turns: VecDeque<QueuedTurnSubmission>,
     server_task: Task<()>,
     turn_task: Task<()>,
@@ -3300,6 +3387,63 @@ impl HarnessApp {
                     }
                     Ok(_) => {}
                     Err(error) => log::warn!("could not load Codex permission profiles: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn refresh_queued_turns(&mut self, cx: &mut Context<Self>) {
+        if self.queue_refresh_pending {
+            return;
+        }
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        self.queue_refresh_pending = true;
+        cx.spawn(async move |this, cx| {
+            let result = client.list_queued_turns(&thread_id).await;
+            _ = this.update(cx, |this, cx| {
+                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                this.queue_refresh_pending = false;
+                match result {
+                    Ok(response) => {
+                        let local_keys =
+                            this.queued_turns
+                                .iter()
+                                .filter_map(|entry| {
+                                    entry.local_item_key.as_ref().map(|key| {
+                                        (entry.client_user_message_id.clone(), key.clone())
+                                    })
+                                })
+                                .collect::<HashMap<_, _>>();
+                        let pending = this
+                            .queued_turns
+                            .iter()
+                            .filter(|entry| entry.id.is_none())
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let mut queued = queued_submissions_from_response(&response);
+                        for entry in &mut queued {
+                            entry.local_item_key =
+                                local_keys.get(&entry.client_user_message_id).cloned();
+                        }
+                        for entry in pending {
+                            if !queued.iter().any(|candidate| {
+                                candidate.client_user_message_id == entry.client_user_message_id
+                            }) {
+                                queued.push_back(entry);
+                            }
+                        }
+                        this.queued_turns = queued;
+                        this.error = None;
+                    }
+                    Err(error) => log::warn!("could not refresh queued prompts: {error}"),
                 }
                 cx.notify();
             });
@@ -3580,6 +3724,222 @@ impl HarnessApp {
                         .progress_color(progress_color),
                 )
                 .hoverable_tooltip(Tooltip::text(tooltip))
+                .into_any_element(),
+        )
+    }
+
+    fn render_queued_turns(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if self.queued_turns.is_empty() {
+            return None;
+        }
+        let colors = cx.theme().colors().clone();
+        let queue_count = self.queued_turns.len();
+        let title: SharedString = if queue_count == 1 {
+            "1 queued prompt".into()
+        } else {
+            format!("{queue_count} queued prompts").into()
+        };
+        let active_turn = self.model.current_turn_id.is_some();
+        let pending = self.queue_operation_pending.clone();
+        let weak = cx.weak_entity();
+
+        Some(
+            div()
+                .id("queued-prompts")
+                .flex_none()
+                .max_h(px(190.))
+                .border_t_1()
+                .border_color(colors.border)
+                .bg(colors.editor_background)
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.))
+                        .flex_none()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_xs()
+                        .text_color(colors.text_muted)
+                        .child(
+                            Icon::new(IconName::QueueMessage)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .id("queued-prompt-list")
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .children(self.queued_turns.iter().enumerate().map(|(index, entry)| {
+                            let client_id = entry.client_user_message_id.clone();
+                            let queue_ready = entry.id.is_some();
+                            let operation_pending = pending.contains(&client_id);
+                            let text = queued_submission_text(&entry.input);
+                            let image_count = queued_submission_image_count(&entry.input);
+                            let weak_edit = weak.clone();
+                            let weak_steer = weak.clone();
+                            let weak_send = weak.clone();
+                            let weak_remove = weak.clone();
+                            div()
+                                .id(("queued-prompt", index))
+                                .group("queued-prompt")
+                                .mx_2()
+                                .mb_1()
+                                .px_2()
+                                .py_1p5()
+                                .rounded_sm()
+                                .bg(colors.element_background)
+                                .flex()
+                                .items_start()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            Label::new(if index == 0 { "Next" } else { "Queued" })
+                                                .size(LabelSize::XSmall)
+                                                .color(if index == 0 {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                        )
+                                        .when(!text.is_empty(), |this| {
+                                            this.child(
+                                                div()
+                                                    .max_h(px(52.))
+                                                    .overflow_hidden()
+                                                    .text_sm()
+                                                    .text_color(colors.text)
+                                                    .child(text),
+                                            )
+                                        })
+                                        .when(image_count > 0, |this| {
+                                            this.child(
+                                                Label::new(if image_count == 1 {
+                                                    "1 image attached".into()
+                                                } else {
+                                                    format!("{image_count} images attached")
+                                                })
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(
+                                            IconButton::new(
+                                                ("edit-queued-prompt", index),
+                                                IconName::Pencil,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Subtle)
+                                            .disabled(!queue_ready || operation_pending)
+                                            .aria_label("Edit queued prompt")
+                                            .on_click(
+                                                move |_, window, cx| {
+                                                    let client_id = client_id.clone();
+                                                    weak_edit
+                                                        .update(cx, |this, cx| {
+                                                            this.edit_queued_turn(
+                                                                client_id, window, cx,
+                                                            )
+                                                        })
+                                                        .ok();
+                                                },
+                                            ),
+                                        )
+                                        .when(active_turn, |this| {
+                                            let client_id = entry.client_user_message_id.clone();
+                                            this.child(
+                                                Button::new(
+                                                    ("steer-queued-prompt", index),
+                                                    "Steer",
+                                                )
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .disabled(!queue_ready || operation_pending)
+                                                .on_click(move |_, _, cx| {
+                                                    weak_steer
+                                                        .update(cx, |this, cx| {
+                                                            this.steer_queued_turn(
+                                                                client_id.clone(),
+                                                                cx,
+                                                            )
+                                                        })
+                                                        .ok();
+                                                }),
+                                            )
+                                        })
+                                        .child(
+                                            Button::new(("send-queued-prompt", index), "Send now")
+                                                .size(ButtonSize::Compact)
+                                                .style(if index == 0 {
+                                                    ButtonStyle::Outlined
+                                                } else {
+                                                    ButtonStyle::Subtle
+                                                })
+                                                .disabled(!queue_ready || operation_pending)
+                                                .on_click({
+                                                    let client_id =
+                                                        entry.client_user_message_id.clone();
+                                                    move |_, _, cx| {
+                                                        weak_send
+                                                            .update(cx, |this, cx| {
+                                                                this.send_queued_turn_now(
+                                                                    client_id.clone(),
+                                                                    cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                ("remove-queued-prompt", index),
+                                                IconName::Trash,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Subtle)
+                                            .disabled(!queue_ready || operation_pending)
+                                            .aria_label("Remove queued prompt")
+                                            .on_click(
+                                                {
+                                                    let client_id =
+                                                        entry.client_user_message_id.clone();
+                                                    move |_, _, cx| {
+                                                        weak_remove
+                                                            .update(cx, |this, cx| {
+                                                                this.cancel_queued_turn(
+                                                                    client_id.clone(),
+                                                                    cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                    }
+                                                },
+                                            ),
+                                        ),
+                                )
+                        })),
+                )
                 .into_any_element(),
         )
     }
@@ -4218,6 +4578,8 @@ impl HarnessApp {
             sidebar_user_override: false,
             turn_start_pending: false,
             queue_start_pending: false,
+            queue_refresh_pending: false,
+            queue_operation_pending: HashSet::new(),
             queued_turns: VecDeque::new(),
             server_task: Task::ready(()),
             turn_task: Task::ready(()),
@@ -4609,6 +4971,8 @@ impl HarnessApp {
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
+        self.queue_refresh_pending = false;
+        self.queue_operation_pending.clear();
         self.settings_update_pending = false;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
@@ -4630,6 +4994,15 @@ impl HarnessApp {
     }
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
+        let queue_changed = events.iter().any(|event| {
+            matches!(
+                event,
+                AppServerEvent::Notification { method, params }
+                    if method == "thread/queue/changed"
+                        && params.get("threadId").and_then(Value::as_str)
+                            == self.selected_thread_id.as_deref()
+            )
+        });
         let (events, live_request_ids) = self.dispatch_server_requests(events, cx);
         let had_active_turn = self.model.current_turn_id.is_some();
         let was_following_tail = if self.buffer_view {
@@ -4683,6 +5056,9 @@ impl HarnessApp {
         }
         if completed_turn {
             self.start_next_queued_turn(cx);
+        }
+        if queue_changed {
+            self.refresh_queued_turns(cx);
         }
         cx.notify();
     }
@@ -5576,6 +5952,8 @@ impl HarnessApp {
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
+        self.queue_refresh_pending = false;
+        self.queue_operation_pending.clear();
         self.queued_turns.clear();
         self.selected_thread_id = Some(thread_id.clone());
         self.loaded_thread_updated_at = None;
@@ -5633,6 +6011,7 @@ impl HarnessApp {
             }
         }
         cx.notify();
+        self.refresh_queued_turns(cx);
 
         self.request_task = cx.spawn(async move |this, cx| {
             // `thread/resume` already returns every turn as well as attaching
@@ -5853,6 +6232,8 @@ impl HarnessApp {
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
+        self.queue_refresh_pending = false;
+        self.queue_operation_pending.clear();
         self.queued_turns.clear();
         let old_len = self.model.items.len();
         self.model.clear();
@@ -6120,15 +6501,34 @@ impl HarnessApp {
         if let Some(index) = self.model.set_status_for_key(&key, "queueing") {
             self.list_state.splice(index..index + 1, 1);
         }
+        self.queued_turns.push_back(QueuedTurnSubmission {
+            id: None,
+            client_user_message_id: client_user_message_id.clone(),
+            input: input.clone(),
+            local_item_key: Some(key.clone()),
+        });
         cx.spawn(async move |this, cx| {
             let result = client
                 .queue_turn(&thread_id, input, &client_user_message_id)
                 .await;
             _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => {
-                        this.queued_turns
-                            .push_back(QueuedTurnSubmission { key: key.clone() });
+                    Ok(response) => {
+                        if let Some(mut queued) = response
+                            .get("queuedSubmission")
+                            .and_then(queued_submission_from_value)
+                        {
+                            queued.local_item_key = Some(key.clone());
+                            if let Some(index) = this.queued_turns.iter().position(|entry| {
+                                entry.client_user_message_id == client_user_message_id
+                            }) {
+                                this.queued_turns[index] = queued;
+                            } else {
+                                this.queued_turns.push_back(queued);
+                            }
+                        } else {
+                            this.refresh_queued_turns(cx);
+                        }
                         if let Some(index) = this.model.set_status_for_key(&key, "queued") {
                             this.list_state.splice(index..index + 1, 1);
                         }
@@ -6138,6 +6538,8 @@ impl HarnessApp {
                         }
                     }
                     Err(error) => {
+                        this.queued_turns
+                            .retain(|entry| entry.client_user_message_id != client_user_message_id);
                         if let Some(index) = this.model.set_status_for_key(&key, "failed") {
                             this.list_state.splice(index..index + 1, 1);
                         }
@@ -6165,6 +6567,7 @@ impl HarnessApp {
         else {
             return;
         };
+        let queued_entry = self.queued_turns.front().cloned();
         self.queue_start_pending = true;
         self.turn_task = cx.spawn(async move |this, cx| {
             let result = client.start_next_queued_turn(&thread_id).await;
@@ -6172,10 +6575,13 @@ impl HarnessApp {
                 this.queue_start_pending = false;
                 match result {
                     Ok(response) => {
-                        if let Some(queued) = this.queued_turns.pop_front()
-                            && let Some(index) = this.model.set_status_for_key(&queued.key, "sent")
-                        {
-                            this.list_state.splice(index..index + 1, 1);
+                        if let Some(queued_entry) = queued_entry.as_ref() {
+                            if let Some(queued) = this.take_queued_entry_locally(
+                                &queued_entry.client_user_message_id,
+                                queued_entry,
+                            ) {
+                                this.reveal_queued_user_item(&queued, cx);
+                            }
                         }
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
@@ -6184,7 +6590,12 @@ impl HarnessApp {
                         this.error = None;
                     }
                     Err(error) => {
-                        if this.model.current_turn_id.is_none() {
+                        let already_started = error
+                            .to_string()
+                            .to_ascii_lowercase()
+                            .contains("active or pending turn");
+                        this.refresh_queued_turns(cx);
+                        if this.model.current_turn_id.is_none() && !already_started {
                             this.error =
                                 Some(format!("Could not start queued prompt: {error}").into());
                         }
@@ -6194,6 +6605,309 @@ impl HarnessApp {
                 cx.notify();
             });
         });
+        cx.notify();
+    }
+
+    fn take_queued_entry_locally(
+        &mut self,
+        client_user_message_id: &str,
+        fallback: &QueuedTurnSubmission,
+    ) -> Option<QueuedTurnSubmission> {
+        self.queued_turns
+            .iter()
+            .position(|entry| entry.client_user_message_id == client_user_message_id)
+            .and_then(|index| self.queued_turns.remove(index))
+            .or_else(|| Some(fallback.clone()))
+    }
+
+    fn discard_queued_user_item(&mut self, entry: &QueuedTurnSubmission, cx: &mut Context<Self>) {
+        if let Some(key) = entry.local_item_key.as_deref()
+            && let Some(item_index) = self.model.remove_item_for_key(key)
+        {
+            self.list_state.splice(item_index..item_index + 1, 0);
+            self.selected_item = self
+                .selected_item
+                .min(self.model.items.len().saturating_sub(1));
+            self.mark_all_image_surfaces_dirty();
+            drop(self.sync_transcript_document(cx));
+        }
+    }
+
+    fn reveal_queued_user_item(&mut self, entry: &QueuedTurnSubmission, cx: &mut Context<Self>) {
+        if let Some(key) = entry.local_item_key.as_deref()
+            && let Some(index) = self.model.set_status_for_key(key, "sent")
+        {
+            self.list_state.splice(index..index + 1, 1);
+            drop(self.sync_transcript_document(cx));
+        }
+    }
+
+    fn cancel_queued_turn(&mut self, client_user_message_id: String, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .queued_turns
+            .iter()
+            .find(|entry| entry.client_user_message_id == client_user_message_id)
+            .cloned()
+        else {
+            return;
+        };
+        let (Some(client), Some(thread_id), Some(queued_submission_id)) = (
+            self.client.clone(),
+            self.selected_thread_id.clone(),
+            entry.id.clone(),
+        ) else {
+            return;
+        };
+        if !self
+            .queue_operation_pending
+            .insert(client_user_message_id.clone())
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .delete_queued_turn(&thread_id, &queued_submission_id)
+                .await;
+            _ = this.update(cx, |this, cx| {
+                this.queue_operation_pending.remove(&client_user_message_id);
+                match result {
+                    Ok(_) => {
+                        if let Some(entry) =
+                            this.take_queued_entry_locally(&client_user_message_id, &entry)
+                        {
+                            this.discard_queued_user_item(&entry, cx);
+                        }
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Could not remove queued prompt: {error}").into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn place_queued_turn_in_composer(
+        &mut self,
+        entry: &QueuedTurnSubmission,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let queued_text = queued_submission_text(&entry.input);
+        let existing = self.composer.read(cx).text(cx);
+        let text = match (existing.trim().is_empty(), queued_text.is_empty()) {
+            (true, _) => queued_text,
+            (_, true) => existing,
+            (false, false) => format!("{existing}\n\n{queued_text}"),
+        };
+        self.composer
+            .update(cx, |editor, cx| editor.set_text(&text, window, cx));
+        for image in queued_submission_images(&entry.input)
+            .into_iter()
+            .take(MAX_COMPOSER_IMAGES.saturating_sub(self.composer_images.len()))
+        {
+            self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
+            self.composer_images.push(ComposerImageAttachment {
+                id: self.next_composer_image_id,
+                image,
+            });
+        }
+        self.focus_composer(window, cx);
+    }
+
+    fn edit_queued_turn(
+        &mut self,
+        client_user_message_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .queued_turns
+            .iter()
+            .find(|entry| entry.client_user_message_id == client_user_message_id)
+            .cloned()
+        else {
+            return;
+        };
+        let (Some(client), Some(thread_id), Some(queued_submission_id)) = (
+            self.client.clone(),
+            self.selected_thread_id.clone(),
+            entry.id.clone(),
+        ) else {
+            return;
+        };
+        if !self
+            .queue_operation_pending
+            .insert(client_user_message_id.clone())
+        {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client
+                .delete_queued_turn(&thread_id, &queued_submission_id)
+                .await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.queue_operation_pending.remove(&client_user_message_id);
+                match result {
+                    Ok(_) => {
+                        if let Some(removed) =
+                            this.take_queued_entry_locally(&client_user_message_id, &entry)
+                        {
+                            this.discard_queued_user_item(&removed, cx);
+                        }
+                        this.place_queued_turn_in_composer(&entry, window, cx);
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Could not edit queued prompt: {error}").into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn steer_queued_turn(&mut self, client_user_message_id: String, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .queued_turns
+            .iter()
+            .find(|entry| entry.client_user_message_id == client_user_message_id)
+            .cloned()
+        else {
+            return;
+        };
+        let (Some(client), Some(thread_id), Some(turn_id), Some(queued_submission_id)) = (
+            self.client.clone(),
+            self.selected_thread_id.clone(),
+            self.model.current_turn_id.clone(),
+            entry.id.clone(),
+        ) else {
+            return;
+        };
+        if !self
+            .queue_operation_pending
+            .insert(client_user_message_id.clone())
+        {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let deleted = client
+                .delete_queued_turn(&thread_id, &queued_submission_id)
+                .await;
+            let result = match deleted {
+                Ok(_) => {
+                    client
+                        .steer_turn(
+                            &thread_id,
+                            &turn_id,
+                            entry.input.clone(),
+                            &entry.client_user_message_id,
+                        )
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if result.is_err() {
+                _ = client
+                    .queue_turn(
+                        &thread_id,
+                        entry.input.clone(),
+                        &entry.client_user_message_id,
+                    )
+                    .await;
+            }
+            _ = this.update(cx, |this, cx| {
+                this.queue_operation_pending.remove(&client_user_message_id);
+                match result {
+                    Ok(_) => {
+                        if let Some(entry) =
+                            this.take_queued_entry_locally(&client_user_message_id, &entry)
+                        {
+                            this.reveal_queued_user_item(&entry, cx);
+                        }
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.refresh_queued_turns(cx);
+                        this.error = Some(format!("Could not steer queued prompt: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn send_queued_turn_now(&mut self, client_user_message_id: String, cx: &mut Context<Self>) {
+        let Some(entry) = self
+            .queued_turns
+            .iter()
+            .find(|entry| entry.client_user_message_id == client_user_message_id)
+            .cloned()
+        else {
+            return;
+        };
+        let (Some(client), Some(thread_id), Some(queued_submission_id)) = (
+            self.client.clone(),
+            self.selected_thread_id.clone(),
+            entry.id.clone(),
+        ) else {
+            return;
+        };
+        if !self
+            .queue_operation_pending
+            .insert(client_user_message_id.clone())
+        {
+            return;
+        }
+        // A turn/completed notification may arrive between interrupting the
+        // current turn and starting this particular queued submission. Keep
+        // the ordinary queue drain from racing the explicit "Send now" path.
+        self.queue_start_pending = true;
+        let active_turn_id = self.model.current_turn_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                if let Some(turn_id) = active_turn_id {
+                    client.interrupt_turn(&thread_id, &turn_id).await?;
+                }
+                client
+                    .start_queued_turn(&thread_id, Some(&queued_submission_id))
+                    .await
+            }
+            .await;
+            _ = this.update(cx, |this, cx| {
+                this.queue_start_pending = false;
+                this.queue_operation_pending.remove(&client_user_message_id);
+                match result {
+                    Ok(response) => {
+                        if let Some(entry) =
+                            this.take_queued_entry_locally(&client_user_message_id, &entry)
+                        {
+                            this.reveal_queued_user_item(&entry, cx);
+                        }
+                        this.model.current_turn_id = response
+                            .pointer("/turn/id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.refresh_queued_turns(cx);
+                        this.error =
+                            Some(format!("Could not send queued prompt now: {error}").into());
+                    }
+                }
+                drop(this.sync_transcript_document(cx));
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -11121,6 +11835,7 @@ impl Render for HarnessApp {
         let context_usage = self.render_context_usage(cx);
         let model_selector = self.render_model_effort_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
+        let queued_turns = self.render_queued_turns(cx);
 
         div()
             .key_context(self.key_context())
@@ -11438,6 +12153,9 @@ impl Render for HarnessApp {
                                     "What should we build?"
                                 }),
                         )
+                    })
+                    .when_some(queued_turns, |this, queued_turns| {
+                        this.child(queued_turns)
                     })
                     .child(
                         div()
@@ -12887,6 +13605,30 @@ mod tests {
             Some((123_456, 400_000))
         );
         assert_eq!(context_window_usage(Some(&json!({}))), None);
+    }
+
+    #[test]
+    fn authoritative_queue_response_preserves_ids_text_and_attachments() {
+        let queued = queued_submissions_from_response(&json!({
+            "data": [{
+                "id": "queued-1",
+                "clientUserMessageId": "client-message-1",
+                "input": [
+                    {"type": "text", "text": "first line"},
+                    {"type": "inputText", "text": "second line"},
+                    {"type": "image", "url": "data:image/png;base64,AQID"}
+                ]
+            }]
+        }));
+
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id.as_deref(), Some("queued-1"));
+        assert_eq!(queued[0].client_user_message_id, "client-message-1");
+        assert_eq!(
+            queued_submission_text(&queued[0].input),
+            "first line\nsecond line"
+        );
+        assert_eq!(queued_submission_image_count(&queued[0].input), 1);
     }
 
     #[test]

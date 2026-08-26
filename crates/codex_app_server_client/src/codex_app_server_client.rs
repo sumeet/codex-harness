@@ -520,13 +520,60 @@ impl Client {
         .await
     }
 
+    pub async fn list_queued_turns(&self, thread_id: &str) -> Result<Value, Error> {
+        self.request("thread/queue/list", thread_queue_list_params(thread_id))
+            .await
+    }
+
+    pub async fn update_queued_turn(
+        &self,
+        thread_id: &str,
+        queued_submission_id: &str,
+        input: Value,
+    ) -> Result<Value, Error> {
+        self.request(
+            "thread/queue/update",
+            thread_queue_update_params(thread_id, queued_submission_id, input),
+        )
+        .await
+    }
+
+    pub async fn delete_queued_turn(
+        &self,
+        thread_id: &str,
+        queued_submission_id: &str,
+    ) -> Result<Value, Error> {
+        self.request(
+            "thread/queue/delete",
+            thread_queue_delete_params(thread_id, queued_submission_id),
+        )
+        .await
+    }
+
+    pub async fn reorder_queued_turns(
+        &self,
+        thread_id: &str,
+        queued_submission_ids: Vec<String>,
+    ) -> Result<Value, Error> {
+        self.request(
+            "thread/queue/reorder",
+            thread_queue_reorder_params(thread_id, queued_submission_ids),
+        )
+        .await
+    }
+
     pub async fn start_next_queued_turn(&self, thread_id: &str) -> Result<Value, Error> {
+        self.start_queued_turn(thread_id, None).await
+    }
+
+    pub async fn start_queued_turn(
+        &self,
+        thread_id: &str,
+        queued_submission_id: Option<&str>,
+    ) -> Result<Value, Error> {
         self.request(
             "thread/queue/start",
-            json!({
-                "threadId": thread_id,
-                "queuedSubmissionId": null,
-            }),
+            thread_queue_start_params(thread_id, queued_submission_id),
         )
         .await
     }
@@ -615,6 +662,39 @@ fn thread_queue_add_params(thread_id: &str, input: Value, client_user_message_id
         "threadId": thread_id,
         "clientUserMessageId": client_user_message_id,
         "input": input,
+    })
+}
+
+fn thread_queue_list_params(thread_id: &str) -> Value {
+    json!({ "threadId": thread_id })
+}
+
+fn thread_queue_update_params(thread_id: &str, queued_submission_id: &str, input: Value) -> Value {
+    json!({
+        "threadId": thread_id,
+        "queuedSubmissionId": queued_submission_id,
+        "input": input,
+    })
+}
+
+fn thread_queue_delete_params(thread_id: &str, queued_submission_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "queuedSubmissionId": queued_submission_id,
+    })
+}
+
+fn thread_queue_reorder_params(thread_id: &str, queued_submission_ids: Vec<String>) -> Value {
+    json!({
+        "threadId": thread_id,
+        "queuedSubmissionIds": queued_submission_ids,
+    })
+}
+
+fn thread_queue_start_params(thread_id: &str, queued_submission_id: Option<&str>) -> Value {
+    json!({
+        "threadId": thread_id,
+        "queuedSubmissionId": queued_submission_id,
     })
 }
 
@@ -846,6 +926,51 @@ mod tests {
                 "threadId": "thread-1",
                 "clientUserMessageId": "client-message-2",
                 "input": [{"type": "text", "text": "next"}],
+            })
+        );
+    }
+
+    #[test]
+    fn queue_management_methods_use_authoritative_submission_ids() {
+        let input = json!([{"type": "text", "text": "edited"}]);
+        assert_eq!(
+            thread_queue_list_params("thread-1"),
+            json!({"threadId": "thread-1"})
+        );
+        assert_eq!(
+            thread_queue_update_params("thread-1", "queued-1", input.clone()),
+            json!({
+                "threadId": "thread-1",
+                "queuedSubmissionId": "queued-1",
+                "input": input,
+            })
+        );
+        assert_eq!(
+            thread_queue_delete_params("thread-1", "queued-1"),
+            json!({
+                "threadId": "thread-1",
+                "queuedSubmissionId": "queued-1",
+            })
+        );
+        assert_eq!(
+            thread_queue_reorder_params("thread-1", vec!["queued-2".into(), "queued-1".into()],),
+            json!({
+                "threadId": "thread-1",
+                "queuedSubmissionIds": ["queued-2", "queued-1"],
+            })
+        );
+        assert_eq!(
+            thread_queue_start_params("thread-1", Some("queued-1")),
+            json!({
+                "threadId": "thread-1",
+                "queuedSubmissionId": "queued-1",
+            })
+        );
+        assert_eq!(
+            thread_queue_start_params("thread-1", None),
+            json!({
+                "threadId": "thread-1",
+                "queuedSubmissionId": null,
             })
         );
     }
