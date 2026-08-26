@@ -6594,6 +6594,35 @@ impl HarnessApp {
         drop(self.sync_transcript_document(cx));
     }
 
+    fn show_started_queued_submission(
+        &mut self,
+        submission: &QueuedTurnSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        let input = submission.input.as_array().cloned().unwrap_or_default();
+        let preview = queued_submission_text(&submission.input);
+        let was_following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            self.list_state.is_following_tail()
+        };
+        let Some((index, key)) =
+            self.model
+                .ensure_local_user(&submission.client_user_message_id, preview, &input)
+        else {
+            return;
+        };
+
+        self.model.set_status_for_key(&key, "sent");
+        self.dirty_image_surfaces.insert(key);
+        self.list_state.splice(index..index, 1);
+        if was_following_tail {
+            self.selected_item = index;
+            self.list_state.set_follow_mode(FollowMode::Tail);
+        }
+        drop(self.sync_transcript_document(cx));
+    }
+
     fn start_next_queued_turn(&mut self, cx: &mut Context<Self>) {
         if self.queue_start_pending
             || self.turn_start_pending
@@ -6617,6 +6646,7 @@ impl HarnessApp {
                     Ok(response) => {
                         if let Some(queued_entry) = queued_entry.as_ref() {
                             this.remove_queued_entry_locally(&queued_entry.client_user_message_id);
+                            this.show_started_queued_submission(queued_entry, cx);
                         }
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
@@ -6829,6 +6859,7 @@ impl HarnessApp {
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
+                        this.show_started_queued_submission(&entry, cx);
                         this.error = None;
                     }
                     Err(error) => {
@@ -6886,6 +6917,7 @@ impl HarnessApp {
                 match result {
                     Ok(response) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
+                        this.show_started_queued_submission(&entry, cx);
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
                             .and_then(Value::as_str)

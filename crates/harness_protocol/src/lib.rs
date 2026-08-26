@@ -1670,6 +1670,34 @@ impl TranscriptModel {
         (index, key)
     }
 
+    /// Ensure a successfully started queued submission has a visible user
+    /// item even when its authoritative item notification is late or absent.
+    /// A later authoritative item still reconciles through the stable client
+    /// id (or the existing legacy content fallback) instead of duplicating it.
+    pub fn ensure_local_user(
+        &mut self,
+        client_user_message_id: &str,
+        content: String,
+        content_blocks: &[Value],
+    ) -> Option<(usize, String)> {
+        let local_key = local_user_key(client_user_message_id);
+        if self.item_indices.contains_key(&local_key)
+            || self.items.iter().any(|item| {
+                item.kind == TranscriptKind::User
+                    && string_at(&item.raw, "/clientId") == Some(client_user_message_id)
+            })
+            || self.items.iter().rev().take(64).any(|item| {
+                item.kind == TranscriptKind::User
+                    && string_at(&item.raw, "/clientId").is_none()
+                    && optimistic_user_content_matches(&item.content, &content)
+            })
+        {
+            return None;
+        }
+
+        Some(self.push_local_user(client_user_message_id, content, content_blocks))
+    }
+
     pub fn user_image_sources(&self, item_key: &str) -> &[UserImageSource] {
         self.user_image_sources
             .get(item_key)
@@ -6436,6 +6464,59 @@ mod tests {
         assert!(model.user_image_sources(&local_key).is_empty());
         assert!(!model.item_indices.contains_key(&local_key));
         assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+    }
+
+    #[test]
+    fn queued_user_fallback_is_visible_once_and_reconciles_authoritatively() {
+        let mut model = TranscriptModel::default();
+        let blocks = json!([{"type": "text", "text": "queued follow-up"}]);
+
+        let (_, local_key) = model
+            .ensure_local_user(
+                "queued-client-1",
+                "queued follow-up".into(),
+                blocks.as_array().unwrap(),
+            )
+            .expect("a missing queued user item should receive a local fallback");
+        assert!(
+            model
+                .ensure_local_user(
+                    "queued-client-1",
+                    "queued follow-up".into(),
+                    blocks.as_array().unwrap(),
+                )
+                .is_none()
+        );
+
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "queued-server-message-1",
+                        "clientId": "queued-client-1",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "queued follow-up"}]
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, "queued-server-message-1");
+        assert!(!model.item_indices.contains_key(&local_key));
+        assert!(
+            model
+                .ensure_local_user(
+                    "queued-client-1",
+                    "queued follow-up".into(),
+                    blocks.as_array().unwrap(),
+                )
+                .is_none()
+        );
     }
 
     #[test]
