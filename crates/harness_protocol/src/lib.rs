@@ -1599,7 +1599,13 @@ impl TranscriptModel {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: thread_id.to_string(),
-            items: self.items.iter().map(item_for_snapshot).collect(),
+            // Persistence is an invariant boundary, not a byte-for-byte dump
+            // of potentially corrupt in-memory identity state. Older builds
+            // could append a second copy of a restored history; never write
+            // that ambiguity back out again.
+            items: deduplicate_transcript_items_keep_last(
+                self.items.iter().map(item_for_snapshot).collect(),
+            ),
         };
         let serialized = serde_json::to_vec(&snapshot)?;
         Ok(PreparedTranscriptSnapshot {
@@ -1632,11 +1638,13 @@ impl TranscriptModel {
 
     fn restore_persisted_snapshot(&mut self, snapshot: PersistedTranscript) -> usize {
         self.clear();
-        self.items = snapshot
-            .items
-            .into_iter()
-            .filter(|item| !originates_from_raw_response(item))
-            .collect();
+        self.items = deduplicate_transcript_items_keep_last(
+            snapshot
+                .items
+                .into_iter()
+                .filter(|item| !originates_from_raw_response(item))
+                .collect(),
+        );
         self.rebuild_item_indices();
         self.items.len()
     }
@@ -3206,14 +3214,17 @@ fn merge_snapshot_items(
     fresh: Vec<TranscriptItem>,
     persisted: Vec<TranscriptItem>,
 ) -> (Vec<TranscriptItem>, usize) {
+    let fresh = deduplicate_transcript_items_keep_last(fresh);
     // Version-1 snapshots may contain provider-level tool wrappers that older
     // Harness builds promoted into transcript cards. They have no semantic
     // identity in `thread/read` and must not be resurrected beside their typed
     // command/file/tool counterparts.
-    let persisted = persisted
-        .into_iter()
-        .filter(|item| !originates_from_raw_response(item))
-        .collect::<Vec<_>>();
+    let persisted = deduplicate_transcript_items_keep_last(
+        persisted
+            .into_iter()
+            .filter(|item| !originates_from_raw_response(item))
+            .collect(),
+    );
     let mut next_fresh = 0;
     let mut matches = vec![None; persisted.len()];
     for (persisted_index, persisted_item) in persisted.iter().enumerate() {
@@ -3251,6 +3262,23 @@ fn merge_snapshot_items(
     }
     merged.extend(fresh[next_unmerged_fresh..].iter().cloned());
     (merged, restored)
+}
+
+/// Repair snapshots written by older Harness builds that appended a second
+/// copy of an already-loaded history. Transcript item keys are semantic
+/// identities: retaining more than one makes lookup ambiguous and causes the
+/// native editor to reject the entire navigation document. Keep the last
+/// occurrence because it contains the newest streamed status/content while
+/// preserving the relative order of every surviving item.
+fn deduplicate_transcript_items_keep_last(items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
+    let mut seen = HashSet::with_capacity(items.len());
+    let mut unique = items
+        .into_iter()
+        .rev()
+        .filter(|item| seen.insert(item.key.clone()))
+        .collect::<Vec<_>>();
+    unique.reverse();
+    unique
 }
 
 fn originates_from_raw_response(item: &TranscriptItem) -> bool {
@@ -5271,6 +5299,124 @@ mod tests {
         assert_eq!(model.items[1].content, "cached answer");
         assert_eq!(model.item_indices.get(&user_key), Some(&0));
         assert_eq!(model.item_indices.get(&agent_key), Some(&1));
+    }
+
+    #[test]
+    fn warm_snapshot_repairs_duplicate_item_identities_and_keeps_newest_state() {
+        let prefix = replay_item(0, TranscriptKind::User, "You", "cached prompt", json!(null));
+        let mut stale = replay_item(
+            1,
+            TranscriptKind::Agent,
+            "Codex",
+            "partial answer",
+            json!(null),
+        );
+        let middle = replay_item(
+            2,
+            TranscriptKind::Command,
+            "Command",
+            "command output",
+            json!(null),
+        );
+        let mut complete = stale.clone();
+        complete.content = "complete answer".into();
+        complete.status = Some("completed".into());
+        complete.event_count = 7;
+        stale.status = Some("in progress".into());
+        let duplicate_key = stale.key.clone();
+        let snapshot = PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            items: vec![prefix, stale, middle, complete],
+        };
+        let mut model = TranscriptModel::default();
+
+        let restored = model.restore_persisted_snapshot(snapshot);
+
+        assert_eq!(restored, 3);
+        assert_eq!(model.items.len(), 3);
+        assert_eq!(model.items[2].key, duplicate_key);
+        assert_eq!(model.items[2].content, "complete answer");
+        assert_eq!(model.items[2].status.as_deref(), Some("completed"));
+        assert_eq!(model.item_indices.get(&duplicate_key), Some(&2));
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            model.items.len()
+        );
+    }
+
+    #[test]
+    fn persisted_merge_does_not_restore_a_duplicate_history() {
+        let user = replay_item(0, TranscriptKind::User, "You", "prompt", json!(null));
+        let mut stale_command = replay_item(
+            1,
+            TranscriptKind::Command,
+            "Command",
+            "partial output",
+            json!(null),
+        );
+        let agent = replay_item(2, TranscriptKind::Agent, "Codex", "done", json!(null));
+        let mut complete_command = stale_command.clone();
+        complete_command.content = "complete output".into();
+        complete_command.event_count = 9;
+        stale_command.event_count = 1;
+        let persisted = vec![
+            user.clone(),
+            stale_command,
+            agent.clone(),
+            complete_command,
+            agent.clone(),
+        ];
+        let mut fresh = vec![user, agent];
+        fresh[0].key = "server-user".into();
+        fresh[1].key = "server-agent".into();
+
+        let (merged, restored) = merge_snapshot_items(fresh, persisted);
+
+        assert_eq!(restored, 1);
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[1].kind, TranscriptKind::Command);
+        assert_eq!(merged[1].content, "complete output");
+        assert_eq!(merged[2].key, "server-agent");
+        assert_eq!(
+            merged
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            merged.len()
+        );
+    }
+
+    #[test]
+    fn prepared_snapshot_never_serializes_duplicate_item_identities() {
+        let mut model = TranscriptModel::default();
+        let stale = replay_item(
+            0,
+            TranscriptKind::Agent,
+            "Codex",
+            "partial answer",
+            json!(null),
+        );
+        let mut complete = stale.clone();
+        complete.content = "complete answer".into();
+        complete.event_count = 4;
+        model.items = vec![stale, complete];
+
+        let prepared = model
+            .prepare_transcript_snapshot("duplicate-snapshot-test")
+            .expect("snapshot should serialize");
+        let snapshot: PersistedTranscript =
+            serde_json::from_slice(&prepared.serialized).expect("snapshot should be valid JSON");
+
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].content, "complete answer");
+        assert_eq!(snapshot.items[0].event_count, 4);
     }
 
     #[test]
