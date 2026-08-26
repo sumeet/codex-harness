@@ -279,6 +279,28 @@ fn performance_j_candidate(model: &TranscriptModel) -> Option<usize> {
     })
 }
 
+fn turn_tail_list_splice(
+    current_count: usize,
+    transcript_count: usize,
+    turn_active: bool,
+) -> Option<(Range<usize>, usize)> {
+    let desired_count = transcript_count + usize::from(turn_active);
+    if current_count == desired_count {
+        return None;
+    }
+    if turn_active && current_count == transcript_count {
+        return Some((transcript_count..transcript_count, 1));
+    }
+    if !turn_active && current_count == transcript_count + 1 {
+        return Some((transcript_count..transcript_count + 1, 0));
+    }
+
+    // Thread replacement can race the visual turn transition by one render.
+    // Reconcile an unexpected count in one operation rather than leaving a
+    // stale generating row addressable as a transcript item.
+    Some((0..current_count, desired_count))
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StructuredOutputPreview {
     content: String,
@@ -8748,6 +8770,16 @@ impl HarnessApp {
         self.model.current_turn_id.is_some() || self.turn_start_pending || self.queue_start_pending
     }
 
+    fn sync_turn_tail_indicator(&self, turn_active: bool) {
+        if let Some((range, replacement_count)) = turn_tail_list_splice(
+            self.list_state.item_count(),
+            self.model.items.len(),
+            turn_active,
+        ) {
+            self.list_state.splice(range, replacement_count);
+        }
+    }
+
     fn render_task(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let thread = &self.threads[index];
@@ -11657,6 +11689,35 @@ impl HarnessApp {
         }
         element
     }
+
+    fn render_transcript_list_item(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if index < self.model.items.len() {
+            return self.render_item(index, window, cx);
+        }
+        if index != self.model.items.len() || !self.turn_active() {
+            return div().into_any_element();
+        }
+
+        let narrow = window.viewport_size().width < px(720.);
+        div()
+            .id("transcript-turn-tail")
+            .w_full()
+            .h(px(22.))
+            .px(if narrow { px(10.) } else { px(18.) })
+            .flex()
+            .items_center()
+            .child(
+                SpinnerLabel::dots()
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
 }
 
 impl Render for HarnessApp {
@@ -11710,6 +11771,7 @@ impl Render for HarnessApp {
             };
         let composer_images = self.composer_images.clone();
         let turn_active = self.turn_active();
+        self.sync_turn_tail_indicator(turn_active);
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
@@ -11784,7 +11846,9 @@ impl Render for HarnessApp {
                 .child(
                     list(
                         list_state.clone(),
-                        cx.processor(|this, index, window, cx| this.render_item(index, window, cx)),
+                        cx.processor(|this, index, window, cx| {
+                            this.render_transcript_list_item(index, window, cx)
+                        }),
                     )
                     .flex_1()
                     .min_h_0()
@@ -12185,33 +12249,6 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
-                    // Turn activity describes the next transcript event, not
-                    // the composer draft. Keep it attached to the transcript
-                    // edge while queue and stop controls remain in the input.
-                    .when(turn_active, |this| {
-                        this.child(
-                            div()
-                                .h(px(30.))
-                                .flex_none()
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .border_t_1()
-                                .border_color(colors.border_variant)
-                                .bg(colors.editor_background)
-                                .child(
-                                    SpinnerLabel::dots()
-                                        .size(LabelSize::Small)
-                                        .color(Color::Accent),
-                                )
-                                .child(
-                                    Label::new("Responding…")
-                                        .size(LabelSize::Small)
-                                        .color(Color::Muted),
-                                ),
-                        )
-                    })
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
@@ -14464,6 +14501,19 @@ mod tests {
     fn performance_jk_requires_two_lines_for_repeated_motion() {
         assert!(!performance_j_has_room(1));
         assert!(performance_j_has_room(2));
+    }
+
+    #[test]
+    fn active_turn_tail_is_one_real_transcript_list_item() {
+        assert_eq!(turn_tail_list_splice(3, 3, true), Some((3..3, 1)));
+        assert_eq!(turn_tail_list_splice(4, 3, true), None);
+        assert_eq!(turn_tail_list_splice(4, 3, false), Some((3..4, 0)));
+        assert_eq!(turn_tail_list_splice(3, 3, false), None);
+        assert_eq!(
+            turn_tail_list_splice(7, 3, true),
+            Some((0..7, 4)),
+            "thread replacement must reconcile stale list furniture atomically"
+        );
     }
 
     #[test]
