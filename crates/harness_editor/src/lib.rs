@@ -22,11 +22,12 @@ use gpui::{
     AnyView, App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter,
     FocusHandle, Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla,
     IntoElement, KeyBinding, KeyContext, Pixels, Render, SharedString, TextStyle,
-    TextStyleRefinement, WeakEntity, Window, div, point, prelude::*, px,
+    TextStyleRefinement, WeakEntity, Window, actions, div, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
-    TranscriptSemanticSpan, TranscriptSemanticStyle, minimal_text_edit,
+    TranscriptSemanticSpan, TranscriptSemanticStyle, markdown_monospace_source_ranges,
+    minimal_text_edit,
 };
 use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{
@@ -46,6 +47,8 @@ pub use vim::{
     ModeIndicator, MoveToNext as VimWordNext, MoveToNextMatch as VimNextMatch,
     MoveToPrevious as VimWordPrevious, MoveToPreviousMatch as VimPreviousMatch,
 };
+
+actions!(harness_editor, [SubmitComposer, InsertComposerNewline]);
 
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     editor::init(cx);
@@ -87,6 +90,30 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
             "ctrl-i",
             LocalNavigationForward,
             Some("Editor && VimControl && vim_mode == normal"),
+        ),
+        // Composer submission is owned here, on the same dispatch path as the
+        // Zed Editor. A host-level binding loses to Editor/Vim actions on some
+        // modes and keyboard layouts.
+        KeyBinding::new("enter", SubmitComposer, Some("HarnessComposer && Editor")),
+        KeyBinding::new(
+            "ctrl-enter",
+            SubmitComposer,
+            Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "shift-enter",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "alt-enter",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "ctrl-j",
+            InsertComposerNewline,
+            Some("HarnessComposer && Editor"),
         ),
     ]);
     Ok(())
@@ -131,12 +158,21 @@ fn embedded_language(name: &str, grammar: tree_sitter::Language) -> anyhow::Resu
 pub struct LocalEditor {
     editor: Entity<Editor>,
     typography_profile: TranscriptTypographyProfile,
+    composer_keys: bool,
 }
 
 /// Emitted whenever a host-owned local editor's Buffer text changes.
 pub struct LocalEditorChanged;
 
+/// Emitted by the composer itself after it captures Enter. Keeping this event
+/// at the local-Editor boundary prevents Zed's stock newline/Vim bindings from
+/// winning before the host can submit the prompt.
+pub struct LocalEditorSubmitted;
+
 impl EventEmitter<LocalEditorChanged> for LocalEditor {}
+impl EventEmitter<LocalEditorSubmitted> for LocalEditor {}
+
+struct ComposerMarkdownMonospaceGeometryHighlight;
 
 impl LocalEditor {
     pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -168,8 +204,9 @@ impl LocalEditor {
             apply_typography_profile_to_editor(&mut editor, typography_profile, window, cx);
             editor
         });
-        cx.subscribe(&editor, |_, _, event, cx| {
+        cx.subscribe(&editor, |this, _, event, cx| {
             if matches!(event, EditorEvent::BufferEdited) {
+                this.refresh_composer_markdown_font_geometry(cx);
                 cx.emit(LocalEditorChanged);
             }
         })
@@ -177,6 +214,7 @@ impl LocalEditor {
         Self {
             editor,
             typography_profile,
+            composer_keys: true,
         }
     }
 
@@ -204,6 +242,7 @@ impl LocalEditor {
             // by default. Record that identity explicitly so a host can apply
             // the same Reading/Mono choice without replacing the Editor.
             typography_profile: TranscriptTypographyProfile::Reading,
+            composer_keys: false,
         }
     }
 
@@ -282,6 +321,39 @@ impl LocalEditor {
             window.dispatch_action(action, cx);
         }
     }
+
+    fn refresh_composer_markdown_font_geometry(&mut self, cx: &mut Context<Self>) {
+        if !self.composer_keys {
+            return;
+        }
+        let source = self.editor.read(cx).text(cx);
+        // Most drafts contain no code at all. Avoid reparsing ordinary prose on
+        // every keystroke while still clearing stale ranges after the final
+        // delimiter is deleted.
+        let ranges = if source.contains('`') {
+            markdown_monospace_source_ranges(&source)
+        } else {
+            Vec::new()
+        };
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchors = ranges
+                .into_iter()
+                .map(|range| clipped_anchor_range(&snapshot, range))
+                .collect();
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownMonospaceGeometryHighlight,
+                >()),
+                anchors,
+                HighlightStyle {
+                    font_family: Some(FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+        });
+    }
 }
 
 impl Focusable for LocalEditor {
@@ -291,8 +363,22 @@ impl Focusable for LocalEditor {
 }
 
 impl Render for LocalEditor {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.editor.clone()
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .on_action(cx.listener(|this, _: &SubmitComposer, _, cx| {
+                if this.composer_keys {
+                    cx.stop_propagation();
+                    cx.emit(LocalEditorSubmitted);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &InsertComposerNewline, window, cx| {
+                if this.composer_keys {
+                    cx.stop_propagation();
+                    this.insert_newline(window, cx);
+                }
+            }))
+            .child(self.editor.clone())
     }
 }
 
@@ -4785,6 +4871,25 @@ mod tests {
         let display_map_source = include_str!("../../editor/src/display_map.rs");
         assert!(!display_map_source.contains("use project::"));
         assert!(display_map_source.contains("ranges: Vec<DocumentFoldingRange>"));
+    }
+
+    #[test]
+    fn composer_owns_submit_and_newline_actions_on_its_editor_dispatch_path() {
+        let production = include_str!("lib.rs")
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("the source guard must inspect production code only");
+
+        for key in ["enter", "ctrl-enter"] {
+            assert!(production.contains(&format!("\"{key}\"")));
+        }
+        for key in ["shift-enter", "alt-enter", "ctrl-j"] {
+            assert!(production.contains(&format!("\"{key}\",")));
+        }
+        assert!(production.contains("cx.emit(LocalEditorSubmitted)"));
+        assert!(production.contains("this.insert_newline(window, cx)"));
+        assert!(production.matches("SubmitComposer").count() >= 4);
+        assert!(production.matches("InsertComposerNewline").count() >= 5);
     }
 
     #[test]

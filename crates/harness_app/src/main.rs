@@ -22,10 +22,10 @@ use gpui::{
 };
 use gpui_platform::application;
 use harness_editor::{
-    LocalEditor, LocalEditorChanged, ModeIndicator, TranscriptEditor, TranscriptReplacement,
-    TranscriptSelectionChanged, TranscriptSelectionSnapshot, TranscriptSupplement,
-    TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext,
-    VimWordPrevious, shell_capture_priority, shell_capture_ranges,
+    LocalEditor, LocalEditorChanged, LocalEditorSubmitted, ModeIndicator, TranscriptEditor,
+    TranscriptReplacement, TranscriptSelectionChanged, TranscriptSelectionSnapshot,
+    TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch,
+    VimWordNext, VimWordPrevious, shell_capture_priority, shell_capture_ranges,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -65,7 +65,6 @@ actions!(
     [
         Send,
         Steer,
-        InsertComposerNewline,
         PasteComposer,
         Stop,
         FocusTranscript,
@@ -2690,7 +2689,10 @@ fn composer_height(text: &str, available_width: f32, profile: TranscriptTypograp
             .sum::<usize>()
             .clamp(1, 8)
     };
-    78. + 20. * visual_rows.saturating_sub(1) as f32
+    // Leave one full line of slack below the Editor's measured content. The
+    // display map's final baseline and Vim caret can otherwise paint beneath
+    // the fixed status row when the last logical line is soft-wrapped.
+    86. + 22. * visual_rows.saturating_sub(1) as f32
 }
 
 fn composer_render_metrics(
@@ -4024,6 +4026,12 @@ impl HarnessApp {
                     cx.notify();
                 }
             },
+        )
+        .detach();
+        cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, _: &LocalEditorSubmitted, window, cx| this.send(window, cx),
         )
         .detach();
         cx.subscribe_in(
@@ -11124,12 +11132,6 @@ impl Render for HarnessApp {
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
-            .on_action(cx.listener(
-                |this, _: &InsertComposerNewline, window, cx| {
-                    this.composer
-                        .update(cx, |composer, cx| composer.insert_newline(window, cx));
-                },
-            ))
             .on_action(cx.listener(|this, _: &PasteComposer, window, cx| {
                 this.paste_composer(window, cx)
             }))
@@ -11418,27 +11420,6 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
-                    // Turn activity belongs at the transcript tail, where the
-                    // next event will appear. Keeping it out of the composer's
-                    // Vim row leaves `-- INSERT --` as a pure mode indicator.
-                    .when(turn_active, |this| {
-                        this.child(
-                            div()
-                                .h(px(26.))
-                                .flex_none()
-                                .px_4()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .text_color(colors.text_muted)
-                                .child(SpinnerLabel::dots().size(LabelSize::XSmall))
-                                .child(
-                                    Label::new("Working…")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                        )
-                    })
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
@@ -11543,6 +11524,7 @@ impl Render for HarnessApp {
                                     .overflow_hidden()
                                     .px_3()
                                     .pt_2()
+                                    .pb_2()
                                     .child(self.composer.clone()),
                             )
                             .child(
@@ -11605,6 +11587,10 @@ impl Render for HarnessApp {
                                             .child(permission_selector)
                                             .when(turn_active, |this| {
                                                 this.child(
+                                                    SpinnerLabel::dots()
+                                                        .size(LabelSize::XSmall),
+                                                )
+                                                .child(
                                                     Button::new("queue-turn", "Queue")
                                                         .size(ButtonSize::Compact)
                                                         .style(ButtonStyle::Subtle)
@@ -11615,7 +11601,7 @@ impl Render for HarnessApp {
                                                         )
                                                         .disabled(send_blocked)
                                                         .aria_label(
-                                                            "Queue prompt after the current turn; Ctrl-Enter steers the current turn",
+                                                            "Queue prompt after the current turn",
                                                         )
                                                         .on_click(cx.listener(
                                                             |this, _, window, cx| {
@@ -12682,36 +12668,6 @@ fn load_harness_keymaps(cx: &mut App) {
             "shift-insert",
             PasteComposer,
             Some("HarnessComposer && Editor"),
-        ),
-        KeyBinding::new(
-            "enter",
-            Send,
-            Some("HarnessComposer && Editor && vim_mode == insert"),
-        ),
-        KeyBinding::new(
-            "shift-enter",
-            InsertComposerNewline,
-            Some("HarnessComposer && Editor && vim_mode == insert"),
-        ),
-        KeyBinding::new(
-            "alt-enter",
-            InsertComposerNewline,
-            Some("HarnessComposer && Editor && vim_mode == insert"),
-        ),
-        KeyBinding::new(
-            "ctrl-j",
-            InsertComposerNewline,
-            Some("HarnessComposer && Editor && vim_mode == insert"),
-        ),
-        KeyBinding::new(
-            "ctrl-enter",
-            Steer,
-            Some("HarnessComposer && HarnessTurnActive && Editor"),
-        ),
-        KeyBinding::new(
-            "ctrl-enter",
-            Send,
-            Some("HarnessComposer && !HarnessTurnActive && Editor"),
         ),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
         KeyBinding::new(
@@ -14995,15 +14951,15 @@ mod tests {
     #[test]
     fn composer_height_is_compact_grows_with_content_and_stays_bounded() {
         let reading = TranscriptTypographyProfile::Reading;
-        assert_eq!(composer_height("", 900., reading), 78.);
-        assert_eq!(composer_height("one line", 900., reading), 78.);
-        assert!(composer_height("first\nsecond\nthird", 900., reading) > 78.);
+        assert_eq!(composer_height("", 900., reading), 86.);
+        assert_eq!(composer_height("one line", 900., reading), 86.);
+        assert!(composer_height("first\nsecond\nthird", 900., reading) > 86.);
         assert!(
             composer_height(&"wrapped ".repeat(200), 320., reading)
                 > composer_height(&"wrapped ".repeat(20), 900., reading),
             "narrow, wrapped prompts should receive more editing room"
         );
-        assert_eq!(composer_height(&"line\n".repeat(100), 320., reading), 218.);
+        assert_eq!(composer_height(&"line\n".repeat(100), 320., reading), 240.);
     }
 
     #[test]

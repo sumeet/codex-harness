@@ -251,9 +251,18 @@ impl PreparedTranscriptSnapshot {
 
 impl TranscriptItem {
     pub fn display_status(&self) -> Option<&str> {
-        self.status
-            .as_deref()
-            .filter(|status| !is_routine_terminal_status(status))
+        match self.status.as_deref()? {
+            status
+                if is_routine_terminal_status(status)
+                    || matches!(
+                        status,
+                        "running" | "in progress" | "inProgress" | "in_progress" | "streaming"
+                    ) =>
+            {
+                None
+            }
+            status => Some(status),
+        }
     }
 
     /// Whether this item has anything useful to occupy transcript space.
@@ -860,6 +869,45 @@ fn selectable_markdown_text_with_link_destinations(
         text: output,
         semantic_spans,
     })
+}
+
+/// Byte ranges in raw Markdown whose glyph geometry should use the buffer font.
+///
+/// The composer remains a real plaintext Editor: delimiters stay visible and
+/// selectable, while inline and fenced code can use monospace metrics without
+/// replacing any source bytes with ornamental UI.
+pub fn markdown_monospace_source_ranges(source: &str) -> Vec<Range<usize>> {
+    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
+        | MarkdownOptions::ENABLE_TABLES
+        | MarkdownOptions::ENABLE_TASKLISTS
+        | MarkdownOptions::ENABLE_FOOTNOTES
+        | MarkdownOptions::ENABLE_MATH;
+    let mut ranges = MarkdownParser::new_ext(source, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(
+                event,
+                MarkdownEvent::Code(_)
+                    | MarkdownEvent::Start(Tag::CodeBlock(_))
+                    | MarkdownEvent::End(TagEnd::CodeBlock)
+            )
+            .then_some(range)
+        })
+        .filter(|range| range.start < range.end && range.end <= source.len())
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
 }
 
 fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
@@ -3365,11 +3413,17 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
         protocol_id: Some(protocol_id),
         kind,
         title: title_from_protocol(protocol_kind, &raw),
-        status: raw
-            .get("status")
-            .and_then(protocol_status)
-            .or_else(|| completed.then(|| "completed".into()))
-            .or_else(|| Some("running".into())),
+        status: if protocol_kind == "contextCompaction" {
+            // Compaction is a point-in-time history landmark. Treating an item
+            // without an explicit status as an active operation leaves a
+            // permanent, misleading `running` badge in restored histories.
+            Some("completed".into())
+        } else {
+            raw.get("status")
+                .and_then(protocol_status)
+                .or_else(|| completed.then(|| "completed".into()))
+                .or_else(|| Some("in progress".into()))
+        },
         content: content_from_protocol(protocol_kind, &raw),
         raw: bounded_raw_payload(raw),
         event_count: 1,
@@ -3529,11 +3583,7 @@ fn content_from_protocol(kind: &str, raw: &Value) -> String {
             collect_text_sections(raw.get("summary"), &mut summary);
             collect_text_sections(raw.get("content"), &mut summary);
             let summary = unique_sections(summary).join("\n\n");
-            if summary.is_empty() {
-                "Earlier context was compacted so the task could continue.".into()
-            } else {
-                summary
-            }
+            summary
         }
         _ => pretty_json(raw),
     }
@@ -4610,10 +4660,8 @@ mod tests {
         assert_eq!(model.items[0].title, "Context compacted");
         assert!(model.items[0].is_presentationally_visible());
         assert!(!model.items[0].expanded);
-        assert_eq!(
-            model.items[0].content,
-            "Earlier context was compacted so the task could continue."
-        );
+        assert!(model.items[0].content.is_empty());
+        assert_eq!(model.items[0].display_status(), None);
         assert_eq!(model.raw_events.len(), 1);
         assert_eq!(model.raw_events[0].method, "item/completed");
         assert!(TranscriptModel::replay(120).items.iter().any(|item| {
@@ -4636,6 +4684,27 @@ mod tests {
 
         assert_eq!(item.content, "Retained the implementation plan.");
         assert!(item.is_presentationally_visible());
+    }
+
+    #[test]
+    fn markdown_monospace_ranges_retain_plaintext_source_geometry() {
+        let source = "before `running` after\n\n```rust\nprintln!(\"ok\");\n```";
+        let ranges = markdown_monospace_source_ranges(source);
+
+        assert!(ranges.windows(2).all(|pair| pair[0].end <= pair[1].start));
+        assert!(ranges.iter().all(|range| {
+            source.is_char_boundary(range.start) && source.is_char_boundary(range.end)
+        }));
+        assert!(
+            ranges
+                .iter()
+                .any(|range| source[range.clone()].contains("running"))
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|range| source[range.clone()].contains("println!"))
+        );
     }
 
     #[test]
@@ -5405,7 +5474,7 @@ mod tests {
     }
 
     #[test]
-    fn routine_terminal_statuses_stay_out_of_every_transcript_kind() {
+    fn routine_lifecycle_statuses_stay_out_of_every_transcript_kind() {
         for status in [
             "completed",
             "COMPLETED",
@@ -5417,6 +5486,9 @@ mod tests {
             "inactive",
             "ready",
             "resolved",
+            "streaming",
+            "running",
+            "in progress",
         ] {
             let mut item = replay_item(
                 0,
@@ -5429,15 +5501,7 @@ mod tests {
             assert_eq!(item.display_status(), None, "status {status}");
         }
 
-        for status in [
-            "streaming",
-            "running",
-            "waiting",
-            "responding",
-            "failed",
-            "interrupted",
-            "offline",
-        ] {
+        for status in ["waiting", "responding", "failed", "interrupted", "offline"] {
             let mut item =
                 replay_item(0, TranscriptKind::Command, "Command", "output", json!(null));
             item.status = Some(status.into());
@@ -5479,7 +5543,7 @@ mod tests {
             }),
             false,
         );
-        assert_eq!(running.display_status(), Some("in progress"));
+        assert_eq!(running.display_status(), None);
 
         let opaque = item_from_protocol(
             json!({
@@ -5490,7 +5554,7 @@ mod tests {
             }),
             false,
         );
-        assert_eq!(opaque.status.as_deref(), Some("running"));
+        assert_eq!(opaque.status.as_deref(), Some("in progress"));
         let projection = project_transcript_item(0, &opaque).unwrap();
         assert!(!projection.header_text().contains('{'));
         assert!(!projection.header_text().contains("phaseCode"));
@@ -5545,7 +5609,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_terminal_reasoning_has_no_false_document_disclosure() {
+    fn empty_reasoning_has_no_false_document_disclosure_for_any_routine_status() {
         let mut model = TranscriptModel::default();
         let mut item = replay_item(
             0,
@@ -5563,8 +5627,8 @@ mod tests {
         assert_eq!(model.raw_events.len(), 0);
 
         model.items[0].status = Some("running".into());
-        assert!(model.items[0].is_presentationally_visible());
-        assert!(model.item_projection(0).is_some());
+        assert!(!model.items[0].is_presentationally_visible());
+        assert!(model.item_projection(0).is_none());
     }
 
     #[test]
