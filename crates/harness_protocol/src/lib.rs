@@ -388,6 +388,19 @@ impl TranscriptDocument {
         let mut current_row = 0_u32;
 
         for projection in projections {
+            // A segment without a single selectable byte has no cursor owner.
+            // Keeping it would poison the Editor's all-or-nothing semantic
+            // index, disabling navigation for every otherwise-valid item in
+            // the document. Header-only Rich cards are deliberately omitted
+            // from this text projection instead.
+            if projection.text.is_empty() {
+                continue;
+            }
+            let valid = projection.has_valid_ranges();
+            debug_assert!(valid, "invalid transcript item projection");
+            if !valid {
+                continue;
+            }
             let item_index = projection.segment.item_index;
             if item_index >= model_item_count {
                 continue;
@@ -421,6 +434,38 @@ pub struct TranscriptItemProjection {
 }
 
 impl TranscriptItemProjection {
+    /// Whether every item-relative byte range belongs to this projection.
+    /// Document assembly and the native Editor share this invariant so an
+    /// invalid card can never disable navigation for unrelated cards.
+    pub fn has_valid_ranges(&self) -> bool {
+        let segment = &self.segment;
+        !self.text.is_empty()
+            && segment.whole_range == (0..self.text.len())
+            && segment.header_range.start <= segment.header_range.end
+            && segment.header_range.end <= self.text.len()
+            && self.text.is_char_boundary(segment.header_range.start)
+            && self.text.is_char_boundary(segment.header_range.end)
+            && segment.body_range.start <= segment.body_range.end
+            && segment.body_range.end <= self.text.len()
+            && self.text.is_char_boundary(segment.body_range.start)
+            && self.text.is_char_boundary(segment.body_range.end)
+            && segment.header_range.end <= segment.body_range.start
+            && segment.semantic_spans.len() <= MAX_SEMANTIC_SPANS_PER_ITEM
+            && segment.semantic_spans.iter().all(|span| {
+                segment.body_range.start <= span.range.start
+                    && span.range.start < span.range.end
+                    && span.range.end <= segment.body_range.end
+                    && self.text.is_char_boundary(span.range.start)
+                    && self.text.is_char_boundary(span.range.end)
+            })
+            && segment.semantic_spans.windows(2).all(|pair| {
+                let left = &pair[0];
+                let right = &pair[1];
+                (left.range.start, left.range.end, left.style)
+                    <= (right.range.start, right.range.end, right.style)
+            })
+    }
+
     pub fn header_text(&self) -> &str {
         &self.text[self.segment.header_range.clone()]
     }
@@ -1069,7 +1114,7 @@ fn project_transcript_item_with_header(
     let body_end = body_start + body.text.len();
 
     let whole_end = text.len();
-    Some(TranscriptItemProjection {
+    let projection = TranscriptItemProjection {
         text,
         segment: TranscriptDocumentSegment {
             item_index,
@@ -1087,7 +1132,8 @@ fn project_transcript_item_with_header(
                 })
                 .collect(),
         },
-    })
+    };
+    (!projection.text.is_empty()).then_some(projection)
 }
 
 fn shifted_range(range: &Range<usize>, offset: usize) -> Range<usize> {
@@ -6254,6 +6300,75 @@ mod tests {
                 .text
                 .contains("Earlier context was summarized here")
         );
+    }
+
+    #[test]
+    fn header_only_items_never_create_empty_rich_navigation_segments() {
+        let mut model = TranscriptModel::default();
+        model.push_without_splice(replay_item(
+            0,
+            TranscriptKind::Agent,
+            "Codex",
+            "before",
+            json!(null),
+        ));
+        model.push_without_splice(replay_item(
+            1,
+            TranscriptKind::Trace,
+            "Context compacted",
+            "",
+            json!({"type": "contextCompaction"}),
+        ));
+        model.push_without_splice(replay_item(
+            2,
+            TranscriptKind::Agent,
+            "Codex",
+            "after",
+            json!(null),
+        ));
+
+        let full = model.full_document();
+        assert_eq!(
+            full.segments
+                .iter()
+                .map(|segment| segment.item_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "the Text view still owns the visible compaction header"
+        );
+        assert!(full.text.contains("Context compacted"));
+
+        let rich = model.rich_navigation_document();
+        assert_eq!(
+            rich.segments
+                .iter()
+                .map(|segment| segment.item_index)
+                .collect::<Vec<_>>(),
+            [0, 2],
+            "a Rich header without selectable body text is skipped"
+        );
+        assert_eq!(rich.item_rows, [Some(0), None, Some(1)]);
+        assert!(
+            rich.segments
+                .iter()
+                .all(|segment| !segment.whole_range.is_empty())
+        );
+    }
+
+    #[test]
+    fn document_assembly_defensively_drops_empty_custom_projections() {
+        let model = TranscriptModel::replay(1);
+        let empty = model
+            .rich_navigation_item_projection(0)
+            .unwrap()
+            .with_body_text(String::new());
+        assert!(empty.text.is_empty());
+
+        let document = TranscriptDocument::from_item_projections(1, [empty]);
+
+        assert!(document.text.is_empty());
+        assert!(document.segments.is_empty());
+        assert_eq!(document.item_rows, [None]);
     }
 
     #[test]

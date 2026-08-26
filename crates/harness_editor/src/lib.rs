@@ -1711,22 +1711,7 @@ fn segment_position_at_offset(
 }
 
 fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -> bool {
-    let segment = &projection.segment;
-    segment.whole_range == (0..projection.text.len())
-        && segment.header_range.start <= segment.header_range.end
-        && segment.header_range.end <= projection.text.len()
-        && projection.text.is_char_boundary(segment.header_range.start)
-        && projection.text.is_char_boundary(segment.header_range.end)
-        && segment.body_range.start <= segment.body_range.end
-        && segment.body_range.end <= projection.text.len()
-        && projection.text.is_char_boundary(segment.body_range.start)
-        && projection.text.is_char_boundary(segment.body_range.end)
-        && segment.header_range.end <= segment.body_range.start
-        && semantic_spans_are_valid(
-            &segment.semantic_spans,
-            &segment.body_range,
-            &projection.text,
-        )
+    projection.has_valid_ranges()
 }
 
 fn semantic_spans_are_valid(

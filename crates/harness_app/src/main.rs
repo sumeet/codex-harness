@@ -2391,6 +2391,9 @@ fn rich_navigation_item_projection(
     } else {
         projection.with_body_text(body)
     };
+    if projection.text.is_empty() {
+        return None;
+    }
     let has_following_visible_item = model.items[item_index + 1..]
         .iter()
         .any(TranscriptItem::is_presentationally_visible);
@@ -16149,6 +16152,66 @@ mod tests {
                 }),
                 completed_status: "accepted".into(),
             }
+        );
+    }
+
+    #[test]
+    fn header_only_landmarks_cannot_disable_the_rich_vim_document() {
+        let mut model = TranscriptModel::default();
+        model.items = vec![
+            TranscriptItem {
+                key: "before".into(),
+                protocol_id: None,
+                kind: model::TranscriptKind::Agent,
+                title: "Codex".into(),
+                status: Some("completed".into()),
+                content: "before compaction".into(),
+                raw: Value::Null,
+                event_count: 1,
+                expanded: true,
+                pending_request: None,
+            },
+            TranscriptItem {
+                key: "compaction".into(),
+                protocol_id: Some("compaction".into()),
+                kind: model::TranscriptKind::Trace,
+                title: "Context compacted".into(),
+                status: Some("completed".into()),
+                content: String::new(),
+                raw: json!({"type": "contextCompaction"}),
+                event_count: 1,
+                expanded: false,
+                pending_request: None,
+            },
+            TranscriptItem {
+                key: "after".into(),
+                protocol_id: None,
+                kind: model::TranscriptKind::Agent,
+                title: "Codex".into(),
+                status: Some("completed".into()),
+                content: "after compaction".into(),
+                raw: Value::Null,
+                event_count: 1,
+                expanded: true,
+                pending_request: None,
+            },
+        ];
+
+        let document = rich_navigation_document(&model);
+        assert_eq!(
+            document
+                .segments
+                .iter()
+                .map(|segment| segment.item_index)
+                .collect::<Vec<_>>(),
+            [0, 2]
+        );
+        assert_eq!(document.item_rows, [Some(0), None, Some(1)]);
+        assert!(
+            document
+                .segments
+                .iter()
+                .all(|segment| !segment.whole_range.is_empty())
         );
     }
 }
