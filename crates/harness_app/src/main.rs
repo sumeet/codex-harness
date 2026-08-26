@@ -4041,6 +4041,10 @@ impl HarnessApp {
                 .rich_nested_scrolls
                 .entry(item.key.clone())
                 .or_default();
+            let command_text_changed = state
+                .command
+                .as_ref()
+                .is_none_or(|surface| surface.data.command != data.command);
             let command_list_state = state.command.as_ref().map_or_else(
                 || {
                     // Command source is normally only a few logical rows. Let
@@ -4069,6 +4073,13 @@ impl HarnessApp {
             output_list_state.set_diagnostics_name(format!("command-output:{}", item.key));
             if command_list_state.item_count() != command_row_count {
                 command_list_state.splice(0..command_list_state.item_count(), command_row_count);
+            } else if command_text_changed {
+                // Streaming command arguments commonly grow without adding a
+                // logical newline. Their soft-wrapped height can therefore
+                // change while the virtual row count remains identical. Keep
+                // the row identity and scroll anchor, but discard its stale
+                // one-line measurement so every wrapped line is laid out.
+                command_list_state.remeasure_items(0..command_row_count);
             }
             if output_list_state.item_count() != output_row_count {
                 output_list_state.splice(0..output_list_state.item_count(), output_row_count);
