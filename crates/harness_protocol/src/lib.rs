@@ -1355,6 +1355,13 @@ pub struct BatchOutcome {
     pub refresh_threads: bool,
     pub renamed_thread: Option<String>,
     pub transport_error: Option<String>,
+    pub transient_turn_status: Option<TransientTurnStatusUpdate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransientTurnStatusUpdate {
+    Set(String),
+    Clear,
 }
 
 #[derive(Default)]
@@ -1604,7 +1611,11 @@ impl TranscriptModel {
             // could append a second copy of a restored history; never write
             // that ambiguity back out again.
             items: deduplicate_transcript_items_keep_last(
-                self.items.iter().map(item_for_snapshot).collect(),
+                self.items
+                    .iter()
+                    .filter(|item| !is_transient_transport_item(item))
+                    .map(item_for_snapshot)
+                    .collect(),
             ),
         };
         let serialized = serde_json::to_vec(&snapshot)?;
@@ -1642,7 +1653,9 @@ impl TranscriptModel {
             snapshot
                 .items
                 .into_iter()
-                .filter(|item| !originates_from_raw_response(item))
+                .filter(|item| {
+                    !originates_from_raw_response(item) && !is_transient_transport_item(item)
+                })
                 .collect(),
         );
         self.rebuild_item_indices();
@@ -1745,6 +1758,13 @@ impl TranscriptModel {
                 self.record_raw(method.clone(), params.clone());
                 if self.telemetry.ingest(&method, &params) {
                     return;
+                }
+                if let Some(status) = transient_transport_status(&method, &params) {
+                    outcome.transient_turn_status = Some(TransientTurnStatusUpdate::Set(status));
+                    return;
+                }
+                if notification_resumes_turn_activity(&method, &params) {
+                    outcome.transient_turn_status = Some(TransientTurnStatusUpdate::Clear);
                 }
                 match method.as_str() {
                     "item/started" | "item/completed" => {
@@ -3222,7 +3242,9 @@ fn merge_snapshot_items(
     let persisted = deduplicate_transcript_items_keep_last(
         persisted
             .into_iter()
-            .filter(|item| !originates_from_raw_response(item))
+            .filter(|item| {
+                !originates_from_raw_response(item) && !is_transient_transport_item(item)
+            })
             .collect(),
     );
     let mut next_fresh = 0;
@@ -3279,6 +3301,62 @@ fn deduplicate_transcript_items_keep_last(items: Vec<TranscriptItem>) -> Vec<Tra
         .collect::<Vec<_>>();
     unique.reverse();
     unique
+}
+
+fn transient_transport_status(method: &str, params: &Value) -> Option<String> {
+    if method == "error"
+        && params
+            .get("willRetry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        let message = string_at(params, "/error/message")?;
+        return Some(message.replace("...", "…"));
+    }
+
+    if method == "warning" {
+        let message = string_at(params, "/message")?;
+        if message.starts_with("Falling back from WebSockets to HTTPS transport.") {
+            return Some("Switching to HTTPS…".into());
+        }
+        if message.starts_with("stream connection failed; waiting to retry") {
+            return Some("Waiting for connection…".into());
+        }
+    }
+
+    None
+}
+
+fn notification_resumes_turn_activity(method: &str, params: &Value) -> bool {
+    if matches!(method, "error" | "warning" | "configWarning") {
+        return false;
+    }
+    method.starts_with("item/")
+        || method.starts_with("hook/")
+        || matches!(
+            method,
+            "turn/started"
+                | "turn/completed"
+                | "turn/diff/updated"
+                | "turn/plan/updated"
+                | "model/rerouted"
+                | "model/verification"
+                | "command/exec/outputDelta"
+                | "process/outputDelta"
+                | "process/exited"
+        )
+        || params
+            .get("turnId")
+            .is_some_and(|turn_id| !turn_id.is_null())
+}
+
+fn is_transient_transport_item(item: &TranscriptItem) -> bool {
+    let method = match item.title.as_str() {
+        "Codex error" => "error",
+        "Codex warning" => "warning",
+        _ => return false,
+    };
+    transient_transport_status(method, &item.raw).is_some()
 }
 
 fn originates_from_raw_response(item: &TranscriptItem) -> bool {
@@ -5282,12 +5360,22 @@ mod tests {
             "legacy wrapper",
             json!({"type": "custom_tool_call_output"}),
         );
+        let retry = replay_item(
+            3,
+            TranscriptKind::Error,
+            "Codex error",
+            "Reconnecting... 3/5",
+            json!({
+                "willRetry": true,
+                "error": {"message": "Reconnecting... 3/5"}
+            }),
+        );
         let user_key = user.key.clone();
         let agent_key = agent.key.clone();
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
-            items: vec![user, wrapper, agent],
+            items: vec![user, wrapper, retry, agent],
         };
         let mut model = TranscriptModel::replay(5);
 
@@ -5406,7 +5494,17 @@ mod tests {
         let mut complete = stale.clone();
         complete.content = "complete answer".into();
         complete.event_count = 4;
-        model.items = vec![stale, complete];
+        let retry = replay_item(
+            1,
+            TranscriptKind::Error,
+            "Codex error",
+            "Reconnecting... 4/5",
+            json!({
+                "willRetry": true,
+                "error": {"message": "Reconnecting... 4/5"}
+            }),
+        );
+        model.items = vec![stale, retry, complete];
 
         let prepared = model
             .prepare_transcript_snapshot("duplicate-snapshot-test")
@@ -7070,6 +7168,107 @@ mod tests {
         assert!(model.items[1].title.contains("gpt-a → gpt-b"));
         assert_eq!(model.items[2].kind, TranscriptKind::Agent);
         assert_eq!(model.items[2].content, "Final realtime text");
+    }
+
+    #[test]
+    fn retry_and_transport_fallback_are_transient_turn_statuses_not_cards() {
+        let mut model = TranscriptModel {
+            current_turn_id: Some("turn-1".into()),
+            ..Default::default()
+        };
+        let reconnecting = model.apply_batch(
+            vec![Event::Notification {
+                method: "error".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "willRetry": true,
+                    "error": {
+                        "message": "Reconnecting... 3/5",
+                        "codexErrorInfo": {
+                            "responseStreamDisconnected": {"httpStatusCode": null}
+                        },
+                        "additionalDetails": "stream disconnected before completion"
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert!(model.items.is_empty());
+        assert_eq!(
+            reconnecting.transient_turn_status,
+            Some(TransientTurnStatusUpdate::Set("Reconnecting… 3/5".into()))
+        );
+
+        let fallback = model.apply_batch(
+            vec![Event::Notification {
+                method: "warning".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "message": "Falling back from WebSockets to HTTPS transport. stream disconnected before completion"
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert!(model.items.is_empty());
+        assert_eq!(
+            fallback.transient_turn_status,
+            Some(TransientTurnStatusUpdate::Set("Switching to HTTPS…".into()))
+        );
+
+        let resumed = model.apply_batch(
+            vec![Event::Notification {
+                method: "item/agentMessage/delta".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "agent-1",
+                    "delta": "Recovered"
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(
+            resumed.transient_turn_status,
+            Some(TransientTurnStatusUpdate::Clear)
+        );
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].content, "Recovered");
+    }
+
+    #[test]
+    fn final_codex_errors_and_general_warnings_remain_transcript_items() {
+        let mut model = TranscriptModel::default();
+        let outcome = model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "error".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "willRetry": false,
+                        "error": {"message": "Authentication failed"}
+                    }),
+                },
+                Event::Notification {
+                    method: "warning".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "message": "Check the generated command"
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 2);
+        assert!(outcome.transient_turn_status.is_none());
+        assert_eq!(model.items[0].title, "Codex error");
+        assert_eq!(model.items[1].title, "Codex warning");
     }
 
     #[test]

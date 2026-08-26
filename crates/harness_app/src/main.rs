@@ -3163,6 +3163,7 @@ struct HarnessApp {
     attaching_thread: bool,
     thread_read_only_reason: Option<SharedString>,
     error: Option<SharedString>,
+    transient_turn_status: Option<SharedString>,
     model: TranscriptModel,
     composer: Entity<LocalEditor>,
     composer_metrics: ComposerRenderMetrics,
@@ -4546,6 +4547,7 @@ impl HarnessApp {
             attaching_thread: false,
             thread_read_only_reason: None,
             error: None,
+            transient_turn_status: None,
             selected_item: model.items.len().saturating_sub(1),
             model,
             composer,
@@ -5009,6 +5011,7 @@ impl HarnessApp {
         self.settings_update_pending = false;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
+        self.transient_turn_status = None;
         self.thread_read_only_reason = None;
         self.error = Some("Codex app server disconnected.".into());
         self.retire_all_request_surfaces();
@@ -5068,6 +5071,12 @@ impl HarnessApp {
         }
         if let Some(error) = outcome.transport_error {
             self.error = Some(error.into());
+        }
+        if let Some(update) = outcome.transient_turn_status {
+            self.transient_turn_status = match update {
+                model::TransientTurnStatusUpdate::Set(status) => Some(status.into()),
+                model::TransientTurnStatusUpdate::Clear => None,
+            };
         }
         self.track_live_request_updates(&live_request_ids, old_len, new_len, &dirty_items);
         self.track_image_surface_updates(old_len, new_len, &dirty_items);
@@ -5994,6 +6003,7 @@ impl HarnessApp {
         self.attaching_thread = true;
         self.settings_update_pending = false;
         self.thread_read_only_reason = None;
+        self.transient_turn_status = None;
         self.error = None;
         let old_len = self.model.items.len();
         self.model.clear();
@@ -6468,6 +6478,7 @@ impl HarnessApp {
         } = submission;
         let existing_thread_id = self.selected_thread_id.clone();
         let cwd = self.cwd.clone();
+        self.transient_turn_status = None;
         self.turn_start_pending = true;
         self.turn_task = cx.spawn(async move |this, cx| {
             let result = async {
@@ -11713,6 +11724,7 @@ impl HarnessApp {
         }
 
         let narrow = window.viewport_size().width < px(720.);
+        let transient_status = self.transient_turn_status.clone();
         div()
             .id("transcript-turn-tail")
             .w_full()
@@ -11720,11 +11732,19 @@ impl HarnessApp {
             .px(if narrow { px(10.) } else { px(18.) })
             .flex()
             .items_center()
+            .gap_1()
             .child(
                 SpinnerLabel::dots()
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
+            .when_some(transient_status, |this, status| {
+                this.child(
+                    Label::new(status)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
             .into_any_element()
     }
 }
