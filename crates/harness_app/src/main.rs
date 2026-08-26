@@ -2590,6 +2590,13 @@ fn queued_submission_text(input: &Value) -> String {
         .join("\n")
 }
 
+fn queued_submission_preview(input: &Value) -> String {
+    queued_submission_text(input)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn queued_submission_image_count(input: &Value) -> usize {
     input
         .as_array()
@@ -3804,7 +3811,7 @@ impl HarnessApp {
                             let client_id = entry.client_user_message_id.clone();
                             let queue_ready = entry.id.is_some();
                             let operation_pending = pending.contains(&client_id);
-                            let text = queued_submission_text(&entry.input);
+                            let preview = queued_submission_preview(&entry.input);
                             let image_count = queued_submission_image_count(&entry.input);
                             let weak_edit = weak.clone();
                             let weak_steer = weak.clone();
@@ -3814,43 +3821,37 @@ impl HarnessApp {
                                 .id(("queued-prompt", index))
                                 .group("queued-prompt")
                                 .mx_2()
-                                .mb_1()
+                                .h(px(38.))
                                 .px_2()
-                                .py_1p5()
-                                .rounded_sm()
-                                .bg(colors.element_background)
+                                .border_t_1()
+                                .border_color(colors.border_variant)
                                 .flex()
-                                .items_start()
-                                .gap_2()
+                                .items_center()
+                                .gap_1()
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_0p5()
-                                        .when(!text.is_empty(), |this| {
-                                            this.child(
-                                                div()
-                                                    .max_h(px(52.))
-                                                    .overflow_hidden()
-                                                    .text_sm()
-                                                    .text_color(colors.text)
-                                                    .child(text),
-                                            )
-                                        })
-                                        .when(image_count > 0, |this| {
-                                            this.child(
-                                                Label::new(if image_count == 1 {
-                                                    "1 image attached".into()
-                                                } else {
-                                                    format!("{image_count} images attached")
-                                                })
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                            )
+                                        .truncate()
+                                        .text_sm()
+                                        .text_color(colors.text)
+                                        .child(if preview.is_empty() {
+                                            "Image prompt".to_owned()
+                                        } else {
+                                            preview
                                         }),
                                 )
+                                .when(image_count > 0, |this| {
+                                    this.child(
+                                        Label::new(if image_count == 1 {
+                                            "1 image".into()
+                                        } else {
+                                            format!("{image_count} images")
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .flex_none()
@@ -13664,6 +13665,10 @@ mod tests {
         assert_eq!(
             queued_submission_text(&queued[0].input),
             "first line\nsecond line"
+        );
+        assert_eq!(
+            queued_submission_preview(&queued[0].input),
+            "first line second line"
         );
         assert_eq!(queued_submission_image_count(&queued[0].input), 1);
     }
