@@ -3829,15 +3829,6 @@ impl HarnessApp {
                                         .flex()
                                         .flex_col()
                                         .gap_0p5()
-                                        .child(
-                                            Label::new(if index == 0 { "Next" } else { "Queued" })
-                                                .size(LabelSize::XSmall)
-                                                .color(if index == 0 {
-                                                    Color::Accent
-                                                } else {
-                                                    Color::Muted
-                                                }),
-                                        )
                                         .when(!text.is_empty(), |this| {
                                             this.child(
                                                 div()
