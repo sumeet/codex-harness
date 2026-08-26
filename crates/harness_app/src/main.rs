@@ -2525,7 +2525,7 @@ struct ComposerImageAttachment {
 }
 
 struct ComposerSubmission {
-    key: String,
+    key: Option<String>,
     client_user_message_id: String,
     input: Value,
 }
@@ -2535,7 +2535,6 @@ struct QueuedTurnSubmission {
     id: Option<String>,
     client_user_message_id: String,
     input: Value,
-    local_item_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -2552,6 +2551,10 @@ fn composer_prompt_preview(text: &str) -> String {
     text.to_owned()
 }
 
+fn show_submission_optimistically_in_transcript(turn_active: bool) -> bool {
+    !turn_active
+}
+
 fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
     Some(QueuedTurnSubmission {
         id: Some(value.get("id")?.as_str()?.to_owned()),
@@ -2561,7 +2564,6 @@ fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
             .unwrap_or_default()
             .to_owned(),
         input: value.get("input").cloned().unwrap_or_else(|| json!([])),
-        local_item_key: None,
     })
 }
 
@@ -3209,6 +3211,7 @@ struct ModelChoice {
     display_name: SharedString,
     default_effort: String,
     efforts: Vec<String>,
+    is_default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -3243,11 +3246,6 @@ fn model_choices_from_response(response: &Value) -> Vec<ModelChoice> {
                 .unwrap_or(&model)
                 .to_owned()
                 .into();
-            let default_effort = entry
-                .get("defaultReasoningEffort")
-                .and_then(Value::as_str)
-                .unwrap_or("default")
-                .to_owned();
             let efforts = entry
                 .get("supportedReasoningEfforts")
                 .and_then(Value::as_array)
@@ -3259,16 +3257,62 @@ fn model_choices_from_response(response: &Value) -> Vec<ModelChoice> {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned)
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            let default_effort = entry
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| efforts.first().cloned())
+                .unwrap_or_default();
             Some(ModelChoice {
                 id,
                 model,
                 display_name,
                 default_effort,
                 efforts,
+                is_default: entry
+                    .get("isDefault")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
+}
+
+fn effective_model_choice<'a>(
+    choices: &'a [ModelChoice],
+    selected_model: Option<&str>,
+) -> Option<&'a ModelChoice> {
+    match selected_model {
+        Some(selected) => choices
+            .iter()
+            .find(|choice| choice.model == selected || choice.id == selected),
+        None => choices
+            .iter()
+            .find(|choice| choice.is_default)
+            .or_else(|| choices.first()),
+    }
+}
+
+fn effective_reasoning_effort(
+    selected_effort: Option<&str>,
+    choice: Option<&ModelChoice>,
+) -> Option<String> {
+    selected_effort
+        .map(ToOwned::to_owned)
+        .or_else(|| choice.map(|choice| choice.default_effort.clone()))
+        .filter(|effort| !effort.is_empty())
+}
+
+fn reasoning_effort_label(effort: &str) -> SharedString {
+    match effort {
+        "low" => "Low".into(),
+        "medium" => "Medium".into(),
+        "high" => "High".into(),
+        "xhigh" => "X high".into(),
+        "ultra" => "Ultra".into(),
+        other => other.to_owned().into(),
+    }
 }
 
 fn permission_profile_choices_from_response(response: &Value) -> Vec<PermissionProfileChoice> {
@@ -3413,15 +3457,6 @@ impl HarnessApp {
                 this.queue_refresh_pending = false;
                 match result {
                     Ok(response) => {
-                        let local_keys =
-                            this.queued_turns
-                                .iter()
-                                .filter_map(|entry| {
-                                    entry.local_item_key.as_ref().map(|key| {
-                                        (entry.client_user_message_id.clone(), key.clone())
-                                    })
-                                })
-                                .collect::<HashMap<_, _>>();
                         let pending = this
                             .queued_turns
                             .iter()
@@ -3429,10 +3464,6 @@ impl HarnessApp {
                             .cloned()
                             .collect::<Vec<_>>();
                         let mut queued = queued_submissions_from_response(&response);
-                        for entry in &mut queued {
-                            entry.local_item_key =
-                                local_keys.get(&entry.client_user_message_id).cloned();
-                        }
                         for entry in pending {
                             if !queued.iter().any(|candidate| {
                                 candidate.client_user_message_id == entry.client_user_message_id
@@ -3518,26 +3549,25 @@ impl HarnessApp {
         let settings = self.model.telemetry.thread_settings.as_ref();
         let selected_model = settings.and_then(|settings| settings.model.as_deref());
         let selected_effort = settings.and_then(|settings| settings.effort.as_deref());
-        let selected_choice = selected_model.and_then(|selected| {
-            self.available_models
-                .iter()
-                .find(|choice| choice.model == selected || choice.id == selected)
-        });
+        let selected_choice = effective_model_choice(&self.available_models, selected_model);
+        let effective_effort = effective_reasoning_effort(selected_effort, selected_choice);
         let model_label = selected_choice
             .map(|choice| choice.display_name.clone())
             .or_else(|| selected_model.map(SharedString::from))
-            .unwrap_or_else(|| "Model".into());
-        let effort_label = selected_effort.unwrap_or("default");
-        let trigger_label: SharedString = format!("{model_label} · {effort_label}").into();
+            .unwrap_or_else(|| "Loading models…".into());
+        let trigger_label: SharedString = effective_effort
+            .as_deref()
+            .map(reasoning_effort_label)
+            .map(|effort| format!("{model_label} · {effort}").into())
+            .unwrap_or(model_label);
         let choices = self.available_models.clone();
-        let current_model = selected_model.map(ToOwned::to_owned);
-        let current_effort = selected_effort.map(ToOwned::to_owned);
+        let current_model = selected_choice
+            .map(|choice| choice.model.clone())
+            .or_else(|| selected_model.map(ToOwned::to_owned));
+        let current_effort = effective_effort;
         let effort_choices = selected_choice
             .map(|choice| choice.efforts.clone())
             .unwrap_or_default();
-        let default_effort = selected_choice
-            .map(|choice| choice.default_effort.clone())
-            .unwrap_or_else(|| "server default".into());
         let weak = cx.weak_entity();
         let trigger = Button::new("model-effort-selector-trigger", trigger_label)
             .size(ButtonSize::Compact)
@@ -3557,7 +3587,6 @@ impl HarnessApp {
                 let current_model = current_model.clone();
                 let current_effort = current_effort.clone();
                 let effort_choices = effort_choices.clone();
-                let default_effort = default_effort.clone();
                 let weak = weak.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     menu = menu.header("Model");
@@ -3567,9 +3596,12 @@ impl HarnessApp {
                     } else {
                         for choice in choices {
                             let model = choice.model.clone();
-                            let is_selected = current_model.as_deref().is_some_and(|selected| {
-                                selected == choice.model || selected == choice.id
-                            });
+                            let is_selected = current_model.as_deref() == Some(choice.model.as_str());
+                            let effort = current_effort
+                                .as_ref()
+                                .filter(|effort| choice.efforts.contains(effort))
+                                .cloned()
+                                .unwrap_or_else(|| choice.default_effort.clone());
                             let entry = ContextMenuEntry::new(choice.display_name)
                                 .toggleable(IconPosition::End, is_selected)
                                 .handler({
@@ -3577,7 +3609,7 @@ impl HarnessApp {
                                     move |_, cx| {
                                         weak.update(cx, |this, cx| {
                                             this.update_thread_settings(
-                                                json!({ "model": model }),
+                                                json!({ "model": model, "effort": effort }),
                                                 cx,
                                             )
                                         })
@@ -3588,23 +3620,15 @@ impl HarnessApp {
                         }
                     }
                     menu = menu.separator().header("Thinking effort");
-                    menu = menu.item(
-                        ContextMenuEntry::new(format!("Default ({default_effort})"))
-                            .toggleable(IconPosition::End, current_effort.is_none())
-                            .handler({
-                                let weak = weak.clone();
-                                move |_, cx| {
-                                    weak.update(cx, |this, cx| {
-                                        this.update_thread_settings(json!({ "effort": null }), cx)
-                                    })
-                                    .ok();
-                                }
-                            }),
-                    );
-                    for effort in effort_choices {
-                        let selected = current_effort.as_deref() == Some(effort.as_str());
+                    if effort_choices.is_empty() {
                         menu = menu.item(
-                            ContextMenuEntry::new(effort.clone())
+                            ContextMenuEntry::new("No thinking controls").disabled(true),
+                        );
+                    } else {
+                        for effort in effort_choices {
+                            let selected = current_effort.as_deref() == Some(effort.as_str());
+                            menu = menu.item(
+                                ContextMenuEntry::new(reasoning_effort_label(&effort))
                                 .toggleable(IconPosition::End, selected)
                                 .handler({
                                     let weak = weak.clone();
@@ -3618,7 +3642,8 @@ impl HarnessApp {
                                         .ok();
                                     }
                                 }),
-                        );
+                            );
+                        }
                     }
                     menu
                 }))
@@ -6324,6 +6349,7 @@ impl HarnessApp {
 
     fn take_composer_submission(
         &mut self,
+        show_optimistically_in_transcript: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<ComposerSubmission> {
@@ -6342,25 +6368,28 @@ impl HarnessApp {
         let input = composer_app_server_input(&text, &self.composer_images);
         let preview = composer_prompt_preview(&text);
         let client_user_message_id = Uuid::new_v4().to_string();
-        let (index, key) = self
-            .model
-            .push_local_user(&client_user_message_id, preview, &input);
-        self.dirty_image_surfaces.insert(key.clone());
-        self.list_state.splice(index..index, 1);
-        self.selected_item = index;
-        self.list_state.set_follow_mode(FollowMode::Tail);
-        let document = self.sync_transcript_document(cx);
-        if self.buffer_view {
-            let row = document
-                .as_ref()
-                .and_then(|document| document.item_rows.get(index))
-                .and_then(|row| *row)
-                .unwrap_or(0);
-            self.transcript_editor.update(cx, |editor, cx| {
-                editor.set_cursor_row(row, window, cx);
-                editor.reveal_tail(cx);
-            });
-        }
+        let key = show_optimistically_in_transcript.then(|| {
+            let (index, key) = self
+                .model
+                .push_local_user(&client_user_message_id, preview, &input);
+            self.dirty_image_surfaces.insert(key.clone());
+            self.list_state.splice(index..index, 1);
+            self.selected_item = index;
+            self.list_state.set_follow_mode(FollowMode::Tail);
+            let document = self.sync_transcript_document(cx);
+            if self.buffer_view {
+                let row = document
+                    .as_ref()
+                    .and_then(|document| document.item_rows.get(index))
+                    .and_then(|row| *row)
+                    .unwrap_or(0);
+                self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_cursor_row(row, window, cx);
+                    editor.reveal_tail(cx);
+                });
+            }
+            key
+        });
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.composer_images.clear();
@@ -6383,19 +6412,27 @@ impl HarnessApp {
             cx.notify();
             return;
         }
-        let Some(submission) = self.take_composer_submission(window, cx) else {
+        let turn_active = self.turn_active();
+        let Some(submission) = self.take_composer_submission(
+            show_submission_optimistically_in_transcript(turn_active),
+            window,
+            cx,
+        )
+        else {
             return;
         };
 
         if self.replay_count.is_some() {
-            self.model.set_status_for_key(&submission.key, "replay");
+            if let Some(key) = submission.key.as_deref() {
+                self.model.set_status_for_key(key, "replay");
+            }
             let index = self.model.items.len().saturating_sub(1);
             self.list_state.splice(index..index + 1, 1);
             cx.notify();
             return;
         }
 
-        if self.turn_active() {
+        if turn_active {
             self.queue_submission(submission, cx);
         } else {
             self.start_submission(submission, cx);
@@ -6403,15 +6440,20 @@ impl HarnessApp {
     }
 
     fn start_submission(&mut self, submission: ComposerSubmission, cx: &mut Context<Self>) {
+        let Some(key) = submission.key.clone() else {
+            self.error = Some("Could not prepare the prompt for sending".into());
+            cx.notify();
+            return;
+        };
         let Some(client) = self.client.clone() else {
             self.model
-                .set_status_for_key(&submission.key, "not connected");
+                .set_status_for_key(&key, "not connected");
             self.error = Some("Codex is not connected yet".into());
             if let Some(index) = self
                 .model
                 .items
                 .iter()
-                .position(|item| item.key == submission.key)
+                .position(|item| item.key == key)
             {
                 self.list_state.splice(index..index + 1, 1);
             }
@@ -6419,7 +6461,7 @@ impl HarnessApp {
             return;
         };
         let ComposerSubmission {
-            key,
+            key: _,
             client_user_message_id,
             input,
         } = submission;
@@ -6486,39 +6528,32 @@ impl HarnessApp {
         let (Some(client), Some(thread_id)) =
             (self.client.clone(), self.selected_thread_id.clone())
         else {
-            if let Some(index) = self.model.set_status_for_key(&submission.key, "failed") {
-                self.list_state.splice(index..index + 1, 1);
-            }
+            self.show_failed_queued_submission(&submission, cx);
             self.error = Some("The task is not ready to queue another prompt yet".into());
             cx.notify();
             return;
         };
         let ComposerSubmission {
-            key,
+            key: _,
             client_user_message_id,
             input,
         } = submission;
-        if let Some(index) = self.model.set_status_for_key(&key, "queueing") {
-            self.list_state.splice(index..index + 1, 1);
-        }
         self.queued_turns.push_back(QueuedTurnSubmission {
             id: None,
             client_user_message_id: client_user_message_id.clone(),
             input: input.clone(),
-            local_item_key: Some(key.clone()),
         });
         cx.spawn(async move |this, cx| {
             let result = client
-                .queue_turn(&thread_id, input, &client_user_message_id)
+                .queue_turn(&thread_id, input.clone(), &client_user_message_id)
                 .await;
             _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(response) => {
-                        if let Some(mut queued) = response
+                        if let Some(queued) = response
                             .get("queuedSubmission")
                             .and_then(queued_submission_from_value)
                         {
-                            queued.local_item_key = Some(key.clone());
                             if let Some(index) = this.queued_turns.iter().position(|entry| {
                                 entry.client_user_message_id == client_user_message_id
                             }) {
@@ -6529,9 +6564,6 @@ impl HarnessApp {
                         } else {
                             this.refresh_queued_turns(cx);
                         }
-                        if let Some(index) = this.model.set_status_for_key(&key, "queued") {
-                            this.list_state.splice(index..index + 1, 1);
-                        }
                         this.error = None;
                         if this.model.current_turn_id.is_none() && !this.turn_start_pending {
                             this.start_next_queued_turn(cx);
@@ -6540,9 +6572,14 @@ impl HarnessApp {
                     Err(error) => {
                         this.queued_turns
                             .retain(|entry| entry.client_user_message_id != client_user_message_id);
-                        if let Some(index) = this.model.set_status_for_key(&key, "failed") {
-                            this.list_state.splice(index..index + 1, 1);
-                        }
+                        this.show_failed_queued_submission(
+                            &ComposerSubmission {
+                                key: None,
+                                client_user_message_id: client_user_message_id.clone(),
+                                input: input.clone(),
+                            },
+                            cx,
+                        );
                         this.error = Some(format!("Could not queue prompt: {error}").into());
                     }
                 }
@@ -6552,6 +6589,26 @@ impl HarnessApp {
         })
         .detach();
         cx.notify();
+    }
+
+    fn show_failed_queued_submission(
+        &mut self,
+        submission: &ComposerSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        let input = submission.input.as_array().cloned().unwrap_or_default();
+        let preview = queued_submission_text(&submission.input);
+        let (index, key) = self.model.push_local_user(
+            &submission.client_user_message_id,
+            preview,
+            &input,
+        );
+        self.model.set_status_for_key(&key, "failed");
+        self.dirty_image_surfaces.insert(key);
+        self.list_state.splice(index..index, 1);
+        self.selected_item = index;
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        drop(self.sync_transcript_document(cx));
     }
 
     fn start_next_queued_turn(&mut self, cx: &mut Context<Self>) {
@@ -6576,12 +6633,9 @@ impl HarnessApp {
                 match result {
                     Ok(response) => {
                         if let Some(queued_entry) = queued_entry.as_ref() {
-                            if let Some(queued) = this.take_queued_entry_locally(
+                            this.remove_queued_entry_locally(
                                 &queued_entry.client_user_message_id,
-                                queued_entry,
-                            ) {
-                                this.reveal_queued_user_item(&queued, cx);
-                            }
+                            );
                         }
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
@@ -6608,37 +6662,13 @@ impl HarnessApp {
         cx.notify();
     }
 
-    fn take_queued_entry_locally(
-        &mut self,
-        client_user_message_id: &str,
-        fallback: &QueuedTurnSubmission,
-    ) -> Option<QueuedTurnSubmission> {
-        self.queued_turns
+    fn remove_queued_entry_locally(&mut self, client_user_message_id: &str) {
+        if let Some(index) = self
+            .queued_turns
             .iter()
             .position(|entry| entry.client_user_message_id == client_user_message_id)
-            .and_then(|index| self.queued_turns.remove(index))
-            .or_else(|| Some(fallback.clone()))
-    }
-
-    fn discard_queued_user_item(&mut self, entry: &QueuedTurnSubmission, cx: &mut Context<Self>) {
-        if let Some(key) = entry.local_item_key.as_deref()
-            && let Some(item_index) = self.model.remove_item_for_key(key)
         {
-            self.list_state.splice(item_index..item_index + 1, 0);
-            self.selected_item = self
-                .selected_item
-                .min(self.model.items.len().saturating_sub(1));
-            self.mark_all_image_surfaces_dirty();
-            drop(self.sync_transcript_document(cx));
-        }
-    }
-
-    fn reveal_queued_user_item(&mut self, entry: &QueuedTurnSubmission, cx: &mut Context<Self>) {
-        if let Some(key) = entry.local_item_key.as_deref()
-            && let Some(index) = self.model.set_status_for_key(key, "sent")
-        {
-            self.list_state.splice(index..index + 1, 1);
-            drop(self.sync_transcript_document(cx));
+            self.queued_turns.remove(index);
         }
     }
 
@@ -6672,11 +6702,7 @@ impl HarnessApp {
                 this.queue_operation_pending.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
-                        if let Some(entry) =
-                            this.take_queued_entry_locally(&client_user_message_id, &entry)
-                        {
-                            this.discard_queued_user_item(&entry, cx);
-                        }
+                        this.remove_queued_entry_locally(&client_user_message_id);
                         this.error = None;
                     }
                     Err(error) => {
@@ -6753,11 +6779,7 @@ impl HarnessApp {
                 this.queue_operation_pending.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
-                        if let Some(removed) =
-                            this.take_queued_entry_locally(&client_user_message_id, &entry)
-                        {
-                            this.discard_queued_user_item(&removed, cx);
-                        }
+                        this.remove_queued_entry_locally(&client_user_message_id);
                         this.place_queued_turn_in_composer(&entry, window, cx);
                         this.error = None;
                     }
@@ -6825,11 +6847,7 @@ impl HarnessApp {
                 this.queue_operation_pending.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
-                        if let Some(entry) =
-                            this.take_queued_entry_locally(&client_user_message_id, &entry)
-                        {
-                            this.reveal_queued_user_item(&entry, cx);
-                        }
+                        this.remove_queued_entry_locally(&client_user_message_id);
                         this.error = None;
                     }
                     Err(error) => {
@@ -6886,11 +6904,7 @@ impl HarnessApp {
                 this.queue_operation_pending.remove(&client_user_message_id);
                 match result {
                     Ok(response) => {
-                        if let Some(entry) =
-                            this.take_queued_entry_locally(&client_user_message_id, &entry)
-                        {
-                            this.reveal_queued_user_item(&entry, cx);
-                        }
+                        this.remove_queued_entry_locally(&client_user_message_id);
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
                             .and_then(Value::as_str)
@@ -6916,7 +6930,7 @@ impl HarnessApp {
             self.send(window, cx);
             return;
         };
-        let Some(submission) = self.take_composer_submission(window, cx) else {
+        let Some(submission) = self.take_composer_submission(true, window, cx) else {
             return;
         };
         let (Some(client), Some(thread_id)) =
@@ -6925,10 +6939,13 @@ impl HarnessApp {
             return;
         };
         let ComposerSubmission {
-            key,
+            key: Some(key),
             client_user_message_id,
             input,
-        } = submission;
+        } = submission
+        else {
+            return;
+        };
         if let Some(index) = self.model.set_status_for_key(&key, "steering") {
             self.list_state.splice(index..index + 1, 1);
         }
@@ -13559,6 +13576,7 @@ mod tests {
                     "model": "gpt-5.6-codex",
                     "displayName": "GPT-5.6 Codex",
                     "hidden": false,
+                    "isDefault": true,
                     "defaultReasoningEffort": "high",
                     "supportedReasoningEfforts": [
                         {"reasoningEffort": "high", "description": "Deep"},
@@ -13579,6 +13597,16 @@ mod tests {
         assert_eq!(models[0].model, "gpt-5.6-codex");
         assert_eq!(models[0].default_effort, "high");
         assert_eq!(models[0].efforts, ["high", "xhigh"]);
+        assert!(models[0].is_default);
+        assert_eq!(
+            effective_model_choice(&models, None).map(|choice| choice.model.as_str()),
+            Some("gpt-5.6-codex")
+        );
+        assert_eq!(
+            effective_reasoning_effort(None, effective_model_choice(&models, None)).as_deref(),
+            Some("high")
+        );
+        assert_eq!(reasoning_effort_label("xhigh").as_ref(), "X high");
 
         let profiles = permission_profile_choices_from_response(&json!({
             "data": [
@@ -13590,6 +13618,12 @@ mod tests {
         assert!(profiles[0].allowed);
         assert_eq!(profiles[0].description.as_deref(), Some("Workspace only"));
         assert!(!profiles[1].allowed);
+    }
+
+    #[test]
+    fn active_turn_submissions_belong_only_to_the_authoritative_queue() {
+        assert!(!show_submission_optimistically_in_transcript(true));
+        assert!(show_submission_optimistically_in_transcript(false));
     }
 
     #[test]
