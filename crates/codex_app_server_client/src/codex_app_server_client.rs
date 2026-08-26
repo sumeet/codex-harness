@@ -106,6 +106,31 @@ pub struct ThreadReadResponse {
     pub thread: CodexThread,
 }
 
+/// A started or resumed thread together with the settings that the app-server
+/// actually resolved. Clients should display these values instead of inferring
+/// them from local config, since managed settings and permission profiles may
+/// override the requested defaults.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadOpenResponse {
+    pub thread: CodexThread,
+    #[serde(default)]
+    pub cwd: String,
+    pub model: String,
+    #[serde(default)]
+    pub model_provider: String,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub approval_policy: Value,
+    #[serde(default)]
+    pub sandbox: Value,
+    #[serde(default)]
+    pub active_permission_profile: Option<Value>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Incoming {
     Response {
@@ -393,6 +418,10 @@ impl Client {
     /// Start a persistent Codex thread rooted in `cwd` and subscribe this
     /// connection to every event it emits.
     pub async fn start_thread(&self, cwd: &str) -> Result<CodexThread, Error> {
+        Ok(self.start_thread_with_settings(cwd).await?.thread)
+    }
+
+    pub async fn start_thread_with_settings(&self, cwd: &str) -> Result<ThreadOpenResponse, Error> {
         let response = self
             .request(
                 "thread/start",
@@ -404,13 +433,20 @@ impl Client {
                 }),
             )
             .await?;
-        decode_thread_response(response)
+        decode_thread_open_response(response)
     }
 
     /// Resume an existing thread and subscribe this connection to its live
     /// events. The response includes all turns so a client can render it
     /// without a lossy intermediary protocol.
     pub async fn resume_thread(&self, thread_id: &str) -> Result<CodexThread, Error> {
+        Ok(self.resume_thread_with_settings(thread_id).await?.thread)
+    }
+
+    pub async fn resume_thread_with_settings(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadOpenResponse, Error> {
         let response = self
             .request(
                 "thread/resume",
@@ -420,7 +456,7 @@ impl Client {
                 }),
             )
             .await?;
-        decode_thread_response(response)
+        decode_thread_open_response(response)
     }
 
     pub async fn start_turn(&self, thread_id: &str, input: Value) -> Result<Value, Error> {
@@ -582,8 +618,8 @@ fn thread_queue_add_params(thread_id: &str, input: Value, client_user_message_id
     })
 }
 
-fn decode_thread_response(response: Value) -> Result<CodexThread, Error> {
-    Ok(serde_json::from_value::<ThreadReadResponse>(response)?.thread)
+fn decode_thread_open_response(response: Value) -> Result<ThreadOpenResponse, Error> {
+    Ok(serde_json::from_value(response)?)
 }
 
 fn current_unix_seconds() -> i64 {
@@ -984,7 +1020,7 @@ mod tests {
 
     #[test]
     fn decodes_start_and_resume_thread_responses_with_extra_settings() {
-        let thread = decode_thread_response(json!({
+        let response = decode_thread_open_response(json!({
             "thread": {
                 "id": "thread_2",
                 "preview": "Direct app-server",
@@ -992,13 +1028,27 @@ mod tests {
                 "updatedAt": 42,
                 "turns": []
             },
+            "cwd": "/work/harness",
             "model": "gpt-5.6",
+            "modelProvider": "openai",
+            "reasoningEffort": "xhigh",
             "approvalPolicy": "on-request",
-            "sandbox": {"type": "workspace-write"}
+            "sandbox": {"type": "workspaceWrite"},
+            "activePermissionProfile": {"id": ":workspace"}
         }))
-        .expect("thread response should ignore unrelated settings");
+        .expect("thread response should retain effective settings");
 
-        assert_eq!(thread.id, "thread_2");
-        assert_eq!(thread.cwd, "/work/harness");
+        assert_eq!(response.thread.id, "thread_2");
+        assert_eq!(response.thread.cwd, "/work/harness");
+        assert_eq!(response.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(response.model_provider, "openai");
+        assert_eq!(
+            response
+                .active_permission_profile
+                .as_ref()
+                .and_then(|profile| profile.get("id"))
+                .and_then(Value::as_str),
+            Some(":workspace")
+        );
     }
 }

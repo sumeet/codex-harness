@@ -5,6 +5,10 @@ use std::{
     io::Write as _,
     ops::Range,
     path::{Path, PathBuf},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use base64::Engine as _;
@@ -103,6 +107,9 @@ const RAW_ARRAY_LIMIT: usize = 512;
 const SNAPSHOT_VERSION: u32 = 1;
 const SNAPSHOT_RAW_LIMIT: usize = 512 * 1_024;
 const SNAPSHOT_CONTENT_LIMIT: usize = 2 * 1_024 * 1_024;
+static SNAPSHOT_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LATEST_SNAPSHOT_WRITES: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum TranscriptKind {
@@ -192,6 +199,54 @@ struct PersistedTranscript {
     version: u32,
     thread_id: String,
     items: Vec<TranscriptItem>,
+}
+
+/// A fully serialized transcript cache entry whose filesystem commit can be
+/// moved off the UI thread. Serialization remains synchronous so the bytes are
+/// an exact snapshot of the model at the call site.
+pub struct PreparedTranscriptSnapshot {
+    path: PathBuf,
+    serialized: Vec<u8>,
+    sequence: u64,
+}
+
+impl PreparedTranscriptSnapshot {
+    pub fn write(self) -> anyhow::Result<()> {
+        let Some(directory) = self.path.parent() else {
+            anyhow::bail!("transcript snapshot path has no parent");
+        };
+        fs::create_dir_all(directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+
+        let temporary_path =
+            self.path
+                .with_extension(format!("{}.{}.tmp", std::process::id(), self.sequence));
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary_path)?;
+        file.write_all(&self.serialized)?;
+        file.sync_all()?;
+        let mut latest_writes = LATEST_SNAPSHOT_WRITES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if latest_writes.get(&self.path).copied() != Some(self.sequence) {
+            drop(file);
+            let _ = fs::remove_file(temporary_path);
+            return Ok(());
+        }
+        fs::rename(&temporary_path, &self.path)?;
+        latest_writes.remove(&self.path);
+        Ok(())
+    }
 }
 
 impl TranscriptItem {
@@ -1104,6 +1159,30 @@ impl ThreadSettingsSnapshot {
             service_tier: string_at(settings, "/serviceTier").map(ToOwned::to_owned),
         }
     }
+
+    pub fn from_open_response(
+        model: String,
+        model_provider: String,
+        effort: Option<String>,
+        approval_policy: Value,
+        sandbox_policy: Value,
+        active_permission_profile: Option<Value>,
+        service_tier: Option<String>,
+        cwd: String,
+    ) -> Self {
+        Self {
+            model: Some(model),
+            model_provider: (!model_provider.is_empty()).then_some(model_provider),
+            effort,
+            approval_policy: serde_json::from_value(approval_policy).ok(),
+            sandbox_policy: serde_json::from_value(sandbox_policy).ok(),
+            active_permission_profile: active_permission_profile
+                .and_then(|value| serde_json::from_value(value).ok()),
+            cwd: (!cwd.is_empty()).then_some(cwd),
+            service_tier,
+            ..Self::default()
+        }
+    }
 }
 
 fn setting_value<T>(settings: &Value, field: &str) -> Option<T>
@@ -1130,6 +1209,10 @@ pub struct SessionTelemetry {
 }
 
 impl SessionTelemetry {
+    pub fn set_thread_settings(&mut self, settings: ThreadSettingsSnapshot) {
+        self.thread_settings = Some(settings);
+    }
+
     pub fn summary(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(status) = &self.thread_status {
@@ -1452,36 +1535,30 @@ impl TranscriptModel {
     }
 
     pub fn persist_transcript(&self, thread_id: &str) -> anyhow::Result<()> {
-        let path = transcript_snapshot_path(thread_id)?;
-        let Some(directory) = path.parent() else {
-            anyhow::bail!("transcript snapshot path has no parent");
-        };
-        fs::create_dir_all(directory)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-        }
+        self.prepare_transcript_snapshot(thread_id)?.write()
+    }
 
+    pub fn prepare_transcript_snapshot(
+        &self,
+        thread_id: &str,
+    ) -> anyhow::Result<PreparedTranscriptSnapshot> {
+        let path = transcript_snapshot_path(thread_id)?;
+        let sequence = SNAPSHOT_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        LATEST_SNAPSHOT_WRITES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path.clone(), sequence);
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: thread_id.to_string(),
             items: self.items.iter().map(item_for_snapshot).collect(),
         };
         let serialized = serde_json::to_vec(&snapshot)?;
-        let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary_path)?;
-        file.write_all(&serialized)?;
-        file.sync_all()?;
-        fs::rename(&temporary_path, path)?;
-        Ok(())
+        Ok(PreparedTranscriptSnapshot {
+            path,
+            serialized,
+            sequence,
+        })
     }
 
     pub fn merge_persisted_transcript(&mut self, thread_id: &str) -> anyhow::Result<usize> {

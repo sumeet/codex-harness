@@ -10,7 +10,7 @@ use std::{
 
 use assets::Assets;
 use base64::Engine as _;
-use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent};
+use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent, ThreadOpenResponse};
 use gpui::{
     AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity, FocusHandle,
     Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding, KeyContext,
@@ -34,11 +34,11 @@ use serde_json::{Value, json};
 use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
-    AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, Clickable, Color,
-    ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, Icon, IconButton,
-    IconButtonShape, IconName, IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing,
-    ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable,
-    WithScrollbar, right_click_menu,
+    AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
+    Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
+    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
+    LabelSize, ListItem, ListItemSpacing, PopoverMenu, ScrollAxes, Scrollbars, SelectableButton,
+    SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -146,7 +146,10 @@ const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
 const PERFORMANCE_SCROLL_SETTLE_DURATION: Duration = Duration::from_millis(1_600);
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
-const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 2;
+// Keep the most recently visited tasks warm. Two entries made ordinary
+// back-and-forth navigation fall through to a full app-server history request
+// far too often, while eight still keeps the cache deliberately bounded.
+const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 8;
 
 fn rich_card_identity_row() -> gpui::Div {
     div()
@@ -2711,10 +2714,17 @@ fn composer_edit_requires_root_invalidation(
 fn composer_send_blocked(
     composer_empty: bool,
     loading_thread: bool,
+    attaching_thread: bool,
+    settings_update_pending: bool,
     read_only: bool,
     transport_available: bool,
 ) -> bool {
-    composer_empty || loading_thread || read_only || !transport_available
+    composer_empty
+        || loading_thread
+        || attaching_thread
+        || settings_update_pending
+        || read_only
+        || !transport_available
 }
 
 fn request_should_take_focus(
@@ -3017,11 +3027,15 @@ struct HarnessApp {
     replay_count: Option<usize>,
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
+    available_models: Vec<ModelChoice>,
+    permission_profiles: Vec<PermissionProfileChoice>,
+    settings_update_pending: bool,
     thread_snapshots: ThreadSnapshotCache,
     selected_thread_id: Option<String>,
     loaded_thread_updated_at: Option<i64>,
     connecting: bool,
     loading_thread: bool,
+    attaching_thread: bool,
     thread_read_only_reason: Option<SharedString>,
     error: Option<SharedString>,
     model: TranscriptModel,
@@ -3099,6 +3113,127 @@ struct ThreadSnapshotCache {
     entries: VecDeque<CodexThread>,
 }
 
+#[derive(Clone, Debug)]
+struct ModelChoice {
+    id: String,
+    model: String,
+    display_name: SharedString,
+    default_effort: String,
+    efforts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PermissionProfileChoice {
+    id: String,
+    description: Option<SharedString>,
+    allowed: bool,
+}
+
+fn model_choices_from_response(response: &Value) -> Vec<ModelChoice> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            !entry
+                .get("hidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|entry| {
+            let model = entry.get("model")?.as_str()?.to_owned();
+            let id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or(&model)
+                .to_owned();
+            let display_name = entry
+                .get("displayName")
+                .and_then(Value::as_str)
+                .unwrap_or(&model)
+                .to_owned()
+                .into();
+            let default_effort = entry
+                .get("defaultReasoningEffort")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_owned();
+            let efforts = entry
+                .get("supportedReasoningEfforts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|effort| {
+                    effort
+                        .get("reasoningEffort")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect();
+            Some(ModelChoice {
+                id,
+                model,
+                display_name,
+                default_effort,
+                efforts,
+            })
+        })
+        .collect()
+}
+
+fn permission_profile_choices_from_response(response: &Value) -> Vec<PermissionProfileChoice> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            Some(PermissionProfileChoice {
+                id: entry.get("id")?.as_str()?.to_owned(),
+                description: entry
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(|description| description.to_owned().into()),
+                allowed: entry
+                    .get("allowed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn permission_profile_label(id: &str) -> SharedString {
+    match id.trim_start_matches(':') {
+        "danger-full-access" | "full-access" => "Full access".into(),
+        "workspace" | "workspace-write" => "Workspace".into(),
+        "read-only" => "Read only".into(),
+        other => other.replace(['-', '_'], " ").into(),
+    }
+}
+
+fn context_window_usage(token_usage: Option<&Value>) -> Option<(i64, i64)> {
+    let token_usage = token_usage?.get("tokenUsage").unwrap_or(token_usage?);
+    let used = token_usage
+        .pointer("/last/totalTokens")
+        .and_then(Value::as_i64)?;
+    let capacity = token_usage
+        .get("modelContextWindow")
+        .and_then(Value::as_i64)?;
+    (capacity > 0).then_some((used.max(0), capacity))
+}
+
+fn compact_token_count(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.)
+    } else {
+        tokens.to_string()
+    }
+}
+
 impl ThreadSnapshotCache {
     fn take(&mut self, thread_id: &str) -> Option<CodexThread> {
         let index = self
@@ -3122,6 +3257,331 @@ impl ThreadSnapshotCache {
 }
 
 impl HarnessApp {
+    fn apply_thread_open_settings(&mut self, response: &ThreadOpenResponse) {
+        self.model.telemetry.set_thread_settings(
+            model::ThreadSettingsSnapshot::from_open_response(
+                response.model.clone(),
+                response.model_provider.clone(),
+                response.reasoning_effort.clone(),
+                response.approval_policy.clone(),
+                response.sandbox.clone(),
+                response.active_permission_profile.clone(),
+                response.service_tier.clone(),
+                response.cwd.clone(),
+            ),
+        );
+    }
+
+    fn load_server_options(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let cwd = self.cwd.clone();
+        let requested_cwd = cwd.clone();
+        cx.spawn(async move |this, cx| {
+            let models = client.request("model/list", json!({ "limit": 100 })).await;
+            let permissions = client
+                .request(
+                    "permissionProfile/list",
+                    json!({ "cwd": cwd, "limit": 100 }),
+                )
+                .await;
+            _ = this.update(cx, |this, cx| {
+                match models {
+                    Ok(response) => this.available_models = model_choices_from_response(&response),
+                    Err(error) => log::warn!("could not load Codex model catalog: {error}"),
+                }
+                match permissions {
+                    Ok(response) if this.cwd == requested_cwd => {
+                        this.permission_profiles =
+                            permission_profile_choices_from_response(&response)
+                    }
+                    Ok(_) => {}
+                    Err(error) => log::warn!("could not load Codex permission profiles: {error}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn update_thread_settings(&mut self, fields: Value, cx: &mut Context<Self>) {
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        let requested_thread_id = thread_id.clone();
+        let mut params = fields.as_object().cloned().unwrap_or_default();
+        params.insert("threadId".into(), thread_id.into());
+        self.settings_update_pending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .request("thread/settings/update", Value::Object(params))
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if this.selected_thread_id.as_deref() != Some(requested_thread_id.as_str()) {
+                    return;
+                }
+                this.settings_update_pending = false;
+                if let Err(error) = result {
+                    this.error = Some(format!("Could not update task settings: {error}").into());
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn persist_transcript_in_background(&self, thread_id: &str, cx: &mut Context<Self>) {
+        let thread_id = thread_id.to_owned();
+        cx.spawn(async move |this, cx| {
+            // Let the newly loaded transcript reach the compositor before
+            // serializing its cache. The write and fsync already run in the
+            // background; this small deferral also keeps JSON preparation out
+            // of the first visible history frame.
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                let snapshot = match this.model.prepare_transcript_snapshot(&thread_id) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::warn!("could not prepare transcript cache for {thread_id}: {error}");
+                        return;
+                    }
+                };
+                let snapshot_thread_id = thread_id.clone();
+                cx.background_spawn(async move {
+                    if let Err(error) = snapshot.write() {
+                        log::warn!("could not cache task {snapshot_thread_id}: {error}");
+                    }
+                })
+                .detach();
+            });
+        })
+        .detach();
+    }
+
+    fn render_model_effort_selector(&self, cx: &Context<Self>) -> AnyElement {
+        let settings = self.model.telemetry.thread_settings.as_ref();
+        let selected_model = settings.and_then(|settings| settings.model.as_deref());
+        let selected_effort = settings.and_then(|settings| settings.effort.as_deref());
+        let selected_choice = selected_model.and_then(|selected| {
+            self.available_models
+                .iter()
+                .find(|choice| choice.model == selected || choice.id == selected)
+        });
+        let model_label = selected_choice
+            .map(|choice| choice.display_name.clone())
+            .or_else(|| selected_model.map(SharedString::from))
+            .unwrap_or_else(|| "Model".into());
+        let effort_label = selected_effort.unwrap_or("default");
+        let trigger_label: SharedString = format!("{model_label} · {effort_label}").into();
+        let choices = self.available_models.clone();
+        let current_model = selected_model.map(ToOwned::to_owned);
+        let current_effort = selected_effort.map(ToOwned::to_owned);
+        let effort_choices = selected_choice
+            .map(|choice| choice.efforts.clone())
+            .unwrap_or_default();
+        let default_effort = selected_choice
+            .map(|choice| choice.default_effort.clone())
+            .unwrap_or_else(|| "server default".into());
+        let weak = cx.weak_entity();
+        let trigger = Button::new("model-effort-selector-trigger", trigger_label)
+            .size(ButtonSize::Compact)
+            .style(ButtonStyle::Subtle)
+            .start_icon(
+                Icon::new(IconName::ThinkingMode)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .disabled(self.selected_thread_id.is_none() || self.settings_update_pending)
+            .aria_label("Change model and thinking effort");
+
+        PopoverMenu::new("model-effort-selector")
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let choices = choices.clone();
+                let current_model = current_model.clone();
+                let current_effort = current_effort.clone();
+                let effort_choices = effort_choices.clone();
+                let default_effort = default_effort.clone();
+                let weak = weak.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Model");
+                    if choices.is_empty() {
+                        menu = menu
+                            .item(ContextMenuEntry::new("Loading model catalog…").disabled(true));
+                    } else {
+                        for choice in choices {
+                            let model = choice.model.clone();
+                            let is_selected = current_model.as_deref().is_some_and(|selected| {
+                                selected == choice.model || selected == choice.id
+                            });
+                            let entry = ContextMenuEntry::new(choice.display_name)
+                                .toggleable(IconPosition::End, is_selected)
+                                .handler({
+                                    let weak = weak.clone();
+                                    move |_, cx| {
+                                        weak.update(cx, |this, cx| {
+                                            this.update_thread_settings(
+                                                json!({ "model": model }),
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                    }
+                                });
+                            menu = menu.item(entry);
+                        }
+                    }
+                    menu = menu.separator().header("Thinking effort");
+                    menu = menu.item(
+                        ContextMenuEntry::new(format!("Default ({default_effort})"))
+                            .toggleable(IconPosition::End, current_effort.is_none())
+                            .handler({
+                                let weak = weak.clone();
+                                move |_, cx| {
+                                    weak.update(cx, |this, cx| {
+                                        this.update_thread_settings(json!({ "effort": null }), cx)
+                                    })
+                                    .ok();
+                                }
+                            }),
+                    );
+                    for effort in effort_choices {
+                        let selected = current_effort.as_deref() == Some(effort.as_str());
+                        menu = menu.item(
+                            ContextMenuEntry::new(effort.clone())
+                                .toggleable(IconPosition::End, selected)
+                                .handler({
+                                    let weak = weak.clone();
+                                    move |_, cx| {
+                                        weak.update(cx, |this, cx| {
+                                            this.update_thread_settings(
+                                                json!({ "effort": effort }),
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                    }
+                                }),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn render_permission_selector(&self, cx: &Context<Self>) -> AnyElement {
+        let active_profile = self
+            .model
+            .telemetry
+            .thread_settings
+            .as_ref()
+            .and_then(|settings| settings.active_permission_profile.as_ref())
+            .and_then(|profile| profile.id.as_deref());
+        let label = active_profile
+            .map(permission_profile_label)
+            .unwrap_or_else(|| "Permissions".into());
+        let current_profile = active_profile.map(ToOwned::to_owned);
+        let profiles = self.permission_profiles.clone();
+        let weak = cx.weak_entity();
+        let trigger = Button::new("permission-selector-trigger", label)
+            .size(ButtonSize::Compact)
+            .style(ButtonStyle::Subtle)
+            .start_icon(
+                Icon::new(IconName::Lock)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .disabled(self.selected_thread_id.is_none() || self.settings_update_pending)
+            .aria_label("Change task permissions");
+
+        PopoverMenu::new("permission-selector")
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let profiles = profiles.clone();
+                let current_profile = current_profile.clone();
+                let weak = weak.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Permissions");
+                    if profiles.is_empty() {
+                        return menu.item(
+                            ContextMenuEntry::new("Loading permission profiles…").disabled(true),
+                        );
+                    }
+                    for profile in profiles {
+                        let id = profile.id.clone();
+                        let mut entry =
+                            ContextMenuEntry::new(permission_profile_label(&profile.id))
+                                .toggleable(
+                                    IconPosition::End,
+                                    current_profile.as_deref() == Some(id.as_str()),
+                                )
+                                .disabled(!profile.allowed);
+                        if let Some(description) = profile.description {
+                            entry = entry
+                                .documentation_aside(DocumentationSide::Right, move |_| {
+                                    Label::new(description.clone()).into_any_element()
+                                });
+                        }
+                        menu = menu.item(entry.handler({
+                            let weak = weak.clone();
+                            move |_, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.update_thread_settings(json!({ "permissions": id }), cx)
+                                })
+                                .ok();
+                            }
+                        }));
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
+    fn render_context_usage(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (used, capacity) = context_window_usage(self.model.telemetry.token_usage.as_ref())?;
+        let ratio = used as f32 / capacity as f32;
+        let progress_color = if ratio >= 0.85 {
+            cx.theme().status().warning
+        } else {
+            cx.theme().colors().text_muted
+        };
+        let tooltip: SharedString = format!(
+            "Context: {} / {} tokens ({:.0}%)",
+            compact_token_count(used),
+            compact_token_count(capacity),
+            ratio * 100.
+        )
+        .into();
+        Some(
+            div()
+                .id("context-window-usage")
+                .size(px(18.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    CircularProgress::new(used as f32, capacity as f32, px(16.), cx)
+                        .stroke_width(px(2.))
+                        .progress_color(progress_color),
+                )
+                .hoverable_tooltip(Tooltip::text(tooltip))
+                .into_any_element(),
+        )
+    }
+
     fn rich_diff_section_bindings(
         &mut self,
         item_key: &str,
@@ -3674,11 +4134,15 @@ impl HarnessApp {
             replay_count,
             client: None,
             threads: Vec::new(),
+            available_models: Vec::new(),
+            permission_profiles: Vec::new(),
+            settings_update_pending: false,
             thread_snapshots: ThreadSnapshotCache::default(),
             selected_thread_id: initial_thread_id,
             loaded_thread_updated_at: None,
             connecting: false,
             loading_thread: false,
+            attaching_thread: false,
             thread_read_only_reason: None,
             error: None,
             selected_item: model.items.len().saturating_sub(1),
@@ -4017,6 +4481,7 @@ impl HarnessApp {
                             this.connecting = false;
                             this.reconnect_attempts = 0;
                             this.error = None;
+                            this.load_server_options(cx);
                             if let Some(query) = initial_thread_query.as_deref() {
                                 let query = query.to_lowercase();
                                 if let Some(index) = this.threads.iter().position(|thread| {
@@ -4136,6 +4601,7 @@ impl HarnessApp {
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
+        self.settings_update_pending = false;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
         self.thread_read_only_reason = None;
@@ -4192,10 +4658,8 @@ impl HarnessApp {
         self.track_live_request_updates(&live_request_ids, old_len, new_len, &dirty_items);
         self.track_image_surface_updates(old_len, new_len, &dirty_items);
         if outcome.refresh_threads {
-            if let Some(thread_id) = self.selected_thread_id.as_deref()
-                && let Err(error) = self.model.persist_transcript(thread_id)
-            {
-                log::warn!("could not persist transcript history: {error}");
+            if let Some(thread_id) = self.selected_thread_id.clone() {
+                self.persist_transcript_in_background(&thread_id, cx);
             }
             self.refresh_threads(cx);
         }
@@ -5094,7 +5558,6 @@ impl HarnessApp {
             return;
         }
         let cached_thread = self.thread_snapshots.take(&thread_id);
-        let had_cached_thread = cached_thread.is_some();
         let load_started_at = thread_load_diagnostics_enabled().then(Instant::now);
         let Some(client) = self.client.clone() else {
             return;
@@ -5109,6 +5572,8 @@ impl HarnessApp {
         self.selected_thread_id = Some(thread_id.clone());
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
+        self.attaching_thread = true;
+        self.settings_update_pending = false;
         self.thread_read_only_reason = None;
         self.error = None;
         let old_len = self.model.items.len();
@@ -5126,9 +5591,12 @@ impl HarnessApp {
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
         drop(self.sync_transcript_document(cx));
+        let mut had_local_content = false;
         if let Some(cached_thread) = cached_thread {
             self.load_thread(&cached_thread, cx);
             self.thread_snapshots.insert(cached_thread);
+            self.loading_thread = false;
+            had_local_content = true;
             if thread_load_diagnostics_enabled() {
                 eprintln!("thread-load cache-hit thread={thread_id}");
             }
@@ -5141,6 +5609,8 @@ impl HarnessApp {
                     self.selected_item = restored.saturating_sub(1);
                     self.list_state.set_follow_mode(FollowMode::Tail);
                     drop(self.sync_transcript_document(cx));
+                    self.loading_thread = false;
+                    had_local_content = true;
                     if thread_load_diagnostics_enabled() {
                         eprintln!(
                             "thread-load disk-cache-hit thread={thread_id} items={restored} total_ms={:.1}",
@@ -5157,116 +5627,124 @@ impl HarnessApp {
         cx.notify();
 
         self.request_task = cx.spawn(async move |this, cx| {
-            let read_started_at = Instant::now();
-            let read = client.read_thread(&thread_id).await;
-            if thread_load_diagnostics_enabled() {
-                eprintln!(
-                    "thread-load read thread={thread_id} elapsed_ms={:.1} success={}",
-                    read_started_at.elapsed().as_secs_f64() * 1_000.,
-                    read.is_ok(),
+            // `thread/resume` already returns every turn as well as attaching
+            // this connection to future events. Reading first duplicated the
+            // complete history transfer on every successful open.
+            let resume_started_at = Instant::now();
+            let resume = client.resume_thread_with_settings(&thread_id).await;
+            let resume_elapsed = resume_started_at.elapsed();
+            if resume_elapsed >= Duration::from_millis(250) {
+                log::info!(
+                    "slow task history response thread={thread_id} elapsed_ms={:.1} local_history_visible={had_local_content}",
+                    resume_elapsed.as_secs_f64() * 1_000.,
                 );
             }
-            let read_thread = match read {
-                Ok(thread) => thread,
-                Err(error) => {
-                    if this
-                        .update(cx, |this, cx| {
-                            if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
-                                return;
-                            }
-                            this.loading_thread = false;
-                            this.thread_read_only_reason = Some(
-                                "This task could not be loaded. Choose another task or start a new one."
+            if thread_load_diagnostics_enabled() {
+                eprintln!(
+                    "thread-load resume thread={thread_id} elapsed_ms={:.1} success={}",
+                    resume_elapsed.as_secs_f64() * 1_000.,
+                    resume.is_ok(),
+                );
+            }
+            let resumed = match resume {
+                Ok(response) => response,
+                Err(resume_error) => {
+                    log::warn!(
+                        "could not resume task {thread_id}; trying read-only: {resume_error}"
+                    );
+                    let read_started_at = Instant::now();
+                    let read = client.read_thread(&thread_id).await;
+                    if thread_load_diagnostics_enabled() {
+                        eprintln!(
+                            "thread-load read-fallback thread={thread_id} elapsed_ms={:.1} success={}",
+                            read_started_at.elapsed().as_secs_f64() * 1_000.,
+                            read.is_ok(),
+                        );
+                    }
+                    match read {
+                        Ok(thread) => {
+                            let active = thread_has_active_turn(&thread);
+                            this.update(cx, |this, cx| {
+                                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                                    return;
+                                }
+                                if had_local_content {
+                                    this.apply_loaded_thread_refresh(&thread, cx);
+                                } else {
+                                    this.load_thread(&thread, cx);
+                                }
+                                this.thread_snapshots.insert(thread);
+                                this.loading_thread = false;
+                                this.attaching_thread = false;
+                                this.thread_read_only_reason = Some(
+                                    "Could not attach live. History is available read-only."
+                                        .into(),
+                                );
+                                this.schedule_read_only_refresh(active, cx);
+                                this.error = None;
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                        Err(read_error) => {
+                            this.update(cx, |this, cx| {
+                                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                                    return;
+                                }
+                                this.loading_thread = false;
+                                this.attaching_thread = false;
+                                this.thread_read_only_reason = Some(if had_local_content {
+                                    "Could not refresh or attach live. Cached history is read-only."
+                                        .into()
+                                } else {
+                                    "This task could not be loaded. Choose another task or start a new one."
+                                        .into()
+                                });
+                                this.error = Some(
+                                    format!(
+                                        "Could not open task: {read_error} (resume failed: {resume_error})"
+                                    )
                                     .into(),
-                            );
-                            this.error = Some(format!("Could not open task: {error}").into());
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        return;
+                                );
+                                cx.notify();
+                            })
+                            .ok();
+                        }
                     }
                     return;
                 }
             };
-            let active = thread_has_active_turn(&read_thread);
-            let content_ready = this
-                .update(cx, |this, cx| {
-                    if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
-                        return false;
-                    }
-                    if had_cached_thread {
-                        this.apply_loaded_thread_refresh(&read_thread, cx);
-                    } else {
-                        this.load_thread(&read_thread, cx);
-                    }
-                    this.thread_snapshots.insert(read_thread);
-                    this.error = None;
-                    if thread_load_diagnostics_enabled() {
-                        eprintln!(
-                            "thread-load content-ready thread={thread_id} total_ms={:.1}",
-                            load_started_at
-                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
-                                .unwrap_or_default(),
-                        );
-                    }
-                    true
-                })
-                .unwrap_or(false);
-            if !content_ready {
-                return;
-            }
 
-            let resume_started_at = Instant::now();
-            let resume = client.resume_thread(&thread_id).await;
-            if thread_load_diagnostics_enabled() {
-                eprintln!(
-                    "thread-load resume thread={thread_id} elapsed_ms={:.1} success={}",
-                    resume_started_at.elapsed().as_secs_f64() * 1_000.,
-                    resume.is_ok(),
-                );
-            }
-            if this
-                .update(cx, |this, cx| {
-                    let update_started_at = Instant::now();
-                    if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
-                        return;
-                    }
-                    this.loading_thread = false;
-                    match resume {
-                        Ok(thread) => {
-                            this.apply_loaded_thread_refresh(&thread, cx);
-                            this.thread_snapshots.insert(thread);
-                            this.thread_read_only_reason = None;
-                            this.error = None;
-                        }
-                        Err(error) => {
-                            log::warn!(
-                                "could not resume task {thread_id}; opening read-only: {error}"
-                            );
-                            this.thread_read_only_reason = Some(
-                                "Another Codex client owns this task. History is available read-only."
-                                    .into(),
-                            );
-                            this.schedule_read_only_refresh(active, cx);
-                            this.error = None;
-                        }
-                    }
-                    cx.notify();
-                    if thread_load_diagnostics_enabled() {
-                        eprintln!(
-                            "thread-load foreground thread={thread_id} elapsed_ms={:.1} total_ms={:.1}",
-                            update_started_at.elapsed().as_secs_f64() * 1_000.,
-                            load_started_at
-                                .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
-                                .unwrap_or_default(),
-                        );
-                    }
-                })
-                .is_err()
-            {
-                return;
-            }
+            let resumed_thread = resumed.thread.clone();
+            this.update(cx, |this, cx| {
+                let update_started_at = Instant::now();
+                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                    return;
+                }
+                if had_local_content {
+                    this.apply_loaded_thread_refresh(&resumed_thread, cx);
+                } else {
+                    this.load_thread(&resumed_thread, cx);
+                }
+                this.apply_thread_open_settings(&resumed);
+                this.load_server_options(cx);
+                this.thread_snapshots.insert(resumed_thread);
+                this.loading_thread = false;
+                this.attaching_thread = false;
+                this.thread_read_only_reason = None;
+                this.error = None;
+                cx.notify();
+                if thread_load_diagnostics_enabled() {
+                    eprintln!(
+                        "thread-load foreground thread={thread_id} elapsed_ms={:.1} total_ms={:.1}",
+                        update_started_at.elapsed().as_secs_f64() * 1_000.,
+                        load_started_at
+                            .map(|started_at| started_at.elapsed().as_secs_f64() * 1_000.)
+                            .unwrap_or_default(),
+                    );
+                }
+            })
+            .ok();
         });
     }
 
@@ -5332,20 +5810,31 @@ impl HarnessApp {
         }
         cx.notify();
         let cache_started_at = Instant::now();
-        if let Err(error) = self.model.persist_transcript(&thread.id) {
-            log::warn!("could not cache task {}: {error}", thread.id);
-        }
+        self.persist_transcript_in_background(&thread.id, cx);
         let cache_elapsed = cache_started_at.elapsed();
-        if thread_load_diagnostics_enabled() {
-            eprintln!(
-                "thread-load model thread={} items={} model_ms={:.1} merge_ms={:.1} document_ms={:.1} cache_write_ms={:.1} total_ms={:.1}",
+        let total_elapsed = load_started_at.elapsed();
+        if total_elapsed >= Duration::from_millis(100) {
+            log::info!(
+                "slow task history projection thread={} items={} model_ms={:.1} merge_ms={:.1} document_ms={:.1} cache_prepare_ms={:.1} total_ms={:.1}",
                 thread.id,
                 self.model.items.len(),
                 model_elapsed.as_secs_f64() * 1_000.,
                 persisted_elapsed.as_secs_f64() * 1_000.,
                 document_elapsed.as_secs_f64() * 1_000.,
                 cache_elapsed.as_secs_f64() * 1_000.,
-                load_started_at.elapsed().as_secs_f64() * 1_000.,
+                total_elapsed.as_secs_f64() * 1_000.,
+            );
+        }
+        if thread_load_diagnostics_enabled() {
+            eprintln!(
+                "thread-load model thread={} items={} model_ms={:.1} merge_ms={:.1} document_ms={:.1} cache_prepare_ms={:.1} total_ms={:.1}",
+                thread.id,
+                self.model.items.len(),
+                model_elapsed.as_secs_f64() * 1_000.,
+                persisted_elapsed.as_secs_f64() * 1_000.,
+                document_elapsed.as_secs_f64() * 1_000.,
+                cache_elapsed.as_secs_f64() * 1_000.,
+                total_elapsed.as_secs_f64() * 1_000.,
             );
         }
     }
@@ -5371,6 +5860,9 @@ impl HarnessApp {
         self.list_state.splice(0..old_len, 0);
         self.selected_thread_id = None;
         self.loaded_thread_updated_at = None;
+        self.loading_thread = false;
+        self.attaching_thread = false;
+        self.settings_update_pending = false;
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
         self.thread_read_only_reason = None;
@@ -5451,6 +5943,8 @@ impl HarnessApp {
         if composer_send_blocked(
             composer_is_empty(&text, self.composer_images.len()),
             self.loading_thread,
+            self.attaching_thread,
+            self.settings_update_pending,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         ) {
@@ -5545,9 +6039,12 @@ impl HarnessApp {
         self.turn_start_pending = true;
         self.turn_task = cx.spawn(async move |this, cx| {
             let result = async {
-                let thread_id = match existing_thread_id {
-                    Some(thread_id) => thread_id,
-                    None => client.start_thread(&cwd).await?.id,
+                let (thread_id, opened_thread) = match existing_thread_id {
+                    Some(thread_id) => (thread_id, None),
+                    None => {
+                        let opened = client.start_thread_with_settings(&cwd).await?;
+                        (opened.thread.id.clone(), Some(opened))
+                    }
                 };
                 let response = client
                     .start_turn_with_client_user_message_id(
@@ -5556,15 +6053,19 @@ impl HarnessApp {
                         Some(&client_user_message_id),
                     )
                     .await?;
-                anyhow::Ok((thread_id, response))
+                anyhow::Ok((thread_id, opened_thread, response))
             }
             .await;
             if this
                 .update(cx, |this, cx| {
                     this.turn_start_pending = false;
                     match result {
-                        Ok((thread_id, response)) => {
+                        Ok((thread_id, opened_thread, response)) => {
                             this.selected_thread_id = Some(thread_id);
+                            if let Some(opened_thread) = opened_thread.as_ref() {
+                                this.apply_thread_open_settings(opened_thread);
+                                this.load_server_options(cx);
+                            }
                             this.model.current_turn_id = response
                                 .pointer("/turn/id")
                                 .and_then(Value::as_str)
@@ -7779,16 +8280,10 @@ impl HarnessApp {
                 path_range.clone(),
                 Some(owner.clone()),
             );
+            let disclosure_owner = owner.clone();
             let header = rich_card_identity_row()
-                .when(section_index == 0, |this| this.pr_5())
-                .border_b_1()
-                .border_color(colors.border_variant)
-                .bg(colors.editor_subheader_background.opacity(0.72))
-                .child(rich_card_identity_icon(
-                    IconName::File,
-                    IconSize::XSmall,
-                    Color::Muted,
-                ))
+                .px_1()
+                .bg(colors.editor_subheader_background.opacity(0.42))
                 .child(
                     div()
                         .min_w_0()
@@ -7809,6 +8304,27 @@ impl HarnessApp {
                         .tooltip(format!(
                             "{additions} lines added, {deletions} lines removed"
                         )),
+                    )
+                })
+                .when(section_index == 0, |this| {
+                    this.child(
+                        div()
+                            .id(("diff-inline-disclosure", index))
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                disclosure_owner
+                                    .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                                    .ok();
+                            })
+                            .child(Disclosure::new(
+                                ("diff-inline-disclosure-icon", index),
+                                true,
+                            )),
                     )
                 })
                 .into_any_element();
@@ -8070,16 +8586,10 @@ impl HarnessApp {
                     Color::Accent => colors.text_accent,
                     _ => colors.text_muted,
                 };
+                let disclosure_owner = owner.clone();
                 rich_card_identity_row()
-                    .when(row_index == 0, |this| this.pr_5())
-                    .border_b_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_subheader_background.opacity(0.72))
-                    .child(rich_card_identity_icon(
-                        IconName::File,
-                        IconSize::XSmall,
-                        Color::Muted,
-                    ))
+                    .px_1()
+                    .bg(colors.editor_subheader_background.opacity(0.42))
                     .child(
                         div()
                             .min_w_0()
@@ -8123,6 +8633,29 @@ impl HarnessApp {
                                 )
                             }),
                     )
+                    .when(row_index == 0, |this| {
+                        this.child(
+                            div()
+                                .id(("file-change-inline-disclosure", index))
+                                .size(px(18.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| {
+                                    disclosure_owner
+                                        .update(cx, |this, cx| {
+                                            this.toggle_item_at(index, window, cx)
+                                        })
+                                        .ok();
+                                })
+                                .child(Disclosure::new(
+                                    ("file-change-inline-disclosure-icon", index),
+                                    true,
+                                )),
+                        )
+                    })
                     .into_any_element()
             }
             RichFileChangeRow::Line {
@@ -10173,29 +10706,34 @@ impl HarnessApp {
                     .child(Disclosure::new(("item-disclosure", index), item.expanded))
             });
 
-        let floating_disclosure = (headerless_expanded && is_disclosure).then(|| {
-            let disclosure_weak = cx.weak_entity();
-            div()
-                .id(("item-floating-disclosure", index))
-                .absolute()
-                .top(px(1.))
-                .right(px(1.))
-                .size(px(18.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded_sm()
-                .cursor_pointer()
-                .on_click(move |_, window, cx| {
-                    disclosure_weak
-                        .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
-                        .ok();
-                })
-                .child(Disclosure::new(
-                    ("item-floating-disclosure-icon", index),
-                    true,
-                ))
-        });
+        let content_has_inline_disclosure = matches!(
+            item.kind,
+            model::TranscriptKind::Diff | model::TranscriptKind::FileChange
+        );
+        let floating_disclosure =
+            (headerless_expanded && is_disclosure && !content_has_inline_disclosure).then(|| {
+                let disclosure_weak = cx.weak_entity();
+                div()
+                    .id(("item-floating-disclosure", index))
+                    .absolute()
+                    .top(px(1.))
+                    .right(px(1.))
+                    .size(px(18.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .on_click(move |_, window, cx| {
+                        disclosure_weak
+                            .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                            .ok();
+                    })
+                    .child(Disclosure::new(
+                        ("item-floating-disclosure-icon", index),
+                        true,
+                    ))
+            });
 
         let raw = raw_visible.then(|| {
             let content =
@@ -10387,6 +10925,8 @@ impl Render for HarnessApp {
         let send_blocked = composer_send_blocked(
             composer_empty,
             self.loading_thread,
+            self.attaching_thread,
+            self.settings_update_pending,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         );
@@ -10557,6 +11097,10 @@ impl Render for HarnessApp {
                 Some((status, Color::Muted))
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
+            } else if self.attaching_thread {
+                Some(("Connecting live…".into(), Color::Muted))
+            } else if self.settings_update_pending {
+                Some(("Updating task settings…".into(), Color::Muted))
             } else if self.thread_read_only_reason.is_some() {
                 Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
             } else if self.connecting {
@@ -10566,6 +11110,9 @@ impl Render for HarnessApp {
             } else {
                 None
             };
+        let context_usage = self.render_context_usage(cx);
+        let model_selector = self.render_model_effort_selector(cx);
+        let permission_selector = self.render_permission_selector(cx);
 
         div()
             .key_context(self.key_context())
@@ -11051,6 +11598,11 @@ impl Render for HarnessApp {
                                                 },
                                             )
                                             .child(div().flex_1())
+                                            .when_some(context_usage, |this, usage| {
+                                                this.child(usage)
+                                            })
+                                            .child(model_selector)
+                                            .child(permission_selector)
                                             .when(turn_active, |this| {
                                                 this.child(
                                                     Button::new("queue-turn", "Queue")
@@ -11100,6 +11652,10 @@ impl Render for HarnessApp {
                                                         })
                                                         .aria_label(if self.loading_thread {
                                                             "Wait for task history to finish loading"
+                                                        } else if self.attaching_thread {
+                                                            "Wait for the live task connection"
+                                                        } else if self.settings_update_pending {
+                                                            "Wait for task settings to finish updating"
                                                         } else if self
                                                             .thread_read_only_reason
                                                             .is_some()
@@ -12304,17 +12860,77 @@ mod tests {
     #[test]
     fn thread_snapshot_cache_replaces_and_evicts_least_recent_snapshots() {
         let mut cache = ThreadSnapshotCache::default();
-        cache.insert(cached_thread("a", 1));
-        cache.insert(cached_thread("b", 1));
+        for index in 0..THREAD_SNAPSHOT_CACHE_LIMIT {
+            cache.insert(cached_thread(&format!("thread-{index}"), 1));
+        }
 
-        let a = cache.take("a").expect("cached snapshot");
-        cache.insert(a);
-        cache.insert(cached_thread("c", 1));
+        let newest = cache
+            .take("thread-0")
+            .expect("cached snapshot promoted to most recent");
+        cache.insert(newest);
+        cache.insert(cached_thread("overflow", 1));
 
-        assert!(cache.take("b").is_none());
-        assert_eq!(cache.take("a").unwrap().updated_at, 1);
-        cache.insert(cached_thread("c", 2));
-        assert_eq!(cache.take("c").unwrap().updated_at, 2);
+        assert!(cache.take("thread-1").is_none());
+        assert_eq!(cache.take("thread-0").unwrap().updated_at, 1);
+        cache.insert(cached_thread("overflow", 2));
+        assert_eq!(cache.take("overflow").unwrap().updated_at, 2);
+    }
+
+    #[test]
+    fn server_option_parsers_preserve_selectable_models_and_permission_profiles() {
+        let models = model_choices_from_response(&json!({
+            "data": [
+                {
+                    "id": "gpt-5.6",
+                    "model": "gpt-5.6-codex",
+                    "displayName": "GPT-5.6 Codex",
+                    "hidden": false,
+                    "defaultReasoningEffort": "high",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "high", "description": "Deep"},
+                        {"reasoningEffort": "xhigh", "description": "Deeper"}
+                    ]
+                },
+                {
+                    "id": "hidden",
+                    "model": "hidden",
+                    "displayName": "Hidden",
+                    "hidden": true,
+                    "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": []
+                }
+            ]
+        }));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "gpt-5.6-codex");
+        assert_eq!(models[0].default_effort, "high");
+        assert_eq!(models[0].efforts, ["high", "xhigh"]);
+
+        let profiles = permission_profile_choices_from_response(&json!({
+            "data": [
+                {"id": ":workspace", "allowed": true, "description": "Workspace only"},
+                {"id": ":full-access", "allowed": false}
+            ]
+        }));
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles[0].allowed);
+        assert_eq!(profiles[0].description.as_deref(), Some("Workspace only"));
+        assert!(!profiles[1].allowed);
+    }
+
+    #[test]
+    fn context_ring_uses_last_turn_tokens_and_model_capacity() {
+        assert_eq!(
+            context_window_usage(Some(&json!({
+                "threadId": "thread-1",
+                "tokenUsage": {
+                    "last": {"totalTokens": 123_456},
+                    "modelContextWindow": 400_000
+                }
+            }))),
+            Some((123_456, 400_000))
+        );
+        assert_eq!(context_window_usage(Some(&json!({}))), None);
     }
 
     #[test]
@@ -14479,11 +15095,27 @@ mod tests {
 
     #[test]
     fn composer_send_is_blocked_while_loading_or_read_only() {
-        assert!(composer_send_blocked(true, false, false, true));
-        assert!(composer_send_blocked(false, true, false, true));
-        assert!(composer_send_blocked(false, false, true, true));
-        assert!(composer_send_blocked(false, false, false, false));
-        assert!(!composer_send_blocked(false, false, false, true));
+        assert!(composer_send_blocked(
+            true, false, false, false, false, true
+        ));
+        assert!(composer_send_blocked(
+            false, true, false, false, false, true
+        ));
+        assert!(composer_send_blocked(
+            false, false, true, false, false, true
+        ));
+        assert!(composer_send_blocked(
+            false, false, false, true, false, true
+        ));
+        assert!(composer_send_blocked(
+            false, false, false, false, true, true
+        ));
+        assert!(composer_send_blocked(
+            false, false, false, false, false, false
+        ));
+        assert!(!composer_send_blocked(
+            false, false, false, false, false, true
+        ));
     }
 
     #[test]
