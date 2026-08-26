@@ -8385,6 +8385,7 @@ dependencies = [
  "pulldown-cmark 0.13.0",
  "serde",
  "serde_json",
+ "shlex",
 ]
 
 [[package]]

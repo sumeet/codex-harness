@@ -42,6 +42,7 @@ use gpui::{
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
+use parser::TaskListMarkerState;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
     parse_markdown_with_options,
@@ -2785,15 +2786,18 @@ impl Element for MarkdownElement {
                             let marker_range =
                                 list_item_marker_source_range(parsed_markdown.source(), range);
                             let bullet =
-                                if let Some((task_range, MarkdownEvent::TaskListMarker(checked))) =
+                                if let Some((task_range, MarkdownEvent::TaskListMarker(state))) =
                                     parsed_markdown.events.get(index.saturating_add(1))
                                 {
                                     let source = &parsed_markdown.source()[range.clone()];
-                                    let checked = *checked;
-                                    let toggle_state = if checked {
-                                        ToggleState::Selected
-                                    } else {
-                                        ToggleState::Unselected
+                                    let state = *state;
+                                    let checked = state == TaskListMarkerState::Checked;
+                                    let toggle_state = match state {
+                                        TaskListMarkerState::Unchecked => ToggleState::Unselected,
+                                        TaskListMarkerState::Indeterminate => {
+                                            ToggleState::Indeterminate
+                                        }
+                                        TaskListMarkerState::Checked => ToggleState::Selected,
                                     };
 
                                     let checkbox = Checkbox::new(

@@ -1,9 +1,10 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write as _,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use base64::Engine as _;
@@ -161,6 +162,31 @@ pub struct CommandTranscript {
 
 pub const COMMAND_PROMPT: &str = "$ ";
 
+/// Present the program supplied to a conventional Bash login-shell wrapper.
+///
+/// App-server command items contain one flattened shell string rather than an
+/// argv array. Parse the complete outer invocation and unwrap only the exact
+/// three-argument form we understand. Any ambiguity falls back losslessly to
+/// the raw command, which remains available on `TranscriptItem::raw` even when
+/// the friendly script is used by the transcript projection.
+pub fn command_for_display(command: &str) -> Cow<'_, str> {
+    let Some(words) = shlex::split(command) else {
+        return Cow::Borrowed(command);
+    };
+    let [program, flags, script] = words.as_slice() else {
+        return Cow::Borrowed(command);
+    };
+    let is_bash = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("bash");
+    if is_bash && matches!(flags.as_str(), "-lc" | "-cl") {
+        Cow::Owned(script.clone())
+    } else {
+        Cow::Borrowed(command)
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct PersistedTranscript {
     version: u32,
@@ -179,7 +205,9 @@ impl TranscriptItem {
     /// Raw protocol history remains available even when an empty terminal
     /// reasoning placeholder is omitted from both reading surfaces.
     pub fn is_presentationally_visible(&self) -> bool {
-        self.kind != TranscriptKind::Trace
+        let visible_trace = self.kind != TranscriptKind::Trace
+            || string_at(&self.raw, "/type") == Some("contextCompaction");
+        visible_trace
             && (self.kind != TranscriptKind::Reasoning
                 || !self.content.trim().is_empty()
                 || self.pending_request.is_some()
@@ -198,13 +226,18 @@ impl TranscriptItem {
         let raw_command = string_at(&self.raw, "/command");
         let raw_cwd = string_at(&self.raw, "/cwd");
         let mut remainder = self.content.as_str();
-        let command = if let Some(command) = raw_command {
-            if let Some(rest) = remainder.strip_prefix("$ ")
-                && let Some(rest) = rest.strip_prefix(command)
-            {
-                remainder = rest;
+        let command = if let Some(raw_command) = raw_command {
+            let display_command = command_for_display(raw_command);
+            if let Some(rest) = remainder.strip_prefix("$ ") {
+                if let Some(rest) = rest.strip_prefix(display_command.as_ref()) {
+                    remainder = rest;
+                } else if let Some(rest) = rest.strip_prefix(raw_command) {
+                    // Older persisted projections may still contain the raw
+                    // wrapper. Consume it without reintroducing it visually.
+                    remainder = rest;
+                }
             }
-            command.to_string()
+            display_command.into_owned()
         } else {
             let rest = remainder.strip_prefix("$ ")?;
             let separator = ["\n\nWorking directory\n", "\n\nResult\n", "\n\n"]
@@ -892,7 +925,11 @@ fn project_transcript_item_with_header(
     item: &TranscriptItem,
     include_header: bool,
 ) -> Option<TranscriptItemProjection> {
-    if item.kind == TranscriptKind::Trace || !item.is_presentationally_visible() {
+    // Visibility belongs to the protocol item, not to the broad `Trace`
+    // presentation bucket. Most unknown trace events remain hidden, while
+    // semantic trace landmarks such as context compaction participate in the
+    // same Rich/Vim document as every other visible item.
+    if !item.is_presentationally_visible() {
         return None;
     }
 
@@ -1220,7 +1257,7 @@ impl TranscriptModel {
         let mut this = Self::default();
         let templates = replay_templates()
             .into_iter()
-            .filter(|item| item.kind != TranscriptKind::Trace)
+            .filter(TranscriptItem::is_presentationally_visible)
             .collect::<Vec<_>>();
         for index in 0..item_count {
             let mut item = templates[index % templates.len()].clone();
@@ -2109,9 +2146,6 @@ impl TranscriptModel {
         completed: bool,
         turn_id: Option<&str>,
     ) -> Option<usize> {
-        if string_at(&value, "/type") == Some("contextCompaction") {
-            return None;
-        }
         let protocol_id = string_at(&value, "/id")
             .unwrap_or("unknown-item")
             .to_string();
@@ -3341,10 +3375,7 @@ fn title_from_protocol(kind: &str, raw: &Value) -> String {
         "commandExecution" => command_title(raw),
         "fileChange" => file_changes_title(raw.get("changes").unwrap_or(&Value::Null)),
         "mcpToolCall" => mcp_tool_title(raw),
-        "dynamicToolCall" => format!(
-            "Tool · {}",
-            humanize_identifier(string_at(raw, "/tool").unwrap_or("dynamic tool"))
-        ),
+        "dynamicToolCall" => humanize_identifier(string_at(raw, "/tool").unwrap_or("Dynamic tool")),
         "collabAgentToolCall" => format!(
             "Subagent · {}",
             humanize_identifier(string_at(raw, "/tool").unwrap_or("activity"))
@@ -3380,7 +3411,8 @@ fn content_from_protocol(kind: &str, raw: &Value) -> String {
             unique_sections(sections).join("\n\n")
         }
         "commandExecution" => {
-            let command = string_at(raw, "/command").unwrap_or_default();
+            let raw_command = string_at(raw, "/command").unwrap_or_default();
+            let command = command_for_display(raw_command);
             let output = string_at(raw, "/aggregatedOutput").unwrap_or_default();
             if output.is_empty() {
                 format!("$ {command}")
@@ -3415,7 +3447,17 @@ fn content_from_protocol(kind: &str, raw: &Value) -> String {
         "enteredReviewMode" | "exitedReviewMode" => {
             string_at(raw, "/review").unwrap_or_default().to_string()
         }
-        "contextCompaction" => "Earlier context was compacted so the task could continue.".into(),
+        "contextCompaction" => {
+            let mut summary = Vec::new();
+            collect_text_sections(raw.get("summary"), &mut summary);
+            collect_text_sections(raw.get("content"), &mut summary);
+            let summary = unique_sections(summary).join("\n\n");
+            if summary.is_empty() {
+                "Earlier context was compacted so the task could continue.".into()
+            } else {
+                summary
+            }
+        }
         _ => pretty_json(raw),
     }
 }
@@ -3936,10 +3978,10 @@ fn render_plan(params: &Value) -> String {
             // Status is structural protocol data, not prose. Markdown's task
             // marker is the visual status indicator, so repeating the raw
             // enum after the step produces a second, contradictory UI.
-            let marker = if matches!(status, "completed" | "complete") {
-                "x"
-            } else {
-                " "
+            let marker = match status {
+                "completed" | "complete" => "x",
+                "inProgress" | "in_progress" | "running" => "~",
+                _ => " ",
             };
             output.push_str(&format!("- [{marker}] {text}\n"));
         }
@@ -4467,7 +4509,7 @@ mod tests {
     }
 
     #[test]
-    fn context_compaction_stays_in_the_raw_journal_not_the_transcript() {
+    fn context_compaction_is_a_compact_visible_transcript_landmark() {
         let mut model = TranscriptModel::default();
         let outcome = model.apply_batch(
             vec![Event::Notification {
@@ -4485,16 +4527,38 @@ mod tests {
             Some("thread-1"),
         );
 
-        assert!(model.items.is_empty());
-        assert!(outcome.dirty.is_empty());
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(outcome.dirty, HashSet::from([0]));
+        assert_eq!(model.items[0].kind, TranscriptKind::Trace);
+        assert_eq!(model.items[0].title, "Context compacted");
+        assert!(model.items[0].is_presentationally_visible());
+        assert!(!model.items[0].expanded);
+        assert_eq!(
+            model.items[0].content,
+            "Earlier context was compacted so the task could continue."
+        );
         assert_eq!(model.raw_events.len(), 1);
         assert_eq!(model.raw_events[0].method, "item/completed");
-        assert!(
-            TranscriptModel::replay(120)
-                .items
-                .iter()
-                .all(|item| item.kind != TranscriptKind::Trace)
+        assert!(TranscriptModel::replay(120).items.iter().any(|item| {
+            item.kind == TranscriptKind::Trace
+                && string_at(&item.raw, "/type") == Some("contextCompaction")
+        }));
+    }
+
+    #[test]
+    fn context_compaction_uses_the_summary_when_the_server_provides_one() {
+        let item = item_from_protocol(
+            json!({
+                "id": "compaction-1",
+                "type": "contextCompaction",
+                "status": "completed",
+                "summary": [{"type": "text", "text": "Retained the implementation plan."}]
+            }),
+            true,
         );
+
+        assert_eq!(item.content, "Retained the implementation plan.");
+        assert!(item.is_presentationally_visible());
     }
 
     #[test]
@@ -4811,6 +4875,64 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn exact_bash_login_wrapper_projects_its_script_but_retains_raw_invocation() {
+        let raw = "/usr/bin/bash -lc \"printf '%s\\n' hello\"";
+        assert_eq!(command_for_display(raw), "printf '%s\\n' hello");
+        assert_eq!(
+            command_for_display("cargo test -p harness_app"),
+            "cargo test -p harness_app"
+        );
+        assert_eq!(
+            command_for_display("/usr/bin/bash -lc 'echo ok' extra"),
+            "/usr/bin/bash -lc 'echo ok' extra",
+            "an invocation with additional argv must remain lossless"
+        );
+
+        let mut model = TranscriptModel::default();
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "item": {
+                        "id": "command-1",
+                        "type": "commandExecution",
+                        "command": raw,
+                        "cwd": "/workspace",
+                        "status": "inProgress"
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items[0].content, "$ printf '%s\\n' hello");
+        assert_eq!(
+            model.items[0].command_transcript().unwrap().command,
+            "printf '%s\\n' hello"
+        );
+        assert_eq!(
+            model.items[0].raw.get("command").and_then(Value::as_str),
+            Some(raw)
+        );
+    }
+
+    #[test]
+    fn plan_status_is_encoded_by_the_task_marker_not_appended_as_prose() {
+        let rendered = render_plan(&json!({
+            "plan": [
+                {"step": "Done", "status": "completed"},
+                {"step": "Working", "status": "inProgress"},
+                {"step": "Later", "status": "pending"}
+            ]
+        }));
+
+        assert_eq!(rendered, "- [x] Done\n- [~] Working\n- [ ] Later\n");
+        assert!(!rendered.contains("(pending)"));
+        assert!(!rendered.contains("(inProgress)"));
     }
 
     #[test]
@@ -5667,7 +5789,7 @@ mod tests {
     }
 
     #[test]
-    fn document_segments_exclude_trace_items() {
+    fn document_segments_exclude_protocol_noise_but_include_compaction_landmarks() {
         let mut model = TranscriptModel::default();
         model.push_without_splice(replay_item(
             0,
@@ -5685,6 +5807,13 @@ mod tests {
         ));
         model.push_without_splice(replay_item(
             2,
+            TranscriptKind::Trace,
+            "Context compacted",
+            "Earlier context was summarized here",
+            json!({"type": "contextCompaction"}),
+        ));
+        model.push_without_splice(replay_item(
+            3,
             TranscriptKind::Agent,
             "Codex",
             "visible after",
@@ -5698,13 +5827,20 @@ mod tests {
                 .iter()
                 .map(|segment| segment.item_index)
                 .collect::<Vec<_>>(),
-            [0, 2]
+            [0, 2, 3]
         );
         assert!(document.item_rows[0].is_some());
         assert!(document.item_rows[1].is_none());
         assert!(document.item_rows[2].is_some());
+        assert!(document.item_rows[3].is_some());
         assert!(!document.text.contains("Internal event"));
         assert!(!document.text.contains("must not enter the document"));
+        assert!(document.text.contains("Context compacted"));
+        assert!(
+            document
+                .text
+                .contains("Earlier context was summarized here")
+        );
     }
 
     #[test]
@@ -5715,7 +5851,7 @@ mod tests {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (item.kind != TranscriptKind::Trace).then_some(index))
+            .filter_map(|(index, item)| item.is_presentationally_visible().then_some(index))
             .collect::<Vec<_>>();
 
         assert_eq!(document.item_rows.len(), 10_000);
@@ -5740,7 +5876,7 @@ mod tests {
         for (index, item) in model.items.iter().enumerate() {
             assert_eq!(
                 document.item_rows[index].is_some(),
-                item.kind != TranscriptKind::Trace
+                item.is_presentationally_visible()
             );
         }
         assert!(

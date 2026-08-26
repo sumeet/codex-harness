@@ -64,6 +64,7 @@ actions!(
     harness,
     [
         Send,
+        Steer,
         InsertComposerNewline,
         PasteComposer,
         Stop,
@@ -132,13 +133,12 @@ const PROGRESSIVE_OUTPUT_MEDIUM_BYTES: usize = 16 * 1_024;
 const PROGRESSIVE_OUTPUT_LARGE_LINES: usize = 500;
 const PROGRESSIVE_OUTPUT_LARGE_BYTES: usize = 64 * 1_024;
 const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
-const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 140.;
-const RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT: f32 = 160.;
-const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 280.;
+const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 98.;
+const RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT: f32 = 112.;
+const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
-const RICH_DIRECT_FILE_CHANGE_MAX_ROWS: usize = 10;
 const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 44.;
 const RICH_DIFF_GUTTER_GAP: f32 = 6.;
 const PERFORMANCE_J_STEPS: u16 = 240;
@@ -341,6 +341,7 @@ struct RichNestedScrollBinding {
 #[derive(Default)]
 struct RichNestedScrollState {
     handle: ScrollHandle,
+    diff_section_handles: Vec<ScrollHandle>,
     last_cursor: Option<usize>,
     command: Option<RichCommandSurface>,
     file_change: Option<RichFileChangeSurface>,
@@ -373,7 +374,6 @@ struct RichCommandSurface {
     data: RichCommandData,
     command_list_state: ListState,
     output_list_state: ListState,
-    command_horizontal_handle: ScrollHandle,
     output_horizontal_handle: ScrollHandle,
 }
 
@@ -408,15 +408,21 @@ impl RichFileChangeRow {
 struct RichFileChangeData {
     presentations: Arc<[FileChangePresentation]>,
     rows: Arc<[RichFileChangeRow]>,
-    total_additions: usize,
-    total_deletions: usize,
 }
 
 struct RichFileChangeSurface {
     event_count: usize,
     content_len: usize,
     data: RichFileChangeData,
-    list_state: UniformListScrollHandle,
+    sections: Vec<RichFileChangeSectionSurface>,
+}
+
+#[derive(Clone)]
+struct RichFileChangeSectionSurface {
+    header_row: usize,
+    line_rows: Arc<[usize]>,
+    list_state: ListState,
+    horizontal_handle: ScrollHandle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1331,6 +1337,12 @@ fn activity_text_sections(content: &str) -> Vec<ActivityTextSection> {
             });
         }
     }
+    // A lone `Result` label merely restates that the tool card has a body.
+    // Preserve headings when they distinguish multiple semantic sections,
+    // but let the common one-result case render its payload directly.
+    if sections.len() == 1 && sections[0].heading.as_deref() == Some("Result") {
+        sections[0].heading = None;
+    }
     sections
 }
 
@@ -1591,6 +1603,29 @@ struct DiffFilePresentation {
     content: String,
 }
 
+/// Keep file headers informative without letting machine-specific absolute
+/// prefixes dominate the card. This transformation happens in the shared
+/// presentation model so paint, Vim navigation, search geometry, and copying
+/// all see the same string.
+fn compact_file_panel_path(path: &str) -> String {
+    let path = path.trim();
+    if !Path::new(path).is_absolute() {
+        return path.to_owned();
+    }
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = Path::new(path).strip_prefix(&cwd)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_string_lossy().into_owned();
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && let Ok(relative) = Path::new(path).strip_prefix(home)
+    {
+        return format!("~/{}", relative.to_string_lossy());
+    }
+    path.to_owned()
+}
+
 fn normalized_diff_path(path: &str) -> Option<String> {
     let path = path
         .trim()
@@ -1749,15 +1784,6 @@ fn diff_content_counts(content: &str) -> (usize, usize) {
         })
 }
 
-fn aggregate_diff_counts<'a>(contents: impl IntoIterator<Item = &'a str>) -> (usize, usize) {
-    contents.into_iter().map(diff_content_counts).fold(
-        (0, 0),
-        |(total_additions, total_deletions), (additions, deletions)| {
-            (total_additions + additions, total_deletions + deletions)
-        },
-    )
-}
-
 fn fair_line_allocations(line_counts: &[usize], budget: usize) -> Vec<usize> {
     if budget == usize::MAX {
         return line_counts.to_vec();
@@ -1823,7 +1849,7 @@ fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
             }
             current = Some(FileChangePresentation {
                 operation: operation.into(),
-                path: path.into(),
+                path: compact_file_panel_path(path),
                 content: String::new(),
             });
         } else if let Some(presentation) = current.as_mut() {
@@ -1991,12 +2017,6 @@ fn render_compact_diff_line_number(
 
 fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
     let presentations = file_change_presentations(&item.content);
-    let (total_additions, total_deletions) = presentations.iter().map(file_change_counts).fold(
-        (0, 0),
-        |(total_additions, total_deletions), (additions, deletions)| {
-            (total_additions + additions, total_deletions + deletions)
-        },
-    );
     let mut rows = Vec::new();
     let mut logical_cursor = 0;
 
@@ -2055,8 +2075,6 @@ fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
     RichFileChangeData {
         presentations: presentations.into(),
         rows: rows.into(),
-        total_additions,
-        total_deletions,
     }
 }
 
@@ -2305,7 +2323,11 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
         | model::TranscriptKind::Review => {
             let sections = activity_text_sections(&item.content);
             if !sections.iter().any(|section| section.heading.is_some()) {
-                return fallback.to_owned();
+                return sections
+                    .into_iter()
+                    .map(|section| section.body)
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             for section in sections {
                 if let Some(heading) = section.heading {
@@ -2498,6 +2520,16 @@ struct LiveRequestSurface {
 struct ComposerImageAttachment {
     id: u64,
     image: Arc<Image>,
+}
+
+struct ComposerSubmission {
+    key: String,
+    client_user_message_id: String,
+    input: Value,
+}
+
+struct QueuedTurnSubmission {
+    key: String,
 }
 
 #[derive(Clone)]
@@ -3051,7 +3083,11 @@ struct HarnessApp {
     task_list_state: UniformListScrollHandle,
     sidebar_open: bool,
     sidebar_user_override: bool,
+    turn_start_pending: bool,
+    queue_start_pending: bool,
+    queued_turns: VecDeque<QueuedTurnSubmission>,
     server_task: Task<()>,
+    turn_task: Task<()>,
     request_task: Task<()>,
     reconnect_task: Task<()>,
     read_only_refresh_task: Task<()>,
@@ -3086,6 +3122,36 @@ impl ThreadSnapshotCache {
 }
 
 impl HarnessApp {
+    fn rich_diff_section_bindings(
+        &mut self,
+        item_key: &str,
+        section_count: usize,
+        navigation: Option<&RichNavigationPaint>,
+    ) -> Vec<RichNestedScrollBinding> {
+        let cursor = navigation
+            .and_then(RichNavigationPaint::cursor_range)
+            .map(|range| range.start);
+        let state = self
+            .rich_nested_scrolls
+            .entry(item_key.to_owned())
+            .or_default();
+        state
+            .diff_section_handles
+            .resize_with(section_count, ScrollHandle::default);
+        state.diff_section_handles.truncate(section_count);
+        let reveal_cursor = cursor.is_some() && cursor != state.last_cursor;
+        state.last_cursor = cursor;
+        state
+            .diff_section_handles
+            .iter()
+            .cloned()
+            .map(|handle| RichNestedScrollBinding {
+                handle,
+                reveal_cursor,
+            })
+            .collect()
+    }
+
     fn rich_nested_scroll_binding(
         &mut self,
         item_key: &str,
@@ -3110,13 +3176,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> Option<(
-        RichCommandData,
-        ListState,
-        ListState,
-        ScrollHandle,
-        ScrollHandle,
-    )> {
+    ) -> Option<(RichCommandData, ListState, ListState, ScrollHandle)> {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -3135,11 +3195,14 @@ impl HarnessApp {
                 .or_default();
             let command_list_state = state.command.as_ref().map_or_else(
                 || {
-                    // Every command source row is painted as one unwrapped terminal
-                    // line. Horizontal overflow belongs to its own scroll surface,
-                    // so the list can retain exact, fixed-height hit geometry.
-                    ListState::new(command_row_count, ListAlignment::Top, px(120.))
-                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                    // Command source is normally only a few logical rows. Let
+                    // Zed measure its soft-wrapped text so long shell programs
+                    // remain readable and retain exact wrapped hit geometry.
+                    ListState::new(
+                        command_row_count,
+                        ListAlignment::Top,
+                        px(RICH_COMMAND_ROW_HEIGHT_HINT),
+                    )
                 },
                 |surface| surface.command_list_state.clone(),
             );
@@ -3171,11 +3234,6 @@ impl HarnessApp {
                 data,
                 command_list_state,
                 output_list_state,
-                command_horizontal_handle: state
-                    .command
-                    .as_ref()
-                    .map(|surface| surface.command_horizontal_handle.clone())
-                    .unwrap_or_default(),
                 output_horizontal_handle: state
                     .command
                     .as_ref()
@@ -3214,7 +3272,6 @@ impl HarnessApp {
             surface.data.clone(),
             surface.command_list_state.clone(),
             surface.output_list_state.clone(),
-            surface.command_horizontal_handle.clone(),
             surface.output_horizontal_handle.clone(),
         ))
     }
@@ -3223,7 +3280,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> (RichFileChangeData, UniformListScrollHandle, ScrollHandle) {
+    ) -> (RichFileChangeData, Vec<RichFileChangeSectionSurface>) {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -3234,19 +3291,59 @@ impl HarnessApp {
 
         if needs_rebuild {
             let data = rich_file_change_data(item);
-            // Diff rows are deliberately single-line. A uniform list avoids
-            // remeasuring the same visible rows every time the outer
-            // transcript moves while retaining virtualization for huge diffs.
-            let list_state = UniformListScrollHandle::new();
             let state = self
                 .rich_nested_scrolls
                 .entry(item.key.clone())
                 .or_default();
+            let previous = state.file_change.take();
+            let mut section_rows = vec![Vec::new(); data.presentations.len()];
+            let mut header_rows = vec![None; data.presentations.len()];
+            for (row_index, row) in data.rows.iter().enumerate() {
+                match row {
+                    RichFileChangeRow::Header { section_index, .. } => {
+                        header_rows[*section_index] = Some(row_index);
+                    }
+                    RichFileChangeRow::Line { section_index, .. } => {
+                        section_rows[*section_index].push(row_index);
+                    }
+                }
+            }
+            let sections = header_rows
+                .into_iter()
+                .zip(section_rows)
+                .enumerate()
+                .filter_map(|(section_index, (header_row, line_rows))| {
+                    let header_row = header_row?;
+                    let previous_section = previous
+                        .as_ref()
+                        .and_then(|surface| surface.sections.get(section_index));
+                    let list_state = previous_section.map_or_else(
+                        || {
+                            ListState::new(line_rows.len(), ListAlignment::Top, px(80.))
+                                .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                        },
+                        |section| section.list_state.clone(),
+                    );
+                    if list_state.item_count() != line_rows.len() {
+                        list_state.splice(0..list_state.item_count(), line_rows.len());
+                    }
+                    list_state
+                        .set_diagnostics_name(format!("file-change:{}:{section_index}", item.key));
+                    Some(RichFileChangeSectionSurface {
+                        header_row,
+                        line_rows: line_rows.into(),
+                        list_state,
+                        horizontal_handle: previous_section
+                            .map(|section| section.horizontal_handle.clone())
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect();
             state.file_change = Some(RichFileChangeSurface {
                 event_count: item.event_count,
                 content_len: item.content.len(),
                 data,
-                list_state,
+                sections,
             });
         }
 
@@ -3271,18 +3368,20 @@ impl HarnessApp {
                 row.logical_range()
                     .is_some_and(|range| !range.is_empty() && cursor <= range.start)
             });
-            if let Some(row) = exact.or(next) {
-                surface
-                    .list_state
-                    .scroll_to_item(row, ScrollStrategy::Nearest);
+            if let Some(row) = exact.or(next)
+                && let Some((section, local_row)) = surface.sections.iter().find_map(|section| {
+                    section
+                        .line_rows
+                        .iter()
+                        .position(|candidate| *candidate == row)
+                        .map(|local_row| (section, local_row))
+                })
+            {
+                section.list_state.scroll_to_reveal_item(local_row);
             }
         }
         state.last_cursor = cursor;
-        (
-            surface.data.clone(),
-            surface.list_state.clone(),
-            state.handle.clone(),
-        )
+        (surface.data.clone(), surface.sections.clone())
     }
 
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
@@ -3645,7 +3744,11 @@ impl HarnessApp {
             rich_nested_scrolls: HashMap::default(),
             sidebar_open: true,
             sidebar_user_override: false,
+            turn_start_pending: false,
+            queue_start_pending: false,
+            queued_turns: VecDeque::new(),
             server_task: Task::ready(()),
+            turn_task: Task::ready(()),
             request_task: Task::ready(()),
             reconnect_task: Task::ready(()),
             read_only_refresh_task: Task::ready(()),
@@ -4030,6 +4133,10 @@ impl HarnessApp {
         self.client = None;
         self.connecting = false;
         self.read_only_refresh_task = Task::ready(());
+        self.turn_task = Task::ready(());
+        self.turn_start_pending = false;
+        self.queue_start_pending = false;
+        self.queued_turns.clear();
         self.model.current_turn_id = None;
         self.thread_read_only_reason = None;
         self.error = Some("Codex app server disconnected.".into());
@@ -4050,6 +4157,7 @@ impl HarnessApp {
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
         let (events, live_request_ids) = self.dispatch_server_requests(events, cx);
+        let had_active_turn = self.model.current_turn_id.is_some();
         let was_following_tail = if self.buffer_view {
             self.transcript_editor.read(cx).is_following_tail()
         } else {
@@ -4059,6 +4167,10 @@ impl HarnessApp {
         let outcome = self
             .model
             .apply_batch(events, self.selected_thread_id.as_deref());
+        if self.model.current_turn_id.is_some() {
+            self.turn_start_pending = false;
+        }
+        let completed_turn = had_active_turn && self.model.current_turn_id.is_none();
         let new_len = self.model.items.len();
         let document_changed = new_len != old_len || !outcome.dirty.is_empty();
         let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
@@ -4096,6 +4208,9 @@ impl HarnessApp {
             if !incrementally_applied {
                 drop(self.sync_transcript_document(cx));
             }
+        }
+        if completed_turn {
+            self.start_next_queued_turn(cx);
         }
         cx.notify();
     }
@@ -4987,6 +5102,10 @@ impl HarnessApp {
 
         self.reject_pending_requests(cx);
         self.read_only_refresh_task = Task::ready(());
+        self.turn_task = Task::ready(());
+        self.turn_start_pending = false;
+        self.queue_start_pending = false;
+        self.queued_turns.clear();
         self.selected_thread_id = Some(thread_id.clone());
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
@@ -5234,6 +5353,10 @@ impl HarnessApp {
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reject_pending_requests(cx);
         self.read_only_refresh_task = Task::ready(());
+        self.turn_task = Task::ready(());
+        self.turn_start_pending = false;
+        self.queue_start_pending = false;
+        self.queued_turns.clear();
         let old_len = self.model.items.len();
         self.model.clear();
         self.mark_all_image_surfaces_dirty();
@@ -5318,7 +5441,11 @@ impl HarnessApp {
         }
     }
 
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn take_composer_submission(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<ComposerSubmission> {
         let text = self.composer.read(cx).text(cx);
         let text = text.trim().to_string();
         if composer_send_blocked(
@@ -5327,7 +5454,7 @@ impl HarnessApp {
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         ) {
-            return;
+            return None;
         }
         let input = composer_app_server_input(&text, &self.composer_images);
         let preview = composer_prompt_preview(&text);
@@ -5356,22 +5483,67 @@ impl HarnessApp {
         self.composer_images.clear();
         self.composer_attachment_error = None;
 
+        Some(ComposerSubmission {
+            key,
+            client_user_message_id,
+            input: Value::Array(input),
+        })
+    }
+
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Starting a brand-new task is the only moment at which no stable
+        // thread id exists for the server-owned queue. Leave the composer
+        // untouched until thread/start returns instead of losing a fast second
+        // submission into a Harness-only queue.
+        if self.turn_start_pending && self.selected_thread_id.is_none() {
+            self.error = Some("Starting the task; send again when it is ready.".into());
+            cx.notify();
+            return;
+        }
+        let Some(submission) = self.take_composer_submission(window, cx) else {
+            return;
+        };
+
         if self.replay_count.is_some() {
-            self.model.set_status_for_key(&key, "replay");
+            self.model.set_status_for_key(&submission.key, "replay");
+            let index = self.model.items.len().saturating_sub(1);
             self.list_state.splice(index..index + 1, 1);
             cx.notify();
             return;
         }
+
+        if self.turn_active() {
+            self.queue_submission(submission, cx);
+        } else {
+            self.start_submission(submission, cx);
+        }
+    }
+
+    fn start_submission(&mut self, submission: ComposerSubmission, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
-            self.model.set_status_for_key(&key, "not connected");
+            self.model
+                .set_status_for_key(&submission.key, "not connected");
             self.error = Some("Codex is not connected yet".into());
-            self.list_state.splice(index..index + 1, 1);
+            if let Some(index) = self
+                .model
+                .items
+                .iter()
+                .position(|item| item.key == submission.key)
+            {
+                self.list_state.splice(index..index + 1, 1);
+            }
             cx.notify();
             return;
         };
+        let ComposerSubmission {
+            key,
+            client_user_message_id,
+            input,
+        } = submission;
         let existing_thread_id = self.selected_thread_id.clone();
         let cwd = self.cwd.clone();
-        self.request_task = cx.spawn(async move |this, cx| {
+        self.turn_start_pending = true;
+        self.turn_task = cx.spawn(async move |this, cx| {
             let result = async {
                 let thread_id = match existing_thread_id {
                     Some(thread_id) => thread_id,
@@ -5380,7 +5552,7 @@ impl HarnessApp {
                 let response = client
                     .start_turn_with_client_user_message_id(
                         &thread_id,
-                        Value::Array(input),
+                        input,
                         Some(&client_user_message_id),
                     )
                     .await?;
@@ -5389,6 +5561,7 @@ impl HarnessApp {
             .await;
             if this
                 .update(cx, |this, cx| {
+                    this.turn_start_pending = false;
                     match result {
                         Ok((thread_id, response)) => {
                             this.selected_thread_id = Some(thread_id);
@@ -5419,6 +5592,150 @@ impl HarnessApp {
         cx.notify();
     }
 
+    fn queue_submission(&mut self, submission: ComposerSubmission, cx: &mut Context<Self>) {
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            if let Some(index) = self.model.set_status_for_key(&submission.key, "failed") {
+                self.list_state.splice(index..index + 1, 1);
+            }
+            self.error = Some("The task is not ready to queue another prompt yet".into());
+            cx.notify();
+            return;
+        };
+        let ComposerSubmission {
+            key,
+            client_user_message_id,
+            input,
+        } = submission;
+        if let Some(index) = self.model.set_status_for_key(&key, "queueing") {
+            self.list_state.splice(index..index + 1, 1);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .queue_turn(&thread_id, input, &client_user_message_id)
+                .await;
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.queued_turns
+                            .push_back(QueuedTurnSubmission { key: key.clone() });
+                        if let Some(index) = this.model.set_status_for_key(&key, "queued") {
+                            this.list_state.splice(index..index + 1, 1);
+                        }
+                        this.error = None;
+                        if this.model.current_turn_id.is_none() && !this.turn_start_pending {
+                            this.start_next_queued_turn(cx);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(index) = this.model.set_status_for_key(&key, "failed") {
+                            this.list_state.splice(index..index + 1, 1);
+                        }
+                        this.error = Some(format!("Could not queue prompt: {error}").into());
+                    }
+                }
+                drop(this.sync_transcript_document(cx));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn start_next_queued_turn(&mut self, cx: &mut Context<Self>) {
+        if self.queue_start_pending
+            || self.turn_start_pending
+            || self.model.current_turn_id.is_some()
+            || self.queued_turns.is_empty()
+        {
+            return;
+        }
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        self.queue_start_pending = true;
+        self.turn_task = cx.spawn(async move |this, cx| {
+            let result = client.start_next_queued_turn(&thread_id).await;
+            _ = this.update(cx, |this, cx| {
+                this.queue_start_pending = false;
+                match result {
+                    Ok(response) => {
+                        if let Some(queued) = this.queued_turns.pop_front()
+                            && let Some(index) = this.model.set_status_for_key(&queued.key, "sent")
+                        {
+                            this.list_state.splice(index..index + 1, 1);
+                        }
+                        this.model.current_turn_id = response
+                            .pointer("/turn/id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        if this.model.current_turn_id.is_none() {
+                            this.error =
+                                Some(format!("Could not start queued prompt: {error}").into());
+                        }
+                    }
+                }
+                drop(this.sync_transcript_document(cx));
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(turn_id) = self.model.current_turn_id.clone() else {
+            self.send(window, cx);
+            return;
+        };
+        let Some(submission) = self.take_composer_submission(window, cx) else {
+            return;
+        };
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        let ComposerSubmission {
+            key,
+            client_user_message_id,
+            input,
+        } = submission;
+        if let Some(index) = self.model.set_status_for_key(&key, "steering") {
+            self.list_state.splice(index..index + 1, 1);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .steer_turn(&thread_id, &turn_id, input, &client_user_message_id)
+                .await;
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        if let Some(index) = this.model.set_status_for_key(&key, "sent") {
+                            this.list_state.splice(index..index + 1, 1);
+                        }
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        if let Some(index) = this.model.set_status_for_key(&key, "failed") {
+                            this.list_state.splice(index..index + 1, 1);
+                        }
+                        this.error = Some(format!("Could not steer turn: {error}").into());
+                    }
+                }
+                drop(this.sync_transcript_document(cx));
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn stop(&mut self, cx: &mut Context<Self>) {
         let (Some(client), Some(thread_id), Some(turn_id)) = (
             self.client.clone(),
@@ -5427,7 +5744,7 @@ impl HarnessApp {
         ) else {
             return;
         };
-        self.request_task = cx.spawn(async move |this, cx| {
+        self.turn_task = cx.spawn(async move |this, cx| {
             let result = client.interrupt_turn(&thread_id, &turn_id).await;
             if let Err(error) = result {
                 if this
@@ -7127,6 +7444,9 @@ impl HarnessApp {
     fn key_context(&self) -> KeyContext {
         let mut context = KeyContext::new_with_defaults();
         context.add("Harness");
+        if self.turn_active() {
+            context.add("HarnessTurnActive");
+        }
         if self.search_visible {
             context.add("HarnessSearchVisible");
         }
@@ -7149,6 +7469,10 @@ impl HarnessApp {
             FocusMode::Buffer => context.add("HarnessBuffer"),
         }
         context
+    }
+
+    fn turn_active(&self) -> bool {
+        self.model.current_turn_id.is_some() || self.turn_start_pending || self.queue_start_pending
     }
 
     fn render_task(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -7428,22 +7752,10 @@ impl HarnessApp {
         let presentations = diff_file_presentations(&item.content);
         let owner = cx.weak_entity();
         let mut logical_cursor = 0;
-        let mut row_ranges = Vec::new();
-        let mut rows = Vec::new();
+        let bindings = self.rich_diff_section_bindings(&item.key, presentations.len(), navigation);
+        let mut sections = Vec::new();
 
         for (section_index, presentation) in presentations.into_iter().enumerate() {
-            if section_index > 0 {
-                row_ranges.push(None);
-                rows.push(
-                    div()
-                        .w_full()
-                        .h(px(5.))
-                        .mt_0p5()
-                        .border_t_1()
-                        .border_color(colors.border_variant)
-                        .into_any_element(),
-                );
-            }
             let path_range =
                 rich_navigation_fragment_range(navigation, &presentation.path, &mut logical_cursor);
             let content_range = rich_navigation_fragment_range(
@@ -7467,52 +7779,56 @@ impl HarnessApp {
                 path_range.clone(),
                 Some(owner.clone()),
             );
-            row_ranges.push(Some(path_range));
-            rows.push(
-                rich_card_identity_row()
-                    .when(section_index == 0, |this| this.pr_5())
-                    .border_b_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_subheader_background.opacity(0.72))
-                    .child(rich_card_identity_icon(
-                        IconName::File,
-                        IconSize::XSmall,
-                        Color::Muted,
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
-                            .truncate()
-                            .child(clickable_path),
-                    )
-                    .when(additions > 0 || deletions > 0, |this| {
-                        this.child(
-                            DiffStat::new(
-                                format!("rich-diff-file-stat:{index}:{section_index}"),
-                                additions,
-                                deletions,
-                            )
-                            .label_size(LabelSize::XSmall)
-                            .tooltip(format!(
-                                "{additions} lines added, {deletions} lines removed"
-                            )),
+            let header = rich_card_identity_row()
+                .when(section_index == 0, |this| this.pr_5())
+                .border_b_1()
+                .border_color(colors.border_variant)
+                .bg(colors.editor_subheader_background.opacity(0.72))
+                .child(rich_card_identity_icon(
+                    IconName::File,
+                    IconSize::XSmall,
+                    Color::Muted,
+                ))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .font_buffer(cx)
+                        .text_ui_sm(cx)
+                        .truncate()
+                        .child(clickable_path),
+                )
+                .when(additions > 0 || deletions > 0, |this| {
+                    this.child(
+                        DiffStat::new(
+                            format!("rich-diff-file-stat:{index}:{section_index}"),
+                            additions,
+                            deletions,
                         )
-                    })
-                    .into_any_element(),
-            );
+                        .label_size(LabelSize::XSmall)
+                        .tooltip(format!(
+                            "{additions} lines added, {deletions} lines removed"
+                        )),
+                    )
+                })
+                .into_any_element();
 
-            if !presentation.content.is_empty() {
+            let body = if !presentation.content.is_empty() {
                 let line_count = presentation.content.lines().count();
-                row_ranges.extend(
-                    logical_line_fragments(&presentation.content, content_range.start)
-                        .into_iter()
-                        .take(line_count)
-                        .map(|(_, range)| Some(range)),
-                );
-                rows.extend(Self::render_diff_lines(
+                let row_ranges = logical_line_fragments(&presentation.content, content_range.start)
+                    .into_iter()
+                    .take(line_count)
+                    .map(|(_, range)| Some(range))
+                    .collect::<Vec<_>>();
+                if navigation
+                    .and_then(RichNavigationPaint::cursor_range)
+                    .is_some_and(|cursor| {
+                        content_range.start <= cursor.start && cursor.start <= content_range.end
+                    })
+                {
+                    reveal_rich_nested_cursor(bindings.get(section_index), navigation, &row_ranges);
+                }
+                let rows = Self::render_diff_lines(
                     &presentation.content,
                     usize::MAX,
                     search,
@@ -7521,37 +7837,49 @@ impl HarnessApp {
                     index,
                     Some(owner.clone()),
                     cx,
-                ));
-            }
+                );
+                let binding = &bindings[section_index];
+                Some(
+                    div()
+                        .id(format!("rich-diff-file-scroll:{index}:{section_index}"))
+                        .w_full()
+                        .min_w_0()
+                        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                        .overflow_x_scroll()
+                        .overflow_y_scroll()
+                        .track_scroll(&binding.handle)
+                        .children(rows)
+                        .custom_scrollbars(
+                            Scrollbars::new(ScrollAxes::Both)
+                                .id(format!("rich-diff-file-scrollbar:{index}:{section_index}"))
+                                .with_thumb_color(colors.text_muted.opacity(0.5))
+                                .tracked_scroll_handle(&binding.handle),
+                            window,
+                            cx,
+                        ),
+                )
+            } else {
+                None
+            };
+            sections.push(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(section_index > 0, |this| this.mt_1())
+                    .child(header)
+                    .when_some(body, |this, body| this.child(body)),
+            );
         }
 
-        let binding = self.rich_nested_scroll_binding(&item.key, navigation);
-        reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
         div()
             .id(("rich-diff-output", index))
             .w_full()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .id(("rich-diff-scroll", index))
-                    .w_full()
-                    .min_w_0()
-                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                    .overflow_x_scroll()
-                    .overflow_y_scroll()
-                    .track_scroll(&binding.handle)
-                    .children(rows)
-                    .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Both)
-                            .id(("rich-diff-scrollbar", index))
-                            .with_thumb_color(colors.text_muted.opacity(0.5))
-                            .tracked_scroll_handle(&binding.handle),
-                        window,
-                        cx,
-                    ),
-            )
+            .children(sections)
             .into_any_element()
     }
 
@@ -7878,105 +8206,98 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (data, list_state, horizontal_handle) = self.rich_file_change_surface(item, navigation);
+        let (data, sections) = self.rich_file_change_surface(item, navigation);
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
 
-        let vertical_region = if data.rows.len() <= RICH_DIRECT_FILE_CHANGE_MAX_ROWS {
-            let rows = (0..data.rows.len())
-                .map(|row_index| {
+        let file_panels = sections
+            .into_iter()
+            .enumerate()
+            .map(|(section_index, section)| {
+                let header = Self::render_rich_file_change_row(
+                    &data,
+                    section.header_row,
+                    index,
+                    search.as_ref(),
+                    navigation.as_ref(),
+                    &owner,
+                    cx,
+                );
+                let row_data = data.clone();
+                let row_owner = owner.clone();
+                let row_search = search.clone();
+                let row_navigation = navigation.clone();
+                let line_rows = section.line_rows.clone();
+                let row_count = line_rows.len();
+                let rows = list(section.list_state.clone(), move |local_row, _, cx| {
+                    let row_index = line_rows[local_row];
                     Self::render_rich_file_change_row(
-                        &data,
+                        &row_data,
                         row_index,
                         index,
-                        search.as_ref(),
-                        navigation.as_ref(),
-                        &owner,
+                        row_search.as_ref(),
+                        row_navigation.as_ref(),
+                        &row_owner,
                         cx,
                     )
                 })
-                .collect::<Vec<_>>();
-            div()
-                .w_full()
-                .min_w_0()
-                .relative()
-                .children(rows)
-                .into_any_element()
-        } else {
-            let row_data = data.clone();
-            let row_owner = owner.clone();
-            let row_search = search.clone();
-            let row_navigation = navigation.clone();
-            let row_count = row_data.rows.len();
-            let rows = uniform_list(
-                ("file-change-rows", index),
-                row_count,
-                move |range, _, cx| {
-                    range
-                        .map(|row_index| {
-                            Self::render_rich_file_change_row(
-                                &row_data,
-                                row_index,
-                                index,
-                                row_search.as_ref(),
-                                row_navigation.as_ref(),
-                                &row_owner,
-                                cx,
-                            )
-                        })
-                        .collect()
-                },
-            )
-            .track_scroll(&list_state)
-            // A nested list has no flex height to fill. Infer its height from
-            // the fixed-height rows so the body is present on the first frame,
-            // then let the cap turn larger diffs into scroll regions.
-            .with_sizing_behavior(ListSizingBehavior::Infer)
-            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
-
-            div()
-                .w_full()
-                .min_w_0()
-                .relative()
-                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                .child(rows)
-                .custom_scrollbars(
-                    Scrollbars::new(ScrollAxes::Vertical)
-                        .id(("file-change-vertical-scrollbar", index))
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
-                        .tracked_scroll_handle(&list_state),
-                    window,
-                    cx,
-                )
-                .into_any_element()
-        };
+                .with_sizing_behavior(ListSizingBehavior::Infer)
+                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
+                let vertical = div()
+                    .w_full()
+                    .min_w_0()
+                    .relative()
+                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                    .overflow_y_hidden()
+                    .child(rows)
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Vertical)
+                            .id(format!(
+                                "file-change-vertical-scrollbar:{index}:{section_index}"
+                            ))
+                            .with_thumb_color(colors.text_muted.opacity(0.5))
+                            .tracked_scroll_handle(&section.list_state),
+                        window,
+                        cx,
+                    );
+                let body = div()
+                    .id(format!("file-change-scroll:{index}:{section_index}"))
+                    .w_full()
+                    .min_w_0()
+                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+                    .overflow_x_scroll()
+                    .overflow_y_hidden()
+                    .track_scroll(&section.horizontal_handle)
+                    .child(vertical)
+                    .custom_scrollbars(
+                        Scrollbars::new(ScrollAxes::Horizontal)
+                            .id(format!(
+                                "file-change-horizontal-scrollbar:{index}:{section_index}"
+                            ))
+                            .with_thumb_color(colors.text_muted.opacity(0.5))
+                            .tracked_scroll_handle(&section.horizontal_handle),
+                        window,
+                        cx,
+                    );
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(section_index > 0, |this| this.mt_1())
+                    .child(header)
+                    .when(row_count > 0, |this| this.child(body))
+            })
+            .collect::<Vec<_>>();
         div()
             .id(("file-change-output", index))
             .w_full()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .id(("file-change-scroll", index))
-                    .w_full()
-                    .min_w_0()
-                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                    .overflow_x_scroll()
-                    .overflow_y_hidden()
-                    .track_scroll(&horizontal_handle)
-                    .child(vertical_region)
-                    .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Horizontal)
-                            .id(("file-change-horizontal-scrollbar", index))
-                            .with_thumb_color(colors.text_muted.opacity(0.5))
-                            .tracked_scroll_handle(&horizontal_handle),
-                        window,
-                        cx,
-                    ),
-            )
+            .children(file_panels)
             .into_any_element()
     }
 
@@ -8120,6 +8441,11 @@ impl HarnessApp {
     ) -> AnyElement {
         let sections = activity_text_sections(&content);
         if !sections.iter().any(|section| section.heading.is_some()) {
+            let content = sections
+                .into_iter()
+                .map(|section| section.body)
+                .collect::<Vec<_>>()
+                .join("\n");
             return self.render_terminal(content, item_key, index, search, navigation, window, cx);
         }
 
@@ -8283,13 +8609,8 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (
-            data,
-            command_list_state,
-            output_list_state,
-            command_horizontal_handle,
-            output_horizontal_handle,
-        ) = self.rich_command_surface(item, navigation)?;
+        let (data, command_list_state, output_list_state, output_horizontal_handle) =
+            self.rich_command_surface(item, navigation)?;
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
@@ -8354,7 +8675,7 @@ impl HarnessApp {
                     .min_w_0()
                     .min_h(px(20.))
                     .relative()
-                    .whitespace_nowrap()
+                    .whitespace_normal()
                     .when(first_command_row, |this| this.pr_5())
                     .child(clickable)
                     .when_some(cursor_marker, |this, marker| this.child(marker))
@@ -8408,7 +8729,7 @@ impl HarnessApp {
                 .into_any_element()
         })
         .with_sizing_behavior(ListSizingBehavior::Infer)
-        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
+        .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT));
 
         let command_vertical_region = div()
             .id(("command-input-vertical-scroll", index))
@@ -8416,6 +8737,7 @@ impl HarnessApp {
             .min_w_0()
             .relative()
             .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT))
+            .overflow_y_hidden()
             .child(command_rows)
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
@@ -8429,17 +8751,9 @@ impl HarnessApp {
             .id(("command-input-scroll", index))
             .w_full()
             .min_w_0()
-            .overflow_x_scroll()
-            .track_scroll(&command_horizontal_handle)
-            .child(command_vertical_region)
-            .custom_scrollbars(
-                Scrollbars::new(ScrollAxes::Horizontal)
-                    .id(("command-input-horizontal-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
-                    .tracked_scroll_handle(&command_horizontal_handle),
-                window,
-                cx,
-            );
+            .overflow_x_hidden()
+            .overflow_y_hidden()
+            .child(command_vertical_region);
 
         let output_region = (!data.output.is_empty()).then(|| {
             let vertical = div()
@@ -8448,6 +8762,7 @@ impl HarnessApp {
                 .min_w_0()
                 .relative()
                 .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT))
+                .overflow_y_hidden()
                 .child(output_rows)
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
@@ -8467,6 +8782,7 @@ impl HarnessApp {
                 .mt_1()
                 .pt_1()
                 .overflow_x_scroll()
+                .overflow_y_hidden()
                 .track_scroll(&output_horizontal_handle)
                 .child(vertical)
                 .custom_scrollbars(
@@ -10081,7 +10397,7 @@ impl Render for HarnessApp {
                 COMPOSER_ATTACHMENT_STRIP_HEIGHT
             };
         let composer_images = self.composer_images.clone();
-        let turn_active = self.model.current_turn_id.is_some();
+        let turn_active = self.turn_active();
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
@@ -10260,6 +10576,7 @@ impl Render for HarnessApp {
             .text_color(colors.text)
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
+            .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
             .on_action(cx.listener(
                 |this, _: &InsertComposerNewline, window, cx| {
                     this.composer
@@ -10554,6 +10871,27 @@ impl Render for HarnessApp {
                         )
                     })
                     .child(div().flex_1().min_h_0().flex().child(transcript_body))
+                    // Turn activity belongs at the transcript tail, where the
+                    // next event will appear. Keeping it out of the composer's
+                    // Vim row leaves `-- INSERT --` as a pure mode indicator.
+                    .when(turn_active, |this| {
+                        this.child(
+                            div()
+                                .h(px(26.))
+                                .flex_none()
+                                .px_4()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_color(colors.text_muted)
+                                .child(SpinnerLabel::dots().size(LabelSize::XSmall))
+                                .child(
+                                    Label::new("Working…")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
@@ -10712,28 +11050,28 @@ impl Render for HarnessApp {
                                                     )
                                                 },
                                             )
-                                            .when(turn_active, |this| {
-                                                this.child(
-                                                    div()
-                                                        .flex_none()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1()
-                                                        .text_color(colors.text_muted)
-                                                        .child(
-                                                            SpinnerLabel::dots()
-                                                                .size(LabelSize::XSmall),
-                                                        )
-                                                        .child(
-                                                            Label::new("Working…")
-                                                                .size(LabelSize::XSmall)
-                                                                .color(Color::Muted),
-                                                        ),
-                                                )
-                                            })
                                             .child(div().flex_1())
                                             .when(turn_active, |this| {
                                                 this.child(
+                                                    Button::new("queue-turn", "Queue")
+                                                        .size(ButtonSize::Compact)
+                                                        .style(ButtonStyle::Subtle)
+                                                        .start_icon(
+                                                            Icon::new(IconName::Send)
+                                                                .size(IconSize::XSmall)
+                                                                .color(Color::Accent),
+                                                        )
+                                                        .disabled(send_blocked)
+                                                        .aria_label(
+                                                            "Queue prompt after the current turn; Ctrl-Enter steers the current turn",
+                                                        )
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.send(window, cx)
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
                                                     Button::new("stop-turn", "Stop")
                                                         .size(ButtonSize::Compact)
                                                         .style(ButtonStyle::Subtle)
@@ -11623,7 +11961,7 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
         model::TranscriptKind::Subagent => IconName::UserGroup,
         model::TranscriptKind::Web => IconName::ToolWeb,
         model::TranscriptKind::Review => IconName::Eye,
-        model::TranscriptKind::Trace => IconName::Code,
+        model::TranscriptKind::Trace => IconName::Compact,
         model::TranscriptKind::Error => IconName::Warning,
         model::TranscriptKind::Approval => IconName::Lock,
     }
@@ -11792,24 +12130,33 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new(
             "enter",
             Send,
-            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+            Some("HarnessComposer && Editor && vim_mode == insert"),
         ),
         KeyBinding::new(
             "shift-enter",
             InsertComposerNewline,
-            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+            Some("HarnessComposer && Editor && vim_mode == insert"),
         ),
         KeyBinding::new(
             "alt-enter",
             InsertComposerNewline,
-            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+            Some("HarnessComposer && Editor && vim_mode == insert"),
         ),
         KeyBinding::new(
             "ctrl-j",
             InsertComposerNewline,
-            Some("HarnessComposer && Editor && VimControl && vim_mode == insert"),
+            Some("HarnessComposer && Editor && vim_mode == insert"),
         ),
-        KeyBinding::new("ctrl-enter", Send, Some("HarnessComposer && Editor")),
+        KeyBinding::new(
+            "ctrl-enter",
+            Steer,
+            Some("HarnessComposer && HarnessTurnActive && Editor"),
+        ),
+        KeyBinding::new(
+            "ctrl-enter",
+            Send,
+            Some("HarnessComposer && !HarnessTurnActive && Editor"),
+        ),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
         KeyBinding::new(
             "ctrl-w k",
@@ -12840,11 +13187,15 @@ mod tests {
         assert_eq!(diff_content_counts(&presentations[0].content), (2, 1));
         assert_eq!(diff_content_counts(&presentations[1].content), (1, 1));
         assert_eq!(
-            aggregate_diff_counts(
-                presentations
-                    .iter()
-                    .map(|presentation| presentation.content.as_str())
-            ),
+            presentations
+                .iter()
+                .map(|presentation| diff_content_counts(&presentation.content))
+                .fold(
+                    (0, 0),
+                    |(total_additions, total_deletions), (additions, deletions)| {
+                        (total_additions + additions, total_deletions + deletions)
+                    }
+                ),
             (3, 2)
         );
     }
@@ -13536,7 +13887,15 @@ mod tests {
                 "created",
             ]
         );
-        assert_eq!((data.total_additions, data.total_deletions), (2, 1));
+        assert_eq!(
+            data.presentations.iter().map(file_change_counts).fold(
+                (0, 0),
+                |(total_additions, total_deletions), (additions, deletions)| {
+                    (total_additions + additions, total_deletions + deletions)
+                }
+            ),
+            (2, 1)
+        );
 
         let source = include_str!("main.rs");
         let renderer = source

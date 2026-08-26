@@ -1045,7 +1045,13 @@ impl StateInner {
         let padding = self.last_padding.unwrap_or_default();
         let scroll_max =
             (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let previous_scroll_top = self.scroll_top(&self.logical_scroll_top());
+        // A bottom-aligned list uses an implicit item-count anchor to mean
+        // "pinned to the tail". That anchor resolves to the content height,
+        // while the legal scroll position is content height minus viewport
+        // height. Clamp before calculating consumption so a gesture that
+        // begins at the bottom reports zero movement and can immediately
+        // arbitrate outward instead of swallowing its first frame.
+        let previous_scroll_top = self.scroll_top(&self.logical_scroll_top()).min(scroll_max);
         let new_scroll_top = (previous_scroll_top - delta.y).max(px(0.)).min(scroll_max);
         if new_scroll_top == previous_scroll_top {
             return ListScrollResult {
@@ -2751,6 +2757,68 @@ mod test {
         assert_eq!(
             list_state.logical_scroll_top(),
             crate::ListOffset::default()
+        );
+    }
+
+    #[gpui::test]
+    fn bottom_aligned_child_at_tail_hands_first_frame_to_parent(cx: &mut TestAppContext) {
+        let mut cx = cx.add_empty_window();
+        cx.update(|window, _| {
+            window.set_nested_scroll_policy_for_test(crate::NestedScrollPolicy::ContinuousOutward);
+        });
+        let outer = ListState::new(20, crate::ListAlignment::Top, px(40.)).measure_all();
+        let inner = ListState::new(10, crate::ListAlignment::Bottom, px(20.)).measure_all();
+
+        struct TestView {
+            outer: ListState,
+            inner: ListState,
+        }
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let inner = self.inner.clone();
+                list(self.outer.clone(), move |index, _, _| {
+                    if index == 0 {
+                        list(inner.clone(), |_, _, _| {
+                            div().h(px(20.)).w_full().into_any()
+                        })
+                        .h(px(80.))
+                        .into_any()
+                    } else {
+                        div().h(px(40.)).w_full().into_any()
+                    }
+                })
+                .size_full()
+            }
+        }
+
+        let view = cx.update(|_, cx| {
+            cx.new(|_| TestView {
+                outer: outer.clone(),
+                inner: inner.clone(),
+            })
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert_eq!(inner.logical_scroll_top().item_ix, 10);
+        cx.simulate_event(ScrollWheelEvent {
+            position: point(px(50.), px(40.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(-12.))),
+            touch_phase: TouchPhase::Started,
+            synthesize_momentum: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            inner.logical_scroll_top().item_ix,
+            10,
+            "the pinned child must not invent visible movement"
+        );
+        assert_ne!(
+            outer.logical_scroll_top(),
+            crate::ListOffset::default(),
+            "the first boundary frame should reach the parent immediately"
         );
     }
 

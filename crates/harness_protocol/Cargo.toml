@@ -18,3 +18,4 @@ codex_app_server_client.workspace = true
 pulldown-cmark.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+shlex.workspace = true

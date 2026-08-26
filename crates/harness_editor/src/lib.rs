@@ -150,7 +150,12 @@ impl LocalEditor {
             // composer becomes internally scrollable. Keeping the Editor's
             // intrinsic cap identical prevents its caret from painting under
             // the host-owned Vim/status row.
-            let mut editor = Editor::auto_height(3, 8, window, cx);
+            // The host owns the compact empty-state height. Requiring three
+            // intrinsic Editor rows made the child taller than that viewport,
+            // so its final painted line could sit underneath the mode row.
+            // One intrinsic row lets the host provide the breathing room while
+            // real content still grows naturally to the eight-row cap.
+            let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             editor.set_use_modal_editing(true);
             editor.register_addon(ComposerKeyContextAddon);

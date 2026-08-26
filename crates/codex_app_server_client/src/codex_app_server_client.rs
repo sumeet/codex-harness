@@ -452,6 +452,49 @@ impl Client {
         .await
     }
 
+    /// Add input to the active turn without interrupting it. The expected turn
+    /// id makes a stale composer submission fail instead of steering a newer
+    /// turn accidentally.
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        input: Value,
+        client_user_message_id: &str,
+    ) -> Result<Value, Error> {
+        self.request(
+            "turn/steer",
+            turn_steer_params(thread_id, expected_turn_id, input, client_user_message_id),
+        )
+        .await
+    }
+
+    /// Persist input in Codex's thread-owned queue. Unlike a Harness-local
+    /// queue this remains authoritative across windows and process restarts.
+    pub async fn queue_turn(
+        &self,
+        thread_id: &str,
+        input: Value,
+        client_user_message_id: &str,
+    ) -> Result<Value, Error> {
+        self.request(
+            "thread/queue/add",
+            thread_queue_add_params(thread_id, input, client_user_message_id),
+        )
+        .await
+    }
+
+    pub async fn start_next_queued_turn(&self, thread_id: &str) -> Result<Value, Error> {
+        self.request(
+            "thread/queue/start",
+            json!({
+                "threadId": thread_id,
+                "queuedSubmissionId": null,
+            }),
+        )
+        .await
+    }
+
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -515,6 +558,28 @@ fn turn_start_params(thread_id: &str, input: Value, client_user_message_id: Opti
         params["clientUserMessageId"] = client_user_message_id.into();
     }
     params
+}
+
+fn turn_steer_params(
+    thread_id: &str,
+    expected_turn_id: &str,
+    input: Value,
+    client_user_message_id: &str,
+) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": expected_turn_id,
+        "clientUserMessageId": client_user_message_id,
+        "input": input,
+    })
+}
+
+fn thread_queue_add_params(thread_id: &str, input: Value, client_user_message_id: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "clientUserMessageId": client_user_message_id,
+        "input": input,
+    })
 }
 
 fn decode_thread_response(response: Value) -> Result<CodexThread, Error> {
@@ -720,6 +785,32 @@ mod tests {
         assert_eq!(
             turn_start_params("thread-1", json!([]), None),
             json!({"threadId": "thread-1", "input": []})
+        );
+    }
+
+    #[test]
+    fn steering_and_queueing_carry_stable_user_message_ids() {
+        let input = json!([{"type": "text", "text": "keep going"}]);
+        assert_eq!(
+            turn_steer_params("thread-1", "turn-1", input.clone(), "client-message-1",),
+            json!({
+                "threadId": "thread-1",
+                "expectedTurnId": "turn-1",
+                "clientUserMessageId": "client-message-1",
+                "input": input,
+            })
+        );
+        assert_eq!(
+            thread_queue_add_params(
+                "thread-1",
+                json!([{"type": "text", "text": "next"}]),
+                "client-message-2",
+            ),
+            json!({
+                "threadId": "thread-1",
+                "clientUserMessageId": "client-message-2",
+                "input": [{"type": "text", "text": "next"}],
+            })
         );
     }
 

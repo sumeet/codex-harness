@@ -536,6 +536,31 @@ pub(crate) fn parse_markdown_with_options(
                     merged_text.push_str(&range.parsed);
                 }
 
+                // pulldown-cmark recognizes checked and unchecked GFM task
+                // markers, but has no indeterminate state. It emits `[~]` as
+                // several adjacent Text events, so detect it after the normal
+                // adjacent-text merge and promote it to a structural marker.
+                let source_start = ranges.first().unwrap().source_range.start;
+                let source_end = ranges.last().unwrap().source_range.end;
+                let line_start = text[..source_start]
+                    .rfind('\n')
+                    .map_or(0, |newline| newline + 1);
+                let list_prefix = &text[line_start..source_start];
+                if merged_text.starts_with("[~] ")
+                    && list_prefix.trim_start().starts_with("- ")
+                    && text[source_start..source_end].starts_with("[~] ")
+                {
+                    state.push_event(
+                        source_start..source_start + 3,
+                        MarkdownEvent::TaskListMarker(TaskListMarkerState::Indeterminate),
+                    );
+                    let body_range = source_start + 4..source_end;
+                    let body = &merged_text[4..];
+                    let (body_range, body_event) = event_for(text, body_range, body);
+                    state.push_event(body_range, body_event);
+                    continue;
+                }
+
                 let mut ranges = ranges.into_iter().peekable();
 
                 if !within_link && !within_code_block {
@@ -654,9 +679,14 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::SoftBreak => state.push_event(range, MarkdownEvent::SoftBreak),
             pulldown_cmark::Event::HardBreak => state.push_event(range, MarkdownEvent::HardBreak),
             pulldown_cmark::Event::Rule => state.push_event(range, MarkdownEvent::Rule),
-            pulldown_cmark::Event::TaskListMarker(checked) => {
-                state.push_event(range, MarkdownEvent::TaskListMarker(checked))
-            }
+            pulldown_cmark::Event::TaskListMarker(checked) => state.push_event(
+                range,
+                MarkdownEvent::TaskListMarker(if checked {
+                    TaskListMarkerState::Checked
+                } else {
+                    TaskListMarkerState::Unchecked
+                }),
+            ),
             pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
         }
     }
@@ -776,12 +806,19 @@ pub enum MarkdownEvent {
     HardBreak,
     /// A horizontal ruler.
     Rule,
-    /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
-    TaskListMarker(bool),
+    /// A task-list marker rendered as a checkbox.
+    TaskListMarker(TaskListMarkerState),
     /// Start of a root-level block (a top-level structural element like a paragraph, heading, list, etc.).
     RootStart,
     /// End of a root-level block. Contains the root block index.
     RootEnd(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskListMarkerState {
+    Unchecked,
+    Indeterminate,
+    Checked,
 }
 
 /// Tags for elements that can contain other elements.
@@ -1510,6 +1547,29 @@ mod tests {
             "Table checkboxes should remain text, not task-list markers"
         );
         assert_eq!(checkbox_cells, vec!["[x]", "[ ]"]);
+    }
+
+    #[test]
+    fn indeterminate_task_marker_is_structural_and_owns_its_source_range() {
+        let markdown = "- [~] Active step\n- [ ] Pending step\n- [x] Finished step";
+        let parsed = parse_markdown_with_options(markdown, false, false, false);
+        let markers = parsed
+            .events
+            .iter()
+            .filter_map(|(range, event)| match event {
+                MarkdownEvent::TaskListMarker(state) => Some((range.clone(), *state)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            markers,
+            [
+                (2..5, TaskListMarkerState::Indeterminate),
+                (20..23, TaskListMarkerState::Unchecked),
+                (39..42, TaskListMarkerState::Checked),
+            ]
+        );
     }
 
     #[test]
