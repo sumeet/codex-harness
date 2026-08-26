@@ -396,7 +396,7 @@ struct RichCommandSurface {
     event_count: usize,
     content_len: usize,
     data: RichCommandData,
-    command_list_state: ListState,
+    command_scroll_handle: ScrollHandle,
     output_list_state: ListState,
     output_horizontal_handle: ScrollHandle,
 }
@@ -4044,7 +4044,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> Option<(RichCommandData, ListState, ListState, ScrollHandle)> {
+    ) -> Option<(RichCommandData, ScrollHandle, ListState, ScrollHandle)> {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -4061,23 +4061,6 @@ impl HarnessApp {
                 .rich_nested_scrolls
                 .entry(item.key.clone())
                 .or_default();
-            let command_text_changed = state
-                .command
-                .as_ref()
-                .is_none_or(|surface| surface.data.command != data.command);
-            let command_list_state = state.command.as_ref().map_or_else(
-                || {
-                    // Command source is normally only a few logical rows. Let
-                    // Zed measure its soft-wrapped text so long shell programs
-                    // remain readable and retain exact wrapped hit geometry.
-                    ListState::new(
-                        command_row_count,
-                        ListAlignment::Top,
-                        px(RICH_COMMAND_ROW_HEIGHT_HINT),
-                    )
-                },
-                |surface| surface.command_list_state.clone(),
-            );
             let output_list_state = state.command.as_ref().map_or_else(
                 || {
                     // Completed and streaming terminal output opens at its tail. Each
@@ -4089,18 +4072,7 @@ impl HarnessApp {
                 },
                 |surface| surface.output_list_state.clone(),
             );
-            command_list_state.set_diagnostics_name(format!("command-input:{}", item.key));
             output_list_state.set_diagnostics_name(format!("command-output:{}", item.key));
-            if command_list_state.item_count() != command_row_count {
-                command_list_state.splice(0..command_list_state.item_count(), command_row_count);
-            } else if command_text_changed {
-                // Streaming command arguments commonly grow without adding a
-                // logical newline. Their soft-wrapped height can therefore
-                // change while the virtual row count remains identical. Keep
-                // the row identity and scroll anchor, but discard its stale
-                // one-line measurement so every wrapped line is laid out.
-                command_list_state.remeasure_items(0..command_row_count);
-            }
             if output_list_state.item_count() != output_row_count {
                 output_list_state.splice(0..output_list_state.item_count(), output_row_count);
                 output_list_state
@@ -4111,7 +4083,11 @@ impl HarnessApp {
                 event_count: item.event_count,
                 content_len: item.content.len(),
                 data,
-                command_list_state,
+                command_scroll_handle: state
+                    .command
+                    .as_ref()
+                    .map(|surface| surface.command_scroll_handle.clone())
+                    .unwrap_or_default(),
                 output_list_state,
                 output_horizontal_handle: state
                     .command
@@ -4138,7 +4114,7 @@ impl HarnessApp {
                 .map(|(index, _)| index);
             if let Some(row) = row {
                 if row < surface.data.command_row_count {
-                    surface.command_list_state.scroll_to_reveal_item(row);
+                    surface.command_scroll_handle.scroll_to_item(row);
                 } else {
                     surface
                         .output_list_state
@@ -4149,7 +4125,7 @@ impl HarnessApp {
         state.last_cursor = cursor;
         Some((
             surface.data.clone(),
-            surface.command_list_state.clone(),
+            surface.command_scroll_handle.clone(),
             surface.output_list_state.clone(),
             surface.output_horizontal_handle.clone(),
         ))
@@ -9979,7 +9955,7 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (data, command_list_state, output_list_state, output_horizontal_handle) =
+        let (data, command_scroll_handle, output_list_state, output_horizontal_handle) =
             self.rich_command_surface(item, navigation)?;
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
@@ -9989,9 +9965,11 @@ impl HarnessApp {
         let command_search = search.clone();
         let command_navigation = navigation.clone();
         let command_owner = owner.clone();
-        let command_rows =
-            list(command_list_state.clone(), move |row_index, _, cx| {
-                let row = &command_data.rows[row_index];
+        let command_rows = command_data
+            .rows
+            .iter()
+            .take(command_data.command_row_count)
+            .map(|row| {
                 let line = &command_data.command[row.source_range.clone()];
                 let first_command_row = row.line_index == 0;
                 let logical_range = rich_command_row_navigation_range(&command_data, row);
@@ -10051,8 +10029,7 @@ impl HarnessApp {
                     .when_some(cursor_marker, |this, marker| this.child(marker))
                     .into_any_element()
             })
-            .with_sizing_behavior(ListSizingBehavior::Infer)
-            .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT));
+            .collect::<Vec<_>>();
 
         let output_data = data.clone();
         let output_search = search.clone();
@@ -10107,13 +10084,14 @@ impl HarnessApp {
             .min_w_0()
             .relative()
             .max_h(px(RICH_NESTED_COMMAND_MAX_HEIGHT))
-            .overflow_y_hidden()
-            .child(command_rows)
+            .overflow_y_scroll()
+            .track_scroll(&command_scroll_handle)
+            .children(command_rows)
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
                     .id(("command-input-scrollbar", index))
                     .with_thumb_color(colors.text_muted.opacity(0.5))
-                    .tracked_scroll_handle(&command_list_state),
+                    .tracked_scroll_handle(&command_scroll_handle),
                 window,
                 cx,
             );
