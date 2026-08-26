@@ -1113,9 +1113,7 @@ fn rich_clickable_styled_text(
                     {
                         state.last_cursor = Some(body_offset);
                     }
-                    this.transcript_editor.update(cx, |editor, cx| {
-                        editor.set_cursor_in_item(item_index, body_offset, window, cx);
-                    });
+                    this.place_rich_cursor_in_item(item_index, body_offset, window, cx);
                     this.transcript_editor.focus_handle(cx).focus(window, cx);
                     this.transcript_editor.update(cx, |editor, cx| {
                         editor.enter_normal_mode(window, cx);
@@ -7593,9 +7591,7 @@ impl HarnessApp {
             self.focus_mode = FocusMode::Buffer;
             if let Some(target_item) = entry_placement {
                 self.selected_item = target_item;
-                self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_cursor_at_item_last_line(target_item, window, cx);
-                });
+                self.place_rich_cursor_at_item_last_line(target_item, window, cx);
             }
             self.transcript_cursor_initialized = true;
             self.transcript_editor.focus_handle(cx).focus(window, cx);
@@ -7621,6 +7617,47 @@ impl HarnessApp {
             }
         });
         cx.notify();
+    }
+
+    /// Host-driven Rich cursor placement does not produce a local native
+    /// Editor selection event. Snapshot it immediately so the painted Rich
+    /// transcript and its hidden Vim input surface agree in the same frame.
+    /// Ordinary Vim motions continue through `TranscriptSelectionChanged`.
+    fn place_rich_cursor_in_item(
+        &mut self,
+        item_index: usize,
+        body_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let placed = self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_cursor_in_item(item_index, body_offset, window, cx)
+        });
+        if placed && rich_vim_experiment() && !self.buffer_view {
+            self.rich_navigation_selection = Some(
+                self.transcript_editor
+                    .update(cx, |editor, cx| editor.selection_snapshot(cx)),
+            );
+        }
+        placed
+    }
+
+    fn place_rich_cursor_at_item_last_line(
+        &mut self,
+        item_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let placed = self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_cursor_at_item_last_line(item_index, window, cx)
+        });
+        if placed && rich_vim_experiment() && !self.buffer_view {
+            self.rich_navigation_selection = Some(
+                self.transcript_editor
+                    .update(cx, |editor, cx| editor.selection_snapshot(cx)),
+            );
+        }
+        placed
     }
 
     fn show_rich_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7667,9 +7704,7 @@ impl HarnessApp {
         if rich_vim_experiment() {
             drop(self.sync_transcript_document(cx));
             if let Some((item_index, body_offset)) = rich_cursor {
-                self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_cursor_in_item(item_index, body_offset, window, cx);
-                });
+                self.place_rich_cursor_in_item(item_index, body_offset, window, cx);
             }
             self.transcript_editor.focus_handle(cx).focus(window, cx);
         } else {
@@ -8156,9 +8191,7 @@ impl HarnessApp {
         } else {
             self.show_text_transcript(window, cx);
         }
-        self.transcript_editor.update(cx, |editor, cx| {
-            editor.set_cursor_in_item(candidate, 0, window, cx);
-        });
+        self.place_rich_cursor_in_item(candidate, 0, window, cx);
 
         self.performance_j_run = Some(PerformanceJDriver::new(generation, j, k));
         self.set_performance_status("Preparing Vim j/k performance sample…", None, cx);
@@ -11333,9 +11366,7 @@ impl HarnessApp {
                             this.focus_mode = FocusMode::Buffer;
                             this.transcript_cursor_initialized = true;
                             this.list_state.pause_following_tail();
-                            this.transcript_editor.update(cx, |editor, cx| {
-                                editor.set_cursor_in_item(index, body_offset, window, cx);
-                            });
+                            this.place_rich_cursor_in_item(index, body_offset, window, cx);
                             this.transcript_editor.focus_handle(cx).focus(window, cx);
                             this.transcript_editor.update(cx, |editor, cx| {
                                 editor.enter_normal_mode(window, cx);
@@ -15886,6 +15917,35 @@ mod tests {
         assert_eq!(method.matches("set_typography_profile(profile").count(), 2);
         assert!(!method.contains("LocalEditor::modal_composer"));
         assert!(!method.contains("TranscriptEditor::read_only"));
+    }
+
+    #[test]
+    fn host_driven_rich_cursor_placement_updates_the_painted_snapshot_immediately() {
+        let source = include_str!("main.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("the production/test boundary must remain explicit");
+        let cursor_bridge = production
+            .split_once("fn place_rich_cursor_in_item(")
+            .and_then(|(_, after)| after.split_once("fn place_rich_cursor_at_item_last_line("))
+            .map(|(method, _)| method)
+            .expect("Rich cursor placement must remain an auditable host/editor bridge");
+        let last_line_bridge = production
+            .split_once("fn place_rich_cursor_at_item_last_line(")
+            .and_then(|(_, after)| after.split_once("fn show_rich_transcript("))
+            .map(|(method, _)| method)
+            .expect("last-line Rich cursor placement must share the same bridge contract");
+
+        for bridge in [cursor_bridge, last_line_bridge] {
+            assert!(bridge.contains("selection_snapshot(cx)"));
+            assert!(bridge.contains("self.rich_navigation_selection = Some("));
+        }
+        assert_eq!(
+            production.matches("editor.set_cursor_in_item(").count(),
+            1,
+            "Rich call sites must not bypass the placement/snapshot bridge"
+        );
     }
 
     #[test]
