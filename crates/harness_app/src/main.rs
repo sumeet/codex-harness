@@ -1663,6 +1663,7 @@ fn diff_header_path(line: &str) -> Option<String> {
 fn compact_diff_indentation(content: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     let mut trims = vec![0; lines.len()];
+    let mut change_rows = vec![false; lines.len()];
     let mut hunk_rows = Vec::<(usize, usize)>::new();
     let mut minimum_indent = None::<usize>;
 
@@ -1697,6 +1698,7 @@ fn compact_diff_indentation(content: &str) -> String {
         if !matches!(marker, b'+' | b'-' | b' ') {
             continue;
         }
+        change_rows[line_index] = matches!(marker, b'+' | b'-');
 
         let body = &line[1..];
         let indent = body
@@ -1716,7 +1718,14 @@ fn compact_diff_indentation(content: &str) -> String {
         .enumerate()
         .map(|(line_index, line)| {
             let trim = trims[line_index];
-            if trim == 0 {
+            if change_rows[line_index] {
+                // The unified-diff marker is presentation furniture, so give
+                // it one ordinary character of breathing room. Keep that
+                // space in the presentation string itself: rendered text,
+                // Vim navigation, hit testing, search, and copying must all
+                // continue to describe identical bytes.
+                format!("{} {}", &line[..1], &line[1 + trim..])
+            } else if trim == 0 {
                 line.to_owned()
             } else {
                 format!("{}{}", &line[..1], &line[1 + trim..])
@@ -13939,7 +13948,7 @@ mod tests {
                 "Modified · /tmp/a\n@@ -1 +1 @@\n-old\n+new",
                 Value::Null,
             ),
-            "/tmp/a\n@@ -1 +1 @@\n-old\n+new"
+            "/tmp/a\n@@ -1 +1 @@\n- old\n+ new"
         );
         assert_eq!(
             project(
@@ -14305,7 +14314,7 @@ mod tests {
         let presentation = diff_file_presentations(&model.items[0].content)
             .pop()
             .unwrap();
-        assert_eq!(body, "src/main.rs\n@@ -1 +1 @@\n-old\n+new");
+        assert_eq!(body, "src/main.rs\n@@ -1 +1 @@\n- old\n+ new");
 
         let normal = RichNavigationPaint {
             body_text: body.into(),
@@ -14612,8 +14621,8 @@ mod tests {
                 "+++ b/src/main.rs\n",
                 "@@ -10,2 +10,2 @@\n",
                 " context\n",
-                "-old\n",
-                "+    new\n",
+                "- old\n",
+                "+     new\n",
                 "@@ -30 +30 @@\n",
                 " second hunk",
             )
@@ -15262,15 +15271,15 @@ mod tests {
 
         assert_eq!(
             body,
-            "/tmp/first.rs\n@@ -1 +1 @@\n-old\n+new\n/tmp/second.rs\ncreated"
+            "/tmp/first.rs\n@@ -1 +1 @@\n- old\n+ new\n/tmp/second.rs\ncreated"
         );
         assert_eq!(
             visible_rows,
             [
                 "/tmp/first.rs",
                 "@@ -1 +1 @@",
-                "-old",
-                "+new",
+                "- old",
+                "+ new",
                 "/tmp/second.rs",
                 "created",
             ]
