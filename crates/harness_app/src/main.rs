@@ -12535,8 +12535,10 @@ impl Render for HarnessApp {
                             .border_t_1()
                             .border_color(visuals.divider)
                             .bg(colors.editor_background)
+                            .py_2()
                             .flex()
                             .flex_col()
+                            .gap_2()
                             .when(!composer_images.is_empty(), |this| {
                                 this.child(
                                     div()
@@ -12603,6 +12605,7 @@ impl Render for HarnessApp {
                                     .flex_none()
                                     .min_w_0()
                                     .px_2()
+                                    .pt_1()
                                     .child(self.composer.clone()),
                             )
                             .child(
