@@ -13519,6 +13519,16 @@ fn thread_load_diagnostics_enabled() -> bool {
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-p", OpenActionPalette, Some("Harness")),
+        // In the modal composer, Ctrl-V should behave like an ordinary app
+        // paste while typing: image clipboard entries become attachments and
+        // text entries flow through the native Editor paste path. Keep this
+        // insert-specific so Vim's Normal/Visual Ctrl-V semantics remain
+        // available outside the composer typing state.
+        KeyBinding::new(
+            "ctrl-v",
+            PasteComposer,
+            Some("HarnessComposer && Editor && vim_mode == insert"),
+        ),
         KeyBinding::new(
             "ctrl-shift-v",
             PasteComposer,
