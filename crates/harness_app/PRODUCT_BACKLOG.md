@@ -21,8 +21,8 @@ must survive conversation compaction and hand-offs.
   across user messages, tool calls, diffs, images, queue rows, and the composer.
 - [ ] Preserve the core Harness direction: show a lot of information in a
   document-like transcript while keeping its structure easy to scan.
-- [ ] Add theme selection and live preview after the semantic roles are stable;
-  do not make components depend on a particular dark theme.
+- [x] Add persistent in-app theme selection with immediate live application;
+  components remain independent of any particular dark theme.
 
 ### Draft destinations and queue/later model
 

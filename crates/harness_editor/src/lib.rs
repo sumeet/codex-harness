@@ -54,7 +54,16 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
     editor::init(cx);
     vim::init(cx);
     let language_set = HarnessLanguageSet::new(cx)?;
+    let language_registry = language_set.registry.clone();
     cx.set_global(language_set);
+    // Zed's full application keeps its shared LanguageRegistry synchronized
+    // with GlobalTheme. Harness owns a deliberately smaller registry, so it
+    // must establish the same observer for live theme changes to recolor
+    // Markdown, Bash, Rust, and JSON without rebuilding the window.
+    cx.observe_global::<theme::GlobalTheme>(move |cx| {
+        language_registry.set_theme(cx.theme().clone());
+    })
+    .detach();
 
     let mut defaults =
         KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;

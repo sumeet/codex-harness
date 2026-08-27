@@ -1,5 +1,54 @@
+use std::{fs, path::PathBuf};
+
+use anyhow::Context as _;
 use gpui::Hsla;
+use serde_json::{Value, json};
 use theme::ThemeColors;
+
+pub(crate) const DEFAULT_HARNESS_THEME: &str = "One Dark";
+
+fn preferences_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("harness").join("preferences.json"))
+}
+
+fn theme_name_from_preferences(contents: &str) -> Option<String> {
+    serde_json::from_str::<Value>(contents)
+        .ok()?
+        .get("theme")?
+        .as_str()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Returns an explicit launch override, then the last in-app selection, then
+/// Harness's bundled default. The environment variable remains useful for
+/// replay screenshots, but ordinary users never need it.
+pub(crate) fn preferred_theme_name() -> String {
+    std::env::var("HARNESS_THEME")
+        .ok()
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            let path = preferences_path()?;
+            let contents = fs::read_to_string(path).ok()?;
+            theme_name_from_preferences(&contents)
+        })
+        .unwrap_or_else(|| DEFAULT_HARNESS_THEME.to_owned())
+}
+
+/// Persists only Harness-owned preferences rather than mutating Zed's user
+/// settings file. A later settings surface can extend this small object.
+pub(crate) fn remember_theme_name(theme_name: &str) -> anyhow::Result<()> {
+    let path = preferences_path().context("no user configuration directory is available")?;
+    let parent = path
+        .parent()
+        .context("Harness preferences path has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
+    let contents = serde_json::to_string_pretty(&json!({ "theme": theme_name }))?;
+    fs::write(&path, contents).with_context(|| format!("could not write {}", path.display()))?;
+    Ok(())
+}
 
 /// Harness's semantic visual vocabulary.
 ///
@@ -44,6 +93,17 @@ impl HarnessVisualTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persisted_theme_requires_a_nonempty_string() {
+        assert_eq!(
+            theme_name_from_preferences(r#"{ "theme": "Ayu Mirage" }"#).as_deref(),
+            Some("Ayu Mirage")
+        );
+        assert_eq!(theme_name_from_preferences(r#"{ "theme": "  " }"#), None);
+        assert_eq!(theme_name_from_preferences(r#"{ "theme": 3 }"#), None);
+        assert_eq!(theme_name_from_preferences("not json"), None);
+    }
 
     #[test]
     fn semantic_theme_is_derived_only_from_zed_theme_colors() {

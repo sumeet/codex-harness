@@ -59,7 +59,7 @@ use request_surface::{
     RequestSurface, Respond as RequestSurfaceRespond, ReturnToTranscript, SurfaceSyncDecision,
     surface_sync_decision,
 };
-use visual_theme::HarnessVisualTheme;
+use visual_theme::{HarnessVisualTheme, preferred_theme_name, remember_theme_name};
 use zed_actions::command_palette::{OpenWithQuery, Toggle as ToggleCommandPalette};
 
 actions!(
@@ -3357,6 +3357,28 @@ fn reasoning_effort_label(effort: &str) -> SharedString {
     }
 }
 
+fn apply_harness_theme(theme_name: &str, cx: &mut App) {
+    if let Err(error) = theme::ThemeRegistry::global(cx).get(theme_name) {
+        log::error!("cannot select Harness theme: {error}");
+        return;
+    }
+
+    let settings = json!({
+        "vim_mode": true,
+        "theme": theme_name,
+    })
+    .to_string();
+    SettingsStore::update_global(cx, |store, cx| {
+        if let Err(error) = store.set_user_settings(&settings, cx).result() {
+            log::error!("could not apply Harness theme {theme_name}: {error}");
+        }
+    });
+    theme_settings::reload_theme(cx);
+    if let Err(error) = remember_theme_name(theme_name) {
+        log::warn!("could not remember Harness theme {theme_name}: {error}");
+    }
+}
+
 fn permission_profile_choices_from_response(response: &Value) -> Vec<PermissionProfileChoice> {
     response
         .get("data")
@@ -3432,6 +3454,47 @@ impl ThreadSnapshotCache {
 }
 
 impl HarnessApp {
+    fn render_theme_selector(&self, cx: &Context<Self>) -> AnyElement {
+        let current_theme = cx.theme().name.clone();
+        let mut themes = theme::ThemeRegistry::global(cx).list();
+        themes.sort_unstable_by(|left, right| {
+            left.appearance
+                .is_light()
+                .cmp(&right.appearance.is_light())
+                .then(left.name.cmp(&right.name))
+        });
+        let trigger = IconButton::new("theme-selector-trigger", IconName::Settings)
+            .shape(IconButtonShape::Square)
+            .size(ButtonSize::Default)
+            .style(ButtonStyle::Subtle)
+            .aria_label(format!("Theme: {current_theme}"));
+
+        PopoverMenu::new("theme-selector")
+            .trigger(trigger)
+            .menu(move |window, cx| {
+                let themes = themes.clone();
+                let current_theme = current_theme.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    let mut rendering_light_themes = false;
+                    menu = menu.header("Dark");
+                    for theme in themes {
+                        if theme.appearance.is_light() && !rendering_light_themes {
+                            rendering_light_themes = true;
+                            menu = menu.separator().header("Light");
+                        }
+                        let theme_name = theme.name.clone();
+                        menu = menu.item(
+                            ContextMenuEntry::new(theme.name)
+                                .toggleable(IconPosition::End, theme_name == current_theme)
+                                .handler(move |_, cx| apply_harness_theme(&theme_name, cx)),
+                        );
+                    }
+                    menu
+                }))
+            })
+            .into_any_element()
+    }
+
     fn apply_thread_open_settings(&mut self, response: &ThreadOpenResponse) {
         self.model.telemetry.set_thread_settings(
             model::ThreadSettingsSnapshot::from_open_response(
@@ -12249,6 +12312,7 @@ impl Render for HarnessApp {
                                             this.toggle_buffer_view(window, cx)
                                         })),
                                 )
+                                .child(self.render_theme_selector(cx))
                                 .child(
                                     IconButton::new("refresh-tasks", IconName::RotateCw)
                                         .shape(IconButtonShape::Square)
@@ -16313,10 +16377,7 @@ fn main() {
             log::error!("failed to load fonts: {error}");
             return;
         }
-        let initial_theme = std::env::var("HARNESS_THEME")
-            .ok()
-            .filter(|theme| !theme.trim().is_empty())
-            .unwrap_or_else(|| "One Dark".to_owned());
+        let initial_theme = preferred_theme_name();
         let initial_settings = json!({
             "vim_mode": true,
             "theme": initial_theme,

@@ -18,6 +18,7 @@ harness_protocol.workspace = true
 language = { path = "../language", default-features = false }
 multi_buffer.workspace = true
 settings.workspace = true
+theme.workspace = true
 theme_settings.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true

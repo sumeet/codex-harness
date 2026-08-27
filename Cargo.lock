@@ -8365,6 +8365,7 @@ dependencies = [
  "language",
  "multi_buffer",
  "settings",
+ "theme",
  "theme_settings",
  "tree-sitter",
  "tree-sitter-bash",
