@@ -61,7 +61,7 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) canvas: Hsla,
     pub(crate) transcript: Hsla,
     pub(crate) rail: Hsla,
-    pub(crate) composer: Hsla,
+    pub(crate) status_strip: Hsla,
     pub(crate) raised_surface: Hsla,
     pub(crate) inset_surface: Hsla,
     pub(crate) pending_surface: Hsla,
@@ -74,7 +74,6 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) diff_deleted_surface: Hsla,
     pub(crate) divider: Hsla,
     pub(crate) strong_divider: Hsla,
-    pub(crate) focus_wash: Hsla,
 }
 
 impl HarnessVisualTheme {
@@ -83,10 +82,10 @@ impl HarnessVisualTheme {
             canvas: colors.background,
             transcript: colors.editor_background,
             rail: colors.panel_background,
-            // The composer is part of the document's working surface, but its
-            // slightly raised subheader tone separates it without a bright
-            // focus-colored rule.
-            composer: colors.editor_subheader_background,
+            // Use the same quiet terminal edge as Zed's workspace status bar.
+            // The composer controls belong to this strip, not to a second
+            // floating toolbar inside the draft surface.
+            status_strip: colors.status_bar_background,
             raised_surface: colors.surface_background,
             inset_surface: colors.editor_background,
             pending_surface: colors
@@ -103,9 +102,6 @@ impl HarnessVisualTheme {
             diff_deleted_surface: colors.version_control_deleted.opacity(0.12),
             divider: colors.border_variant.opacity(0.82),
             strong_divider: colors.border,
-            // Focus is a low-amplitude surface change. Explicit controls still
-            // use the theme's ordinary focused/selected tokens.
-            focus_wash: colors.element_selected.opacity(0.16),
         }
     }
 }

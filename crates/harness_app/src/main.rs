@@ -127,8 +127,7 @@ const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
 const MAX_COMPOSER_IMAGES: usize = 8;
 const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-const COMPOSER_ATTACHMENT_STRIP_HEIGHT: f32 = 62.;
-const COMPOSER_NOTICE_HEIGHT: f32 = 28.;
+const COMPOSER_ATTACHMENT_STRIP_HEIGHT: f32 = 48.;
 #[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
@@ -2830,10 +2829,11 @@ fn composer_height(text: &str, available_width: f32, profile: TranscriptTypograp
             .sum::<usize>()
             .clamp(1, 8)
     };
-    // Leave one full line of slack below the Editor's measured content. The
-    // display map's final baseline and Vim caret can otherwise paint beneath
-    // the fixed status row when the last logical line is soft-wrapped.
-    86. + 22. * visual_rows.saturating_sub(1) as f32
+    // One editor line plus Zed's compact bottom control strip. The old 86px
+    // minimum made an empty draft look like a large, separate panel; this
+    // keeps the composer attached to the transcript while retaining a full
+    // baseline of slack for the Vim caret.
+    68. + 22. * visual_rows.saturating_sub(1) as f32
 }
 
 fn composer_render_metrics(
@@ -12155,17 +12155,11 @@ impl Render for HarnessApp {
             } else {
                 None
             };
-        let composer_notice_visible = composer_status.is_some();
         let composer_height = composer_metrics.height
             + if self.composer_images.is_empty() {
                 0.
             } else {
                 COMPOSER_ATTACHMENT_STRIP_HEIGHT
-            }
-            + if composer_notice_visible {
-                COMPOSER_NOTICE_HEIGHT
-            } else {
-                0.
             };
         let composer_images = self.composer_images.clone();
         let turn_active = self.turn_active();
@@ -12657,10 +12651,7 @@ impl Render for HarnessApp {
                             .h(px(composer_height))
                             .border_t_1()
                             .border_color(visuals.divider)
-                            .bg(visuals.composer)
-                            .when(self.focus_mode == FocusMode::Composer, |this| {
-                                this.bg(visuals.composer.blend(visuals.focus_wash))
-                            })
+                            .bg(colors.editor_background)
                             .flex()
                             .flex_col()
                             .when(!composer_images.is_empty(), |this| {
@@ -12669,9 +12660,8 @@ impl Render for HarnessApp {
                                         .id("composer-attachments")
                                         .h(px(COMPOSER_ATTACHMENT_STRIP_HEIGHT))
                                         .flex_none()
-                                        .px_3()
-                                        .pt_2()
-                                        .pb_1()
+                                        .px_2()
+                                        .py_1()
                                         .flex()
                                         .overflow_x_scroll()
                                         .items_center()
@@ -12681,7 +12671,7 @@ impl Render for HarnessApp {
                                             div()
                                                 .id(("composer-image", attachment_id))
                                                 .relative()
-                                                .size(px(52.))
+                                                .size(px(40.))
                                                 .flex_none()
                                                 .overflow_hidden()
                                                 .rounded_sm()
@@ -12725,59 +12715,28 @@ impl Render for HarnessApp {
                                         })),
                                 )
                             })
-                            .when_some(composer_status.clone(), |this, (status, color)| {
-                                this.child(
-                                    div()
-                                        .h(px(COMPOSER_NOTICE_HEIGHT))
-                                        .flex_none()
-                                        .px_3()
-                                        .border_b_1()
-                                        .border_color(visuals.divider)
-                                        .bg(visuals.inset_surface.opacity(0.56))
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .when(
-                                            matches!(
-                                                color,
-                                                Color::Muted
-                                                    if self.loading_thread
-                                                        || self.attaching_thread
-                                                        || self.settings_update_pending
-                                                        || self.connecting
-                                            ),
-                                            |this| {
-                                                this.child(
-                                                    SpinnerLabel::dots()
-                                                        .size(LabelSize::Small)
-                                                        .color(Color::Muted),
-                                                )
-                                            },
-                                        )
-                                        .child(
-                                            Label::new(status).size(LabelSize::Small).color(color),
-                                        ),
-                                )
-                            })
                             .child(
                                 div()
                                     .flex_1()
                                     .min_h_0()
-                                    .min_h(px(48.))
+                                    .min_h(px(38.))
                                     .overflow_hidden()
-                                    .px_3()
-                                    .pt_2()
-                                    .pb_2()
+                                    .px_2()
+                                    .pt_1()
+                                    .pb_0p5()
                                     .child(self.composer.clone()),
                             )
                             .child(
                                 div()
-                                    .h(px(30.))
+                                    .h(px(26.))
                                     .flex_none()
                                     .px_2()
+                                    .bg(visuals.status_strip)
+                                    .border_t_1()
+                                    .border_color(visuals.divider)
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap_1()
                                     .when(self.search_visible, |this| {
                                         this.key_context("HarnessSearch")
                                             .child(
@@ -12817,8 +12776,36 @@ impl Render for HarnessApp {
                                                     .min_w_0()
                                                     .flex()
                                                     .items_center()
-                                                    .gap_0p5()
-                                                    .child(self.mode_indicator.clone()),
+                                                    .gap_1()
+                                                    .child(self.mode_indicator.clone())
+                                                    .when_some(
+                                                        composer_status.clone(),
+                                                        |this, (status, color)| {
+                                                            this.when(
+                                                                matches!(
+                                                                    color,
+                                                                    Color::Muted
+                                                                        if self.loading_thread
+                                                                            || self.attaching_thread
+                                                                            || self.settings_update_pending
+                                                                            || self.connecting
+                                                                ),
+                                                                |this| {
+                                                                    this.child(
+                                                                        SpinnerLabel::dots()
+                                                                            .size(LabelSize::Small)
+                                                                            .color(Color::Muted),
+                                                                    )
+                                                                },
+                                                            )
+                                                            .child(
+                                                                Label::new(status)
+                                                                    .size(LabelSize::Small)
+                                                                    .color(color)
+                                                                    .truncate(),
+                                                            )
+                                                        },
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -16222,15 +16209,15 @@ mod tests {
     #[test]
     fn composer_height_is_compact_grows_with_content_and_stays_bounded() {
         let reading = TranscriptTypographyProfile::Reading;
-        assert_eq!(composer_height("", 900., reading), 86.);
-        assert_eq!(composer_height("one line", 900., reading), 86.);
-        assert!(composer_height("first\nsecond\nthird", 900., reading) > 86.);
+        assert_eq!(composer_height("", 900., reading), 68.);
+        assert_eq!(composer_height("one line", 900., reading), 68.);
+        assert!(composer_height("first\nsecond\nthird", 900., reading) > 68.);
         assert!(
             composer_height(&"wrapped ".repeat(200), 320., reading)
                 > composer_height(&"wrapped ".repeat(20), 900., reading),
             "narrow, wrapped prompts should receive more editing room"
         );
-        assert_eq!(composer_height(&"line\n".repeat(100), 320., reading), 240.);
+        assert_eq!(composer_height(&"line\n".repeat(100), 320., reading), 222.);
     }
 
     #[test]
