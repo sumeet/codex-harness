@@ -37,11 +37,11 @@ use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
-    Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
-    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
-    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
-    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
-    right_click_menu,
+    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure,
+    DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
+    LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes,
+    Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip,
+    WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -143,8 +143,11 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
-const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 44.;
-const RICH_DIFF_GUTTER_GAP: f32 = 6.;
+// Zed's native diff editor keeps the line-number gutter visually subordinate
+// to the code. Five digits still fit at our compact buffer size without the
+// large blank runway the previous 44 px gutter introduced.
+const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 38.;
+const RICH_DIFF_GUTTER_GAP: f32 = 8.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -1052,10 +1055,28 @@ fn diff_line_syntax_highlights(
         _ => 0,
     };
     let source = &line[prefix_len.min(line.len())..];
-    syntax_highlights_for_path(Path::new(path), source, cx)
+    let mut highlights = syntax_highlights_for_path(Path::new(path), source, cx)
         .into_iter()
         .map(|(range, style)| (range.start + prefix_len..range.end + prefix_len, style))
-        .collect()
+        .collect::<Vec<_>>();
+    // Zed's diff editor colors the change marker, not every token on a changed
+    // row. Let the language theme keep ownership of the code glyphs and use
+    // the diff background plus this one marker to communicate row state.
+    if matches!(tone, DiffLineTone::Addition | DiffLineTone::Deletion) && !line.is_empty() {
+        let visuals = HarnessVisualTheme::from_zed(cx.theme().colors());
+        highlights.push((
+            0..1,
+            gpui::HighlightStyle {
+                color: Some(if tone == DiffLineTone::Addition {
+                    visuals.diff_added
+                } else {
+                    visuals.diff_deleted
+                }),
+                ..Default::default()
+            },
+        ));
+    }
+    highlights
 }
 
 fn logical_offset_for_rendered_index(
@@ -1651,6 +1672,57 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
         rows: rows.into(),
         command_row_count,
     })
+}
+
+fn render_command_visual_status(
+    status: model::CommandExecutionStatus,
+    item_index: usize,
+    _cx: &App,
+) -> AnyElement {
+    let (icon, color, tooltip): (IconName, Color, SharedString) = match status {
+        model::CommandExecutionStatus::Running => (
+            IconName::LoadCircle,
+            Color::Muted,
+            "Command is still running".into(),
+        ),
+        model::CommandExecutionStatus::Succeeded => (
+            IconName::Check,
+            Color::Success,
+            "Command completed successfully".into(),
+        ),
+        model::CommandExecutionStatus::Failed(Some(code)) => (
+            IconName::Close,
+            Color::Error,
+            format!("Command exited with code {code}").into(),
+        ),
+        model::CommandExecutionStatus::Failed(None) => {
+            (IconName::Close, Color::Error, "Command failed".into())
+        }
+    };
+
+    if status == model::CommandExecutionStatus::Running {
+        div()
+            .size(px(18.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                Icon::new(icon)
+                    .size(IconSize::Small)
+                    .color(color)
+                    .with_rotate_animation(2),
+            )
+            .into_any_element()
+    } else {
+        IconButton::new(("command-status", item_index), icon)
+            .style(ButtonStyle::Transparent)
+            .size(ButtonSize::Compact)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(Tooltip::text(tooltip))
+            .into_any_element()
+    }
 }
 
 fn rich_command_row_logical_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
@@ -9229,11 +9301,7 @@ impl HarnessApp {
                     } else {
                         gpui::transparent_black()
                     })
-                    .text_color(if tone == DiffLineTone::Addition {
-                        visuals.diff_added
-                    } else if tone == DiffLineTone::Deletion {
-                        visuals.diff_deleted
-                    } else if tone == DiffLineTone::Hunk {
+                    .text_color(if tone == DiffLineTone::Hunk {
                         colors.text_accent
                     } else {
                         colors.text
@@ -9388,7 +9456,6 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_0p5()
             .children(sections)
             .when_some(toggle, |this, toggle| {
                 this.child(
@@ -9561,11 +9628,7 @@ impl HarnessApp {
                     } else {
                         gpui::transparent_black()
                     })
-                    .text_color(if *tone == DiffLineTone::Addition {
-                        visuals.diff_added
-                    } else if *tone == DiffLineTone::Deletion {
-                        visuals.diff_deleted
-                    } else if *tone == DiffLineTone::Hunk {
+                    .text_color(if *tone == DiffLineTone::Hunk {
                         colors.text_accent
                     } else {
                         colors.text
@@ -9963,6 +10026,7 @@ impl HarnessApp {
         let command_search = search.clone();
         let command_navigation = navigation.clone();
         let command_owner = owner.clone();
+        let command_status = item.command_execution_status();
         let command_rows = command_data
             .rows
             .iter()
@@ -10022,8 +10086,29 @@ impl HarnessApp {
                     .min_h(px(20.))
                     .relative()
                     .whitespace_normal()
-                    .when(first_command_row, |this| this.pr_5())
+                    .when(first_command_row, |this| {
+                        this.pr(if command_status.is_some() {
+                            px(44.)
+                        } else {
+                            px(22.)
+                        })
+                    })
                     .child(clickable)
+                    .when_some(
+                        first_command_row.then_some(command_status).flatten(),
+                        |this, status| {
+                            this.child(
+                                div()
+                                    .absolute()
+                                    .top(px(0.))
+                                    // The outer card's disclosure owns the
+                                    // rightmost 20 px. Status sits immediately
+                                    // before it, as in Zed's terminal header.
+                                    .right(px(21.))
+                                    .child(render_command_visual_status(status, index, cx)),
+                            )
+                        },
+                    )
                     .when_some(cursor_marker, |this, marker| this.child(marker))
                     .into_any_element()
             })
@@ -11660,10 +11745,20 @@ impl HarnessApp {
                 .when(!compact_trace, |this| {
                     this.rounded_md()
                         .border_1()
-                        .border_color(colors.border.opacity(0.8))
+                        .border_color(colors.border.opacity(0.6))
                         .bg(colors.editor_background)
                         .overflow_hidden()
                 })
+                .when(
+                    matches!(
+                        item.command_execution_status(),
+                        Some(model::CommandExecutionStatus::Failed(_))
+                    ),
+                    |this| {
+                        this.border_dashed()
+                            .border_color(cx.theme().status().error.opacity(0.62))
+                    },
+                )
                 .when(compact_trace, |this| this.px_1().py_0p5().gap_0p5())
                 .when(render_header, |this| this.child(header))
                 .when_some(search_context, |this, context| {
@@ -12359,7 +12454,10 @@ impl Render for HarnessApp {
                         div()
                             .flex_none()
                             .border_t_1()
-                            .border_color(visuals.divider)
+                            // Match Zed's message editor: the composer is one
+                            // editor surface separated by the ordinary theme
+                            // border, not a Harness-specific blue status bar.
+                            .border_color(colors.border)
                             .bg(colors.editor_background)
                             .py_2()
                             .flex()
@@ -12436,10 +12534,11 @@ impl Render for HarnessApp {
                             )
                             .child(
                                 div()
-                                    .h(px(24.))
+                                    .min_h(px(24.))
                                     .flex_none()
                                     .px_2()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_1()
                                     .when(self.search_visible, |this| {

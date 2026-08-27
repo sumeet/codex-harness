@@ -167,6 +167,13 @@ pub struct CommandTranscript {
     pub output: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandExecutionStatus {
+    Running,
+    Succeeded,
+    Failed(Option<i64>),
+}
+
 pub const COMMAND_PROMPT: &str = "$ ";
 
 /// Present the program supplied to a conventional Bash login-shell wrapper.
@@ -340,6 +347,72 @@ impl TranscriptItem {
             cwd,
             output,
         })
+    }
+
+    /// Normalize typed command state for every presentation surface. Process
+    /// exit code is authoritative; textual status remains a compatibility
+    /// fallback for streamed and older persisted events.
+    pub fn command_execution_status(&self) -> Option<CommandExecutionStatus> {
+        if self.kind != TranscriptKind::Command {
+            return None;
+        }
+        let exit_code = [
+            "/exitCode",
+            "/exit_code",
+            "/exitStatus/code",
+            "/output/exitCode",
+            "/output/exit_code",
+        ]
+        .into_iter()
+        .find_map(|pointer| self.raw.pointer(pointer).and_then(Value::as_i64))
+        .or_else(|| {
+            self.status
+                .as_deref()?
+                .trim()
+                .strip_prefix("exit ")?
+                .parse()
+                .ok()
+        });
+        if let Some(exit_code) = exit_code {
+            return Some(if exit_code == 0 {
+                CommandExecutionStatus::Succeeded
+            } else {
+                CommandExecutionStatus::Failed(Some(exit_code))
+            });
+        }
+
+        let status = self
+            .status
+            .as_deref()
+            .or_else(|| self.raw.get("status").and_then(Value::as_str))?
+            .to_ascii_lowercase();
+        if [
+            "running",
+            "in progress",
+            "inprogress",
+            "in_progress",
+            "streaming",
+            "pending",
+        ]
+        .iter()
+        .any(|candidate| status == *candidate)
+        {
+            Some(CommandExecutionStatus::Running)
+        } else if status.contains("fail")
+            || status.contains("error")
+            || status.contains("cancel")
+            || status.contains("reject")
+            || status.starts_with("exit ")
+        {
+            Some(CommandExecutionStatus::Failed(None))
+        } else if status.contains("complete")
+            || status.contains("success")
+            || status.contains("succeed")
+        {
+            Some(CommandExecutionStatus::Succeeded)
+        } else {
+            None
+        }
     }
 }
 
@@ -5243,6 +5316,40 @@ mod tests {
         assert_eq!(
             model.items[0].raw.get("command").and_then(Value::as_str),
             Some(raw)
+        );
+    }
+
+    #[test]
+    fn command_execution_status_prefers_structured_exit_code() {
+        let command = |status: Option<&str>, raw: Value| TranscriptItem {
+            key: "command-status".into(),
+            protocol_id: None,
+            kind: TranscriptKind::Command,
+            title: "Command".into(),
+            status: status.map(ToOwned::to_owned),
+            content: "$ true".into(),
+            raw,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert_eq!(
+            command(Some("failed"), json!({"exitCode": 0})).command_execution_status(),
+            Some(CommandExecutionStatus::Succeeded),
+            "the process exit code is more reliable than stale streamed status"
+        );
+        assert_eq!(
+            command(Some("completed"), json!({"exitCode": 17})).command_execution_status(),
+            Some(CommandExecutionStatus::Failed(Some(17)))
+        );
+        assert_eq!(
+            command(Some("running"), Value::Null).command_execution_status(),
+            Some(CommandExecutionStatus::Running)
+        );
+        assert_eq!(
+            command(Some("exit 7"), Value::Null).command_execution_status(),
+            Some(CommandExecutionStatus::Failed(Some(7)))
         );
     }
 
