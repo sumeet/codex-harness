@@ -46,6 +46,7 @@ mod image_surface;
 mod palette;
 mod performance;
 mod request_surface;
+mod visual_theme;
 
 use image_surface::{
     ImageSurface, SurfaceSyncDecision as ImageSurfaceSyncDecision,
@@ -58,6 +59,7 @@ use request_surface::{
     RequestSurface, Respond as RequestSurfaceRespond, ReturnToTranscript, SurfaceSyncDecision,
     surface_sync_decision,
 };
+use visual_theme::HarnessVisualTheme;
 use zed_actions::command_palette::{OpenWithQuery, Toggle as ToggleCommandPalette};
 
 actions!(
@@ -3798,6 +3800,7 @@ impl HarnessApp {
             return None;
         }
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let queue_count = self.queued_turns.len();
         let title: SharedString = if queue_count == 1 {
             "1 queued prompt".into()
@@ -3814,8 +3817,8 @@ impl HarnessApp {
                 .flex_none()
                 .max_h(px(190.))
                 .border_t_1()
-                .border_color(colors.border)
-                .bg(colors.editor_background)
+                .border_color(visuals.divider)
+                .bg(visuals.pending_surface)
                 .flex()
                 .flex_col()
                 .child(
@@ -11728,23 +11731,28 @@ impl HarnessApp {
 
         let narrow = window.viewport_size().width < px(720.);
         let transient_status = self.transient_turn_status.clone();
+        let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let activity_color = if transient_status.is_some() {
             Color::Warning
         } else {
-            Color::Muted
+            Color::Accent
         };
         div()
             .id("transcript-turn-tail")
             .w_full()
-            .min_h(px(34.))
+            .min_h(px(40.))
             .px(if narrow { px(10.) } else { px(18.) })
             .py_2()
+            .border_t_1()
+            .border_color(visuals.divider)
+            .bg(visuals.activity_surface)
             .flex()
             .items_center()
             .gap_2()
             .child(
                 SpinnerLabel::dots()
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Large)
                     .color(activity_color),
             )
             .when_some(transient_status, |this, status| {
@@ -11778,6 +11786,7 @@ impl Render for HarnessApp {
         self.sync_image_surfaces(window, cx);
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let viewport_width = f32::from(window.viewport_size().width);
@@ -11870,7 +11879,7 @@ impl Render for HarnessApp {
                 // narrows soft wrapping without inserting transcript bytes.
                 .px_4()
                 .overflow_hidden()
-                .bg(colors.editor_background)
+                .bg(visuals.transcript)
                 .child(self.transcript_editor.clone())
                 .into_any_element()
         } else {
@@ -11907,6 +11916,7 @@ impl Render for HarnessApp {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
+                .bg(visuals.transcript)
                 .child(rich_list)
                 .when(rich_vim_experiment(), |this| {
                     // Keep the native Editor fully laid out so its Vim action
@@ -11994,7 +12004,7 @@ impl Render for HarnessApp {
             .track_focus(&self.transcript_focus)
             .size_full()
             .flex()
-            .bg(colors.background)
+            .bg(visuals.canvas)
             .text_color(colors.text)
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
@@ -12194,8 +12204,8 @@ impl Render for HarnessApp {
                         .h_full()
                         .flex_none()
                         .border_r_1()
-                        .border_color(colors.border)
-                        .bg(colors.panel_background)
+                        .border_color(visuals.strong_divider)
+                        .bg(visuals.rail)
                         .flex()
                         .flex_col()
                         .child(
@@ -12206,7 +12216,7 @@ impl Render for HarnessApp {
                                 .items_center()
                                 .gap_1()
                                 .border_b_1()
-                                .border_color(colors.border)
+                                .border_color(visuals.divider)
                                 .child(
                                     IconButton::new(
                                         "hide-sidebar",
@@ -12314,12 +12324,11 @@ impl Render for HarnessApp {
                             .flex_none()
                             .h(px(composer_height))
                             .border_t_1()
-                            .border_color(if self.focus_mode == FocusMode::Composer {
-                                colors.border_focused
-                            } else {
-                                colors.border
+                            .border_color(visuals.divider)
+                            .bg(visuals.composer)
+                            .when(self.focus_mode == FocusMode::Composer, |this| {
+                                this.bg(visuals.composer.blend(visuals.focus_wash))
                             })
-                            .bg(colors.editor_background)
                             .flex()
                             .flex_col()
                             .when(!composer_images.is_empty(), |this| {
@@ -16296,14 +16305,32 @@ fn main() {
             cx,
         );
         settings::init(cx);
-        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        // Load the same bundled theme catalog as Zed instead of constraining
+        // Harness to the test-only base theme. Components still consume
+        // semantic Harness roles derived from the active Zed theme.
+        theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
         if let Err(error) = Assets.load_fonts(cx) {
             log::error!("failed to load fonts: {error}");
             return;
         }
+        let initial_theme = std::env::var("HARNESS_THEME")
+            .ok()
+            .filter(|theme| !theme.trim().is_empty())
+            .unwrap_or_else(|| "One Dark".to_owned());
+        let initial_settings = json!({
+            "vim_mode": true,
+            "theme": initial_theme,
+        })
+        .to_string();
         SettingsStore::update_global(cx, |store, cx| {
-            _ = store.set_user_settings(r#"{"vim_mode": true}"#, cx);
+            if let Err(error) = store.set_user_settings(&initial_settings, cx).result() {
+                log::error!("failed to initialize Harness settings: {error}");
+            }
         });
+        // The settings observer is deferred; make the first frame use the
+        // selected Harness theme as well instead of briefly (or permanently,
+        // in short replay sessions) painting the system-mode fallback.
+        theme_settings::reload_theme(cx);
         if let Err(error) = harness_editor::init(cx) {
             log::error!("failed to load editor keymaps: {error}");
             return;
