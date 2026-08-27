@@ -61,7 +61,6 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) canvas: Hsla,
     pub(crate) transcript: Hsla,
     pub(crate) rail: Hsla,
-    pub(crate) status_strip: Hsla,
     pub(crate) raised_surface: Hsla,
     pub(crate) inset_surface: Hsla,
     pub(crate) pending_surface: Hsla,
@@ -82,10 +81,6 @@ impl HarnessVisualTheme {
             canvas: colors.background,
             transcript: colors.editor_background,
             rail: colors.panel_background,
-            // Use the same quiet terminal edge as Zed's workspace status bar.
-            // The composer controls belong to this strip, not to a second
-            // floating toolbar inside the draft surface.
-            status_strip: colors.status_bar_background,
             raised_surface: colors.surface_background,
             inset_surface: colors.editor_background,
             pending_surface: colors

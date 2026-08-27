@@ -26,8 +26,8 @@ must survive conversation compaction and hand-offs.
   components remain independent of any particular dark theme.
 - [x] Port Zed's composer composition rather than only its buttons: a compact
   auto-height draft surface, one contextual Send/Queue/Stop control, a native
-  context ring, consistent model/effort and permission selectors, and a real
-  theme-derived bottom status strip that preserves Harness Vim state.
+  context ring, and consistent model/effort and permission selectors in a
+  quiet editor-surface footer that preserves Harness Vim state.
 
 ### Draft destinations and queue/later model
 
