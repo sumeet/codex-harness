@@ -3479,7 +3479,7 @@ fn replay_templates() -> Vec<TranscriptItem> {
             4,
             TranscriptKind::Diff,
             "Working tree diff · 3 files",
-            "diff --git a/crates/harness_app/src/main.rs b/crates/harness_app/src/main.rs\n@@ -83,7 +83,10 @@\n-    let transcript = DebugCards::new(events);\n+    let transcript = SemanticDocument::from_journal(events);\n+    transcript.enable_vim_navigation();\n+    transcript.enable_raw_inspection();\n \n     window.render(transcript);",
+            "diff --git a/crates/harness_app/src/main.rs b/crates/harness_app/src/main.rs\n@@ -83,7 +83,10 @@\n-    let transcript = DebugCards::new(events);\n+    let transcript = SemanticDocument::from_journal(events);\n+    transcript.enable_vim_navigation();\n+    transcript.enable_raw_inspection();\n \n     window.render(transcript);\ndiff --git a/crates/harness_editor/src/lib.rs b/crates/harness_editor/src/lib.rs\n@@ -41,2 +41,3 @@\n editor.set_read_only(true);\n+editor.set_use_modal_editing(true);\n editor.set_show_gutter(false);\ndiff --git a/README.md b/README.md\n@@ -11,2 +11,2 @@\n-Text transcript prototype\n+Rich transcript with native Vim navigation",
             json!({"threadId":"fixture-turn","diff":"@@ -83,7 +83,10 @@"}),
         ),
         replay_item(

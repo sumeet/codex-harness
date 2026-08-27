@@ -62,7 +62,7 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) transcript: Hsla,
     pub(crate) rail: Hsla,
     pub(crate) raised_surface: Hsla,
-    pub(crate) inset_surface: Hsla,
+    pub(crate) tool_header_surface: Hsla,
     pub(crate) pending_surface: Hsla,
     pub(crate) error_surface: Hsla,
     pub(crate) error_border: Hsla,
@@ -82,7 +82,12 @@ impl HarnessVisualTheme {
             transcript: colors.editor_background,
             rail: colors.panel_background,
             raised_surface: colors.surface_background,
-            inset_surface: colors.editor_background,
+            // Match the header wash used by Zed's agent tool cards. This is
+            // intentionally subtler than `surface_background`: it separates
+            // identity from output without turning every tool into a banner.
+            tool_header_surface: colors
+                .element_background
+                .blend(colors.editor_foreground.opacity(0.025)),
             pending_surface: colors
                 .editor_background
                 .blend(colors.surface_background.opacity(0.86)),

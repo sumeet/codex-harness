@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::{Range, RangeInclusive},
+    path::Path,
     sync::{Arc, LazyLock},
 };
 
@@ -34,6 +35,7 @@ use multi_buffer::{
     Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
 };
 use settings::{KeybindSource, KeymapFile, Settings as _};
+use text::Rope;
 use theme_settings::ThemeSettings;
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
@@ -135,6 +137,9 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
 struct HarnessLanguageSet {
     registry: Arc<LanguageRegistry>,
     markdown: Arc<Language>,
+    bash: Arc<Language>,
+    rust: Arc<Language>,
+    json: Arc<Language>,
 }
 
 impl Global for HarnessLanguageSet {}
@@ -143,18 +148,77 @@ impl HarnessLanguageSet {
     fn new(cx: &mut App) -> anyhow::Result<Self> {
         let registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
         let markdown = embedded_language("markdown", tree_sitter_md::LANGUAGE.into())?;
+        let bash = embedded_language("bash", tree_sitter_bash::LANGUAGE.into())?;
+        let rust = embedded_language("rust", tree_sitter_rust::LANGUAGE.into())?;
+        let json = embedded_language("json", tree_sitter_json::LANGUAGE.into())?;
         for language in [
             markdown.clone(),
             embedded_language("markdown-inline", tree_sitter_md::INLINE_LANGUAGE.into())?,
-            embedded_language("bash", tree_sitter_bash::LANGUAGE.into())?,
-            embedded_language("rust", tree_sitter_rust::LANGUAGE.into())?,
-            embedded_language("json", tree_sitter_json::LANGUAGE.into())?,
+            bash.clone(),
+            rust.clone(),
+            json.clone(),
         ] {
             registry.add(language);
         }
         registry.set_theme(cx.theme().clone());
-        Ok(Self { registry, markdown })
+        Ok(Self {
+            registry,
+            markdown,
+            bash,
+            rust,
+            json,
+        })
     }
+}
+
+/// Highlight a source fragment with the same compact language registry and
+/// active syntax theme as Harness's native Editors.
+///
+/// The rich transcript uses this for unified-diff rows. Keeping the language
+/// choice here prevents the card renderer from growing a second, approximate
+/// syntax system, while the returned byte ranges still compose with the
+/// transcript's search and Vim-selection overlays.
+pub fn syntax_highlights_for_path(
+    path: &Path,
+    source: &str,
+    cx: &App,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if source.is_empty() {
+        return Vec::new();
+    }
+
+    let languages = cx.global::<HarnessLanguageSet>();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let language = match extension.as_str() {
+        "rs" => Some(&languages.rust),
+        "json" | "jsonc" => Some(&languages.json),
+        "sh" | "bash" | "zsh" => Some(&languages.bash),
+        _ if matches!(file_name, ".bashrc" | ".bash_profile" | ".zshrc") => Some(&languages.bash),
+        _ => None,
+    };
+    let Some(language) = language else {
+        return Vec::new();
+    };
+
+    language
+        .highlight_text(&Rope::from(source), 0..source.len())
+        .into_iter()
+        .filter_map(|(range, highlight_id)| {
+            cx.theme()
+                .syntax()
+                .get(highlight_id)
+                .cloned()
+                .map(|style| (range, style))
+        })
+        .collect()
 }
 
 fn embedded_language(name: &str, grammar: tree_sitter::Language) -> anyhow::Result<Arc<Language>> {

@@ -11,6 +11,7 @@ use std::{
 use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent, ThreadOpenResponse};
+use file_icons::FileIcons;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
     FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
@@ -26,6 +27,7 @@ use harness_editor::{
     TranscriptReplacement, TranscriptSelectionChanged, TranscriptSelectionSnapshot,
     TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch,
     VimWordNext, VimWordPrevious, shell_capture_priority, shell_capture_ranges,
+    syntax_highlights_for_path,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -171,6 +173,30 @@ fn rich_card_identity_icon(icon: IconName, size: IconSize, color: Color) -> gpui
         .items_center()
         .justify_center()
         .child(Icon::new(icon).size(size).color(color))
+}
+
+/// Use the same icon-theme lookup as Zed's agent edit cards. A semantic
+/// fallback keeps replay fixtures and icon themes without a matching suffix
+/// deterministic.
+fn rich_file_identity_icon(path: &str, cx: &App) -> gpui::Div {
+    let icon = FileIcons::get_icon(Path::new(path), cx)
+        .map(|path| {
+            Icon::from_path(path)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+        })
+        .unwrap_or_else(|| {
+            Icon::new(IconName::File)
+                .size(IconSize::Small)
+                .color(Color::Muted)
+        });
+    div()
+        .w(px(RICH_CARD_LEADING_WIDTH))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -377,7 +403,6 @@ struct RichNestedScrollBinding {
 #[derive(Default)]
 struct RichNestedScrollState {
     handle: ScrollHandle,
-    diff_section_handles: Vec<ScrollHandle>,
     last_cursor: Option<usize>,
     command: Option<RichCommandSurface>,
     file_change: Option<RichFileChangeSurface>,
@@ -450,13 +475,6 @@ struct RichFileChangeSurface {
     event_count: usize,
     content_len: usize,
     data: RichFileChangeData,
-    sections: Vec<RichFileChangeSectionSurface>,
-}
-
-#[derive(Clone)]
-struct RichFileChangeSectionSurface {
-    header_row: usize,
-    line_rows: Arc<[usize]>,
     list_state: ListState,
     horizontal_handle: ScrollHandle,
 }
@@ -1000,6 +1018,44 @@ fn navigation_searchable_styled_text(
     let navigation = navigation_highlights_for_fragment(navigation, logical_fragment, cx);
     let base = gpui::combine_highlights(base, navigation).collect::<Vec<_>>();
     searchable_styled_text(text, base, search, cx)
+}
+
+/// Apply Zed's active syntax theme to the source portion of a rendered diff
+/// row. Unified-diff markers remain ordinary selectable transcript bytes, but
+/// they are deliberately excluded from parsing so Tree-sitter sees the code
+/// the same way it does in Zed's native diff Editor.
+fn diff_line_syntax_highlights(
+    path: &str,
+    line: &str,
+    tone: DiffLineTone,
+    unified: bool,
+    cx: &App,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    if tone == DiffLineTone::Hunk
+        || line.starts_with("diff --git ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("\\ No newline")
+    {
+        return Vec::new();
+    }
+
+    let prefix_len = match tone {
+        DiffLineTone::Addition | DiffLineTone::Deletion => {
+            if line.as_bytes().get(1).is_some_and(u8::is_ascii_whitespace) {
+                2
+            } else {
+                1
+            }
+        }
+        DiffLineTone::Normal if unified && line.starts_with(' ') => 1,
+        _ => 0,
+    };
+    let source = &line[prefix_len.min(line.len())..];
+    syntax_highlights_for_path(Path::new(path), source, cx)
+        .into_iter()
+        .map(|(range, style)| (range.start + prefix_len..range.end + prefix_len, style))
+        .collect()
 }
 
 fn logical_offset_for_rendered_index(
@@ -2061,7 +2117,18 @@ fn render_compact_diff_line_number(
 }
 
 fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
-    let presentations = file_change_presentations(&item.content);
+    let presentations = if item.kind == model::TranscriptKind::Diff {
+        diff_file_presentations(&item.content)
+            .into_iter()
+            .map(|presentation| FileChangePresentation {
+                operation: "Modified".into(),
+                path: presentation.path,
+                content: presentation.content,
+            })
+            .collect()
+    } else {
+        file_change_presentations(&item.content)
+    };
     let mut rows = Vec::new();
     let mut logical_cursor = 0;
 
@@ -2997,7 +3064,7 @@ impl Render for HybridStructuredSurface {
                     .ok();
             })
             .child(rich_card_identity_icon(
-                icon_for_kind(self.item.kind),
+                icon_for_item(&self.item),
                 IconSize::Small,
                 Color::Muted,
             ))
@@ -4136,36 +4203,6 @@ impl HarnessApp {
         )
     }
 
-    fn rich_diff_section_bindings(
-        &mut self,
-        item_key: &str,
-        section_count: usize,
-        navigation: Option<&RichNavigationPaint>,
-    ) -> Vec<RichNestedScrollBinding> {
-        let cursor = navigation
-            .and_then(RichNavigationPaint::cursor_range)
-            .map(|range| range.start);
-        let state = self
-            .rich_nested_scrolls
-            .entry(item_key.to_owned())
-            .or_default();
-        state
-            .diff_section_handles
-            .resize_with(section_count, ScrollHandle::default);
-        state.diff_section_handles.truncate(section_count);
-        let reveal_cursor = cursor.is_some() && cursor != state.last_cursor;
-        state.last_cursor = cursor;
-        state
-            .diff_section_handles
-            .iter()
-            .cloned()
-            .map(|handle| RichNestedScrollBinding {
-                handle,
-                reveal_cursor,
-            })
-            .collect()
-    }
-
     fn rich_nested_scroll_binding(
         &mut self,
         item_key: &str,
@@ -4281,7 +4318,7 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
-    ) -> (RichFileChangeData, Vec<RichFileChangeSectionSurface>) {
+    ) -> (RichFileChangeData, ListState, ScrollHandle) {
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
@@ -4297,54 +4334,25 @@ impl HarnessApp {
                 .entry(item.key.clone())
                 .or_default();
             let previous = state.file_change.take();
-            let mut section_rows = vec![Vec::new(); data.presentations.len()];
-            let mut header_rows = vec![None; data.presentations.len()];
-            for (row_index, row) in data.rows.iter().enumerate() {
-                match row {
-                    RichFileChangeRow::Header { section_index, .. } => {
-                        header_rows[*section_index] = Some(row_index);
-                    }
-                    RichFileChangeRow::Line { section_index, .. } => {
-                        section_rows[*section_index].push(row_index);
-                    }
-                }
+            let list_state = previous.as_ref().map_or_else(
+                || {
+                    ListState::new(data.rows.len(), ListAlignment::Top, px(80.))
+                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                },
+                |surface| surface.list_state.clone(),
+            );
+            if list_state.item_count() != data.rows.len() {
+                list_state.splice(0..list_state.item_count(), data.rows.len());
             }
-            let sections = header_rows
-                .into_iter()
-                .zip(section_rows)
-                .enumerate()
-                .filter_map(|(section_index, (header_row, line_rows))| {
-                    let header_row = header_row?;
-                    let previous_section = previous
-                        .as_ref()
-                        .and_then(|surface| surface.sections.get(section_index));
-                    let list_state = previous_section.map_or_else(
-                        || {
-                            ListState::new(line_rows.len(), ListAlignment::Top, px(80.))
-                                .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
-                        },
-                        |section| section.list_state.clone(),
-                    );
-                    if list_state.item_count() != line_rows.len() {
-                        list_state.splice(0..list_state.item_count(), line_rows.len());
-                    }
-                    list_state
-                        .set_diagnostics_name(format!("file-change:{}:{section_index}", item.key));
-                    Some(RichFileChangeSectionSurface {
-                        header_row,
-                        line_rows: line_rows.into(),
-                        list_state,
-                        horizontal_handle: previous_section
-                            .map(|section| section.horizontal_handle.clone())
-                            .unwrap_or_default(),
-                    })
-                })
-                .collect();
+            list_state.set_diagnostics_name(format!("file-change:{}", item.key));
             state.file_change = Some(RichFileChangeSurface {
                 event_count: item.event_count,
                 content_len: item.content.len(),
                 data,
-                sections,
+                list_state,
+                horizontal_handle: previous
+                    .map(|surface| surface.horizontal_handle)
+                    .unwrap_or_default(),
             });
         }
 
@@ -4369,20 +4377,16 @@ impl HarnessApp {
                 row.logical_range()
                     .is_some_and(|range| !range.is_empty() && cursor <= range.start)
             });
-            if let Some(row) = exact.or(next)
-                && let Some((section, local_row)) = surface.sections.iter().find_map(|section| {
-                    section
-                        .line_rows
-                        .iter()
-                        .position(|candidate| *candidate == row)
-                        .map(|local_row| (section, local_row))
-                })
-            {
-                section.list_state.scroll_to_reveal_item(local_row);
+            if let Some(row) = exact.or(next) {
+                surface.list_state.scroll_to_reveal_item(row);
             }
         }
         state.last_cursor = cursor;
-        (surface.data.clone(), surface.sections.clone())
+        (
+            surface.data.clone(),
+            surface.list_state.clone(),
+            surface.horizontal_handle.clone(),
+        )
     }
 
     fn rich_navigation_for_item(&self, item_index: usize) -> Option<RichNavigationPaint> {
@@ -9160,6 +9164,7 @@ impl HarnessApp {
 
     fn render_diff_lines(
         content: &str,
+        path: &str,
         visible_line_count: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
@@ -9192,9 +9197,10 @@ impl HarnessApp {
                     &mut new_line,
                     index + 1,
                 );
+                let syntax = diff_line_syntax_highlights(path, line, tone, unified, cx);
                 let highlighted_line = navigation_searchable_styled_text(
                     line.to_string(),
-                    Vec::new(),
+                    syntax,
                     search,
                     navigation,
                     logical_line_range.clone(),
@@ -9255,155 +9261,7 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
-        let presentations = diff_file_presentations(&item.content);
-        let owner = cx.weak_entity();
-        let mut logical_cursor = 0;
-        let bindings = self.rich_diff_section_bindings(&item.key, presentations.len(), navigation);
-        let mut sections = Vec::new();
-
-        for (section_index, presentation) in presentations.into_iter().enumerate() {
-            let path_range =
-                rich_navigation_fragment_range(navigation, &presentation.path, &mut logical_cursor);
-            let content_range = rich_navigation_fragment_range(
-                navigation,
-                &presentation.content,
-                &mut logical_cursor,
-            );
-            let (additions, deletions) = diff_content_counts(&presentation.content);
-            let highlighted_path = navigation_searchable_styled_text(
-                presentation.path,
-                Vec::new(),
-                search,
-                navigation,
-                path_range.clone(),
-                cx,
-            );
-            let clickable_path = rich_clickable_styled_text(
-                format!("rich-diff-path:{index}:{section_index}"),
-                highlighted_path,
-                index,
-                path_range.clone(),
-                Some(owner.clone()),
-            );
-            let disclosure_owner = owner.clone();
-            let header = rich_card_identity_row()
-                .px_1()
-                .bg(visuals.inset_surface)
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .font_buffer(cx)
-                        .text_ui_sm(cx)
-                        .truncate()
-                        .child(clickable_path),
-                )
-                .when(additions > 0 || deletions > 0, |this| {
-                    this.child(
-                        DiffStat::new(
-                            format!("rich-diff-file-stat:{index}:{section_index}"),
-                            additions,
-                            deletions,
-                        )
-                        .label_size(LabelSize::XSmall)
-                        .tooltip(format!(
-                            "{additions} lines added, {deletions} lines removed"
-                        )),
-                    )
-                })
-                .when(section_index == 0, |this| {
-                    this.child(
-                        div()
-                            .id(("diff-inline-disclosure", index))
-                            .size(px(18.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .cursor_pointer()
-                            .on_click(move |_, window, cx| {
-                                disclosure_owner
-                                    .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
-                                    .ok();
-                            })
-                            .child(Disclosure::new(
-                                ("diff-inline-disclosure-icon", index),
-                                true,
-                            )),
-                    )
-                })
-                .into_any_element();
-
-            let body = if !presentation.content.is_empty() {
-                let line_count = presentation.content.lines().count();
-                let row_ranges = logical_line_fragments(&presentation.content, content_range.start)
-                    .into_iter()
-                    .take(line_count)
-                    .map(|(_, range)| Some(range))
-                    .collect::<Vec<_>>();
-                if navigation
-                    .and_then(RichNavigationPaint::cursor_range)
-                    .is_some_and(|cursor| {
-                        content_range.start <= cursor.start && cursor.start <= content_range.end
-                    })
-                {
-                    reveal_rich_nested_cursor(bindings.get(section_index), navigation, &row_ranges);
-                }
-                let rows = Self::render_diff_lines(
-                    &presentation.content,
-                    usize::MAX,
-                    search,
-                    navigation,
-                    content_range.start,
-                    index,
-                    Some(owner.clone()),
-                    cx,
-                );
-                let binding = &bindings[section_index];
-                Some(
-                    div()
-                        .id(format!("rich-diff-file-scroll:{index}:{section_index}"))
-                        .w_full()
-                        .min_w_0()
-                        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                        .overflow_x_scroll()
-                        .overflow_y_scroll()
-                        .track_scroll(&binding.handle)
-                        .children(rows)
-                        .custom_scrollbars(
-                            Scrollbars::new(ScrollAxes::Both)
-                                .id(format!("rich-diff-file-scrollbar:{index}:{section_index}"))
-                                .with_thumb_color(colors.text_muted.opacity(0.5))
-                                .tracked_scroll_handle(&binding.handle),
-                            window,
-                            cx,
-                        ),
-                )
-            } else {
-                None
-            };
-            sections.push(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .when(section_index > 0, |this| this.mt_1())
-                    .child(header)
-                    .when_some(body, |this, body| this.child(body)),
-            );
-        }
-
-        div()
-            .id(("rich-diff-output", index))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .children(sections)
-            .into_any_element()
+        self.render_file_change(item, index, search, navigation, window, cx)
     }
 
     fn render_diff_content(
@@ -9444,7 +9302,7 @@ impl HarnessApp {
             );
             let (additions, deletions) = diff_content_counts(&presentation.content);
             let highlighted_path = navigation_searchable_styled_text(
-                presentation.path,
+                presentation.path.clone(),
                 Vec::new(),
                 search,
                 navigation,
@@ -9465,22 +9323,16 @@ impl HarnessApp {
                     .flex()
                     .flex_col()
                     .when(section_index > 0, |this| {
-                        this.mt_0p5()
-                            .pt_0p5()
-                            .border_t_1()
-                            .border_color(colors.border_variant)
+                        this.border_t_1().border_color(colors.border_variant)
                     })
                     .child(
                         rich_card_identity_row()
+                            .px_1()
                             .when(section_index == 0, |this| this.pr_5())
                             .border_b_1()
                             .border_color(visuals.divider)
-                            .bg(visuals.inset_surface)
-                            .child(rich_card_identity_icon(
-                                IconName::File,
-                                IconSize::XSmall,
-                                Color::Muted,
-                            ))
+                            .bg(visuals.tool_header_surface)
+                            .child(rich_file_identity_icon(&presentation.path, cx))
                             .child(
                                 div()
                                     .min_w_0()
@@ -9515,6 +9367,7 @@ impl HarnessApp {
                                     .overflow_x_scroll()
                                     .children(Self::render_diff_lines(
                                         &presentation.content,
+                                        &presentation.path,
                                         visible_lines,
                                         search,
                                         navigation,
@@ -9595,10 +9448,14 @@ impl HarnessApp {
                     Color::Accent => colors.text_accent,
                     _ => colors.text_muted,
                 };
-                let disclosure_owner = owner.clone();
                 rich_card_identity_row()
                     .px_1()
-                    .bg(visuals.inset_surface)
+                    .pr_5()
+                    .when(row_index > 0, |this| {
+                        this.border_t_1().border_color(visuals.divider)
+                    })
+                    .bg(visuals.tool_header_surface)
+                    .child(rich_file_identity_icon(&presentation.path, cx))
                     .child(
                         div()
                             .min_w_0()
@@ -9642,29 +9499,6 @@ impl HarnessApp {
                                 )
                             }),
                     )
-                    .when(row_index == 0, |this| {
-                        this.child(
-                            div()
-                                .id(("file-change-inline-disclosure", index))
-                                .size(px(18.))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .cursor_pointer()
-                                .on_click(move |_, window, cx| {
-                                    disclosure_owner
-                                        .update(cx, |this, cx| {
-                                            this.toggle_item_at(index, window, cx)
-                                        })
-                                        .ok();
-                                })
-                                .child(Disclosure::new(
-                                    ("file-change-inline-disclosure-icon", index),
-                                    true,
-                                )),
-                        )
-                    })
                     .into_any_element()
             }
             RichFileChangeRow::Line {
@@ -9678,10 +9512,17 @@ impl HarnessApp {
             } => {
                 let colors = cx.theme().colors();
                 let visuals = HarnessVisualTheme::from_zed(colors);
-                let line = &row_data.presentations[*section_index].content[source_range.clone()];
+                let presentation = &row_data.presentations[*section_index];
+                let line = &presentation.content[source_range.clone()];
+                let unified = presentation
+                    .content
+                    .lines()
+                    .any(|line| line.starts_with("@@"));
+                let syntax =
+                    diff_line_syntax_highlights(&presentation.path, line, *tone, unified, cx);
                 let highlighted_line = navigation_searchable_styled_text(
                     line.to_owned(),
-                    Vec::new(),
+                    syntax,
                     search,
                     navigation,
                     logical_range.clone(),
@@ -9749,98 +9590,58 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (data, sections) = self.rich_file_change_surface(item, navigation);
+        let (data, list_state, horizontal_handle) = self.rich_file_change_surface(item, navigation);
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
-
-        let file_panels = sections
-            .into_iter()
-            .enumerate()
-            .map(|(section_index, section)| {
-                let header = Self::render_rich_file_change_row(
-                    &data,
-                    section.header_row,
-                    index,
-                    search.as_ref(),
-                    navigation.as_ref(),
-                    &owner,
-                    cx,
-                );
-                let row_data = data.clone();
-                let row_owner = owner.clone();
-                let row_search = search.clone();
-                let row_navigation = navigation.clone();
-                let line_rows = section.line_rows.clone();
-                let row_count = line_rows.len();
-                let rows = list(section.list_state.clone(), move |local_row, _, cx| {
-                    let row_index = line_rows[local_row];
-                    Self::render_rich_file_change_row(
-                        &row_data,
-                        row_index,
-                        index,
-                        row_search.as_ref(),
-                        row_navigation.as_ref(),
-                        &row_owner,
-                        cx,
-                    )
-                })
-                .with_sizing_behavior(ListSizingBehavior::Infer)
-                .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
-                let vertical = div()
-                    .w_full()
-                    .min_w_0()
-                    .relative()
-                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                    .overflow_y_hidden()
-                    .child(rows)
-                    .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Vertical)
-                            .id(format!(
-                                "file-change-vertical-scrollbar:{index}:{section_index}"
-                            ))
-                            .with_thumb_color(colors.text_muted.opacity(0.5))
-                            .tracked_scroll_handle(&section.list_state),
-                        window,
-                        cx,
-                    );
-                let body = div()
-                    .id(format!("file-change-scroll:{index}:{section_index}"))
-                    .w_full()
-                    .min_w_0()
-                    .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
-                    .overflow_x_scroll()
-                    .overflow_y_hidden()
-                    .track_scroll(&section.horizontal_handle)
-                    .child(vertical)
-                    .custom_scrollbars(
-                        Scrollbars::new(ScrollAxes::Horizontal)
-                            .id(format!(
-                                "file-change-horizontal-scrollbar:{index}:{section_index}"
-                            ))
-                            .with_thumb_color(colors.text_muted.opacity(0.5))
-                            .tracked_scroll_handle(&section.horizontal_handle),
-                        window,
-                        cx,
-                    );
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .when(section_index > 0, |this| this.mt_1())
-                    .child(header)
-                    .when(row_count > 0, |this| this.child(body))
-            })
-            .collect::<Vec<_>>();
+        let row_data = data.clone();
+        let row_owner = owner.clone();
+        let rows = list(list_state.clone(), move |row_index, _, cx| {
+            Self::render_rich_file_change_row(
+                &row_data,
+                row_index,
+                index,
+                search.as_ref(),
+                navigation.as_ref(),
+                &row_owner,
+                cx,
+            )
+        })
+        .with_sizing_behavior(ListSizingBehavior::Infer)
+        .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT));
+        let vertical = div()
+            .w_full()
+            .min_w_0()
+            .relative()
+            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+            .overflow_y_hidden()
+            .child(rows)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Vertical)
+                    .id(("file-change-vertical-scrollbar", index))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .tracked_scroll_handle(&list_state),
+                window,
+                cx,
+            );
         div()
             .id(("file-change-output", index))
             .w_full()
             .min_w_0()
-            .flex()
-            .flex_col()
-            .children(file_panels)
+            .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+            .overflow_x_scroll()
+            .overflow_y_hidden()
+            .track_scroll(&horizontal_handle)
+            .child(vertical)
+            .custom_scrollbars(
+                Scrollbars::new(ScrollAxes::Horizontal)
+                    .id(("file-change-horizontal-scrollbar", index))
+                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .tracked_scroll_handle(&horizontal_handle),
+                window,
+                cx,
+            )
             .into_any_element()
     }
 
@@ -10324,8 +10125,8 @@ impl HarnessApp {
                 .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT))
                 .border_t_1()
                 .border_color(colors.border_variant)
-                .mt_1()
-                .pt_1()
+                .px_1p5()
+                .py_1()
                 .overflow_x_scroll()
                 .overflow_y_hidden()
                 .track_scroll(&output_horizontal_handle)
@@ -10349,7 +10150,14 @@ impl HarnessApp {
                 .text_ui_sm(cx)
                 .line_height(relative(1.35))
                 .text_color(colors.text)
-                .child(command_region)
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .p_1p5()
+                        .bg(HarnessVisualTheme::from_zed(&colors).tool_header_surface)
+                        .child(command_region),
+                )
                 .when_some(output_region, |this, output| this.child(output))
                 .into_any_element(),
         )
@@ -11418,7 +11226,7 @@ impl HarnessApp {
             && !self.search_query.trim().is_empty()
             && search_item_position.is_some())
         .then(|| RichSearchPaint::new(self.search_query.clone(), active_search_ordinal));
-        let icon = icon_for_kind(item.kind);
+        let icon = icon_for_item(&item);
         let user_input = (legacy_request_controls && has_user_input)
             .then(|| self.render_user_input_request(index, &item, window, cx));
         let mcp_elicitation = (legacy_request_controls && has_elicitation)
@@ -11702,6 +11510,9 @@ impl HarnessApp {
 
         let header = rich_card_identity_row()
             .id(("item-header", index))
+            .when(!narrative && !compact_trace, |this| {
+                this.px_1().bg(visuals.tool_header_surface)
+            })
             .child(rich_card_identity_icon(
                 icon,
                 IconSize::Small,
@@ -11743,34 +11554,29 @@ impl HarnessApp {
                     .child(Disclosure::new(("item-disclosure", index), item.expanded))
             });
 
-        let content_has_inline_disclosure = matches!(
-            item.kind,
-            model::TranscriptKind::Diff | model::TranscriptKind::FileChange
-        );
-        let floating_disclosure =
-            (headerless_expanded && is_disclosure && !content_has_inline_disclosure).then(|| {
-                let disclosure_weak = cx.weak_entity();
-                div()
-                    .id(("item-floating-disclosure", index))
-                    .absolute()
-                    .top(px(1.))
-                    .right(px(1.))
-                    .size(px(18.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .on_click(move |_, window, cx| {
-                        disclosure_weak
-                            .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
-                            .ok();
-                    })
-                    .child(Disclosure::new(
-                        ("item-floating-disclosure-icon", index),
-                        true,
-                    ))
-            });
+        let floating_disclosure = (headerless_expanded && is_disclosure).then(|| {
+            let disclosure_weak = cx.weak_entity();
+            div()
+                .id(("item-floating-disclosure", index))
+                .absolute()
+                .top(px(1.))
+                .right(px(1.))
+                .size(px(18.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_sm()
+                .cursor_pointer()
+                .on_click(move |_, window, cx| {
+                    disclosure_weak
+                        .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                        .ok();
+                })
+                .child(Disclosure::new(
+                    ("item-floating-disclosure-icon", index),
+                    true,
+                ))
+        });
 
         let raw = raw_visible.then(|| {
             let content =
@@ -11844,34 +11650,58 @@ impl HarnessApp {
                 narrative_panel
             }
         } else {
+            let flush_tool_surface = matches!(
+                item.kind,
+                model::TranscriptKind::Command
+                    | model::TranscriptKind::Diff
+                    | model::TranscriptKind::FileChange
+            );
             div()
                 .w_full()
                 .relative()
                 .flex()
                 .flex_col()
-                .gap_0p5()
                 .when(!compact_trace, |this| {
-                    this.rounded_sm()
+                    this.rounded_md()
                         .border_1()
-                        .border_color(visuals.divider)
-                        .bg(visuals.raised_surface)
-                        .px_2()
-                        .py_0p5()
+                        .border_color(colors.border.opacity(0.8))
+                        .bg(colors.editor_background)
+                        .overflow_hidden()
                 })
-                .when(compact_trace, |this| this.px_1().py_0p5())
+                .when(compact_trace, |this| this.px_1().py_0p5().gap_0p5())
                 .when(render_header, |this| this.child(header))
-                .when_some(search_context, |this, context| this.child(context))
-                .when_some(request_surface, |this, surface| this.child(surface))
-                .when_some(body, |this, body| this.child(body))
-                .when_some(raw, |this, raw| this.child(raw))
-                .when_some(pending_summary, |this, summary| this.child(summary))
-                .when_some(user_input, |this, input| this.child(input))
-                .when_some(mcp_elicitation, |this, elicitation| this.child(elicitation))
+                .when_some(search_context, |this, context| {
+                    this.child(
+                        div()
+                            .when(!flush_tool_surface, |this| this.px_2().pt_1())
+                            .child(context),
+                    )
+                })
+                .when_some(request_surface, |this, surface| {
+                    this.child(div().px_2().py_1().child(surface))
+                })
+                .when_some(body, |this, body| {
+                    if flush_tool_surface || compact_trace {
+                        this.child(body)
+                    } else {
+                        this.child(div().px_2().py_1().child(body))
+                    }
+                })
+                .when_some(raw, |this, raw| this.child(div().px_2().pb_1().child(raw)))
+                .when_some(pending_summary, |this, summary| {
+                    this.child(div().px_2().py_1().child(summary))
+                })
+                .when_some(user_input, |this, input| {
+                    this.child(div().px_2().py_1().child(input))
+                })
+                .when_some(mcp_elicitation, |this, elicitation| {
+                    this.child(div().px_2().py_1().child(elicitation))
+                })
                 .when(has_approval, |this| {
                     this.child(
                         div()
-                            .mt_1()
-                            .pt_1()
+                            .px_2()
+                            .py_1()
                             .border_t_1()
                             .border_color(colors.border_variant)
                             .flex()
@@ -13529,7 +13359,7 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
     match kind {
         model::TranscriptKind::User => IconName::Person,
         model::TranscriptKind::Agent => IconName::AiOpenAi,
-        model::TranscriptKind::Reasoning => IconName::ToolThink,
+        model::TranscriptKind::Reasoning => IconName::ThinkingMode,
         model::TranscriptKind::Plan => IconName::ListTodo,
         model::TranscriptKind::Command => IconName::ToolTerminal,
         model::TranscriptKind::FileChange => IconName::FileDiff,
@@ -13539,9 +13369,48 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
         model::TranscriptKind::Subagent => IconName::UserGroup,
         model::TranscriptKind::Web => IconName::ToolWeb,
         model::TranscriptKind::Review => IconName::Eye,
-        model::TranscriptKind::Trace => IconName::Compact,
+        model::TranscriptKind::Trace => IconName::Code,
         model::TranscriptKind::Error => IconName::Warning,
         model::TranscriptKind::Approval => IconName::Lock,
+    }
+}
+
+/// Mirror Zed's ACP tool-kind icon vocabulary even though the Codex app-server
+/// transcript does not expose ACP's enum directly. The title is structured by
+/// Harness's protocol projector (`server · tool`), so this is semantic
+/// projection rather than a renderer-specific list of individual tool names.
+fn icon_for_item(item: &TranscriptItem) -> IconName {
+    if item.kind != model::TranscriptKind::Tool {
+        return icon_for_kind(item.kind);
+    }
+
+    let title = item.title.to_ascii_lowercase();
+    if title.contains("web")
+        || title.contains("fetch")
+        || title.contains("browser")
+        || title.contains("http")
+    {
+        IconName::ToolWeb
+    } else if title.contains("read") || title.contains("search") || title.contains("find") {
+        IconName::ToolSearch
+    } else if title.contains("delete") || title.contains("remove") {
+        IconName::ToolDeleteFile
+    } else if title.contains("edit")
+        || title.contains("write")
+        || title.contains("patch")
+        || title.contains("apply")
+    {
+        IconName::ToolPencil
+    } else if title.contains("command")
+        || title.contains("shell")
+        || title.contains("exec")
+        || title.contains("terminal")
+    {
+        IconName::ToolTerminal
+    } else if title.contains("think") || title.contains("reason") {
+        IconName::ToolThink
+    } else {
+        IconName::ToolHammer
     }
 }
 
@@ -14828,6 +14697,33 @@ mod tests {
     }
 
     #[test]
+    fn projected_tools_use_zeds_semantic_tool_icons() {
+        let tool = |title: &str| TranscriptItem {
+            key: title.into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Tool,
+            title: title.into(),
+            status: None,
+            content: String::new(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+
+        assert_eq!(
+            icon_for_item(&tool("App Server · thread/read")),
+            IconName::ToolSearch
+        );
+        assert_eq!(
+            icon_for_item(&tool("Web fetch · example.com")),
+            IconName::ToolWeb
+        );
+        assert_eq!(icon_for_item(&tool("Apply patch")), IconName::ToolPencil);
+        assert_eq!(icon_for_item(&tool("Unknown MCP")), IconName::ToolHammer);
+    }
+
+    #[test]
     fn large_structured_output_gets_a_stable_non_scrolling_preview() {
         assert_eq!(
             structured_output_preview("one\ntwo\nthree", "output"),
@@ -15615,6 +15511,46 @@ mod tests {
         assert!(
             renderer.contains(".with_sizing_behavior(ListSizingBehavior::Infer)"),
             "virtualized nested diffs must infer a real first-frame height instead of collapsing"
+        );
+    }
+
+    #[test]
+    fn aggregate_and_file_change_diffs_share_one_flat_virtual_document() {
+        let mut replay = TranscriptModel::replay(6);
+        let item = replay.items.remove(4);
+        let body = rich_navigation_body_for_item(&item, "");
+        let data = rich_file_change_data(&item);
+        let visible_rows = data
+            .rows
+            .iter()
+            .filter_map(RichFileChangeRow::logical_range)
+            .map(|range| &body[range.clone()])
+            .collect::<Vec<_>>();
+
+        assert_eq!(data.presentations.len(), 3);
+        assert_eq!(
+            data.presentations
+                .iter()
+                .map(|presentation| presentation.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "crates/harness_app/src/main.rs",
+                "crates/harness_editor/src/lib.rs",
+                "README.md",
+            ]
+        );
+        assert_eq!(visible_rows.len(), data.rows.len());
+        assert_eq!(
+            visible_rows.first().copied(),
+            Some("crates/harness_app/src/main.rs")
+        );
+        assert_eq!(
+            visible_rows
+                .iter()
+                .filter(|row| row.ends_with(".rs") || **row == "README.md")
+                .count(),
+            3,
+            "each file contributes one ordinary row to the same virtualized surface"
         );
     }
 
