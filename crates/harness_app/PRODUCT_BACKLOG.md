@@ -24,6 +24,9 @@ must survive conversation compaction and hand-offs.
   document-like transcript while keeping its structure easy to scan.
 - [x] Add persistent in-app theme selection with immediate live application;
   components remain independent of any particular dark theme.
+- [x] Port Zed's compact two-sided composer footer grammar: one contextual
+  Send/Queue/Stop control, a native context ring, and consistent small-label
+  model/effort and permission selectors without discarding Harness Vim state.
 
 ### Draft destinations and queue/later model
 

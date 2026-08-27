@@ -37,8 +37,9 @@ use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
     Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
     Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
-    LabelSize, ListItem, ListItemSpacing, PopoverMenu, ScrollAxes, Scrollbars, SelectableButton,
-    SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar, right_click_menu,
+    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
+    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
+    right_click_menu,
 };
 use uuid::Uuid;
 
@@ -3173,6 +3174,8 @@ struct HarnessApp {
     threads: Vec<CodexThread>,
     available_models: Vec<ModelChoice>,
     permission_profiles: Vec<PermissionProfileChoice>,
+    model_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
+    permission_menu_handle: PopoverMenuHandle<ContextMenu>,
     settings_update_pending: bool,
     thread_snapshots: ThreadSnapshotCache,
     selected_thread_id: Option<String>,
@@ -3275,6 +3278,21 @@ struct PermissionProfileChoice {
     id: String,
     description: Option<SharedString>,
     allowed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerActionState {
+    Send,
+    Queue,
+    Stop,
+}
+
+fn composer_action_state(turn_active: bool, composer_empty: bool) -> ComposerActionState {
+    match (turn_active, composer_empty) {
+        (true, true) => ComposerActionState::Stop,
+        (true, false) => ComposerActionState::Queue,
+        (false, _) => ComposerActionState::Send,
+    }
 }
 
 fn model_choices_from_response(response: &Value) -> Vec<ModelChoice> {
@@ -3687,20 +3705,45 @@ impl HarnessApp {
         let effort_choices = selected_choice
             .map(|choice| choice.efforts.clone())
             .unwrap_or_default();
+        let menu_deployed = self.model_effort_menu_handle.is_deployed();
+        let trigger_color = if menu_deployed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
         let weak = cx.weak_entity();
         let trigger = Button::new("model-effort-selector-trigger", trigger_label)
             .size(ButtonSize::Compact)
+            .label_size(LabelSize::Small)
             .style(ButtonStyle::Subtle)
+            .color(trigger_color)
             .start_icon(
                 Icon::new(IconName::ThinkingMode)
                     .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                    .color(trigger_color),
             )
-            .disabled(self.selected_thread_id.is_none() || self.settings_update_pending)
+            .end_icon(
+                Icon::new(if menu_deployed {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .disabled(
+                (self.selected_thread_id.is_none() && self.replay_count.is_none())
+                    || self.settings_update_pending,
+            )
             .aria_label("Change model and thinking effort");
 
         PopoverMenu::new("model-effort-selector")
             .trigger(trigger)
+            .anchor(gpui::Anchor::BottomRight)
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(-2.),
+            })
             .menu(move |window, cx| {
                 let choices = choices.clone();
                 let current_model = current_model.clone();
@@ -3767,6 +3810,7 @@ impl HarnessApp {
                     menu
                 }))
             })
+            .with_handle(self.model_effort_menu_handle.clone())
             .into_any_element()
     }
 
@@ -3783,20 +3827,45 @@ impl HarnessApp {
             .unwrap_or_else(|| "Permissions".into());
         let current_profile = active_profile.map(ToOwned::to_owned);
         let profiles = self.permission_profiles.clone();
+        let menu_deployed = self.permission_menu_handle.is_deployed();
+        let trigger_color = if menu_deployed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
         let weak = cx.weak_entity();
         let trigger = Button::new("permission-selector-trigger", label)
             .size(ButtonSize::Compact)
+            .label_size(LabelSize::Small)
             .style(ButtonStyle::Subtle)
+            .color(trigger_color)
             .start_icon(
                 Icon::new(IconName::Lock)
                     .size(IconSize::XSmall)
-                    .color(Color::Muted),
+                    .color(trigger_color),
             )
-            .disabled(self.selected_thread_id.is_none() || self.settings_update_pending)
+            .end_icon(
+                Icon::new(if menu_deployed {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .disabled(
+                (self.selected_thread_id.is_none() && self.replay_count.is_none())
+                    || self.settings_update_pending,
+            )
             .aria_label("Change task permissions");
 
         PopoverMenu::new("permission-selector")
             .trigger(trigger)
+            .anchor(gpui::Anchor::BottomRight)
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(-2.),
+            })
             .menu(move |window, cx| {
                 let profiles = profiles.clone();
                 let current_profile = current_profile.clone();
@@ -3836,6 +3905,7 @@ impl HarnessApp {
                     menu
                 }))
             })
+            .with_handle(self.permission_menu_handle.clone())
             .into_any_element()
     }
 
@@ -3870,6 +3940,76 @@ impl HarnessApp {
                 .hoverable_tooltip(Tooltip::text(tooltip))
                 .into_any_element(),
         )
+    }
+
+    /// Match Zed's compact composer action: one stable control changes meaning
+    /// with the turn and draft state instead of growing into a row of textual
+    /// Queue/Stop buttons. Stopping remains the primary action while the draft
+    /// is empty; as soon as there is a draft, the same location queues it.
+    fn render_composer_action(
+        &self,
+        turn_active: bool,
+        composer_empty: bool,
+        send_blocked: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let state = composer_action_state(turn_active, composer_empty);
+        if state == ComposerActionState::Stop {
+            return IconButton::new("stop-turn", IconName::Stop)
+                .shape(IconButtonShape::Square)
+                .size(ButtonSize::Default)
+                .style(ButtonStyle::Tinted(TintColor::Error))
+                .icon_color(Color::Error)
+                .aria_label("Stop the current response")
+                .tooltip(Tooltip::text("Stop response"))
+                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
+                .into_any_element();
+        }
+
+        let (id, icon, label): (&'static str, IconName, SharedString) =
+            if state == ComposerActionState::Queue {
+                (
+                    "queue-turn",
+                    IconName::QueueMessage,
+                    "Queue prompt after the current response".into(),
+                )
+            } else {
+                (
+                    "send-turn",
+                    IconName::Send,
+                    if self.loading_thread {
+                        "Wait for task history to finish loading".into()
+                    } else if self.attaching_thread {
+                        "Wait for the live task connection".into()
+                    } else if self.settings_update_pending {
+                        "Wait for task settings to finish updating".into()
+                    } else if self.thread_read_only_reason.is_some() {
+                        "This task is open read-only".into()
+                    } else if self.client.is_none() && self.replay_count.is_none() {
+                        "Reconnect to Codex before sending".into()
+                    } else if composer_empty {
+                        "Type a prompt to send".into()
+                    } else {
+                        "Send prompt".into()
+                    },
+                )
+            };
+        let tooltip = label.clone();
+
+        IconButton::new(id, icon)
+            .shape(IconButtonShape::Square)
+            .size(ButtonSize::Default)
+            .style(ButtonStyle::Filled)
+            .disabled(send_blocked)
+            .icon_color(if send_blocked {
+                Color::Muted
+            } else {
+                Color::Accent
+            })
+            .aria_label(label)
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+            .into_any_element()
     }
 
     fn render_queued_turns(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -4599,6 +4739,42 @@ impl HarnessApp {
             }
             model.current_turn_id = Some("fixture-streaming-turn".into());
         }
+        let (available_models, permission_profiles) = if replay_count.is_some() {
+            model
+                .telemetry
+                .set_thread_settings(model::ThreadSettingsSnapshot {
+                    model: Some("gpt-5.6-sol".into()),
+                    effort: Some("xhigh".into()),
+                    active_permission_profile: Some(model::ActivePermissionProfileSnapshot {
+                        id: Some("danger-full-access".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+            model.telemetry.token_usage = Some(json!({
+                "tokenUsage": {
+                    "last": { "totalTokens": 91_200 },
+                    "modelContextWindow": 256_000
+                }
+            }));
+            (
+                vec![ModelChoice {
+                    id: "gpt-5.6-sol".into(),
+                    model: "gpt-5.6-sol".into(),
+                    display_name: "GPT-5.6-Sol".into(),
+                    default_effort: "xhigh".into(),
+                    efforts: vec!["medium".into(), "high".into(), "xhigh".into()],
+                    is_default: true,
+                }],
+                vec![PermissionProfileChoice {
+                    id: "danger-full-access".into(),
+                    description: Some("Read and write anywhere without approval prompts".into()),
+                    allowed: true,
+                }],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         mark_unbacked_requests_inactive(&mut model, &HashSet::default());
         let dirty_image_surfaces = model
             .items
@@ -4630,8 +4806,10 @@ impl HarnessApp {
             replay_count,
             client: None,
             threads: Vec::new(),
-            available_models: Vec::new(),
-            permission_profiles: Vec::new(),
+            available_models,
+            permission_profiles,
+            model_effort_menu_handle: PopoverMenuHandle::default(),
+            permission_menu_handle: PopoverMenuHandle::default(),
             settings_update_pending: false,
             thread_snapshots: ThreadSnapshotCache::default(),
             selected_thread_id: initial_thread_id,
@@ -12150,6 +12328,8 @@ impl Render for HarnessApp {
         let context_usage = self.render_context_usage(cx);
         let model_selector = self.render_model_effort_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
+        let composer_action =
+            self.render_composer_action(turn_active, composer_empty, send_blocked, cx);
         let queued_turns = self.render_queued_turns(cx);
 
         div()
@@ -12162,9 +12342,9 @@ impl Render for HarnessApp {
             .font_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
-            .on_action(cx.listener(|this, _: &PasteComposer, window, cx| {
-                this.paste_composer(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &PasteComposer, window, cx| this.paste_composer(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &Stop, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
                 this.focus_transcript(window, cx)
@@ -12470,9 +12650,7 @@ impl Render for HarnessApp {
                                 }),
                         )
                     })
-                    .when_some(queued_turns, |this, queued_turns| {
-                        this.child(queued_turns)
-                    })
+                    .when_some(queued_turns, |this, queued_turns| this.child(queued_turns))
                     .child(
                         div()
                             .flex_none()
@@ -12498,55 +12676,53 @@ impl Render for HarnessApp {
                                         .overflow_x_scroll()
                                         .items_center()
                                         .gap_1()
-                                        .children(composer_images.into_iter().map(
-                                            |attachment| {
-                                                let attachment_id = attachment.id;
-                                                div()
-                                                    .id(("composer-image", attachment_id))
-                                                    .relative()
-                                                    .size(px(52.))
-                                                    .flex_none()
-                                                    .overflow_hidden()
-                                                    .rounded_sm()
-                                                    .border_1()
-                                                    .border_color(colors.border_variant)
-                                                    .bg(colors.element_background)
-                                                    .child(
-                                                        gpui::img(attachment.image)
-                                                            .size_full()
-                                                            .object_fit(ObjectFit::Cover),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .absolute()
-                                                            .top(px(2.))
-                                                            .right(px(2.))
-                                                            .rounded_sm()
-                                                            .bg(colors.editor_background)
-                                                            .child(
-                                                                IconButton::new(
-                                                                    (
-                                                                        "remove-composer-image",
+                                        .children(composer_images.into_iter().map(|attachment| {
+                                            let attachment_id = attachment.id;
+                                            div()
+                                                .id(("composer-image", attachment_id))
+                                                .relative()
+                                                .size(px(52.))
+                                                .flex_none()
+                                                .overflow_hidden()
+                                                .rounded_sm()
+                                                .border_1()
+                                                .border_color(colors.border_variant)
+                                                .bg(colors.element_background)
+                                                .child(
+                                                    gpui::img(attachment.image)
+                                                        .size_full()
+                                                        .object_fit(ObjectFit::Cover),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .top(px(2.))
+                                                        .right(px(2.))
+                                                        .rounded_sm()
+                                                        .bg(colors.editor_background)
+                                                        .child(
+                                                            IconButton::new(
+                                                                (
+                                                                    "remove-composer-image",
+                                                                    attachment_id,
+                                                                ),
+                                                                IconName::Close,
+                                                            )
+                                                            .shape(IconButtonShape::Square)
+                                                            .size(ButtonSize::Compact)
+                                                            .style(ButtonStyle::Subtle)
+                                                            .aria_label("Remove attached image")
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.remove_composer_image(
                                                                         attachment_id,
-                                                                    ),
-                                                                    IconName::Close,
-                                                                )
-                                                                .shape(IconButtonShape::Square)
-                                                                .size(ButtonSize::Compact)
-                                                                .style(ButtonStyle::Subtle)
-                                                                .aria_label("Remove attached image")
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.remove_composer_image(
-                                                                            attachment_id,
-                                                                            cx,
-                                                                        )
-                                                                    },
-                                                                )),
-                                                            ),
-                                                    )
-                                            },
-                                        )),
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            )),
+                                                        ),
+                                                )
+                                        })),
                                 )
                             })
                             .when_some(composer_status.clone(), |this, (status, color)| {
@@ -12579,9 +12755,7 @@ impl Render for HarnessApp {
                                             },
                                         )
                                         .child(
-                                            Label::new(status)
-                                                .size(LabelSize::Small)
-                                                .color(color),
+                                            Label::new(status).size(LabelSize::Small).color(color),
                                         ),
                                 )
                             })
@@ -12637,87 +12811,28 @@ impl Render for HarnessApp {
                                             )
                                     })
                                     .when(!self.search_visible, |this| {
-                                        this.child(self.mode_indicator.clone())
-                                            .child(div().flex_1())
-                                            .when_some(context_usage, |this, usage| {
-                                                this.child(usage)
-                                            })
-                                            .child(model_selector)
-                                            .child(permission_selector)
-                                            .when(turn_active, |this| {
-                                                this.child(
-                                                    Button::new("queue-turn", "Queue")
-                                                        .size(ButtonSize::Compact)
-                                                        .style(ButtonStyle::Subtle)
-                                                        .start_icon(
-                                                            Icon::new(IconName::Send)
-                                                                .size(IconSize::XSmall)
-                                                                .color(Color::Accent),
-                                                        )
-                                                        .disabled(send_blocked)
-                                                        .aria_label(
-                                                            "Queue prompt after the current turn",
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            |this, _, window, cx| {
-                                                                this.send(window, cx)
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    Button::new("stop-turn", "Stop")
-                                                        .size(ButtonSize::Compact)
-                                                        .style(ButtonStyle::Subtle)
-                                                        .start_icon(
-                                                            Icon::new(IconName::Stop)
-                                                                .size(IconSize::XSmall)
-                                                                .color(Color::Error),
-                                                        )
-                                                        .aria_label("Stop turn")
-                                                        .on_click(cx.listener(
-                                                            |this, _, _, cx| this.stop(cx),
-                                                        )),
-                                                )
-                                            })
-                                            .when(!turn_active, |this| {
-                                                this.child(
-                                                    IconButton::new("send-turn", IconName::Send)
-                                                        .shape(IconButtonShape::Square)
-                                                        .size(ButtonSize::Default)
-                                                        .style(ButtonStyle::Filled)
-                                                        .disabled(send_blocked)
-                                                        .icon_color(if send_blocked {
-                                                            Color::Muted
-                                                        } else {
-                                                            Color::Accent
-                                                        })
-                                                        .aria_label(if self.loading_thread {
-                                                            "Wait for task history to finish loading"
-                                                        } else if self.attaching_thread {
-                                                            "Wait for the live task connection"
-                                                        } else if self.settings_update_pending {
-                                                            "Wait for task settings to finish updating"
-                                                        } else if self
-                                                            .thread_read_only_reason
-                                                            .is_some()
-                                                        {
-                                                            "This task is open read-only"
-                                                        } else if self.client.is_none()
-                                                            && self.replay_count.is_none()
-                                                        {
-                                                            "Reconnect to Codex before sending"
-                                                        } else if composer_empty {
-                                                            "Type a prompt to send"
-                                                        } else {
-                                                            "Send prompt"
-                                                        })
-                                                        .on_click(cx.listener(
-                                                            |this, _, window, cx| {
-                                                                this.send(window, cx)
-                                                            },
-                                                        )),
-                                                )
-                                            })
+                                        this.justify_between()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_0p5()
+                                                    .child(self.mode_indicator.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .when_some(context_usage, |this, usage| {
+                                                        this.child(usage)
+                                                    })
+                                                    .child(model_selector)
+                                                    .child(permission_selector)
+                                                    .child(composer_action),
+                                            )
                                     }),
                             ),
                     )
@@ -16257,6 +16372,23 @@ mod tests {
         assert!(!composer_send_blocked(
             false, false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn composer_action_uses_one_context_sensitive_control() {
+        assert_eq!(
+            composer_action_state(false, true),
+            ComposerActionState::Send
+        );
+        assert_eq!(
+            composer_action_state(false, false),
+            ComposerActionState::Send
+        );
+        assert_eq!(
+            composer_action_state(true, false),
+            ComposerActionState::Queue
+        );
+        assert_eq!(composer_action_state(true, true), ComposerActionState::Stop);
     }
 
     #[test]
