@@ -11728,24 +11728,30 @@ impl HarnessApp {
 
         let narrow = window.viewport_size().width < px(720.);
         let transient_status = self.transient_turn_status.clone();
+        let activity_color = if transient_status.is_some() {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
         div()
             .id("transcript-turn-tail")
             .w_full()
-            .h(px(22.))
+            .min_h(px(34.))
             .px(if narrow { px(10.) } else { px(18.) })
+            .py_2()
             .flex()
             .items_center()
-            .gap_1()
+            .gap_2()
             .child(
                 SpinnerLabel::dots()
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
+                    .size(LabelSize::Small)
+                    .color(activity_color),
             )
             .when_some(transient_status, |this, status| {
                 this.child(
                     Label::new(status)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
                 )
             })
             .into_any_element()
