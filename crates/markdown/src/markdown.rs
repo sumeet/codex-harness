@@ -24,6 +24,7 @@ use util::maybe;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::f32::consts::{PI, TAU};
 use std::mem;
 use std::ops::Range;
 use std::path::Path;
@@ -36,7 +37,7 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    MouseMoveEvent, MouseUpEvent, PathBuilder, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad,
 };
@@ -1565,6 +1566,7 @@ pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
     trailing_activity: Option<(SharedString, Hsla)>,
+    trailing_activity_phase: Option<f32>,
     code_block_renderer: CodeBlockRenderer,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
@@ -1588,6 +1590,7 @@ impl MarkdownElement {
             markdown,
             style,
             trailing_activity: None,
+            trailing_activity_phase: None,
             code_block_renderer: CodeBlockRenderer::Default {
                 copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
@@ -1616,6 +1619,24 @@ impl MarkdownElement {
     /// external keyboard-navigation coordinates.
     pub fn trailing_activity(mut self, glyph: impl Into<SharedString>, color: Hsla) -> Self {
         self.trailing_activity = Some((glyph.into(), color));
+        self.trailing_activity_phase = None;
+        self
+    }
+
+    /// Append a continuously painted activity spinner to the final inline run.
+    ///
+    /// Unlike a frame-stepped Unicode spinner, `phase` can change on every
+    /// compositor frame. A transparent placeholder still participates in text
+    /// wrapping, while the spinner itself is painted at that exact insertion
+    /// point and remains absent from copy, search, and source geometry.
+    pub fn trailing_spinner_activity(
+        mut self,
+        label: impl Into<SharedString>,
+        color: Hsla,
+        phase: f32,
+    ) -> Self {
+        self.trailing_activity = Some((label.into(), color));
+        self.trailing_activity_phase = Some(phase.rem_euclid(1.0));
         self
     }
 
@@ -3264,7 +3285,12 @@ impl Element for MarkdownElement {
             if trailing_activity_event == Some(index)
                 && let Some((glyph, color)) = self.trailing_activity.as_ref()
             {
-                builder.push_decorative_tail(glyph, *color, markdown_end);
+                builder.push_decorative_tail(
+                    glyph,
+                    *color,
+                    markdown_end,
+                    self.trailing_activity_phase.is_some(),
+                );
             }
         }
         if self.style.code_block_overflow_x_scroll {
@@ -3342,8 +3368,107 @@ impl Element for MarkdownElement {
         // these quads afterwards punches opaque holes through matched text.
         self.paint_search_highlights(&rendered_markdown.text, window, cx);
         rendered_markdown.element.paint(window, cx);
+        if let Some(phase) = self.trailing_activity_phase
+            && let Some((_, color)) = self.trailing_activity.as_ref()
+        {
+            paint_trailing_activity_spinner(&rendered_markdown.text, phase, *color, window);
+        }
         self.paint_selection(&rendered_markdown.text, window, cx);
         self.paint_external_cursor(&rendered_markdown.text, bounds, window, cx);
+    }
+}
+
+/// Paint a calm, continuously moving comet at the final Markdown insertion
+/// point. The six short arcs create a fading trail without increasing the
+/// angular velocity; GPUI supplies a new `phase` on every presentation frame.
+fn paint_trailing_activity_spinner(
+    rendered_text: &RenderedText,
+    phase: f32,
+    color: Hsla,
+    window: &mut Window,
+) {
+    let Some((line, spinner_start)) = rendered_text.lines.iter().find_map(|line| {
+        line.decorative_spinner_start
+            .map(|spinner_start| (line, spinner_start))
+    }) else {
+        return;
+    };
+    let Some(start) = line.layout.position_for_index(spinner_start) else {
+        return;
+    };
+    let Some(end) = line
+        .layout
+        .position_for_index(spinner_start + '●'.len_utf8())
+    else {
+        return;
+    };
+
+    let line_height = line.layout.line_height();
+    let glyph_width = if end.y == start.y {
+        (end.x - start.x).abs()
+    } else {
+        line_height * 0.55
+    };
+    let radius = (glyph_width.min(line_height * 0.58) * 0.42).max(px(2.5));
+    let stroke_width = (radius * 0.32).clamp(px(1.), px(1.6));
+    let center = point(start.x + glyph_width / 2., start.y + line_height / 2.);
+
+    paint_activity_arc(
+        window,
+        center,
+        radius,
+        stroke_width,
+        0.,
+        TAU,
+        color.opacity(0.10),
+    );
+
+    let head = phase * TAU - PI / 2.;
+    let trail = PI * 0.72;
+    let segment_sweep = trail / 6.;
+    for segment in 0..6 {
+        let start_angle = head - trail + segment_sweep * segment as f32;
+        let end_angle = start_angle + segment_sweep * 0.78;
+        let alpha = 0.13 + 0.145 * segment as f32;
+        paint_activity_arc(
+            window,
+            center,
+            radius,
+            stroke_width,
+            start_angle,
+            end_angle,
+            color.opacity(alpha.min(1.)),
+        );
+    }
+}
+
+fn paint_activity_arc(
+    window: &mut Window,
+    center: Point<Pixels>,
+    radius: Pixels,
+    stroke_width: Pixels,
+    start_angle: f32,
+    end_angle: f32,
+    color: Hsla,
+) {
+    let mut builder = PathBuilder::stroke(stroke_width);
+    builder.move_to(point(
+        center.x + radius * start_angle.cos(),
+        center.y + radius * start_angle.sin(),
+    ));
+    let sweep = end_angle - start_angle;
+    builder.arc_to(
+        point(radius, radius),
+        px(0.),
+        sweep.abs() > PI,
+        sweep >= 0.,
+        point(
+            center.x + radius * end_angle.cos(),
+            center.y + radius * end_angle.sin(),
+        ),
+    );
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
     }
 }
 
@@ -3672,6 +3797,7 @@ struct PendingLine {
     runs: Vec<TextRun>,
     source_mappings: Vec<SourceMapping>,
     decorative_tail_start: Option<usize>,
+    decorative_spinner_start: Option<usize>,
 }
 
 struct ListStackEntry {
@@ -3975,19 +4101,49 @@ impl MarkdownElementBuilder {
         }
     }
 
-    fn push_decorative_tail(&mut self, glyph: &str, color: Hsla, source_index: usize) {
-        let text = format!(" {glyph}");
+    fn push_decorative_tail(
+        &mut self,
+        glyph: &str,
+        color: Hsla,
+        source_index: usize,
+        spinner: bool,
+    ) {
         let rendered_start = self.pending_line.text.len();
         self.pending_line.decorative_tail_start = Some(rendered_start);
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: rendered_start,
             source_index,
         });
-        self.pending_line.text.push_str(&text);
 
-        let mut style = self.base_text_style.clone();
-        style.color = color;
-        self.pending_line.runs.push(style.to_run(text.len()));
+        if spinner {
+            // Reserve one real glyph box so wrapping and line height remain
+            // honest, then paint the continuously animated arc over it. The
+            // placeholder is transparent and source-less.
+            const PLACEHOLDER: &str = " ●";
+            self.pending_line.decorative_spinner_start = Some(rendered_start + 1);
+            self.pending_line.text.push_str(PLACEHOLDER);
+
+            let mut placeholder_style = self.base_text_style.clone();
+            placeholder_style.color = Hsla::transparent_black();
+            self.pending_line
+                .runs
+                .push(placeholder_style.to_run(PLACEHOLDER.len()));
+
+            if !glyph.is_empty() {
+                let label = format!(" {glyph}");
+                self.pending_line.text.push_str(&label);
+                let mut label_style = self.base_text_style.clone();
+                label_style.color = color;
+                self.pending_line.runs.push(label_style.to_run(label.len()));
+            }
+        } else {
+            let text = format!(" {glyph}");
+            self.pending_line.text.push_str(&text);
+            let mut style = self.base_text_style.clone();
+            style.color = color;
+            self.pending_line.runs.push(style.to_run(text.len()));
+        }
+
         self.pending_line.source_mappings.push(SourceMapping {
             rendered_index: self.pending_line.text.len(),
             source_index,
@@ -4077,6 +4233,7 @@ impl MarkdownElementBuilder {
             }],
             source_end: source_range.end,
             decorative_tail_start: None,
+            decorative_spinner_start: None,
             language: None,
             text_align: TextAlign::Left,
         });
@@ -4102,6 +4259,7 @@ impl MarkdownElementBuilder {
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
             decorative_tail_start: line.decorative_tail_start,
+            decorative_spinner_start: line.decorative_spinner_start,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
         });
@@ -4129,6 +4287,7 @@ struct RenderedLine {
     source_mappings: Vec<SourceMapping>,
     source_end: usize,
     decorative_tail_start: Option<usize>,
+    decorative_spinner_start: Option<usize>,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
 }
@@ -4830,6 +4989,7 @@ mod tests {
         style: MarkdownStyle,
         code_span_link: Option<CodeSpanLinkCallback>,
         trailing_activity: Option<(SharedString, Hsla)>,
+        trailing_activity_phase: Option<f32>,
         rendered_text: Rc<RefCell<Option<RenderedText>>>,
     }
 
@@ -4842,7 +5002,11 @@ mod tests {
                     markdown_element.on_code_span_link(move |text, cx| code_span_link(text, cx));
             }
             if let Some((glyph, color)) = self.trailing_activity.clone() {
-                markdown_element = markdown_element.trailing_activity(glyph, color);
+                markdown_element = if let Some(phase) = self.trailing_activity_phase {
+                    markdown_element.trailing_spinner_activity(glyph, color, phase)
+                } else {
+                    markdown_element.trailing_activity(glyph, color)
+                };
             }
             CapturingMarkdownElement {
                 markdown_element: markdown_element.code_block_renderer(
@@ -4955,6 +5119,7 @@ mod tests {
                 style,
                 code_span_link,
                 trailing_activity: None,
+                trailing_activity_phase: None,
                 rendered_text,
             }
         });
@@ -4982,6 +5147,7 @@ mod tests {
                 style: MarkdownStyle::default(),
                 code_span_link: None,
                 trailing_activity: Some(("⠋".into(), Hsla::default())),
+                trailing_activity_phase: None,
                 rendered_text,
             }
         });
@@ -5002,6 +5168,44 @@ mod tests {
         );
         assert_eq!(
             line.source_index_for_rendered_index(decorative_start + 1),
+            source.len()
+        );
+    }
+
+    #[gpui::test]
+    fn trailing_spinner_reserves_real_geometry_but_maps_to_source_end(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "Streaming response";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        let rendered_text = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let rendered_text = rendered_text.clone();
+            move |_, _| MarkdownTestView {
+                markdown,
+                style: MarkdownStyle::default(),
+                code_span_link: None,
+                trailing_activity: Some(("Reconnecting…".into(), Hsla::default())),
+                trailing_activity_phase: Some(0.375),
+                rendered_text,
+            }
+        });
+        cx.run_until_parked();
+
+        let rendered_text = rendered_text.borrow();
+        let line = rendered_text
+            .as_ref()
+            .and_then(|rendered| rendered.lines.last())
+            .expect("streaming Markdown should render one line");
+        let decorative_start = line
+            .decorative_tail_start
+            .expect("activity spinner should be a decorative tail");
+        let spinner_start = line
+            .decorative_spinner_start
+            .expect("activity spinner should retain its paint anchor");
+        assert!(line.layout.text().ends_with(" ● Reconnecting…"));
+        assert_eq!(spinner_start, decorative_start + 1);
+        assert_eq!(
+            line.source_index_for_rendered_index(spinner_start),
             source.len()
         );
     }
@@ -6907,6 +7111,7 @@ mod tests {
                 },
                 code_span_link: None,
                 trailing_activity: None,
+                trailing_activity_phase: None,
                 rendered_text,
             }
         });

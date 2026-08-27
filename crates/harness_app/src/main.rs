@@ -37,10 +37,10 @@ use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
-    Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
-    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
-    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
-    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
+    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure,
+    DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
+    LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes,
+    Scrollbars, SelectableButton, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
     right_click_menu,
 };
 use uuid::Uuid;
@@ -11362,8 +11362,6 @@ impl HarnessApp {
                 });
             }
             let element = if streaming && item.kind == model::TranscriptKind::Agent {
-                const ACTIVITY_FRAMES: [&str; 10] =
-                    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let activity_color = if inline_turn_status.is_some() {
                     cx.theme().status().warning
                 } else {
@@ -11372,15 +11370,13 @@ impl HarnessApp {
                 element
                     .with_animation(
                         format!("streaming-agent-activity-{}", item.key),
-                        gpui::Animation::new(Duration::from_millis(1000)).repeat(),
+                        gpui::Animation::new(Duration::from_millis(1400)).repeat_synced(),
                         move |element, delta| {
-                            let frame = ((delta * ACTIVITY_FRAMES.len() as f32) as usize)
-                                % ACTIVITY_FRAMES.len();
                             let activity = inline_turn_status
                                 .as_ref()
-                                .map(|status| format!("{} {status}", ACTIVITY_FRAMES[frame]))
-                                .unwrap_or_else(|| ACTIVITY_FRAMES[frame].to_owned());
-                            element.trailing_activity(activity, activity_color)
+                                .map(|status| status.clone())
+                                .unwrap_or_default();
+                            element.trailing_spinner_activity(activity, activity_color, delta)
                         },
                     )
                     .into_any_element()
@@ -11805,9 +11801,10 @@ impl HarnessApp {
                             .items_center()
                             .justify_center()
                             .child(
-                                SpinnerLabel::dots()
-                                    .size(LabelSize::Large)
-                                    .color(activity_color),
+                                Icon::new(IconName::LoadCircle)
+                                    .size(IconSize::Small)
+                                    .color(activity_color)
+                                    .with_keyed_rotate_animation("transcript-tail-activity", 2),
                             ),
                     )
                     .when_some(transient_status, |this, status| {
@@ -12501,9 +12498,15 @@ impl Render for HarnessApp {
                                                                 ),
                                                                 |this| {
                                                                     this.child(
-                                                                        SpinnerLabel::dots()
-                                                                            .size(LabelSize::Small)
-                                                                            .color(Color::Muted),
+                                                                        Icon::new(
+                                                                            IconName::LoadCircle,
+                                                                        )
+                                                                        .size(IconSize::XSmall)
+                                                                        .color(Color::Muted)
+                                                                        .with_keyed_rotate_animation(
+                                                                            "composer-status-activity",
+                                                                            2,
+                                                                        ),
                                                                     )
                                                                 },
                                                             )
