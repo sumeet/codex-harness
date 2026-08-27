@@ -37,10 +37,10 @@ use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
-    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure,
-    DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
-    LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes,
-    Scrollbars, SelectableButton, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
+    Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
+    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
+    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
+    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
     right_click_menu,
 };
 use uuid::Uuid;
@@ -11370,7 +11370,7 @@ impl HarnessApp {
                 element
                     .with_animation(
                         format!("streaming-agent-activity-{}", item.key),
-                        gpui::Animation::new(Duration::from_millis(1400)).repeat_synced(),
+                        gpui::Animation::new(Duration::from_millis(1000)).repeat_synced(),
                         move |element, delta| {
                             let activity = inline_turn_status
                                 .as_ref()
@@ -11801,10 +11801,9 @@ impl HarnessApp {
                             .items_center()
                             .justify_center()
                             .child(
-                                Icon::new(IconName::LoadCircle)
-                                    .size(IconSize::Small)
-                                    .color(activity_color)
-                                    .with_keyed_rotate_animation("transcript-tail-activity", 2),
+                                SpinnerLabel::dots()
+                                    .size(LabelSize::Large)
+                                    .color(activity_color),
                             ),
                     )
                     .when_some(transient_status, |this, status| {
@@ -12498,15 +12497,9 @@ impl Render for HarnessApp {
                                                                 ),
                                                                 |this| {
                                                                     this.child(
-                                                                        Icon::new(
-                                                                            IconName::LoadCircle,
-                                                                        )
-                                                                        .size(IconSize::XSmall)
-                                                                        .color(Color::Muted)
-                                                                        .with_keyed_rotate_animation(
-                                                                            "composer-status-activity",
-                                                                            2,
-                                                                        ),
+                                                                        SpinnerLabel::dots()
+                                                                            .size(LabelSize::Small)
+                                                                            .color(Color::Muted),
                                                                     )
                                                                 },
                                                             )

@@ -24,7 +24,6 @@ use util::maybe;
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::f32::consts::{PI, TAU};
 use std::mem;
 use std::ops::Range;
 use std::path::Path;
@@ -37,7 +36,7 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, PathBuilder, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad,
 };
@@ -3378,9 +3377,10 @@ impl Element for MarkdownElement {
     }
 }
 
-/// Paint a calm, continuously moving comet at the final Markdown insertion
-/// point. The six short arcs create a fading trail without increasing the
-/// angular velocity; GPUI supplies a new `phase` on every presentation frame.
+/// Paint Zed's familiar Braille-dot activity indicator at the final Markdown
+/// insertion point, while smoothly cross-fading its original ten silhouettes.
+/// GPUI supplies a new `phase` on every presentation frame, so a 120 Hz output
+/// gets 120 distinct states without changing the spinner's one-second cadence.
 fn paint_trailing_activity_spinner(
     rendered_text: &RenderedText,
     phase: f32,
@@ -3398,7 +3398,7 @@ fn paint_trailing_activity_spinner(
     };
     let Some(end) = line
         .layout
-        .position_for_index(spinner_start + '●'.len_utf8())
+        .position_for_index(spinner_start + '⠋'.len_utf8())
     else {
         return;
     };
@@ -3409,66 +3409,61 @@ fn paint_trailing_activity_spinner(
     } else {
         line_height * 0.55
     };
-    let radius = (glyph_width.min(line_height * 0.58) * 0.42).max(px(2.5));
-    let stroke_width = (radius * 0.32).clamp(px(1.), px(1.6));
     let center = point(start.x + glyph_width / 2., start.y + line_height / 2.);
 
-    paint_activity_arc(
-        window,
-        center,
-        radius,
-        stroke_width,
-        0.,
-        TAU,
-        color.opacity(0.10),
-    );
+    // These are the bit patterns behind Zed's original sequence:
+    // ⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏. Interpolating the individual dot
+    // opacities preserves its visual identity instead of replacing it with a
+    // generic ring.
+    const FRAMES: [u8; 10] = [0x0b, 0x19, 0x39, 0x38, 0x3c, 0x34, 0x26, 0x27, 0x07, 0x0f];
+    const DOT_POSITIONS: [(f32, f32); 8] = [
+        (-0.5, -1.5),
+        (-0.5, -0.5),
+        (-0.5, 0.5),
+        (0.5, -1.5),
+        (0.5, -0.5),
+        (0.5, 0.5),
+        (-0.5, 1.5),
+        (0.5, 1.5),
+    ];
 
-    let head = phase * TAU - PI / 2.;
-    let trail = PI * 0.72;
-    let segment_sweep = trail / 6.;
-    for segment in 0..6 {
-        let start_angle = head - trail + segment_sweep * segment as f32;
-        let end_angle = start_angle + segment_sweep * 0.78;
-        let alpha = 0.13 + 0.145 * segment as f32;
-        paint_activity_arc(
-            window,
-            center,
-            radius,
-            stroke_width,
-            start_angle,
-            end_angle,
-            color.opacity(alpha.min(1.)),
-        );
-    }
-}
+    let frame_position = phase.rem_euclid(1.) * FRAMES.len() as f32;
+    let frame = frame_position.floor() as usize % FRAMES.len();
+    let next_frame = (frame + 1) % FRAMES.len();
+    // Smoothstep avoids a visible velocity kink at the old frame boundaries.
+    let linear_blend = frame_position.fract();
+    let blend = linear_blend * linear_blend * (3. - 2. * linear_blend);
+    let dot_radius = (glyph_width.min(line_height * 0.5) * 0.105).clamp(px(0.9), px(1.35));
+    let column_step = dot_radius * 2.8;
+    let row_step = dot_radius * 2.65;
 
-fn paint_activity_arc(
-    window: &mut Window,
-    center: Point<Pixels>,
-    radius: Pixels,
-    stroke_width: Pixels,
-    start_angle: f32,
-    end_angle: f32,
-    color: Hsla,
-) {
-    let mut builder = PathBuilder::stroke(stroke_width);
-    builder.move_to(point(
-        center.x + radius * start_angle.cos(),
-        center.y + radius * start_angle.sin(),
-    ));
-    let sweep = end_angle - start_angle;
-    builder.arc_to(
-        point(radius, radius),
-        px(0.),
-        sweep.abs() > PI,
-        sweep >= 0.,
-        point(
-            center.x + radius * end_angle.cos(),
-            center.y + radius * end_angle.sin(),
-        ),
-    );
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
+    for (dot, (column, row)) in DOT_POSITIONS.into_iter().enumerate() {
+        let current = if FRAMES[frame] & (1 << dot) != 0 {
+            1.
+        } else {
+            0.
+        };
+        let next = if FRAMES[next_frame] & (1 << dot) != 0 {
+            1.
+        } else {
+            0.
+        };
+        let opacity = current + (next - current) * blend;
+        if opacity <= 0.01 {
+            continue;
+        }
+        let dot_center = point(center.x + column_step * column, center.y + row_step * row);
+        window.paint_quad(quad(
+            Bounds::new(
+                point(dot_center.x - dot_radius, dot_center.y - dot_radius),
+                gpui::size(dot_radius * 2., dot_radius * 2.),
+            ),
+            dot_radius,
+            color.opacity(opacity),
+            px(0.),
+            Hsla::transparent_black(),
+            BorderStyle::default(),
+        ));
     }
 }
 
@@ -4116,10 +4111,10 @@ impl MarkdownElementBuilder {
         });
 
         if spinner {
-            // Reserve one real glyph box so wrapping and line height remain
-            // honest, then paint the continuously animated arc over it. The
-            // placeholder is transparent and source-less.
-            const PLACEHOLDER: &str = " ●";
+            // Reserve the same glyph box as Zed's Braille activity indicator
+            // so wrapping and line height remain honest. The placeholder is
+            // transparent and source-less; its dots are painted continuously.
+            const PLACEHOLDER: &str = " ⠋";
             self.pending_line.decorative_spinner_start = Some(rendered_start + 1);
             self.pending_line.text.push_str(PLACEHOLDER);
 
@@ -5202,7 +5197,7 @@ mod tests {
         let spinner_start = line
             .decorative_spinner_start
             .expect("activity spinner should retain its paint anchor");
-        assert!(line.layout.text().ends_with(" ● Reconnecting…"));
+        assert!(line.layout.text().ends_with(" ⠋ Reconnecting…"));
         assert_eq!(spinner_start, decorative_start + 1);
         assert_eq!(
             line.source_index_for_rendered_index(spinner_start),
