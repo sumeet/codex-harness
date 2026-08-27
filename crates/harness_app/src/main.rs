@@ -127,6 +127,7 @@ const COMMAND_PREVIEW_BYTES: usize = 800;
 const MAX_COMPOSER_IMAGES: usize = 8;
 const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const COMPOSER_ATTACHMENT_STRIP_HEIGHT: f32 = 62.;
+const COMPOSER_NOTICE_HEIGHT: f32 = 28.;
 #[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
@@ -950,7 +951,9 @@ fn rich_navigation_overlay_selection_background(cx: &App) -> gpui::Hsla {
     // theme's element-selection color is already tuned for that compositing
     // order; the read-only player color is opaque and grayscale, so merely
     // lowering its alpha makes selected Rich text look disabled.
-    cx.theme().colors().element_selection_background.alpha(0.42)
+    HarnessVisualTheme::from_zed(cx.theme().colors())
+        .selection_surface
+        .alpha(0.42)
 }
 
 fn rich_navigation_text_highlight_background(
@@ -3012,6 +3015,7 @@ impl HybridStructuredSurface {
 impl Render for HybridStructuredSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let body = self
             .item
             .expanded
@@ -3087,7 +3091,8 @@ impl Render for HybridStructuredSurface {
                 .gap_1()
                 .rounded_sm()
                 .border_1()
-                .border_color(colors.border_variant)
+                .border_color(visuals.divider)
+                .bg(visuals.raised_surface)
                 .px_2()
                 .py_1()
                 .child(header)
@@ -9057,6 +9062,7 @@ impl HarnessApp {
         cx: &App,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let unified = content.lines().any(|line| line.starts_with("@@"));
         let mut in_hunk = false;
         let mut old_line = None;
@@ -9104,16 +9110,16 @@ impl HarnessApp {
                     .font_buffer(cx)
                     .text_ui_sm(cx)
                     .bg(if tone == DiffLineTone::Addition {
-                        colors.version_control_added.opacity(0.12)
+                        visuals.diff_added_surface
                     } else if tone == DiffLineTone::Deletion {
-                        colors.version_control_deleted.opacity(0.12)
+                        visuals.diff_deleted_surface
                     } else {
                         gpui::transparent_black()
                     })
                     .text_color(if tone == DiffLineTone::Addition {
-                        colors.version_control_added
+                        visuals.diff_added
                     } else if tone == DiffLineTone::Deletion {
-                        colors.version_control_deleted
+                        visuals.diff_deleted
                     } else if tone == DiffLineTone::Hunk {
                         colors.text_accent
                     } else {
@@ -9143,6 +9149,7 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let presentations = diff_file_presentations(&item.content);
         let owner = cx.weak_entity();
         let mut logical_cursor = 0;
@@ -9176,7 +9183,7 @@ impl HarnessApp {
             let disclosure_owner = owner.clone();
             let header = rich_card_identity_row()
                 .px_1()
-                .bg(colors.editor_subheader_background.opacity(0.42))
+                .bg(visuals.inset_surface)
                 .child(
                     div()
                         .min_w_0()
@@ -9303,6 +9310,7 @@ impl HarnessApp {
         cx: &App,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let presentations = diff_file_presentations(&item.content);
         let allocations = progressive_file_line_allocations(
             &presentations
@@ -9359,8 +9367,8 @@ impl HarnessApp {
                         rich_card_identity_row()
                             .when(section_index == 0, |this| this.pr_5())
                             .border_b_1()
-                            .border_color(colors.border_variant)
-                            .bg(colors.editor_subheader_background.opacity(0.72))
+                            .border_color(visuals.divider)
+                            .bg(visuals.inset_surface)
                             .child(rich_card_identity_icon(
                                 IconName::File,
                                 IconSize::XSmall,
@@ -9451,6 +9459,7 @@ impl HarnessApp {
             } => {
                 let presentation = &row_data.presentations[*section_index];
                 let colors = cx.theme().colors();
+                let visuals = HarnessVisualTheme::from_zed(colors);
                 let (additions, deletions) = file_change_counts(presentation);
                 let highlighted_path = navigation_searchable_styled_text(
                     presentation.path.clone(),
@@ -9482,7 +9491,7 @@ impl HarnessApp {
                 let disclosure_owner = owner.clone();
                 rich_card_identity_row()
                     .px_1()
-                    .bg(colors.editor_subheader_background.opacity(0.42))
+                    .bg(visuals.inset_surface)
                     .child(
                         div()
                             .min_w_0()
@@ -9561,6 +9570,7 @@ impl HarnessApp {
                 new_line,
             } => {
                 let colors = cx.theme().colors();
+                let visuals = HarnessVisualTheme::from_zed(colors);
                 let line = &row_data.presentations[*section_index].content[source_range.clone()];
                 let highlighted_line = navigation_searchable_styled_text(
                     line.to_owned(),
@@ -9597,16 +9607,16 @@ impl HarnessApp {
                     .font_buffer(cx)
                     .text_ui_sm(cx)
                     .bg(if *tone == DiffLineTone::Addition {
-                        colors.version_control_added.opacity(0.12)
+                        visuals.diff_added_surface
                     } else if *tone == DiffLineTone::Deletion {
-                        colors.version_control_deleted.opacity(0.12)
+                        visuals.diff_deleted_surface
                     } else {
                         gpui::transparent_black()
                     })
                     .text_color(if *tone == DiffLineTone::Addition {
-                        colors.version_control_added
+                        visuals.diff_added
                     } else if *tone == DiffLineTone::Deletion {
-                        colors.version_control_deleted
+                        visuals.diff_deleted
                     } else if *tone == DiffLineTone::Hunk {
                         colors.text_accent
                     } else {
@@ -11266,6 +11276,7 @@ impl HarnessApp {
             self.focus_mode == FocusMode::Approval && index == self.selected_item;
         let approval_cursor = self.approval_cursor;
         let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
         let narrow = window.viewport_size().width < px(720.);
         let narrative = matches!(
             item.kind,
@@ -11658,8 +11669,8 @@ impl HarnessApp {
                 .when(item.kind == model::TranscriptKind::User, |this| {
                     this.rounded_sm()
                         .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.element_background)
+                        .border_color(visuals.divider)
+                        .bg(visuals.raised_surface)
                         .px_2()
                         .py_1()
                 })
@@ -11709,7 +11720,8 @@ impl HarnessApp {
                 .when(!compact_trace, |this| {
                     this.rounded_sm()
                         .border_1()
-                        .border_color(colors.border_variant)
+                        .border_color(visuals.divider)
+                        .bg(visuals.raised_surface)
                         .px_2()
                         .py_0p5()
                 })
@@ -11753,7 +11765,7 @@ impl HarnessApp {
                 px(8.)
             })
             .when(visual, |this| {
-                this.bg(colors.element_selection_background.opacity(0.45))
+                this.bg(visuals.selection_surface.opacity(0.45))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.selected_item = index;
@@ -11804,27 +11816,50 @@ impl HarnessApp {
         div()
             .id("transcript-turn-tail")
             .w_full()
-            .min_h(px(40.))
             .px(if narrow { px(10.) } else { px(18.) })
-            .py_2()
-            .border_t_1()
-            .border_color(visuals.divider)
-            .bg(visuals.activity_surface)
-            .flex()
-            .items_center()
-            .gap_2()
+            .pt_1()
+            .pb_2()
             .child(
-                SpinnerLabel::dots()
-                    .size(LabelSize::Large)
-                    .color(activity_color),
+                div()
+                    .w_full()
+                    .min_h(px(34.))
+                    .px_2()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(if transient_status.is_some() {
+                        visuals.warning_border
+                    } else {
+                        visuals.activity_border
+                    })
+                    .bg(if transient_status.is_some() {
+                        visuals.warning_surface
+                    } else {
+                        visuals.activity_surface
+                    })
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(22.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                SpinnerLabel::dots()
+                                    .size(LabelSize::Large)
+                                    .color(activity_color),
+                            ),
+                    )
+                    .when_some(transient_status, |this, status| {
+                        this.child(
+                            Label::new(status)
+                                .size(LabelSize::Small)
+                                .color(Color::Warning),
+                        )
+                    }),
             )
-            .when_some(transient_status, |this, status| {
-                this.child(
-                    Label::new(status)
-                        .size(LabelSize::Small)
-                        .color(Color::Warning),
-                )
-            })
             .into_any_element()
     }
 }
@@ -11873,11 +11908,37 @@ impl Render for HarnessApp {
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
         );
+        let composer_status: Option<(SharedString, Color)> =
+            if let Some(error) = self.composer_attachment_error.clone() {
+                Some((error, Color::Warning))
+            } else if let Some(status) = self.performance_status.clone() {
+                Some((status, Color::Muted))
+            } else if self.loading_thread {
+                Some(("Loading task history…".into(), Color::Muted))
+            } else if self.attaching_thread {
+                Some(("Connecting live…".into(), Color::Muted))
+            } else if self.settings_update_pending {
+                Some(("Updating task settings…".into(), Color::Muted))
+            } else if self.thread_read_only_reason.is_some() {
+                Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
+            } else if self.connecting {
+                Some(("Connecting…".into(), Color::Muted))
+            } else if self.client.is_none() && self.replay_count.is_none() {
+                Some(("Offline · refresh to reconnect".into(), Color::Warning))
+            } else {
+                None
+            };
+        let composer_notice_visible = composer_status.is_some();
         let composer_height = composer_metrics.height
             + if self.composer_images.is_empty() {
                 0.
             } else {
                 COMPOSER_ATTACHMENT_STRIP_HEIGHT
+            }
+            + if composer_notice_visible {
+                COMPOSER_NOTICE_HEIGHT
+            } else {
+                0.
             };
         let composer_images = self.composer_images.clone();
         let turn_active = self.turn_active();
@@ -12037,26 +12098,6 @@ impl Render for HarnessApp {
             .vim_command_line
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
-        let composer_status: Option<(SharedString, Color)> =
-            if let Some(error) = self.composer_attachment_error.clone() {
-                Some((error, Color::Warning))
-            } else if let Some(status) = self.performance_status.clone() {
-                Some((status, Color::Muted))
-            } else if self.loading_thread {
-                Some(("Loading task history…".into(), Color::Muted))
-            } else if self.attaching_thread {
-                Some(("Connecting live…".into(), Color::Muted))
-            } else if self.settings_update_pending {
-                Some(("Updating task settings…".into(), Color::Muted))
-            } else if self.thread_read_only_reason.is_some() {
-                Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
-            } else if self.connecting {
-                Some(("Connecting…".into(), Color::Muted))
-            } else if self.client.is_none() && self.replay_count.is_none() {
-                Some(("Offline · refresh to reconnect".into(), Color::Warning))
-            } else {
-                None
-            };
         let context_usage = self.render_context_usage(cx);
         let model_selector = self.render_model_effort_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
@@ -12352,8 +12393,8 @@ impl Render for HarnessApp {
                                 .px_4()
                                 .py_2()
                                 .border_b_1()
-                                .border_color(colors.border)
-                                .bg(colors.surface_background)
+                                .border_color(visuals.error_border)
+                                .bg(visuals.error_surface)
                                 .text_xs()
                                 .text_color(cx.theme().status().error)
                                 .truncate()
@@ -12459,6 +12500,42 @@ impl Render for HarnessApp {
                                         )),
                                 )
                             })
+                            .when_some(composer_status.clone(), |this, (status, color)| {
+                                this.child(
+                                    div()
+                                        .h(px(COMPOSER_NOTICE_HEIGHT))
+                                        .flex_none()
+                                        .px_3()
+                                        .border_b_1()
+                                        .border_color(visuals.divider)
+                                        .bg(visuals.inset_surface.opacity(0.56))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .when(
+                                            matches!(
+                                                color,
+                                                Color::Muted
+                                                    if self.loading_thread
+                                                        || self.attaching_thread
+                                                        || self.settings_update_pending
+                                                        || self.connecting
+                                            ),
+                                            |this| {
+                                                this.child(
+                                                    SpinnerLabel::dots()
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
+                                            },
+                                        )
+                                        .child(
+                                            Label::new(status)
+                                                .size(LabelSize::Small)
+                                                .color(color),
+                                        ),
+                                )
+                            })
                             .child(
                                 div()
                                     .flex_1()
@@ -12512,16 +12589,6 @@ impl Render for HarnessApp {
                                     })
                                     .when(!self.search_visible, |this| {
                                         this.child(self.mode_indicator.clone())
-                                            .when_some(
-                                                composer_status,
-                                                |this, (status, color)| {
-                                                    this.child(
-                                                        Label::new(status)
-                                                            .size(LabelSize::XSmall)
-                                                            .color(color),
-                                                    )
-                                                },
-                                            )
                                             .child(div().flex_1())
                                             .when_some(context_usage, |this, usage| {
                                                 this.child(usage)

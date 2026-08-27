@@ -9,17 +9,17 @@ must survive conversation compaction and hand-offs.
 
 ### Visual system and overall aesthetic
 
-- [ ] Define one semantic Harness visual layer on top of Zed theme tokens:
+- [x] Define one semantic Harness visual layer on top of Zed theme tokens:
   canvas, transcript, rail, composer, raised surface, quiet divider, focus,
   activity, warning, error, selection, and syntax/diff roles.
-- [ ] Improve contrast without making text smaller or adding ornamental chrome.
-- [ ] Replace the bright composer/transcript focus line with a calmer,
+- [x] Improve contrast without making text smaller or adding ornamental chrome.
+- [x] Replace the bright composer/transcript focus line with a calmer,
   Zed-native separation and focus treatment.
-- [ ] Make live activity and reconnecting state noticeable at the transcript
+- [x] Make live activity and reconnecting state noticeable at the transcript
   tail without turning it into a heavy status banner.
 - [ ] Normalize typography, padding, borders, radii, identity rows, and density
   across user messages, tool calls, diffs, images, queue rows, and the composer.
-- [ ] Preserve the core Harness direction: show a lot of information in a
+- [x] Preserve the core Harness direction: show a lot of information in a
   document-like transcript while keeping its structure easy to scan.
 - [x] Add persistent in-app theme selection with immediate live application;
   components remain independent of any particular dark theme.

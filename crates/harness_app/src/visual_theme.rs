@@ -62,8 +62,20 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) transcript: Hsla,
     pub(crate) rail: Hsla,
     pub(crate) composer: Hsla,
+    pub(crate) raised_surface: Hsla,
+    pub(crate) inset_surface: Hsla,
     pub(crate) pending_surface: Hsla,
     pub(crate) activity_surface: Hsla,
+    pub(crate) activity_border: Hsla,
+    pub(crate) warning_surface: Hsla,
+    pub(crate) warning_border: Hsla,
+    pub(crate) error_surface: Hsla,
+    pub(crate) error_border: Hsla,
+    pub(crate) selection_surface: Hsla,
+    pub(crate) diff_added: Hsla,
+    pub(crate) diff_added_surface: Hsla,
+    pub(crate) diff_deleted: Hsla,
+    pub(crate) diff_deleted_surface: Hsla,
     pub(crate) divider: Hsla,
     pub(crate) strong_divider: Hsla,
     pub(crate) focus_wash: Hsla,
@@ -79,9 +91,31 @@ impl HarnessVisualTheme {
             // slightly raised subheader tone separates it without a bright
             // focus-colored rule.
             composer: colors.editor_subheader_background,
-            pending_surface: colors.surface_background,
-            activity_surface: colors.editor_subheader_background,
-            divider: colors.border_variant,
+            raised_surface: colors.surface_background,
+            inset_surface: colors.editor_background,
+            pending_surface: colors
+                .editor_background
+                .blend(colors.surface_background.opacity(0.86)),
+            // Match Zed's activity-bar language: activity is a quiet selected
+            // wash over the document, not a saturated status banner.
+            activity_surface: colors
+                .editor_background
+                .blend(colors.element_selected.opacity(0.30)),
+            activity_border: colors.border_selected.opacity(0.72),
+            warning_surface: colors
+                .editor_background
+                .blend(colors.version_control_modified.opacity(0.12)),
+            warning_border: colors.version_control_modified.opacity(0.58),
+            error_surface: colors
+                .editor_background
+                .blend(colors.version_control_deleted.opacity(0.12)),
+            error_border: colors.version_control_deleted.opacity(0.58),
+            selection_surface: colors.element_selection_background,
+            diff_added: colors.version_control_added,
+            diff_added_surface: colors.version_control_added.opacity(0.12),
+            diff_deleted: colors.version_control_deleted,
+            diff_deleted_surface: colors.version_control_deleted.opacity(0.12),
+            divider: colors.border_variant.opacity(0.82),
             strong_divider: colors.border,
             // Focus is a low-amplitude surface change. Explicit controls still
             // use the theme's ordinary focused/selected tokens.
