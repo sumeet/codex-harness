@@ -12,13 +12,13 @@ use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent, ThreadOpenResponse};
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity, FocusHandle,
-    Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding, KeyContext,
-    Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, ObjectFit, PlatformInput,
-    Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledImage,
-    StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal, WeakEntity, Window,
-    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
-    relative, size, uniform_list,
+    AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
+    FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
+    KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, ObjectFit,
+    PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, StyledImage, StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point,
+    prelude::*, px, relative, size, uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -302,6 +302,15 @@ fn turn_tail_list_splice(
     // Reconcile an unexpected count in one operation rather than leaving a
     // stale generating row addressable as a transcript item.
     Some((0..current_count, desired_count))
+}
+
+fn transcript_has_inline_activity(transcript: &TranscriptModel) -> bool {
+    transcript.items.iter().rev().any(|item| {
+        item.kind == model::TranscriptKind::Agent
+            && item.expanded
+            && item.status.as_deref() == Some("streaming")
+            && !item.content.trim().is_empty()
+    })
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4579,6 +4588,17 @@ impl HarnessApp {
         let mut model = replay_count
             .map(TranscriptModel::replay)
             .unwrap_or_default();
+        if replay_count.is_some() && replay_streaming() {
+            if let Some(agent) = model
+                .items
+                .iter_mut()
+                .rev()
+                .find(|item| item.kind == model::TranscriptKind::Agent)
+            {
+                agent.status = Some("streaming".into());
+            }
+            model.current_turn_id = Some("fixture-streaming-turn".into());
+        }
         mark_unbacked_requests_inactive(&mut model, &HashSet::default());
         let dirty_image_surfaces = model
             .items
@@ -8986,13 +9006,21 @@ impl HarnessApp {
                 }
             });
         if cached.source != source {
+            let appended_suffix = source
+                .strip_prefix(cached.source.as_str())
+                .filter(|suffix| !suffix.is_empty())
+                .map(ToOwned::to_owned);
             cached.source = source.to_string();
             cached.search_query = None;
             cached.search_ranges.clear();
             cached.navigation = None;
             cached.last_autoscroll_generation = None;
             cached.entity.update(cx, |markdown, cx| {
-                markdown.reset(source.to_string().into(), cx)
+                if let Some(suffix) = appended_suffix.as_deref() {
+                    markdown.append(suffix, cx);
+                } else {
+                    markdown.reset(source.to_string().into(), cx);
+                }
             });
         }
 
@@ -11395,7 +11423,6 @@ impl HarnessApp {
         let markdown = (narrative
             && item.kind != model::TranscriptKind::Reasoning
             && item.expanded
-            && !streaming
             && !item.content.is_empty())
         .then(|| {
             self.markdown_for(
@@ -11408,6 +11435,7 @@ impl HarnessApp {
                 cx,
             )
         });
+        let inline_turn_status = self.transient_turn_status.clone();
 
         let body = if request_method.is_some() || !item.expanded || item.content.is_empty() {
             None
@@ -11446,6 +11474,32 @@ impl HarnessApp {
                     true
                 });
             }
+            let element = if streaming && item.kind == model::TranscriptKind::Agent {
+                const ACTIVITY_FRAMES: [&str; 10] =
+                    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let activity_color = if inline_turn_status.is_some() {
+                    cx.theme().status().warning
+                } else {
+                    colors.text_accent
+                };
+                element
+                    .with_animation(
+                        format!("streaming-agent-activity-{}", item.key),
+                        gpui::Animation::new(Duration::from_millis(1000)).repeat(),
+                        move |element, delta| {
+                            let frame = ((delta * ACTIVITY_FRAMES.len() as f32) as usize)
+                                % ACTIVITY_FRAMES.len();
+                            let activity = inline_turn_status
+                                .as_ref()
+                                .map(|status| format!("{} {status}", ACTIVITY_FRAMES[frame]))
+                                .unwrap_or_else(|| ACTIVITY_FRAMES[frame].to_owned());
+                            element.trailing_activity(activity, activity_color)
+                        },
+                    )
+                    .into_any_element()
+            } else {
+                element.into_any_element()
+            };
             Some(div().w_full().min_w_0().child(element).into_any_element())
         } else {
             Some(match item.kind {
@@ -11806,8 +11860,18 @@ impl HarnessApp {
 
         let narrow = window.viewport_size().width < px(720.);
         let transient_status = self.transient_turn_status.clone();
-        let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let inline_activity = transcript_has_inline_activity(&self.model);
+        if inline_activity {
+            // Keep the sentinel as a real list item so tail following remains
+            // stable, but let the streaming Markdown own the visible activity
+            // glyph and any transient transport status at its actual insertion
+            // point.
+            return div()
+                .id("transcript-turn-tail")
+                .w_full()
+                .h(px(1.))
+                .into_any_element();
+        }
         let activity_color = if transient_status.is_some() {
             Color::Warning
         } else {
@@ -11821,27 +11885,12 @@ impl HarnessApp {
             .pb_2()
             .child(
                 div()
-                    .w_full()
-                    .min_h(px(34.))
-                    .px_2()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(if transient_status.is_some() {
-                        visuals.warning_border
-                    } else {
-                        visuals.activity_border
-                    })
-                    .bg(if transient_status.is_some() {
-                        visuals.warning_surface
-                    } else {
-                        visuals.activity_surface
-                    })
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
                         div()
-                            .w(px(22.))
+                            .w(px(20.))
                             .flex_none()
                             .flex()
                             .items_center()
@@ -13631,6 +13680,12 @@ fn replay_count() -> Option<usize> {
         .and_then(|count| count.parse().ok())
 }
 
+fn replay_streaming() -> bool {
+    std::env::args().any(|argument| argument == "--replay-streaming")
+        || std::env::var_os("HARNESS_REPLAY_STREAMING")
+            .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"))
+}
+
 fn automatic_performance_j() -> bool {
     std::env::args().any(|argument| argument == "--perf-j")
 }
@@ -14702,6 +14757,33 @@ mod tests {
             Some((0..7, 4)),
             "thread replacement must reconcile stale list furniture atomically"
         );
+    }
+
+    #[test]
+    fn streamed_agent_text_owns_the_visible_turn_activity() {
+        let mut model = TranscriptModel::default();
+        model.items.push(TranscriptItem {
+            key: "streaming-agent".into(),
+            protocol_id: Some("streaming-agent".into()),
+            kind: model::TranscriptKind::Agent,
+            title: "Codex".into(),
+            status: Some("streaming".into()),
+            content: "The response has started".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        });
+
+        assert!(transcript_has_inline_activity(&model));
+        model.items[0].content.clear();
+        assert!(
+            !transcript_has_inline_activity(&model),
+            "the list-tail fallback remains visible before the first text delta"
+        );
+        model.items[0].content = "complete".into();
+        model.items[0].status = Some("completed".into());
+        assert!(!transcript_has_inline_activity(&model));
     }
 
     #[test]

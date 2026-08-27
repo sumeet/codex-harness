@@ -15,8 +15,9 @@ must survive conversation compaction and hand-offs.
 - [x] Improve contrast without making text smaller or adding ornamental chrome.
 - [x] Replace the bright composer/transcript focus line with a calmer,
   Zed-native separation and focus treatment.
-- [x] Make live activity and reconnecting state noticeable at the transcript
-  tail without turning it into a heavy status banner.
+- [x] Attach live activity to the response's actual streaming insertion point;
+  use a quiet transcript-tail fallback only before the first text arrives, and
+  keep reconnecting state nearby without turning either into a status banner.
 - [ ] Normalize typography, padding, borders, radii, identity rows, and density
   across user messages, tool calls, diffs, images, queue rows, and the composer.
 - [x] Preserve the core Harness direction: show a lot of information in a

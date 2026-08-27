@@ -1564,6 +1564,7 @@ pub enum AutoscrollBehavior {
 pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
+    trailing_activity: Option<(SharedString, Hsla)>,
     code_block_renderer: CodeBlockRenderer,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     on_url_hover: Option<UrlHoverCallback>,
@@ -1586,6 +1587,7 @@ impl MarkdownElement {
         Self {
             markdown,
             style,
+            trailing_activity: None,
             code_block_renderer: CodeBlockRenderer::Default {
                 copy_button_visibility: CopyButtonVisibility::VisibleOnHover,
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
@@ -1603,6 +1605,18 @@ impl MarkdownElement {
             #[cfg(test)]
             on_render: None,
         }
+    }
+
+    /// Append a paint-only activity glyph to the final inline text run.
+    ///
+    /// The glyph participates in wrapping and height measurement, but maps to
+    /// the end of the Markdown source instead of becoming part of the source.
+    /// This is useful for a streaming insertion indicator: it stays attached
+    /// to the text being produced without contaminating copy, search, or
+    /// external keyboard-navigation coordinates.
+    pub fn trailing_activity(mut self, glyph: impl Into<SharedString>, color: Hsla) -> Self {
+        self.trailing_activity = Some((glyph.into(), color));
+        self
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2529,6 +2543,20 @@ impl Element for MarkdownElement {
         } else {
             0
         };
+        let trailing_activity_event = self.trailing_activity.as_ref().and_then(|_| {
+            parsed_markdown.events.iter().rposition(|(_, event)| {
+                matches!(
+                    event,
+                    MarkdownEvent::Text
+                        | MarkdownEvent::SubstitutedText(_)
+                        | MarkdownEvent::Code
+                        | MarkdownEvent::SubstitutedCode(_)
+                        | MarkdownEvent::Html
+                        | MarkdownEvent::InlineHtml
+                        | MarkdownEvent::FootnoteReference(_)
+                )
+            })
+        });
         let mut code_block_ids = HashSet::default();
 
         let mut current_img_block_range: Option<Range<usize>> = None;
@@ -3233,6 +3261,11 @@ impl Element for MarkdownElement {
                     builder.pop_text_style();
                 }
             }
+            if trailing_activity_event == Some(index)
+                && let Some((glyph, color)) = self.trailing_activity.as_ref()
+            {
+                builder.push_decorative_tail(glyph, *color, markdown_end);
+            }
         }
         if self.style.code_block_overflow_x_scroll {
             let code_block_ids = code_block_ids;
@@ -3638,6 +3671,7 @@ struct PendingLine {
     text: String,
     runs: Vec<TextRun>,
     source_mappings: Vec<SourceMapping>,
+    decorative_tail_start: Option<usize>,
 }
 
 struct ListStackEntry {
@@ -3941,6 +3975,26 @@ impl MarkdownElementBuilder {
         }
     }
 
+    fn push_decorative_tail(&mut self, glyph: &str, color: Hsla, source_index: usize) {
+        let text = format!(" {glyph}");
+        let rendered_start = self.pending_line.text.len();
+        self.pending_line.decorative_tail_start = Some(rendered_start);
+        self.pending_line.source_mappings.push(SourceMapping {
+            rendered_index: rendered_start,
+            source_index,
+        });
+        self.pending_line.text.push_str(&text);
+
+        let mut style = self.base_text_style.clone();
+        style.color = color;
+        self.pending_line.runs.push(style.to_run(text.len()));
+        self.pending_line.source_mappings.push(SourceMapping {
+            rendered_index: self.pending_line.text.len(),
+            source_index,
+        });
+        self.current_source_index = self.current_source_index.max(source_index);
+    }
+
     fn trim_trailing_newline(&mut self) {
         if self.pending_line.text.ends_with('\n') {
             self.pending_line
@@ -4022,6 +4076,7 @@ impl MarkdownElementBuilder {
                 source_index: source_range.start,
             }],
             source_end: source_range.end,
+            decorative_tail_start: None,
             language: None,
             text_align: TextAlign::Left,
         });
@@ -4046,6 +4101,7 @@ impl MarkdownElementBuilder {
             layout: text.layout().clone(),
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
+            decorative_tail_start: line.decorative_tail_start,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
         });
@@ -4072,6 +4128,7 @@ struct RenderedLine {
     layout: TextLayout,
     source_mappings: Vec<SourceMapping>,
     source_end: usize,
+    decorative_tail_start: Option<usize>,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
 }
@@ -4079,7 +4136,9 @@ struct RenderedLine {
 impl RenderedLine {
     fn rendered_index_for_source_index(&self, source_index: usize) -> usize {
         if source_index >= self.source_end {
-            return self.layout.len();
+            return self
+                .decorative_tail_start
+                .unwrap_or_else(|| self.layout.len());
         }
 
         let mapping = match self
@@ -4093,7 +4152,11 @@ impl RenderedLine {
     }
 
     fn source_index_for_rendered_index(&self, rendered_index: usize) -> usize {
-        if rendered_index >= self.layout.len() {
+        if rendered_index
+            >= self
+                .decorative_tail_start
+                .unwrap_or_else(|| self.layout.len())
+        {
             return self.source_end;
         }
 
@@ -4112,7 +4175,11 @@ impl RenderedLine {
     /// segment (e.g., after stripped markdown syntax like backticks), this returns the end of the
     /// previous segment rather than the start of the current one.
     fn source_index_for_exclusive_rendered_end(&self, rendered_index: usize) -> usize {
-        if rendered_index >= self.layout.len() {
+        if rendered_index
+            >= self
+                .decorative_tail_start
+                .unwrap_or_else(|| self.layout.len())
+        {
             return self.source_end;
         }
 
@@ -4762,6 +4829,7 @@ mod tests {
         markdown: Entity<Markdown>,
         style: MarkdownStyle,
         code_span_link: Option<CodeSpanLinkCallback>,
+        trailing_activity: Option<(SharedString, Hsla)>,
         rendered_text: Rc<RefCell<Option<RenderedText>>>,
     }
 
@@ -4772,6 +4840,9 @@ mod tests {
             if let Some(code_span_link) = self.code_span_link.clone() {
                 markdown_element =
                     markdown_element.on_code_span_link(move |text, cx| code_span_link(text, cx));
+            }
+            if let Some((glyph, color)) = self.trailing_activity.clone() {
+                markdown_element = markdown_element.trailing_activity(glyph, color);
             }
             CapturingMarkdownElement {
                 markdown_element: markdown_element.code_block_renderer(
@@ -4883,6 +4954,7 @@ mod tests {
                 markdown,
                 style,
                 code_span_link,
+                trailing_activity: None,
                 rendered_text,
             }
         });
@@ -4895,6 +4967,43 @@ mod tests {
             .borrow()
             .clone()
             .expect("markdown should be rendered in the test view")
+    }
+
+    #[gpui::test]
+    fn trailing_activity_wraps_with_text_but_maps_to_source_end(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let source = "Streaming response";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        let rendered_text = Rc::new(RefCell::new(None));
+        let (_, cx) = cx.add_window_view({
+            let rendered_text = rendered_text.clone();
+            move |_, _| MarkdownTestView {
+                markdown,
+                style: MarkdownStyle::default(),
+                code_span_link: None,
+                trailing_activity: Some(("⠋".into(), Hsla::default())),
+                rendered_text,
+            }
+        });
+        cx.run_until_parked();
+
+        let rendered_text = rendered_text.borrow();
+        let line = rendered_text
+            .as_ref()
+            .and_then(|rendered| rendered.lines.last())
+            .expect("streaming Markdown should render one line");
+        let decorative_start = line
+            .decorative_tail_start
+            .expect("activity glyph should be a decorative tail");
+        assert!(line.layout.text().ends_with(" ⠋"));
+        assert_eq!(
+            line.rendered_index_for_source_index(source.len()),
+            decorative_start
+        );
+        assert_eq!(
+            line.source_index_for_rendered_index(decorative_start + 1),
+            source.len()
+        );
     }
 
     #[gpui::test]
@@ -6797,6 +6906,7 @@ mod tests {
                     ..MarkdownStyle::default()
                 },
                 code_span_link: None,
+                trailing_activity: None,
                 rendered_text,
             }
         });

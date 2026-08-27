@@ -65,10 +65,6 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) raised_surface: Hsla,
     pub(crate) inset_surface: Hsla,
     pub(crate) pending_surface: Hsla,
-    pub(crate) activity_surface: Hsla,
-    pub(crate) activity_border: Hsla,
-    pub(crate) warning_surface: Hsla,
-    pub(crate) warning_border: Hsla,
     pub(crate) error_surface: Hsla,
     pub(crate) error_border: Hsla,
     pub(crate) selection_surface: Hsla,
@@ -96,16 +92,6 @@ impl HarnessVisualTheme {
             pending_surface: colors
                 .editor_background
                 .blend(colors.surface_background.opacity(0.86)),
-            // Match Zed's activity-bar language: activity is a quiet selected
-            // wash over the document, not a saturated status banner.
-            activity_surface: colors
-                .editor_background
-                .blend(colors.element_selected.opacity(0.30)),
-            activity_border: colors.border_selected.opacity(0.72),
-            warning_surface: colors
-                .editor_background
-                .blend(colors.version_control_modified.opacity(0.12)),
-            warning_border: colors.version_control_modified.opacity(0.58),
             error_surface: colors
                 .editor_background
                 .blend(colors.version_control_deleted.opacity(0.12)),
