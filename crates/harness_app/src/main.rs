@@ -144,8 +144,8 @@ const RICH_SEARCH_HIGHLIGHT_LIMIT: usize = 128;
 const RICH_NESTED_COMMAND_MAX_HEIGHT: f32 = 98.;
 const RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT: f32 = 112.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
-const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
-const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
+const RICH_MIN_CODE_ROW_HEIGHT: f32 = 20.;
+const RICH_MIN_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
@@ -157,11 +157,39 @@ const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
 // far too often, while eight still keeps the cache deliberately bounded.
 const THREAD_SNAPSHOT_CACHE_LIMIT: usize = 8;
 
-fn rich_card_identity_row() -> gpui::Div {
+fn harness_code_font_size(cx: &App) -> gpui::Pixels {
+    ThemeSettings::get_global(cx).agent_buffer_font_size(cx)
+}
+
+fn harness_code_row_height(cx: &App) -> gpui::Pixels {
+    px((harness_code_font_size(cx).as_f32() * 1.35).max(RICH_MIN_CODE_ROW_HEIGHT))
+}
+
+fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
+    let size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
+    px((size.as_f32() * 1.4).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
+}
+
+/// Apply Harness's semantic code role as one indivisible family/size choice.
+///
+/// Zed's `font_buffer` and `text_ui_sm` helpers intentionally represent two
+/// unrelated roles. Combining them made tool cards adopt the configured code
+/// family and then silently overwrite its size with a fixed UI token.
+trait HarnessStyledTypography: gpui::Styled + Sized {
+    fn font_harness_code(self, cx: &App) -> Self {
+        let settings = ThemeSettings::get_global(cx);
+        self.font_family(settings.agent_buffer_font_family().clone())
+            .text_size(settings.agent_buffer_font_size(cx))
+    }
+}
+
+impl<E: gpui::Styled> HarnessStyledTypography for E {}
+
+fn rich_card_identity_row(cx: &App) -> gpui::Div {
     div()
         .w_full()
         .min_w_0()
-        .h(px(RICH_CARD_IDENTITY_ROW_HEIGHT))
+        .h(harness_reading_row_height(cx))
         .flex()
         .items_center()
         .gap_1()
@@ -438,6 +466,7 @@ struct RichCommandSurface {
     command_scroll_handle: ScrollHandle,
     output_list_state: ListState,
     output_horizontal_handle: ScrollHandle,
+    row_height: gpui::Pixels,
 }
 
 #[derive(Clone)]
@@ -477,6 +506,7 @@ struct RichFileChangeSurface {
     data: RichFileChangeData,
     list_state: ListState,
     horizontal_handle: ScrollHandle,
+    row_height: gpui::Pixels,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3025,7 +3055,7 @@ impl Render for HybridStructuredSurface {
             .flatten();
         let item_key = self.item.key.clone();
         let owner = self.owner.clone();
-        let header = rich_card_identity_row()
+        let header = rich_card_identity_row(cx)
             .id(format!("hybrid-structured-header:{}", self.item.key))
             .cursor_pointer()
             .on_click(move |_, _, cx| {
@@ -4401,13 +4431,17 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
+        cx: &App,
     ) -> Option<(RichCommandData, ScrollHandle, ListState, ScrollHandle)> {
+        let row_height = harness_code_row_height(cx);
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
             .and_then(|state| state.command.as_ref())
             .is_none_or(|surface| {
-                surface.event_count != item.event_count || surface.content_len != item.content.len()
+                surface.event_count != item.event_count
+                    || surface.content_len != item.content.len()
+                    || surface.row_height != row_height
             });
 
         if needs_rebuild {
@@ -4422,19 +4456,25 @@ impl HarnessApp {
                 || {
                     // Completed and streaming terminal output opens at its tail. Each
                     // logical output row is one unwrapped terminal row; allowing it
-                    // to wrap while retaining a 20px virtual-row estimate made text
+                    // to wrap while retaining a fixed virtual-row estimate made text
                     // overlap and made click-to-cursor geometry fundamentally wrong.
                     ListState::new(output_row_count, ListAlignment::Bottom, px(160.))
-                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                        .with_uniform_item_height(row_height)
                 },
                 |surface| surface.output_list_state.clone(),
             );
             output_list_state.set_diagnostics_name(format!("command-output:{}", item.key));
-            if output_list_state.item_count() != output_row_count {
+            let row_height_changed = state
+                .command
+                .as_ref()
+                .is_some_and(|surface| surface.row_height != row_height);
+            if row_height_changed {
+                output_list_state.reset_with_uniform_height(output_row_count, row_height);
+            } else if output_list_state.item_count() != output_row_count {
                 output_list_state.splice(0..output_list_state.item_count(), output_row_count);
                 output_list_state
                     .clone()
-                    .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT));
+                    .with_uniform_item_height(row_height);
             }
             state.command = Some(RichCommandSurface {
                 event_count: item.event_count,
@@ -4451,6 +4491,7 @@ impl HarnessApp {
                     .as_ref()
                     .map(|surface| surface.output_horizontal_handle.clone())
                     .unwrap_or_default(),
+                row_height,
             });
         }
 
@@ -4492,13 +4533,17 @@ impl HarnessApp {
         &mut self,
         item: &TranscriptItem,
         navigation: Option<&RichNavigationPaint>,
+        cx: &App,
     ) -> (RichFileChangeData, ListState, ScrollHandle) {
+        let row_height = harness_code_row_height(cx);
         let needs_rebuild = self
             .rich_nested_scrolls
             .get(&item.key)
             .and_then(|state| state.file_change.as_ref())
             .is_none_or(|surface| {
-                surface.event_count != item.event_count || surface.content_len != item.content.len()
+                surface.event_count != item.event_count
+                    || surface.content_len != item.content.len()
+                    || surface.row_height != row_height
             });
 
         if needs_rebuild {
@@ -4511,11 +4556,16 @@ impl HarnessApp {
             let list_state = previous.as_ref().map_or_else(
                 || {
                     ListState::new(data.rows.len(), ListAlignment::Top, px(80.))
-                        .with_uniform_item_height(px(RICH_COMMAND_ROW_HEIGHT_HINT))
+                        .with_uniform_item_height(row_height)
                 },
                 |surface| surface.list_state.clone(),
             );
-            if list_state.item_count() != data.rows.len() {
+            let row_height_changed = previous
+                .as_ref()
+                .is_some_and(|surface| surface.row_height != row_height);
+            if row_height_changed {
+                list_state.reset_with_uniform_height(data.rows.len(), row_height);
+            } else if list_state.item_count() != data.rows.len() {
                 list_state.splice(0..list_state.item_count(), data.rows.len());
             }
             list_state.set_diagnostics_name(format!("file-change:{}", item.key));
@@ -4527,6 +4577,7 @@ impl HarnessApp {
                 horizontal_handle: previous
                     .map(|surface| surface.horizontal_handle)
                     .unwrap_or_default(),
+                row_height,
             });
         }
 
@@ -9381,12 +9432,11 @@ impl HarnessApp {
                 );
                 div()
                     .w_full()
-                    .h(px(20.))
+                    .h(harness_code_row_height(cx))
                     .px_2()
                     .flex()
                     .items_center()
-                    .font_buffer(cx)
-                    .text_ui_sm(cx)
+                    .font_harness_code(cx)
                     .bg(if line.tone == DiffLineTone::Addition {
                         visuals.diff_added_surface
                     } else if line.tone == DiffLineTone::Deletion {
@@ -9471,7 +9521,7 @@ impl HarnessApp {
                         this.border_t_1().border_color(colors.border_variant)
                     })
                     .child(
-                        rich_card_identity_row()
+                        rich_card_identity_row(cx)
                             .px_1()
                             .when(section_index == 0, |this| this.pr_5())
                             .border_b_1()
@@ -9482,8 +9532,7 @@ impl HarnessApp {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .font_buffer(cx)
-                                    .text_ui_sm(cx)
+                                    .font_harness_code(cx)
                                     .truncate()
                                     .child(clickable_path),
                             )
@@ -9593,7 +9642,7 @@ impl HarnessApp {
                     Color::Accent => colors.text_accent,
                     _ => colors.text_muted,
                 };
-                rich_card_identity_row()
+                rich_card_identity_row(cx)
                     .px_1()
                     .pr_5()
                     .when(row_index > 0, |this| {
@@ -9605,8 +9654,7 @@ impl HarnessApp {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
+                            .font_harness_code(cx)
                             .truncate()
                             .child(clickable_path),
                     )
@@ -9684,13 +9732,12 @@ impl HarnessApp {
                 );
                 div()
                     .w_full()
-                    .h(px(20.))
+                    .h(harness_code_row_height(cx))
                     .px_2()
                     .flex()
                     .items_center()
                     .relative()
-                    .font_buffer(cx)
-                    .text_ui_sm(cx)
+                    .font_harness_code(cx)
                     .bg(if *tone == DiffLineTone::Addition {
                         visuals.diff_added_surface
                     } else if *tone == DiffLineTone::Deletion {
@@ -9715,7 +9762,8 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (data, list_state, horizontal_handle) = self.rich_file_change_surface(item, navigation);
+        let (data, list_state, horizontal_handle) =
+            self.rich_file_change_surface(item, navigation, cx);
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
@@ -9870,7 +9918,7 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .min_w_0()
-                    .min_h(px(20.))
+                    .min_h(harness_code_row_height(cx))
                     .whitespace_normal()
                     .child(clickable)
             })
@@ -9882,8 +9930,7 @@ impl HarnessApp {
             .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
             .overflow_y_scroll()
             .track_scroll(&binding.handle)
-            .font_buffer(cx)
-            .text_ui_sm(cx)
+            .font_harness_code(cx)
             .line_height(relative(1.45))
             .text_color(colors.text)
             .children(rows)
@@ -10012,9 +10059,8 @@ impl HarnessApp {
                         div()
                             .w_full()
                             .min_w_0()
-                            .min_h(px(20.))
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
+                            .min_h(harness_code_row_height(cx))
+                            .font_harness_code(cx)
                             .line_height(relative(1.45))
                             .text_color(if error { error_color } else { colors.text })
                             .whitespace_normal()
@@ -10079,7 +10125,7 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let (data, command_scroll_handle, output_list_state, output_horizontal_handle) =
-            self.rich_command_surface(item, navigation)?;
+            self.rich_command_surface(item, navigation, cx)?;
         let colors = cx.theme().colors().clone();
         let owner = cx.weak_entity();
         let search = search.cloned();
@@ -10145,7 +10191,7 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .min_w_0()
-                    .min_h(px(20.))
+                    .min_h(harness_code_row_height(cx))
                     .relative()
                     .whitespace_normal()
                     .when(first_command_row, |this| {
@@ -10213,7 +10259,7 @@ impl HarnessApp {
             div()
                 .w_full()
                 .min_w_0()
-                .min_h(px(20.))
+                .min_h(harness_code_row_height(cx))
                 .relative()
                 .whitespace_nowrap()
                 .child(clickable)
@@ -10293,8 +10339,7 @@ impl HarnessApp {
                 .id(("command-output", index))
                 .w_full()
                 .min_w_0()
-                .font_buffer(cx)
-                .text_ui_sm(cx)
+                .font_harness_code(cx)
                 .line_height(relative(1.35))
                 .text_color(colors.text)
                 .child(
@@ -10422,8 +10467,7 @@ impl HarnessApp {
                         .w_full()
                         .min_w_0()
                         .pr_5()
-                        .font_buffer(cx)
-                        .text_ui_sm(cx)
+                        .font_harness_code(cx)
                         .line_height(relative(1.35))
                         .whitespace_normal()
                         .child(clickable_command),
@@ -10441,8 +10485,7 @@ impl HarnessApp {
                             .flex()
                             .flex_col()
                             .gap_1()
-                            .font_buffer(cx)
-                            .text_ui_sm(cx)
+                            .font_harness_code(cx)
                             .line_height(relative(1.35))
                             .text_color(colors.text)
                             .whitespace_normal()
@@ -10877,8 +10920,7 @@ impl HarnessApp {
                         .bg(colors.editor_background)
                         .px_3()
                         .py_2()
-                        .font_buffer(cx)
-                        .text_ui_sm(cx)
+                        .font_harness_code(cx)
                         .text_color(colors.text)
                         .child(primary),
                 )
@@ -11249,8 +11291,7 @@ impl HarnessApp {
                             .bg(colors.editor_background)
                             .px_3()
                             .py_2()
-                            .font_buffer(cx)
-                            .text_ui_xs(cx)
+                            .font_harness_code(cx)
                             .text_color(colors.text_muted)
                             .child(url),
                     )
@@ -11448,8 +11489,7 @@ impl HarnessApp {
                 .border_color(colors.search_active_match_background)
                 .pl_2()
                 .py_0p5()
-                .font_buffer(cx)
-                .text_ui_xs(cx)
+                .font_harness_code(cx)
                 .text_color(colors.text_muted)
                 .child(styled)
                 .into_any_element()
@@ -11651,7 +11691,7 @@ impl HarnessApp {
             .as_ref()
             .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
 
-        let header = rich_card_identity_row()
+        let header = rich_card_identity_row(cx)
             .id(("item-header", index))
             .when(!narrative && !compact_trace, |this| {
                 this.px_1().bg(visuals.tool_header_surface)
@@ -11732,8 +11772,7 @@ impl HarnessApp {
                 .border_color(colors.border_variant)
                 .bg(colors.editor_background)
                 .p_3()
-                .font_buffer(cx)
-                .text_ui_xs(cx)
+                .font_harness_code(cx)
                 .text_color(colors.text_muted)
                 .child(highlighted)
                 .into_any_element()
