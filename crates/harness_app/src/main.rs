@@ -3657,6 +3657,8 @@ impl HarnessApp {
             .map(|choice| choice.display_name.clone())
             .or_else(|| selected_model.map(SharedString::from))
             .unwrap_or_else(|| "Loading models…".into());
+        // Preserve Codex's important at-a-glance effort state while using the
+        // same provider/model trigger hierarchy as Zed's agent composer.
         let trigger_label: SharedString = effective_effort
             .as_deref()
             .map(reasoning_effort_label)
@@ -3681,7 +3683,7 @@ impl HarnessApp {
             .label_size(LabelSize::Small)
             .color(trigger_color)
             .start_icon(
-                Icon::new(IconName::ThinkingMode)
+                Icon::new(IconName::AiOpenAi)
                     .size(IconSize::XSmall)
                     .color(trigger_color),
             )
@@ -3698,7 +3700,7 @@ impl HarnessApp {
                 (self.selected_thread_id.is_none() && self.replay_count.is_none())
                     || self.settings_update_pending,
             )
-            .aria_label("Change model and thinking effort");
+            .aria_label("Change model or thinking effort");
 
         PopoverMenu::new("model-effort-selector")
             .trigger(trigger)
@@ -3800,11 +3802,6 @@ impl HarnessApp {
         let trigger = Button::new("permission-selector-trigger", label)
             .label_size(LabelSize::Small)
             .color(trigger_color)
-            .start_icon(
-                Icon::new(IconName::Lock)
-                    .size(IconSize::XSmall)
-                    .color(trigger_color),
-            )
             .end_icon(
                 Icon::new(if menu_deployed {
                     IconName::ChevronUp
@@ -3918,7 +3915,7 @@ impl HarnessApp {
         let state = composer_action_state(turn_active, composer_empty);
         if state == ComposerActionState::Stop {
             return IconButton::new("stop-turn", IconName::Stop)
-                .style(ButtonStyle::Tinted(TintColor::Error))
+                .style(ButtonStyle::Subtle)
                 .icon_color(Color::Error)
                 .aria_label("Stop the current response")
                 .tooltip(Tooltip::text("Stop response"))
@@ -3957,7 +3954,7 @@ impl HarnessApp {
         let tooltip = label.clone();
 
         IconButton::new(id, icon)
-            .style(ButtonStyle::Filled)
+            .style(ButtonStyle::Subtle)
             .disabled(send_blocked)
             .icon_color(if send_blocked {
                 Color::Muted
@@ -12470,8 +12467,8 @@ impl Render for HarnessApp {
                                                     .when_some(context_usage, |this, usage| {
                                                         this.child(usage)
                                                     })
-                                                    .child(model_selector)
                                                     .child(permission_selector)
+                                                    .child(model_selector)
                                                     .child(composer_action),
                                             )
                                     }),

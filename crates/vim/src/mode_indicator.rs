@@ -135,8 +135,6 @@ impl Render for ModeIndicator {
             crate::state::Mode::HelixNormal => colors.vim_helix_normal_background,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_background,
         };
-        let compact_on_transparent = self.compact && bg_color == system_transparent;
-
         let (label, mode): (SharedString, Option<SharedString>) = if let Some(label) = status_label
         {
             (label, None)
@@ -171,23 +169,29 @@ impl Render for ModeIndicator {
             .when_some(mode, |el, mode| {
                 el.child(
                     v_flex()
-                        .when(bg_color != system_transparent, |el| el.px_2())
+                        .when(!self.compact && bg_color != system_transparent, |el| {
+                            el.px_2()
+                        })
                         // match with other icons at the bottom that use default buttons
                         .h(ButtonSize::Default.rems())
                         .justify_center()
-                        .rounded_sm()
-                        .bg(bg_color)
+                        .when(!self.compact, |el| el.rounded_sm().bg(bg_color))
                         .child(
                             Label::new(mode)
-                                .size(LabelSize::Small)
+                                .size(if self.compact {
+                                    LabelSize::XSmall
+                                } else {
+                                    LabelSize::Small
+                                })
                                 .line_height_style(LineHeightStyle::UiLabel)
-                                .weight(FontWeight::MEDIUM)
+                                .when(!self.compact, |el| el.weight(FontWeight::MEDIUM))
                                 .when(
-                                    bg_color != system_transparent
+                                    !self.compact
+                                        && bg_color != system_transparent
                                         && vim_mode_text != system_transparent,
                                     |el| el.color(Color::Custom(vim_mode_text)),
                                 )
-                                .when(compact_on_transparent, |el| el.color(Color::Muted)),
+                                .when(self.compact, |el| el.color(Color::Muted)),
                         ),
                 )
             })
