@@ -1028,6 +1028,48 @@ pub fn markdown_monospace_source_ranges(source: &str) -> Vec<Range<usize>> {
     merged
 }
 
+/// Byte ranges in raw Markdown that CommonMark treats as block quotes.
+///
+/// This deliberately returns the parser's complete container range rather
+/// than only lines that carry a literal `>` marker. CommonMark permits a
+/// paragraph to continue lazily on following unmarked lines; plaintext
+/// editors need that effective range in order to make the otherwise-hidden
+/// state visible while the user is typing.
+pub fn markdown_block_quote_source_ranges(source: &str) -> Vec<Range<usize>> {
+    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
+        | MarkdownOptions::ENABLE_TABLES
+        | MarkdownOptions::ENABLE_TASKLISTS
+        | MarkdownOptions::ENABLE_FOOTNOTES
+        | MarkdownOptions::ENABLE_MATH;
+    let mut ranges = MarkdownParser::new_ext(source, options)
+        .into_offset_iter()
+        .filter_map(|(event, range)| {
+            matches!(event, MarkdownEvent::Start(Tag::BlockQuote(_))).then_some(range)
+        })
+        .filter_map(|mut range| {
+            while range.end > range.start
+                && matches!(source.as_bytes()[range.end - 1], b'\n' | b'\r')
+            {
+                range.end -= 1;
+            }
+            (range.start < range.end && range.end <= source.len()).then_some(range)
+        })
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|range| (range.start, range.end));
+
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
 fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
     selectable_markdown_text_with_link_destinations(source, true, false)
 }
@@ -5093,6 +5135,24 @@ mod tests {
                 .iter()
                 .any(|range| source[range.clone()].contains("println!"))
         );
+    }
+
+    #[test]
+    fn markdown_block_quote_ranges_expose_lazy_commonmark_continuations() {
+        let source = "> quoted\nlazy continuation\n\noutside";
+        let ranges = markdown_block_quote_source_ranges(source);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].clone()], "> quoted\nlazy continuation");
+    }
+
+    #[test]
+    fn markdown_block_quote_ranges_end_at_an_explicit_blank_line() {
+        let source = "> quoted\n\noutside";
+        let ranges = markdown_block_quote_source_ranges(source);
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&source[ranges[0].clone()], "> quoted");
     }
 
     #[test]

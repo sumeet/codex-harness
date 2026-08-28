@@ -27,8 +27,8 @@ use gpui::{
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
-    TranscriptSemanticSpan, TranscriptSemanticStyle, markdown_monospace_source_ranges,
-    minimal_text_edit,
+    TranscriptSemanticSpan, TranscriptSemanticStyle, markdown_block_quote_source_ranges,
+    markdown_monospace_source_ranges, minimal_text_edit,
 };
 use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{
@@ -260,6 +260,7 @@ impl EventEmitter<LocalEditorSubmitted> for LocalEditor {}
 impl EventEmitter<LocalEditorSteered> for LocalEditor {}
 
 struct ComposerMarkdownMonospaceGeometryHighlight;
+struct ComposerMarkdownBlockQuoteRows;
 
 impl LocalEditor {
     pub fn modal_composer(window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -288,7 +289,7 @@ impl LocalEditor {
         });
         cx.subscribe(&editor, |this, _, event, cx| {
             if matches!(event, EditorEvent::BufferEdited) {
-                this.refresh_composer_markdown_font_geometry(cx);
+                this.refresh_composer_markdown_semantics(cx);
                 cx.emit(LocalEditorChanged);
             }
         })
@@ -469,7 +470,7 @@ impl LocalEditor {
         }
     }
 
-    fn refresh_composer_markdown_font_geometry(&mut self, cx: &mut Context<Self>) {
+    fn refresh_composer_markdown_semantics(&mut self, cx: &mut Context<Self>) {
         if !self.composer_keys {
             return;
         }
@@ -479,6 +480,11 @@ impl LocalEditor {
         // delimiter is deleted.
         let ranges = if source.contains('`') {
             markdown_monospace_source_ranges(&source)
+        } else {
+            Vec::new()
+        };
+        let block_quote_ranges = if source.contains('>') {
+            markdown_block_quote_source_ranges(&source)
         } else {
             Vec::new()
         };
@@ -499,6 +505,24 @@ impl LocalEditor {
                 },
                 cx,
             );
+            editor.clear_row_highlights::<ComposerMarkdownBlockQuoteRows>();
+            for range in block_quote_ranges {
+                editor.highlight_rows::<ComposerMarkdownBlockQuoteRows>(
+                    clipped_anchor_range(&snapshot, range),
+                    composer_block_quote_background,
+                    RowHighlightOptions {
+                        include_gutter: false,
+                        border: Some(composer_block_quote_rail),
+                        border_widths: Some(Edges {
+                            left: px(2.),
+                            ..Edges::default()
+                        }),
+                        merge_adjacent: true,
+                        ..RowHighlightOptions::default()
+                    },
+                    cx,
+                );
+            }
         });
     }
 }
@@ -1725,6 +1749,17 @@ fn structured_transcript_background(cx: &App) -> Hsla {
         .colors()
         .editor_subheader_background
         .opacity(0.28)
+}
+
+fn composer_block_quote_background(cx: &App) -> Hsla {
+    cx.theme()
+        .colors()
+        .editor_subheader_background
+        .opacity(0.42)
+}
+
+fn composer_block_quote_rail(cx: &App) -> Hsla {
+    cx.theme().colors().text_muted.opacity(0.58)
 }
 
 fn error_transcript_background(cx: &App) -> Hsla {

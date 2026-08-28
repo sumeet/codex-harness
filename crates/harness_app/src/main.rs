@@ -10501,7 +10501,6 @@ impl HarnessApp {
                 .id(("command-output-scroll", index))
                 .w_full()
                 .min_w_0()
-                .max_h(px(RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT))
                 .border_t_1()
                 .border_color(colors.border_variant)
                 .px_1p5()
