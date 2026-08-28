@@ -380,6 +380,15 @@ impl LocalEditor {
         true
     }
 
+    /// Reapply the active role after a live appearance-settings change.
+    pub fn refresh_typography(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profile = self.typography_profile;
+        self.editor.update(cx, |editor, cx| {
+            apply_typography_profile_to_editor(editor, profile, window, cx)
+        });
+        cx.notify();
+    }
+
     /// Put a modal host input into Vim Insert mode after focus transfer.
     ///
     /// Hosts defer this until the focusing keybinding finishes dispatching so
@@ -498,8 +507,9 @@ pub struct TranscriptEditor {
 /// The font geometry used by Harness's full Editor surfaces.
 ///
 /// Both profiles retain Zed's native Buffer, display map, selections, Vim, and
-/// undo implementation. `Reading` changes only the whole-surface font identity;
-/// size and line height remain those of the surface's existing Editor style.
+/// undo implementation. `Reading` uses Harness's UI/prose role while `Buffer`
+/// uses its code role; both roles inherit their family and size from Zed's
+/// theme settings.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TranscriptTypographyProfile {
     Buffer,
@@ -516,29 +526,44 @@ fn typography_profile_changed(
 
 fn font_for_typography_profile(profile: TranscriptTypographyProfile, cx: &App) -> Font {
     let settings = ThemeSettings::get_global(cx);
-    match profile {
+    let mut font = match profile {
         TranscriptTypographyProfile::Buffer => settings.buffer_font.clone(),
         TranscriptTypographyProfile::Reading => settings.ui_font.clone(),
+    };
+    font.family = match profile {
+        TranscriptTypographyProfile::Buffer => settings.agent_buffer_font_family().clone(),
+        TranscriptTypographyProfile::Reading => settings.agent_ui_font_family().clone(),
+    };
+    font
+}
+
+fn font_size_for_typography_profile(profile: TranscriptTypographyProfile, cx: &App) -> Pixels {
+    let settings = ThemeSettings::get_global(cx);
+    match profile {
+        TranscriptTypographyProfile::Buffer => settings.agent_buffer_font_size(cx),
+        TranscriptTypographyProfile::Reading => settings.agent_ui_font_size(cx),
     }
 }
 
-fn typography_refinement(font: &Font) -> TextStyleRefinement {
+fn typography_refinement(font: &Font, font_size: Pixels) -> TextStyleRefinement {
     TextStyleRefinement {
         font_family: Some(font.family.clone()),
         font_features: Some(font.features.clone()),
         font_fallbacks: font.fallbacks.clone(),
         font_weight: Some(font.weight),
         font_style: Some(font.style),
+        font_size: Some(font_size.into()),
         ..TextStyleRefinement::default()
     }
 }
 
-fn apply_typography_font(style: &mut TextStyle, font: &Font) {
+fn apply_typography_font(style: &mut TextStyle, font: &Font, font_size: Pixels) {
     style.font_family = font.family.clone();
     style.font_features = font.features.clone();
     style.font_fallbacks.clone_from(&font.fallbacks);
     style.font_weight = font.weight;
     style.font_style = font.style;
+    style.font_size = font_size.into();
 }
 
 fn apply_typography_profile_to_editor(
@@ -548,9 +573,10 @@ fn apply_typography_profile_to_editor(
     cx: &mut Context<Editor>,
 ) {
     let font = font_for_typography_profile(profile, cx);
-    editor.set_text_style_refinement(typography_refinement(&font));
+    let font_size = font_size_for_typography_profile(profile, cx);
+    editor.set_text_style_refinement(typography_refinement(&font, font_size));
     let mut style = editor.style(cx).clone();
-    apply_typography_font(&mut style.text, &font);
+    apply_typography_font(&mut style.text, &font, font_size);
     editor.set_style(style, window, cx);
 }
 
@@ -2228,7 +2254,6 @@ impl TranscriptEditor {
         // output literally. Applying one Markdown grammar to the entire Buffer
         // would therefore style terminal output as prose markup.
         let buffer = cx.new(|cx| Buffer::local("", cx));
-        let reading_font = font_for_typography_profile(TranscriptTypographyProfile::Reading, cx);
         let editor = cx.new({
             let buffer = buffer.clone();
             |cx| {
@@ -2243,10 +2268,12 @@ impl TranscriptEditor {
                 editor.set_show_horizontal_scrollbar(false, cx);
                 editor.disable_mouse_wheel_zoom();
                 editor.register_addon(TranscriptKeyContextAddon);
-                editor.set_text_style_refinement(typography_refinement(&reading_font));
-                let mut style = editor.style(cx).clone();
-                apply_typography_font(&mut style.text, &reading_font);
-                editor.set_style(style, window, cx);
+                apply_typography_profile_to_editor(
+                    &mut editor,
+                    TranscriptTypographyProfile::Reading,
+                    window,
+                    cx,
+                );
                 editor
             }
         });
@@ -2374,6 +2401,18 @@ impl TranscriptEditor {
         self.typography_profile = profile;
         cx.notify();
         true
+    }
+
+    /// Reapply the active role after a live appearance-settings change.
+    pub fn refresh_typography(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let profile = self.typography_profile;
+        self.editor.update(cx, |editor, cx| {
+            apply_typography_profile_to_editor(editor, profile, window, cx)
+        });
+        self.diff_highlights_dirty = true;
+        self.semantic_highlights_dirty = true;
+        self.search.highlights_dirty = true;
+        cx.notify();
     }
 
     pub fn cursor_offset(&self, cx: &mut App) -> usize {
@@ -4985,7 +5024,7 @@ mod tests {
     }
 
     #[test]
-    fn typography_font_swap_preserves_editor_geometry_and_non_font_paint() {
+    fn typography_swap_updates_size_but_preserves_line_height_and_non_font_paint() {
         let mut style = TextStyle {
             color: gpui::red(),
             font_size: gpui::px(17.).into(),
@@ -4993,7 +5032,7 @@ mod tests {
             background_color: Some(gpui::blue()),
             ..TextStyle::default()
         };
-        let geometry = (style.font_size, style.line_height);
+        let line_height = style.line_height;
         let paint = (style.color, style.background_color, style.underline);
         let reading_font = Font {
             family: "Harness Variable Reading".into(),
@@ -5005,9 +5044,10 @@ mod tests {
             style: gpui::FontStyle::Italic,
         };
 
-        apply_typography_font(&mut style, &reading_font);
+        apply_typography_font(&mut style, &reading_font, gpui::px(19.));
 
-        assert_eq!((style.font_size, style.line_height), geometry);
+        assert_eq!(style.font_size, gpui::px(19.).into());
+        assert_eq!(style.line_height, line_height);
         assert_eq!(
             (style.color, style.background_color, style.underline),
             paint
@@ -5020,12 +5060,12 @@ mod tests {
     }
 
     #[test]
-    fn typography_refinement_never_changes_size_or_line_height() {
+    fn typography_refinement_updates_size_without_overriding_line_height() {
         let font = gpui::font("Harness Reading");
-        let refinement = typography_refinement(&font);
+        let refinement = typography_refinement(&font, gpui::px(18.));
 
         assert_eq!(refinement.font_family, Some(font.family));
-        assert_eq!(refinement.font_size, None);
+        assert_eq!(refinement.font_size, Some(gpui::px(18.).into()));
         assert_eq!(refinement.line_height, None);
     }
 

@@ -33,7 +33,8 @@ use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
 use serde_json::{Value, json};
-use settings::SettingsStore;
+use settings::{Settings as _, SettingsStore};
+use theme_settings::ThemeSettings;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
@@ -62,7 +63,10 @@ use request_surface::{
     RequestSurface, Respond as RequestSurfaceRespond, ReturnToTranscript, SurfaceSyncDecision,
     surface_sync_decision,
 };
-use visual_theme::{HarnessVisualTheme, preferred_theme_name, remember_theme_name};
+use visual_theme::{
+    HarnessPreferences, HarnessVisualTheme, MAX_HARNESS_FONT_SIZE, MIN_HARNESS_FONT_SIZE,
+    preferred_preferences, remember_preferences,
+};
 use zed_actions::command_palette::{OpenWithQuery, Toggle as ToggleCommandPalette};
 
 actions!(
@@ -3354,26 +3358,28 @@ fn reasoning_effort_label(effort: &str) -> SharedString {
     }
 }
 
-fn apply_harness_theme(theme_name: &str, cx: &mut App) {
-    if let Err(error) = theme::ThemeRegistry::global(cx).get(theme_name) {
+fn apply_harness_preferences(preferences: &HarnessPreferences, cx: &mut App) -> bool {
+    if let Err(error) = theme::ThemeRegistry::global(cx).get(&preferences.theme) {
         log::error!("cannot select Harness theme: {error}");
-        return;
+        return false;
     }
 
-    let settings = json!({
-        "vim_mode": true,
-        "theme": theme_name,
-    })
-    .to_string();
+    let settings = preferences.settings_json();
+    let mut applied = true;
     SettingsStore::update_global(cx, |store, cx| {
         if let Err(error) = store.set_user_settings(&settings, cx).result() {
-            log::error!("could not apply Harness theme {theme_name}: {error}");
+            applied = false;
+            log::error!("could not apply Harness appearance settings: {error}");
         }
     });
-    theme_settings::reload_theme(cx);
-    if let Err(error) = remember_theme_name(theme_name) {
-        log::warn!("could not remember Harness theme {theme_name}: {error}");
+    if !applied {
+        return false;
     }
+    theme_settings::reload_theme(cx);
+    if let Err(error) = remember_preferences(preferences) {
+        log::warn!("could not remember Harness appearance settings: {error}");
+    }
+    true
 }
 
 fn permission_profile_choices_from_response(response: &Value) -> Vec<PermissionProfileChoice> {
@@ -3451,7 +3457,32 @@ impl ThreadSnapshotCache {
 }
 
 impl HarnessApp {
-    fn render_theme_selector(&self, cx: &Context<Self>) -> AnyElement {
+    fn refresh_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        theme_settings::setup_ui_font(window, cx);
+        self.transcript_editor
+            .update(cx, |editor, cx| editor.refresh_typography(window, cx));
+        self.composer
+            .update(cx, |editor, cx| editor.refresh_typography(window, cx));
+        cx.notify();
+    }
+
+    fn update_appearance(
+        owner: &WeakEntity<Self>,
+        window: &mut Window,
+        cx: &mut App,
+        update: impl FnOnce(&mut HarnessPreferences),
+    ) {
+        let mut preferences = preferred_preferences();
+        // Preserve the theme currently visible in this window even when it was
+        // selected through a replay-only environment override.
+        preferences.theme = cx.theme().name.to_string();
+        update(&mut preferences);
+        if apply_harness_preferences(&preferences, cx) {
+            _ = owner.update(cx, |this, cx| this.refresh_appearance(window, cx));
+        }
+    }
+
+    fn render_appearance_selector(&self, cx: &Context<Self>) -> AnyElement {
         let current_theme = cx.theme().name.clone();
         let mut themes = theme::ThemeRegistry::global(cx).list();
         themes.sort_unstable_by(|left, right| {
@@ -3460,33 +3491,210 @@ impl HarnessApp {
                 .cmp(&right.appearance.is_light())
                 .then(left.name.cmp(&right.name))
         });
-        let trigger = IconButton::new("theme-selector-trigger", IconName::Settings)
+        let typography = ThemeSettings::get_global(cx);
+        let reading_font = typography.agent_ui_font_family().clone();
+        let reading_size = typography.agent_ui_font_size(cx).as_f32();
+        let code_font = typography.agent_buffer_font_family().clone();
+        let code_size = typography.agent_buffer_font_size(cx).as_f32();
+        let mut fonts = theme::FontFamilyCache::global(cx)
+            .try_list_font_families()
+            .unwrap_or_default();
+        fonts.extend([reading_font.clone(), code_font.clone()]);
+        fonts.sort_unstable_by_key(|font| font.to_lowercase());
+        fonts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let owner = cx.entity().downgrade();
+        let has_custom_typography = {
+            let preferences = preferred_preferences();
+            preferences.reading_font_family.is_some()
+                || preferences.reading_font_size.is_some()
+                || preferences.code_font_family.is_some()
+                || preferences.code_font_size.is_some()
+        };
+        let trigger = IconButton::new("appearance-selector-trigger", IconName::Settings)
             .shape(IconButtonShape::Square)
             .size(ButtonSize::Default)
             .style(ButtonStyle::Subtle)
-            .aria_label(format!("Theme: {current_theme}"));
+            .aria_label(format!(
+                "Appearance: {current_theme}; reading {reading_font} {reading_size:.0}px; code {code_font} {code_size:.0}px"
+            ));
 
-        PopoverMenu::new("theme-selector")
+        PopoverMenu::new("appearance-selector")
             .trigger(trigger)
             .menu(move |window, cx| {
                 let themes = themes.clone();
                 let current_theme = current_theme.clone();
+                let fonts = fonts.clone();
+                let reading_font = reading_font.clone();
+                let code_font = code_font.clone();
+                let owner = owner.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    let mut rendering_light_themes = false;
-                    menu = menu.header("Dark");
-                    for theme in themes {
-                        if theme.appearance.is_light() && !rendering_light_themes {
-                            rendering_light_themes = true;
-                            menu = menu.separator().header("Light");
-                        }
-                        let theme_name = theme.name.clone();
-                        menu = menu.item(
-                            ContextMenuEntry::new(theme.name)
-                                .toggleable(IconPosition::End, theme_name == current_theme)
-                                .handler(move |_, cx| apply_harness_theme(&theme_name, cx)),
-                        );
-                    }
-                    menu
+                    menu = menu
+                        .header("Appearance")
+                        .submenu(format!("Theme · {current_theme}"), {
+                            let owner = owner.clone();
+                            move |mut submenu, _, _| {
+                                let mut rendering_light_themes = false;
+                                submenu = submenu.header("Dark");
+                                for theme in themes.clone() {
+                                    if theme.appearance.is_light() && !rendering_light_themes {
+                                        rendering_light_themes = true;
+                                        submenu = submenu.separator().header("Light");
+                                    }
+                                    let theme_name = theme.name.clone();
+                                    let owner = owner.clone();
+                                    submenu = submenu.item(
+                                        ContextMenuEntry::new(theme.name)
+                                            .toggleable(
+                                                IconPosition::End,
+                                                theme_name == current_theme,
+                                            )
+                                            .handler(move |window, cx| {
+                                                Self::update_appearance(
+                                                    &owner,
+                                                    window,
+                                                    cx,
+                                                    |preferences| {
+                                                        preferences.theme = theme_name.to_string()
+                                                    },
+                                                )
+                                            }),
+                                    );
+                                }
+                                submenu
+                            }
+                        });
+
+                    menu = menu
+                        .separator()
+                        .header("Typography")
+                        .submenu(format!("Reading font · {reading_font}"), {
+                            let owner = owner.clone();
+                            let fonts = fonts.clone();
+                            let reading_font = reading_font.clone();
+                            move |mut submenu, _, _| {
+                                for font in fonts.clone() {
+                                    let selected = font == reading_font;
+                                    let font_name = font.to_string();
+                                    let owner = owner.clone();
+                                    submenu = submenu.item(
+                                        ContextMenuEntry::new(font)
+                                            .toggleable(IconPosition::End, selected)
+                                            .handler(move |window, cx| {
+                                                Self::update_appearance(
+                                                    &owner,
+                                                    window,
+                                                    cx,
+                                                    |preferences| {
+                                                        preferences.reading_font_family =
+                                                            Some(font_name.clone())
+                                                    },
+                                                )
+                                            }),
+                                    );
+                                }
+                                submenu
+                            }
+                        })
+                        .submenu(format!("Reading size · {reading_size:.0} px"), {
+                            let owner = owner.clone();
+                            move |mut submenu, _, _| {
+                                for size in
+                                    MIN_HARNESS_FONT_SIZE as u8..=MAX_HARNESS_FONT_SIZE as u8
+                                {
+                                    let size = f32::from(size);
+                                    let owner = owner.clone();
+                                    submenu = submenu.item(
+                                        ContextMenuEntry::new(format!("{size:.0} px"))
+                                            .toggleable(
+                                                IconPosition::End,
+                                                (reading_size - size).abs() < 0.1,
+                                            )
+                                            .handler(move |window, cx| {
+                                                Self::update_appearance(
+                                                    &owner,
+                                                    window,
+                                                    cx,
+                                                    |preferences| {
+                                                        preferences.reading_font_size = Some(size)
+                                                    },
+                                                )
+                                            }),
+                                    );
+                                }
+                                submenu
+                            }
+                        })
+                        .submenu(format!("Code font · {code_font}"), {
+                            let owner = owner.clone();
+                            let fonts = fonts.clone();
+                            let code_font = code_font.clone();
+                            move |mut submenu, _, _| {
+                                for font in fonts.clone() {
+                                    let selected = font == code_font;
+                                    let font_name = font.to_string();
+                                    let owner = owner.clone();
+                                    submenu = submenu.item(
+                                        ContextMenuEntry::new(font)
+                                            .toggleable(IconPosition::End, selected)
+                                            .handler(move |window, cx| {
+                                                Self::update_appearance(
+                                                    &owner,
+                                                    window,
+                                                    cx,
+                                                    |preferences| {
+                                                        preferences.code_font_family =
+                                                            Some(font_name.clone())
+                                                    },
+                                                )
+                                            }),
+                                    );
+                                }
+                                submenu
+                            }
+                        })
+                        .submenu(format!("Code size · {code_size:.0} px"), {
+                            let owner = owner.clone();
+                            move |mut submenu, _, _| {
+                                for size in
+                                    MIN_HARNESS_FONT_SIZE as u8..=MAX_HARNESS_FONT_SIZE as u8
+                                {
+                                    let size = f32::from(size);
+                                    let owner = owner.clone();
+                                    submenu = submenu.item(
+                                        ContextMenuEntry::new(format!("{size:.0} px"))
+                                            .toggleable(
+                                                IconPosition::End,
+                                                (code_size - size).abs() < 0.1,
+                                            )
+                                            .handler(move |window, cx| {
+                                                Self::update_appearance(
+                                                    &owner,
+                                                    window,
+                                                    cx,
+                                                    |preferences| {
+                                                        preferences.code_font_size = Some(size)
+                                                    },
+                                                )
+                                            }),
+                                    );
+                                }
+                                submenu
+                            }
+                        });
+
+                    let owner = owner.clone();
+                    menu.separator().item(
+                        ContextMenuEntry::new("Reset typography")
+                            .disabled(!has_custom_typography)
+                            .handler(move |window, cx| {
+                                Self::update_appearance(
+                                    &owner,
+                                    window,
+                                    cx,
+                                    HarnessPreferences::reset_typography,
+                                )
+                            }),
+                    )
                 }))
             })
             .into_any_element()
@@ -4488,6 +4696,12 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let font_family_cache = theme::FontFamilyCache::global(cx);
+        cx.spawn(async move |this, cx| {
+            font_family_cache.prefetch(cx).await;
+            this.update(cx, |_, cx| cx.notify())
+        })
+        .detach();
         let mode_indicator = cx.new(|cx| ModeIndicator::compact(window, cx));
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
         let search_editor = cx.new(|cx| LocalEditor::plain_single_line("", window, cx));
@@ -12229,7 +12443,7 @@ impl Render for HarnessApp {
                                             this.toggle_buffer_view(window, cx)
                                         })),
                                 )
-                                .child(self.render_theme_selector(cx))
+                                .child(self.render_appearance_selector(cx))
                                 .child(
                                     IconButton::new("refresh-tasks", IconName::RotateCw)
                                         .shape(IconButtonShape::Square)
@@ -16286,12 +16500,7 @@ fn main() {
             log::error!("failed to load fonts: {error}");
             return;
         }
-        let initial_theme = preferred_theme_name();
-        let initial_settings = json!({
-            "vim_mode": true,
-            "theme": initial_theme,
-        })
-        .to_string();
+        let initial_settings = preferred_preferences().settings_json();
         SettingsStore::update_global(cx, |store, cx| {
             if let Err(error) = store.set_user_settings(&initial_settings, cx).result() {
                 log::error!("failed to initialize Harness settings: {error}");

@@ -8345,6 +8345,7 @@ dependencies = [
  "markdown",
  "release_channel",
  "semver",
+ "serde",
  "serde_json",
  "settings",
  "theme",
