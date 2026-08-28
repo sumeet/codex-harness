@@ -9804,10 +9804,7 @@ impl HarnessApp {
                         source.to_string().into(),
                         None,
                         None,
-                        markdown::MarkdownOptions {
-                            require_explicit_block_quote_markers: true,
-                            ..Default::default()
-                        },
+                        markdown::MarkdownOptions::default(),
                         cx,
                     )
                 });
@@ -14527,6 +14524,19 @@ mod tests {
             assert!(theme_names.contains(expected), "missing theme {expected}");
         }
         assert_eq!(theme_names.len(), 31);
+
+        // Exercise the same registry path used by the live Appearance sheet,
+        // rather than proving only that the JSON files happen to deserialize.
+        let registry = theme::ThemeRegistry::new(Box::new(Assets));
+        theme_settings::load_bundled_themes(&registry);
+        let registered_names = registry.list_names();
+        for expected in theme_names {
+            assert!(
+                registered_names.iter().any(|name| name == expected.as_str()),
+                "theme asset was not registered: {expected}"
+            );
+        }
+        assert_eq!(registered_names.len(), 31);
     }
 
     #[test]

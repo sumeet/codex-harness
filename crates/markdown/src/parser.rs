@@ -20,7 +20,11 @@ pub const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM)
     .union(Options::ENABLE_SUPERSCRIPT)
-    .union(Options::ENABLE_SUBSCRIPT);
+    .union(Options::ENABLE_SUBSCRIPT)
+    // Harness is a standalone product, so use its less surprising quote
+    // dialect throughout the shared Markdown renderer: every quoted line must
+    // carry its own `>` marker instead of CommonMark's lazy continuation.
+    .union(Options::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS);
 
 #[derive(Default)]
 struct ParseState {
@@ -1026,8 +1030,7 @@ mod tests {
     const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
         .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS)
-        .union(Options::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS);
+        .union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {
@@ -1042,19 +1045,10 @@ mod tests {
     }
 
     #[test]
-    fn explicit_block_quote_markers_are_a_rendering_extension() {
+    fn explicit_block_quote_markers_are_the_default_dialect() {
         let source = "> quoted\noutside";
 
-        let commonmark = parse_markdown_with_options(source, false, false, false);
-        assert_eq!(commonmark.root_block_starts, vec![0]);
-
-        let strict = parse_markdown_with_options_and_extensions(
-            source,
-            false,
-            false,
-            false,
-            Options::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS,
-        );
+        let strict = parse_markdown_with_options(source, false, false, false);
         assert_eq!(strict.root_block_starts, vec![0, 9]);
         assert_eq!(
             strict
