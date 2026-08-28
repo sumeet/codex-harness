@@ -36,12 +36,12 @@ use serde_json::{Value, json};
 use settings::SettingsStore;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
-    AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
-    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure,
-    DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
-    LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes,
-    Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip,
-    WithScrollbar, right_click_menu,
+    AgentThreadStatus, Button, ButtonCommon, ButtonLike, ButtonSize, ButtonStyle, CircularProgress,
+    Clickable, Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable,
+    Disclosure, DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition,
+    IconSize, Label, LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu,
+    PopoverMenuHandle, ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem,
+    TintColor, Toggleable, Tooltip, WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -3140,7 +3140,8 @@ struct HarnessApp {
     threads: Vec<CodexThread>,
     available_models: Vec<ModelChoice>,
     permission_profiles: Vec<PermissionProfileChoice>,
-    model_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
+    model_menu_handle: PopoverMenuHandle<ContextMenu>,
+    thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
     permission_menu_handle: PopoverMenuHandle<ContextMenu>,
     settings_update_pending: bool,
     thread_snapshots: ThreadSnapshotCache,
@@ -3647,44 +3648,29 @@ impl HarnessApp {
         .detach();
     }
 
-    fn render_model_effort_selector(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_model_selector(&self, cx: &Context<Self>) -> AnyElement {
         let settings = self.model.telemetry.thread_settings.as_ref();
         let selected_model = settings.and_then(|settings| settings.model.as_deref());
-        let selected_effort = settings.and_then(|settings| settings.effort.as_deref());
         let selected_choice = effective_model_choice(&self.available_models, selected_model);
-        let effective_effort = effective_reasoning_effort(selected_effort, selected_choice);
         let model_label = selected_choice
             .map(|choice| choice.display_name.clone())
             .or_else(|| selected_model.map(SharedString::from))
             .unwrap_or_else(|| "Loading models…".into());
-        let trigger_label: SharedString = effective_effort
-            .as_deref()
-            .map(reasoning_effort_label)
-            .map(|effort| format!("{model_label} · {effort}").into())
-            .unwrap_or(model_label);
         let choices = self.available_models.clone();
         let current_model = selected_choice
             .map(|choice| choice.model.clone())
             .or_else(|| selected_model.map(ToOwned::to_owned));
-        let current_effort = effective_effort;
-        let effort_choices = selected_choice
-            .map(|choice| choice.efforts.clone())
-            .unwrap_or_default();
-        let menu_deployed = self.model_effort_menu_handle.is_deployed();
+        let current_effort = settings.and_then(|settings| settings.effort.clone());
+        let menu_deployed = self.model_menu_handle.is_deployed();
         let trigger_color = if menu_deployed {
             Color::Accent
         } else {
             Color::Muted
         };
         let weak = cx.weak_entity();
-        let trigger = Button::new("model-effort-selector-trigger", trigger_label)
+        let trigger = Button::new("model-selector-trigger", model_label)
             .label_size(LabelSize::Small)
             .color(trigger_color)
-            .start_icon(
-                Icon::new(IconName::ThinkingMode)
-                    .size(IconSize::XSmall)
-                    .color(trigger_color),
-            )
             .end_icon(
                 Icon::new(if menu_deployed {
                     IconName::ChevronUp
@@ -3698,9 +3684,9 @@ impl HarnessApp {
                 (self.selected_thread_id.is_none() && self.replay_count.is_none())
                     || self.settings_update_pending,
             )
-            .aria_label("Change model and thinking effort");
+            .aria_label("Change model");
 
-        PopoverMenu::new("model-effort-selector")
+        PopoverMenu::new("model-selector")
             .trigger(trigger)
             .anchor(gpui::Anchor::BottomRight)
             .offset(gpui::Point {
@@ -3711,7 +3697,6 @@ impl HarnessApp {
                 let choices = choices.clone();
                 let current_model = current_model.clone();
                 let current_effort = current_effort.clone();
-                let effort_choices = effort_choices.clone();
                 let weak = weak.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     menu = menu.header("Model");
@@ -3745,12 +3730,86 @@ impl HarnessApp {
                             menu = menu.item(entry);
                         }
                     }
-                    menu = menu.separator().header("Thinking effort");
-                    if effort_choices.is_empty() {
-                        menu =
-                            menu.item(ContextMenuEntry::new("No thinking controls").disabled(true));
-                    } else {
-                        for effort in effort_choices {
+                    menu
+                }))
+            })
+            .with_handle(self.model_menu_handle.clone())
+            .into_any_element()
+    }
+
+    fn render_thinking_effort_selector(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let settings = self.model.telemetry.thread_settings.as_ref();
+        let selected_choice = effective_model_choice(
+            &self.available_models,
+            settings.and_then(|settings| settings.model.as_deref()),
+        );
+        let efforts = selected_choice?.efforts.clone();
+        if efforts.is_empty() {
+            return None;
+        }
+
+        let current_effort = effective_reasoning_effort(
+            settings.and_then(|settings| settings.effort.as_deref()),
+            selected_choice,
+        );
+        let effort_label = current_effort
+            .as_deref()
+            .map(reasoning_effort_label)
+            .unwrap_or_else(|| "Thinking".into());
+        let menu_deployed = self.thinking_effort_menu_handle.is_deployed();
+        let label_color = if menu_deployed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
+        let disabled = (self.selected_thread_id.is_none() && self.replay_count.is_none())
+            || self.settings_update_pending;
+        let trigger = ButtonLike::new("thinking-effort-selector-trigger")
+            .disabled(disabled)
+            .aria_label("Change thinking effort")
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::ThinkingMode)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
+                    .child(
+                        Label::new(effort_label)
+                            .size(LabelSize::Small)
+                            .color(label_color),
+                    )
+                    .child(
+                        Icon::new(if menu_deployed {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                    ),
+            );
+        let weak = cx.weak_entity();
+
+        Some(
+            PopoverMenu::new("thinking-effort-selector")
+                .trigger(trigger)
+                .anchor(gpui::Anchor::BottomRight)
+                .offset(gpui::Point {
+                    x: px(0.),
+                    y: px(-2.),
+                })
+                .menu(move |window, cx| {
+                    let efforts = efforts.clone();
+                    let current_effort = current_effort.clone();
+                    let weak = weak.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        menu = menu.header("Thinking effort");
+                        for effort in efforts {
                             let selected = current_effort.as_deref() == Some(effort.as_str());
                             menu = menu.item(
                                 ContextMenuEntry::new(reasoning_effort_label(&effort))
@@ -3769,12 +3828,12 @@ impl HarnessApp {
                                     }),
                             );
                         }
-                    }
-                    menu
-                }))
-            })
-            .with_handle(self.model_effort_menu_handle.clone())
-            .into_any_element()
+                        menu
+                    }))
+                })
+                .with_handle(self.thinking_effort_menu_handle.clone())
+                .into_any_element(),
+        )
     }
 
     fn render_permission_selector(&self, cx: &Context<Self>) -> AnyElement {
@@ -3889,7 +3948,6 @@ impl HarnessApp {
             div()
                 .id("context-window-usage")
                 .size(px(18.))
-                .mr_1()
                 .flex_none()
                 .flex()
                 .items_center()
@@ -4684,7 +4742,8 @@ impl HarnessApp {
             threads: Vec::new(),
             available_models,
             permission_profiles,
-            model_effort_menu_handle: PopoverMenuHandle::default(),
+            model_menu_handle: PopoverMenuHandle::default(),
+            thinking_effort_menu_handle: PopoverMenuHandle::default(),
             permission_menu_handle: PopoverMenuHandle::default(),
             settings_update_pending: false,
             thread_snapshots: ThreadSnapshotCache::default(),
@@ -11977,7 +12036,8 @@ impl Render for HarnessApp {
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
         let context_usage = self.render_context_usage(cx);
-        let model_selector = self.render_model_effort_selector(cx);
+        let thinking_effort_selector = self.render_thinking_effort_selector(cx);
+        let model_selector = self.render_model_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
         let composer_action =
             self.render_composer_action(turn_active, composer_empty, send_blocked, cx);
@@ -12430,9 +12490,33 @@ impl Render for HarnessApp {
                                                 div()
                                                     .min_w_0()
                                                     .flex()
+                                                    .flex_wrap()
                                                     .items_center()
-                                                    .gap_1()
+                                                    .gap_0p5()
+                                                    .child(
+                                                        IconButton::new(
+                                                            "paste-composer-content",
+                                                            IconName::Plus,
+                                                        )
+                                                        .icon_size(IconSize::Small)
+                                                        .icon_color(Color::Muted)
+                                                        .aria_label(
+                                                            "Paste text or attach an image",
+                                                        )
+                                                        .tooltip(Tooltip::text(
+                                                            "Paste text or attach an image",
+                                                        ))
+                                                        .on_click(cx.listener(
+                                                            |this, _, window, cx| {
+                                                                this.paste_composer(window, cx)
+                                                            },
+                                                        )),
+                                                    )
                                                     .child(self.mode_indicator.clone())
+                                                    .when_some(
+                                                        thinking_effort_selector,
+                                                        |this, selector| this.child(selector),
+                                                    )
                                                     .when_some(
                                                         composer_status.clone(),
                                                         |this, (status, color)| {
