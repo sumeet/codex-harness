@@ -143,11 +143,6 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_COMMAND_ROW_HEIGHT_HINT: f32 = 20.;
 const RICH_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
-// Zed's native diff editor keeps the line-number gutter visually subordinate
-// to the code. Five digits still fit at our compact buffer size without the
-// large blank runway the previous 44 px gutter introduced.
-const RICH_DIFF_LINE_NUMBER_WIDTH: f32 = 38.;
-const RICH_DIFF_GUTTER_GAP: f32 = 8.;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -450,11 +445,9 @@ enum RichFileChangeRow {
     Line {
         section_index: usize,
         line_index: usize,
-        source_range: Range<usize>,
+        text: Arc<str>,
         logical_range: Range<usize>,
         tone: DiffLineTone,
-        old_line: Option<usize>,
-        new_line: Option<usize>,
     },
 }
 
@@ -1023,60 +1016,20 @@ fn navigation_searchable_styled_text(
     searchable_styled_text(text, base, search, cx)
 }
 
-/// Apply Zed's active syntax theme to the source portion of a rendered diff
-/// row. Unified-diff markers remain ordinary selectable transcript bytes, but
-/// they are deliberately excluded from parsing so Tree-sitter sees the code
-/// the same way it does in Zed's native diff Editor.
+/// Apply Zed's active syntax theme to the code painted by the transcript diff.
+/// The component fork removes unified-diff syntax before this point, matching
+/// the source text Zed's native BufferDiff Editor sends to Tree-sitter.
 fn diff_line_syntax_highlights(
     path: &str,
     line: &str,
     tone: DiffLineTone,
-    unified: bool,
+    _unified: bool,
     cx: &App,
 ) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
-    if tone == DiffLineTone::Hunk
-        || line.starts_with("diff --git ")
-        || line.starts_with("--- ")
-        || line.starts_with("+++ ")
-        || line.starts_with("\\ No newline")
-    {
+    if tone == DiffLineTone::Hunk {
         return Vec::new();
     }
-
-    let prefix_len = match tone {
-        DiffLineTone::Addition | DiffLineTone::Deletion => {
-            if line.as_bytes().get(1).is_some_and(u8::is_ascii_whitespace) {
-                2
-            } else {
-                1
-            }
-        }
-        DiffLineTone::Normal if unified && line.starts_with(' ') => 1,
-        _ => 0,
-    };
-    let source = &line[prefix_len.min(line.len())..];
-    let mut highlights = syntax_highlights_for_path(Path::new(path), source, cx)
-        .into_iter()
-        .map(|(range, style)| (range.start + prefix_len..range.end + prefix_len, style))
-        .collect::<Vec<_>>();
-    // Zed's diff editor colors the change marker, not every token on a changed
-    // row. Let the language theme keep ownership of the code glyphs and use
-    // the diff background plus this one marker to communicate row state.
-    if matches!(tone, DiffLineTone::Addition | DiffLineTone::Deletion) && !line.is_empty() {
-        let visuals = HarnessVisualTheme::from_zed(cx.theme().colors());
-        highlights.push((
-            0..1,
-            gpui::HighlightStyle {
-                color: Some(if tone == DiffLineTone::Addition {
-                    visuals.diff_added
-                } else {
-                    visuals.diff_deleted
-                }),
-                ..Default::default()
-            },
-        ));
-    }
-    highlights
+    syntax_highlights_for_path(Path::new(path), line, cx)
 }
 
 fn logical_offset_for_rendered_index(
@@ -1881,18 +1834,75 @@ fn compact_diff_indentation(content: &str) -> String {
         .map(|(line_index, line)| {
             let trim = trims[line_index];
             if change_rows[line_index] {
-                // The unified-diff marker is presentation furniture, so give
-                // it one ordinary character of breathing room. Keep that
-                // space in the presentation string itself: rendered text,
-                // Vim navigation, hit testing, search, and copying must all
-                // continue to describe identical bytes.
-                format!("{} {}", &line[..1], &line[1 + trim..])
+                format!("{}{}", &line[..1], &line[1 + trim..])
             } else if trim == 0 {
                 line.to_owned()
             } else {
                 format!("{}{}", &line[..1], &line[1 + trim..])
             }
         })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ZedDiffLine {
+    text: Arc<str>,
+    tone: DiffLineTone,
+}
+
+/// Project unified-diff transport text into the code rows painted by Zed's
+/// agent BufferDiff editor. File headers, hunk coordinates, change markers,
+/// and `No newline` notices are protocol furniture rather than editor glyphs.
+/// Keeping this as a shared presentation transform makes Rich paint, Vim,
+/// search, clicking, and copying agree on one visible coordinate space.
+fn zed_diff_lines(content: &str, operation: &str) -> Vec<ZedDiffLine> {
+    let unified = content.lines().any(|line| line.starts_with("@@"));
+    let fallback_tone = match operation {
+        "Added" => DiffLineTone::Addition,
+        "Deleted" => DiffLineTone::Deletion,
+        _ => DiffLineTone::Normal,
+    };
+    let mut in_hunk = false;
+    let mut lines = Vec::new();
+
+    for line in content.lines() {
+        let tone = diff_line_tone(line, &mut in_hunk);
+        if tone == DiffLineTone::Hunk || line.starts_with("\\ No newline") {
+            continue;
+        }
+        if unified {
+            if !in_hunk {
+                continue;
+            }
+            let Some(marker) = line.as_bytes().first().copied() else {
+                lines.push(ZedDiffLine {
+                    text: Arc::from(""),
+                    tone: DiffLineTone::Normal,
+                });
+                continue;
+            };
+            if !matches!(marker, b'+' | b'-' | b' ') {
+                continue;
+            }
+            lines.push(ZedDiffLine {
+                text: Arc::from(&line[1..]),
+                tone,
+            });
+        } else {
+            lines.push(ZedDiffLine {
+                text: Arc::from(line),
+                tone: fallback_tone,
+            });
+        }
+    }
+    lines
+}
+
+fn zed_diff_visible_text(content: &str, operation: &str) -> String {
+    zed_diff_lines(content, operation)
+        .into_iter()
+        .map(|line| line.text.to_string())
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -2093,101 +2103,6 @@ fn diff_line_tone(line: &str, in_hunk: &mut bool) -> DiffLineTone {
     }
 }
 
-fn diff_hunk_starts(line: &str) -> Option<(usize, usize)> {
-    let mut fields = line.split_whitespace();
-    if fields.next()? != "@@" {
-        return None;
-    }
-    let old_line = fields
-        .next()?
-        .strip_prefix('-')?
-        .split(',')
-        .next()?
-        .parse()
-        .ok()?;
-    let new_line = fields
-        .next()?
-        .strip_prefix('+')?
-        .split(',')
-        .next()?
-        .parse()
-        .ok()?;
-    Some((old_line, new_line))
-}
-
-fn diff_line_numbers(
-    line: &str,
-    tone: DiffLineTone,
-    unified: bool,
-    in_hunk: bool,
-    old_line: &mut Option<usize>,
-    new_line: &mut Option<usize>,
-    fallback_line: usize,
-) -> (Option<usize>, Option<usize>) {
-    if tone == DiffLineTone::Hunk {
-        if let Some((old_start, new_start)) = diff_hunk_starts(line) {
-            *old_line = Some(old_start);
-            *new_line = Some(new_start);
-        }
-        return (None, None);
-    }
-    if !unified {
-        return (None, Some(fallback_line));
-    }
-    if !in_hunk || line.starts_with("\\ No newline") {
-        return (None, None);
-    }
-
-    match tone {
-        DiffLineTone::Addition => {
-            let displayed = *new_line;
-            *new_line = new_line.map(|line| line + 1);
-            (None, displayed)
-        }
-        DiffLineTone::Deletion => {
-            let displayed = *old_line;
-            *old_line = old_line.map(|line| line + 1);
-            (displayed, None)
-        }
-        DiffLineTone::Normal => {
-            let displayed = (*old_line, *new_line);
-            *old_line = old_line.map(|line| line + 1);
-            *new_line = new_line.map(|line| line + 1);
-            displayed
-        }
-        DiffLineTone::Hunk => unreachable!(),
-    }
-}
-
-fn compact_diff_line_number(
-    tone: DiffLineTone,
-    old_line: Option<usize>,
-    new_line: Option<usize>,
-) -> Option<usize> {
-    match tone {
-        DiffLineTone::Deletion => old_line.or(new_line),
-        DiffLineTone::Addition | DiffLineTone::Normal | DiffLineTone::Hunk => new_line.or(old_line),
-    }
-}
-
-fn render_compact_diff_line_number(
-    tone: DiffLineTone,
-    old_line: Option<usize>,
-    new_line: Option<usize>,
-) -> gpui::Div {
-    div()
-        .w(px(RICH_DIFF_LINE_NUMBER_WIDTH))
-        .flex_none()
-        .flex()
-        .justify_end()
-        .overflow_hidden()
-        .child(
-            compact_diff_line_number(tone, old_line, new_line)
-                .map(|line| line.to_string())
-                .unwrap_or_default(),
-        )
-}
-
 fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
     let presentations = if item.kind == model::TranscriptKind::Diff {
         diff_file_presentations(&item.content)
@@ -2221,39 +2136,22 @@ fn rich_file_change_data(item: &TranscriptItem) -> RichFileChangeData {
         }
 
         logical_cursor += 1;
-        let content_start = logical_cursor;
-        let unified = presentation
-            .content
-            .lines()
-            .any(|line| line.starts_with("@@"));
-        let mut in_hunk = false;
-        let mut old_line = None;
-        let mut new_line = None;
-        for (line_index, source_range) in command_line_ranges(&presentation.content).enumerate() {
-            let line = &presentation.content[source_range.clone()];
-            let tone = diff_line_tone(line, &mut in_hunk);
-            let (displayed_old_line, displayed_new_line) = diff_line_numbers(
-                line,
-                tone,
-                unified,
-                in_hunk,
-                &mut old_line,
-                &mut new_line,
-                line_index + 1,
-            );
-            let logical_range =
-                content_start + source_range.start..content_start + source_range.end;
+        for (line_index, line) in zed_diff_lines(&presentation.content, &presentation.operation)
+            .into_iter()
+            .enumerate()
+        {
+            let logical_range = logical_cursor..logical_cursor + line.text.len();
+            let logical_end = logical_range.end;
             rows.push(RichFileChangeRow::Line {
                 section_index,
                 line_index,
-                source_range,
+                text: line.text,
                 logical_range,
-                tone,
-                old_line: displayed_old_line,
-                new_line: displayed_new_line,
+                tone: line.tone,
             });
+            logical_cursor = logical_end + 1;
         }
-        logical_cursor += presentation.content.len();
+        logical_cursor = logical_cursor.saturating_sub(1);
     }
 
     RichFileChangeData {
@@ -2478,13 +2376,19 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
         model::TranscriptKind::Diff => {
             for presentation in diff_file_presentations(&item.content) {
                 append_rich_navigation_fragment(&mut output, &presentation.path);
-                append_rich_navigation_fragment(&mut output, &presentation.content);
+                append_rich_navigation_fragment(
+                    &mut output,
+                    &zed_diff_visible_text(&presentation.content, "Modified"),
+                );
             }
         }
         model::TranscriptKind::FileChange => {
             for presentation in file_change_presentations(&item.content) {
                 append_rich_navigation_fragment(&mut output, &presentation.path);
-                append_rich_navigation_fragment(&mut output, &presentation.content);
+                append_rich_navigation_fragment(
+                    &mut output,
+                    &zed_diff_visible_text(&presentation.content, &presentation.operation),
+                );
             }
         }
         model::TranscriptKind::Web => {
@@ -3183,7 +3087,7 @@ fn hybrid_structured_rows(item: &TranscriptItem) -> u32 {
             let visible_lines = progressive_file_line_allocations(
                 &presentations
                     .iter()
-                    .map(|presentation| presentation.content.lines().count())
+                    .map(|presentation| zed_diff_lines(&presentation.content, "Modified").len())
                     .collect::<Vec<_>>(),
                 OutputExpansion::Preview,
             )
@@ -4018,8 +3922,8 @@ impl HarnessApp {
         if state == ComposerActionState::Stop {
             return IconButton::new("stop-turn", IconName::Stop)
                 .shape(IconButtonShape::Square)
-                .size(ButtonSize::Default)
-                .style(ButtonStyle::Tinted(TintColor::Error))
+                .size(ButtonSize::Compact)
+                .style(ButtonStyle::Subtle)
                 .icon_color(Color::Error)
                 .aria_label("Stop the current response")
                 .tooltip(Tooltip::text("Stop response"))
@@ -4059,8 +3963,8 @@ impl HarnessApp {
 
         IconButton::new(id, icon)
             .shape(IconButtonShape::Square)
-            .size(ButtonSize::Default)
-            .style(ButtonStyle::Filled)
+            .size(ButtonSize::Compact)
+            .style(ButtonStyle::Subtle)
             .disabled(send_blocked)
             .icon_color(if send_blocked {
                 Color::Muted
@@ -9237,6 +9141,7 @@ impl HarnessApp {
     fn render_diff_lines(
         content: &str,
         path: &str,
+        operation: &str,
         visible_line_count: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
@@ -9247,31 +9152,16 @@ impl HarnessApp {
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors);
-        let unified = content.lines().any(|line| line.starts_with("@@"));
-        let mut in_hunk = false;
-        let mut old_line = None;
-        let mut new_line = None;
         let mut logical_line_offset = logical_body_start;
-        content
-            .lines()
+        zed_diff_lines(content, operation)
+            .into_iter()
             .take(visible_line_count)
-            .enumerate()
-            .map(|(index, line)| {
-                let logical_line_range = logical_line_offset..logical_line_offset + line.len();
-                logical_line_offset += line.len() + 1;
-                let tone = diff_line_tone(line, &mut in_hunk);
-                let (displayed_old_line, displayed_new_line) = diff_line_numbers(
-                    line,
-                    tone,
-                    unified,
-                    in_hunk,
-                    &mut old_line,
-                    &mut new_line,
-                    index + 1,
-                );
-                let syntax = diff_line_syntax_highlights(path, line, tone, unified, cx);
+            .map(|line| {
+                let logical_line_range = logical_line_offset..logical_line_offset + line.text.len();
+                logical_line_offset += line.text.len() + 1;
+                let syntax = diff_line_syntax_highlights(path, &line.text, line.tone, false, cx);
                 let highlighted_line = navigation_searchable_styled_text(
-                    line.to_string(),
+                    line.text.to_string(),
                     syntax,
                     search,
                     navigation,
@@ -9288,32 +9178,19 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .h(px(20.))
-                    .pr_1()
+                    .px_2()
                     .flex()
                     .items_center()
-                    .gap(px(RICH_DIFF_GUTTER_GAP))
                     .font_buffer(cx)
                     .text_ui_sm(cx)
-                    .bg(if tone == DiffLineTone::Addition {
+                    .bg(if line.tone == DiffLineTone::Addition {
                         visuals.diff_added_surface
-                    } else if tone == DiffLineTone::Deletion {
+                    } else if line.tone == DiffLineTone::Deletion {
                         visuals.diff_deleted_surface
                     } else {
                         gpui::transparent_black()
                     })
-                    .text_color(if tone == DiffLineTone::Hunk {
-                        colors.text_accent
-                    } else {
-                        colors.text
-                    })
-                    .child(
-                        render_compact_diff_line_number(
-                            tone,
-                            displayed_old_line,
-                            displayed_new_line,
-                        )
-                        .text_color(colors.text_muted),
-                    )
+                    .text_color(colors.text)
                     .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
                     .into_any_element()
             })
@@ -9348,7 +9225,7 @@ impl HarnessApp {
         let allocations = progressive_file_line_allocations(
             &presentations
                 .iter()
-                .map(|presentation| presentation.content.lines().count())
+                .map(|presentation| zed_diff_lines(&presentation.content, "Modified").len())
                 .collect::<Vec<_>>(),
             expansion,
         );
@@ -9363,11 +9240,7 @@ impl HarnessApp {
                 &presentation.path,
                 &mut logical_search_start,
             );
-            let content_range = rich_navigation_fragment_range(
-                navigation,
-                &presentation.content,
-                &mut logical_search_start,
-            );
+            let logical_content_start = path_range.end.saturating_add(1);
             let (additions, deletions) = diff_content_counts(&presentation.content);
             let highlighted_path = navigation_searchable_styled_text(
                 presentation.path.clone(),
@@ -9436,10 +9309,11 @@ impl HarnessApp {
                                     .children(Self::render_diff_lines(
                                         &presentation.content,
                                         &presentation.path,
+                                        "Modified",
                                         visible_lines,
                                         search,
                                         navigation,
-                                        content_range.start,
+                                        logical_content_start,
                                         index,
                                         owner.clone(),
                                         cx,
@@ -9571,24 +9445,17 @@ impl HarnessApp {
             RichFileChangeRow::Line {
                 section_index,
                 line_index,
-                source_range,
+                text,
                 logical_range,
                 tone,
-                old_line,
-                new_line,
             } => {
                 let colors = cx.theme().colors();
                 let visuals = HarnessVisualTheme::from_zed(colors);
                 let presentation = &row_data.presentations[*section_index];
-                let line = &presentation.content[source_range.clone()];
-                let unified = presentation
-                    .content
-                    .lines()
-                    .any(|line| line.starts_with("@@"));
                 let syntax =
-                    diff_line_syntax_highlights(&presentation.path, line, *tone, unified, cx);
+                    diff_line_syntax_highlights(&presentation.path, text, *tone, false, cx);
                 let highlighted_line = navigation_searchable_styled_text(
-                    line.to_owned(),
+                    text.to_string(),
                     syntax,
                     search,
                     navigation,
@@ -9614,10 +9481,9 @@ impl HarnessApp {
                 div()
                     .w_full()
                     .h(px(20.))
-                    .pr_1()
+                    .px_2()
                     .flex()
                     .items_center()
-                    .gap(px(RICH_DIFF_GUTTER_GAP))
                     .relative()
                     .font_buffer(cx)
                     .text_ui_sm(cx)
@@ -9628,15 +9494,7 @@ impl HarnessApp {
                     } else {
                         gpui::transparent_black()
                     })
-                    .text_color(if *tone == DiffLineTone::Hunk {
-                        colors.text_accent
-                    } else {
-                        colors.text
-                    })
-                    .child(
-                        render_compact_diff_line_number(*tone, *old_line, *new_line)
-                            .text_color(colors.text_muted),
-                    )
+                    .text_color(colors.text)
                     .child(div().min_w_0().whitespace_nowrap().child(clickable_line))
                     .when_some(cursor_marker, |this, marker| this.child(marker))
                     .into_any_element()
@@ -12454,12 +12312,10 @@ impl Render for HarnessApp {
                         div()
                             .flex_none()
                             .border_t_1()
-                            // Match Zed's message editor: the composer is one
-                            // editor surface separated by the ordinary theme
-                            // border, not a Harness-specific blue status bar.
                             .border_color(colors.border)
                             .bg(colors.editor_background)
                             .py_2()
+                            .px_2()
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -12469,7 +12325,6 @@ impl Render for HarnessApp {
                                         .id("composer-attachments")
                                         .h(px(COMPOSER_ATTACHMENT_STRIP_HEIGHT))
                                         .flex_none()
-                                        .px_2()
                                         .py_1()
                                         .flex()
                                         .overflow_x_scroll()
@@ -12526,17 +12381,19 @@ impl Render for HarnessApp {
                             })
                             .child(
                                 div()
-                                    .flex_none()
+                                    .relative()
+                                    .w_full()
+                                    .min_h_0()
                                     .min_w_0()
-                                    .px_2()
                                     .pt_1()
+                                    .pr_2()
                                     .child(self.composer.clone()),
                             )
                             .child(
                                 div()
-                                    .min_h(px(24.))
+                                    .w_full()
+                                    .min_w_0()
                                     .flex_none()
-                                    .px_2()
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
@@ -14135,8 +13992,9 @@ mod tests {
         let diff = rich_navigation_item_projection(&replay, 4).unwrap();
         assert!(
             diff.body_text()
-                .starts_with("crates/harness_app/src/main.rs\n@@ -83,7 +83,10 @@")
+                .starts_with("crates/harness_app/src/main.rs\n")
         );
+        assert!(!diff.body_text().contains("@@"));
         assert!(!diff.body_text().contains("diff --git"));
 
         let command = rich_navigation_item_projection(&replay, 5).unwrap();
@@ -14184,7 +14042,7 @@ mod tests {
                 "Modified · /tmp/a\n@@ -1 +1 @@\n-old\n+new",
                 Value::Null,
             ),
-            "/tmp/a\n@@ -1 +1 @@\n- old\n+ new"
+            "/tmp/a\nold\nnew"
         );
         assert_eq!(
             project(
@@ -14550,7 +14408,7 @@ mod tests {
         let presentation = diff_file_presentations(&model.items[0].content)
             .pop()
             .unwrap();
-        assert_eq!(body, "src/main.rs\n@@ -1 +1 @@\n- old\n+ new");
+        assert_eq!(body, "src/main.rs\nold\nnew");
 
         let normal = RichNavigationPaint {
             body_text: body.into(),
@@ -14563,11 +14421,9 @@ mod tests {
         let mut logical_cursor = 0;
         let path_range =
             rich_navigation_fragment_range(Some(&normal), &presentation.path, &mut logical_cursor);
-        let content_range = rich_navigation_fragment_range(
-            Some(&normal),
-            &presentation.content,
-            &mut logical_cursor,
-        );
+        let visible_content = zed_diff_visible_text(&presentation.content, "Modified");
+        let content_range =
+            rich_navigation_fragment_range(Some(&normal), &visible_content, &mut logical_cursor);
         assert_eq!(path_range, 0.."src/main.rs".len());
         assert_eq!(&body[path_range.clone()], "src/main.rs");
         assert_eq!(
@@ -14924,8 +14780,8 @@ mod tests {
                 "+++ b/src/main.rs\n",
                 "@@ -10,2 +10,2 @@\n",
                 " context\n",
-                "- old\n",
-                "+     new\n",
+                "-old\n",
+                "+    new\n",
                 "@@ -30 +30 @@\n",
                 " second hunk",
             )
@@ -15481,68 +15337,29 @@ mod tests {
             DiffLineTone::Addition
         );
 
-        let mut old_line = None;
-        let mut new_line = None;
         assert_eq!(
-            diff_line_numbers(
-                "@@ -29,2 +29,4 @@",
-                DiffLineTone::Hunk,
-                true,
-                true,
-                &mut old_line,
-                &mut new_line,
-                1,
+            zed_diff_lines(
+                "@@ -29,2 +29,4 @@\n context\n-removed\n+added\n+another",
+                "Modified",
             ),
-            (None, None)
-        );
-        assert_eq!((old_line, new_line), (Some(29), Some(29)));
-        assert_eq!(
-            diff_line_numbers(
-                " context",
-                DiffLineTone::Normal,
-                true,
-                true,
-                &mut old_line,
-                &mut new_line,
-                2,
-            ),
-            (Some(29), Some(29))
-        );
-        assert_eq!(
-            diff_line_numbers(
-                "+added",
-                DiffLineTone::Addition,
-                true,
-                true,
-                &mut old_line,
-                &mut new_line,
-                3,
-            ),
-            (None, Some(30))
-        );
-        assert_eq!(
-            diff_line_numbers(
-                "-removed",
-                DiffLineTone::Deletion,
-                true,
-                true,
-                &mut old_line,
-                &mut new_line,
-                4,
-            ),
-            (Some(30), None)
-        );
-        assert_eq!(
-            compact_diff_line_number(DiffLineTone::Normal, Some(29), Some(29)),
-            Some(29)
-        );
-        assert_eq!(
-            compact_diff_line_number(DiffLineTone::Addition, None, Some(30)),
-            Some(30)
-        );
-        assert_eq!(
-            compact_diff_line_number(DiffLineTone::Deletion, Some(30), None),
-            Some(30)
+            vec![
+                ZedDiffLine {
+                    text: "context".into(),
+                    tone: DiffLineTone::Normal,
+                },
+                ZedDiffLine {
+                    text: "removed".into(),
+                    tone: DiffLineTone::Deletion,
+                },
+                ZedDiffLine {
+                    text: "added".into(),
+                    tone: DiffLineTone::Addition,
+                },
+                ZedDiffLine {
+                    text: "another".into(),
+                    tone: DiffLineTone::Addition,
+                },
+            ]
         );
     }
 
@@ -15572,20 +15389,10 @@ mod tests {
             .map(|range| &body[range.clone()])
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            body,
-            "/tmp/first.rs\n@@ -1 +1 @@\n- old\n+ new\n/tmp/second.rs\ncreated"
-        );
+        assert_eq!(body, "/tmp/first.rs\nold\nnew\n/tmp/second.rs\ncreated");
         assert_eq!(
             visible_rows,
-            [
-                "/tmp/first.rs",
-                "@@ -1 +1 @@",
-                "- old",
-                "+ new",
-                "/tmp/second.rs",
-                "created",
-            ]
+            ["/tmp/first.rs", "old", "new", "/tmp/second.rs", "created",]
         );
         assert_eq!(
             data.presentations.iter().map(file_change_counts).fold(

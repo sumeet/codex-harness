@@ -255,16 +255,11 @@ impl LocalEditor {
             (languages.registry.clone(), languages.markdown.clone())
         };
         let editor = cx.new(move |cx| {
-            // The host reserves room for at most eight visual rows before the
-            // composer becomes internally scrollable. Keeping the Editor's
-            // intrinsic cap identical prevents its caret from painting under
-            // the host-owned Vim/status row.
-            // The host owns the compact empty-state height. Requiring three
-            // intrinsic Editor rows made the child taller than that viewport,
-            // so its final painted line could sit underneath the mode row.
-            // One intrinsic row lets the host provide the breathing room while
-            // real content still grows naturally to the eight-row cap.
-            let mut editor = Editor::auto_height(1, 8, window, cx);
+            // Zed's agent composer begins as a small writing surface rather
+            // than collapsing to a status-bar-sized single row. The footer is
+            // now outside this Editor's layout, so three intrinsic rows no
+            // longer risk painting the caret underneath host-owned controls.
+            let mut editor = Editor::auto_height(3, 8, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             editor.set_use_modal_editing(true);
             editor.register_addon(ComposerKeyContextAddon);
@@ -438,7 +433,12 @@ impl Focusable for LocalEditor {
 impl Render for LocalEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .size_full()
+            .w_full()
+            // An AutoHeight Editor must be allowed to contribute its own
+            // intrinsic block size. `size_full` collapsed that contract into
+            // whatever height the host happened to have already allocated,
+            // which made the three-row agent composer paint as a single row.
+            .when(!self.composer_keys, |this| this.h_full())
             .on_action(cx.listener(|this, _: &SubmitComposer, _, cx| {
                 if this.composer_keys {
                     cx.stop_propagation();
