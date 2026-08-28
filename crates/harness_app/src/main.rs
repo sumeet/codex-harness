@@ -3266,6 +3266,10 @@ struct HarnessApp {
     model_menu_handle: PopoverMenuHandle<ContextMenu>,
     permission_menu_handle: PopoverMenuHandle<ContextMenu>,
     settings_update_pending: bool,
+    appearance_settings_open: bool,
+    appearance_settings_section: AppearanceSettingsSection,
+    appearance_font_role: AppearanceFontRole,
+    appearance_scroll_handle: ScrollHandle,
     thread_snapshots: ThreadSnapshotCache,
     selected_thread_id: Option<String>,
     loaded_thread_updated_at: Option<i64>,
@@ -3373,6 +3377,20 @@ enum ComposerActionState {
     Send,
     Queue,
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AppearanceSettingsSection {
+    #[default]
+    Themes,
+    Typography,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum AppearanceFontRole {
+    #[default]
+    Reading,
+    Code,
 }
 
 fn composer_action_state(turn_active: bool, composer_empty: bool) -> ComposerActionState {
@@ -3602,220 +3620,503 @@ impl HarnessApp {
     }
 
     fn render_appearance_selector(&self, cx: &Context<Self>) -> AnyElement {
-        let current_theme = cx.theme().name.clone();
-        let mut themes = theme::ThemeRegistry::global(cx).list();
-        themes.sort_unstable_by(|left, right| {
-            left.appearance
-                .is_light()
-                .cmp(&right.appearance.is_light())
-                .then(left.name.cmp(&right.name))
-        });
+        let typography = ThemeSettings::get_global(cx);
+        IconButton::new("appearance-selector-trigger", IconName::Settings)
+            .shape(IconButtonShape::Square)
+            .size(ButtonSize::Default)
+            .style(if self.appearance_settings_open {
+                ButtonStyle::Tinted(TintColor::Accent)
+            } else {
+                ButtonStyle::Subtle
+            })
+            .aria_label(format!(
+                "Appearance settings: {}; reading {} {:.0}px; code {} {:.0}px",
+                cx.theme().name,
+                typography.agent_ui_font_family(),
+                typography.agent_ui_font_size(cx).as_f32(),
+                typography.agent_buffer_font_family(),
+                typography.agent_buffer_font_size(cx).as_f32(),
+            ))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.appearance_settings_open = !this.appearance_settings_open;
+                this.appearance_scroll_handle = ScrollHandle::new();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn render_appearance_settings(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let owner = cx.entity().downgrade();
         let typography = ThemeSettings::get_global(cx);
         let reading_font = typography.agent_ui_font_family().clone();
         let reading_size = typography.agent_ui_font_size(cx).as_f32();
         let code_font = typography.agent_buffer_font_family().clone();
         let code_size = typography.agent_buffer_font_size(cx).as_f32();
-        let mut fonts = theme::FontFamilyCache::global(cx)
-            .try_list_font_families()
-            .unwrap_or_default();
-        fonts.extend([reading_font.clone(), code_font.clone()]);
-        fonts.sort_unstable_by_key(|font| font.to_lowercase());
-        fonts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-        let owner = cx.entity().downgrade();
-        let has_custom_typography = {
-            let preferences = preferred_preferences();
-            preferences.reading_font_family.is_some()
-                || preferences.reading_font_size.is_some()
-                || preferences.code_font_family.is_some()
-                || preferences.code_font_size.is_some()
-        };
-        let trigger = IconButton::new("appearance-selector-trigger", IconName::Settings)
-            .shape(IconButtonShape::Square)
+        let scroll_handle = self.appearance_scroll_handle.clone();
+
+        let theme_tab = Button::new("appearance-themes-tab", "Themes")
             .size(ButtonSize::Default)
             .style(ButtonStyle::Subtle)
-            .aria_label(format!(
-                "Appearance: {current_theme}; reading {reading_font} {reading_size:.0}px; code {code_font} {code_size:.0}px"
-            ));
-
-        PopoverMenu::new("appearance-selector")
-            .trigger(trigger)
-            .menu(move |window, cx| {
-                let themes = themes.clone();
-                let current_theme = current_theme.clone();
-                let fonts = fonts.clone();
-                let reading_font = reading_font.clone();
-                let code_font = code_font.clone();
+            .toggle_state(self.appearance_settings_section == AppearanceSettingsSection::Themes)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .on_click({
                 let owner = owner.clone();
-                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                    menu = menu
-                        .header("Appearance")
-                        .submenu(format!("Theme · {current_theme}"), {
-                            let owner = owner.clone();
-                            move |mut submenu, _, _| {
-                                let mut rendering_light_themes = false;
-                                submenu = submenu.header("Dark");
-                                for theme in themes.clone() {
-                                    if theme.appearance.is_light() && !rendering_light_themes {
-                                        rendering_light_themes = true;
-                                        submenu = submenu.separator().header("Light");
-                                    }
-                                    let theme_name = theme.name.clone();
-                                    let owner = owner.clone();
-                                    submenu = submenu.item(
-                                        ContextMenuEntry::new(theme.name)
-                                            .toggleable(
-                                                IconPosition::End,
-                                                theme_name == current_theme,
-                                            )
-                                            .handler(move |window, cx| {
-                                                Self::update_appearance(
-                                                    &owner,
-                                                    window,
-                                                    cx,
-                                                    |preferences| {
-                                                        preferences.theme = theme_name.to_string()
-                                                    },
-                                                )
-                                            }),
-                                    );
-                                }
-                                submenu
-                            }
-                        });
+                move |_, _, cx| {
+                    _ = owner.update(cx, |this, cx| {
+                        this.appearance_settings_section = AppearanceSettingsSection::Themes;
+                        this.appearance_scroll_handle = ScrollHandle::new();
+                        cx.notify();
+                    });
+                }
+            });
+        let typography_tab = Button::new("appearance-typography-tab", "Typography")
+            .size(ButtonSize::Default)
+            .style(ButtonStyle::Subtle)
+            .toggle_state(self.appearance_settings_section == AppearanceSettingsSection::Typography)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .on_click({
+                let owner = owner.clone();
+                move |_, _, cx| {
+                    _ = owner.update(cx, |this, cx| {
+                        this.appearance_settings_section = AppearanceSettingsSection::Typography;
+                        this.appearance_scroll_handle = ScrollHandle::new();
+                        cx.notify();
+                    });
+                }
+            });
 
-                    menu = menu
-                        .separator()
-                        .header("Typography")
-                        .submenu(format!("Reading font · {reading_font}"), {
-                            let owner = owner.clone();
-                            let fonts = fonts.clone();
-                            let reading_font = reading_font.clone();
-                            move |mut submenu, _, _| {
-                                for font in fonts.clone() {
-                                    let selected = font == reading_font;
-                                    let font_name = font.to_string();
-                                    let owner = owner.clone();
-                                    submenu = submenu.item(
-                                        ContextMenuEntry::new(font)
-                                            .toggleable(IconPosition::End, selected)
-                                            .handler(move |window, cx| {
-                                                Self::update_appearance(
-                                                    &owner,
-                                                    window,
-                                                    cx,
-                                                    |preferences| {
-                                                        preferences.reading_font_family =
-                                                            Some(font_name.clone())
-                                                    },
-                                                )
-                                            }),
-                                    );
-                                }
-                                submenu
-                            }
-                        })
-                        .submenu(format!("Reading size · {reading_size:.0} px"), {
-                            let owner = owner.clone();
-                            move |mut submenu, _, _| {
-                                for size in
-                                    MIN_HARNESS_FONT_SIZE as u8..=MAX_HARNESS_FONT_SIZE as u8
-                                {
-                                    let size = f32::from(size);
-                                    let owner = owner.clone();
-                                    submenu = submenu.item(
-                                        ContextMenuEntry::new(format!("{size:.0} px"))
-                                            .toggleable(
-                                                IconPosition::End,
-                                                (reading_size - size).abs() < 0.1,
-                                            )
-                                            .handler(move |window, cx| {
-                                                Self::update_appearance(
-                                                    &owner,
-                                                    window,
-                                                    cx,
-                                                    |preferences| {
-                                                        preferences.reading_font_size = Some(size)
-                                                    },
-                                                )
-                                            }),
-                                    );
-                                }
-                                submenu
-                            }
-                        })
-                        .submenu(format!("Code font · {code_font}"), {
-                            let owner = owner.clone();
-                            let fonts = fonts.clone();
-                            let code_font = code_font.clone();
-                            move |mut submenu, _, _| {
-                                for font in fonts.clone() {
-                                    let selected = font == code_font;
-                                    let font_name = font.to_string();
-                                    let owner = owner.clone();
-                                    submenu = submenu.item(
-                                        ContextMenuEntry::new(font)
-                                            .toggleable(IconPosition::End, selected)
-                                            .handler(move |window, cx| {
-                                                Self::update_appearance(
-                                                    &owner,
-                                                    window,
-                                                    cx,
-                                                    |preferences| {
-                                                        preferences.code_font_family =
-                                                            Some(font_name.clone())
-                                                    },
-                                                )
-                                            }),
-                                    );
-                                }
-                                submenu
-                            }
-                        })
-                        .submenu(format!("Code size · {code_size:.0} px"), {
-                            let owner = owner.clone();
-                            move |mut submenu, _, _| {
-                                for size in
-                                    MIN_HARNESS_FONT_SIZE as u8..=MAX_HARNESS_FONT_SIZE as u8
-                                {
-                                    let size = f32::from(size);
-                                    let owner = owner.clone();
-                                    submenu = submenu.item(
-                                        ContextMenuEntry::new(format!("{size:.0} px"))
-                                            .toggleable(
-                                                IconPosition::End,
-                                                (code_size - size).abs() < 0.1,
-                                            )
-                                            .handler(move |window, cx| {
-                                                Self::update_appearance(
-                                                    &owner,
-                                                    window,
-                                                    cx,
-                                                    |preferences| {
-                                                        preferences.code_font_size = Some(size)
-                                                    },
-                                                )
-                                            }),
-                                    );
-                                }
-                                submenu
-                            }
-                        });
-
+        let body = match self.appearance_settings_section {
+            AppearanceSettingsSection::Themes => {
+                let current_theme = cx.theme().name.clone();
+                let mut themes = theme::ThemeRegistry::global(cx).list();
+                themes.sort_unstable_by(|left, right| {
+                    left.appearance
+                        .is_light()
+                        .cmp(&right.appearance.is_light())
+                        .then(left.name.cmp(&right.name))
+                });
+                let registry = theme::ThemeRegistry::global(cx);
+                let mut rows = Vec::with_capacity(themes.len() + 2);
+                let mut rendering_light_themes = false;
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .text_ui_sm(cx)
+                        .text_color(colors.text_muted)
+                        .child("Dark")
+                        .into_any_element(),
+                );
+                for (index, theme) in themes.into_iter().enumerate() {
+                    if theme.appearance.is_light() && !rendering_light_themes {
+                        rendering_light_themes = true;
+                        rows.push(
+                            div()
+                                .px_3()
+                                .pt_3()
+                                .pb_1()
+                                .text_ui_sm(cx)
+                                .text_color(colors.text_muted)
+                                .child("Light")
+                                .into_any_element(),
+                        );
+                    }
+                    let selected = theme.name == current_theme;
+                    let theme_name = theme.name.clone();
+                    let theme_colors = registry
+                        .get(&theme.name)
+                        .map(|theme| theme.colors().clone())
+                        .unwrap_or_else(|_| colors.clone());
                     let owner = owner.clone();
-                    menu.separator().item(
-                        ContextMenuEntry::new("Reset typography")
-                            .disabled(!has_custom_typography)
-                            .handler(move |window, cx| {
-                                Self::update_appearance(
-                                    &owner,
-                                    window,
-                                    cx,
-                                    HarnessPreferences::reset_typography,
-                                )
+                    rows.push(
+                        div()
+                            .id(("appearance-theme", index))
+                            .mx_2()
+                            .mb_1()
+                            .min_h(px(38.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if selected {
+                                colors.border_selected
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .bg(if selected {
+                                colors.element_selected
+                            } else {
+                                visuals.raised_surface
+                            })
+                            .hover(|style| style.bg(colors.element_hover))
+                            .cursor_pointer()
+                            .on_click(move |_, window, cx| {
+                                let theme_name = theme_name.clone();
+                                Self::update_appearance(&owner, window, cx, move |preferences| {
+                                    preferences.theme = theme_name.to_string();
+                                });
+                            })
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .gap_0p5()
+                                    .rounded_xs()
+                                    .overflow_hidden()
+                                    .children(
+                                        [
+                                            theme_colors.editor_background,
+                                            theme_colors.text,
+                                            theme_colors.text_accent,
+                                            theme_colors.version_control_added,
+                                            theme_colors.version_control_deleted,
+                                        ]
+                                        .map(|color| div().w(px(10.)).h(px(20.)).bg(color)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .text_ui(cx)
+                                    .text_color(colors.text)
+                                    .child(theme.name),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .children(rows)
+                    .into_any_element()
+            }
+            AppearanceSettingsSection::Typography => {
+                let role = self.appearance_font_role;
+                let (current_font, current_size, sample): (SharedString, f32, &'static str) =
+                    match role {
+                        AppearanceFontRole::Reading => (
+                            reading_font.clone(),
+                            reading_size,
+                            "Clear prose should feel effortless to read.",
+                        ),
+                        AppearanceFontRole::Code => (
+                            code_font.clone(),
+                            code_size,
+                            "let transcript = render(events);",
+                        ),
+                    };
+                let mut fonts = theme::FontFamilyCache::global(cx)
+                    .try_list_font_families()
+                    .unwrap_or_default();
+                fonts.extend([reading_font.clone(), code_font.clone()]);
+                fonts.sort_unstable_by_key(|font| font.to_lowercase());
+                fonts.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+
+                let reading_role = Button::new("appearance-reading-role", "Reading")
+                    .size(ButtonSize::Default)
+                    .style(ButtonStyle::Subtle)
+                    .toggle_state(role == AppearanceFontRole::Reading)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .on_click({
+                        let owner = owner.clone();
+                        move |_, _, cx| {
+                            _ = owner.update(cx, |this, cx| {
+                                this.appearance_font_role = AppearanceFontRole::Reading;
+                                cx.notify();
+                            });
+                        }
+                    });
+                let code_role = Button::new("appearance-code-role", "Code")
+                    .size(ButtonSize::Default)
+                    .style(ButtonStyle::Subtle)
+                    .toggle_state(role == AppearanceFontRole::Code)
+                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                    .on_click({
+                        let owner = owner.clone();
+                        move |_, _, cx| {
+                            _ = owner.update(cx, |this, cx| {
+                                this.appearance_font_role = AppearanceFontRole::Code;
+                                cx.notify();
+                            });
+                        }
+                    });
+
+                let smaller_owner = owner.clone();
+                let larger_owner = owner.clone();
+                let size_controls = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        IconButton::new("appearance-font-smaller", IconName::Dash)
+                            .shape(IconButtonShape::Square)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .aria_label("Decrease font size")
+                            .on_click(move |_, window, cx| {
+                                Self::update_appearance(&smaller_owner, window, cx, |preferences| {
+                                    match role {
+                                        AppearanceFontRole::Reading => {
+                                            preferences.reading_font_size =
+                                                Some((current_size - 1.).clamp(
+                                                    MIN_HARNESS_FONT_SIZE,
+                                                    MAX_HARNESS_FONT_SIZE,
+                                                ))
+                                        }
+                                        AppearanceFontRole::Code => {
+                                            preferences.code_font_size =
+                                                Some((current_size - 1.).clamp(
+                                                    MIN_HARNESS_FONT_SIZE,
+                                                    MAX_HARNESS_FONT_SIZE,
+                                                ))
+                                        }
+                                    }
+                                })
                             }),
                     )
-                }))
-            })
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .text_center()
+                            .text_ui_sm(cx)
+                            .text_color(colors.text)
+                            .child(format!("{current_size:.0} px")),
+                    )
+                    .child(
+                        IconButton::new("appearance-font-larger", IconName::Plus)
+                            .shape(IconButtonShape::Square)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .aria_label("Increase font size")
+                            .on_click(move |_, window, cx| {
+                                Self::update_appearance(&larger_owner, window, cx, |preferences| {
+                                    match role {
+                                        AppearanceFontRole::Reading => {
+                                            preferences.reading_font_size =
+                                                Some((current_size + 1.).clamp(
+                                                    MIN_HARNESS_FONT_SIZE,
+                                                    MAX_HARNESS_FONT_SIZE,
+                                                ))
+                                        }
+                                        AppearanceFontRole::Code => {
+                                            preferences.code_font_size =
+                                                Some((current_size + 1.).clamp(
+                                                    MIN_HARNESS_FONT_SIZE,
+                                                    MAX_HARNESS_FONT_SIZE,
+                                                ))
+                                        }
+                                    }
+                                })
+                            }),
+                    );
+
+                let has_custom_typography = {
+                    let preferences = preferred_preferences();
+                    preferences.reading_font_family.is_some()
+                        || preferences.reading_font_size.is_some()
+                        || preferences.code_font_family.is_some()
+                        || preferences.code_font_size.is_some()
+                };
+                let reset_owner = owner.clone();
+                let mut font_rows = Vec::with_capacity(fonts.len());
+                for (index, font) in fonts.into_iter().enumerate() {
+                    let selected = font == current_font;
+                    let font_name = font.to_string();
+                    let owner = owner.clone();
+                    font_rows.push(
+                        div()
+                            .id(("appearance-font", index))
+                            .mx_2()
+                            .mb_1()
+                            .min_h(px(38.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(if selected {
+                                colors.border_selected
+                            } else {
+                                gpui::transparent_black()
+                            })
+                            .bg(if selected {
+                                colors.element_selected
+                            } else {
+                                visuals.raised_surface
+                            })
+                            .hover(|style| style.bg(colors.element_hover))
+                            .cursor_pointer()
+                            .font_family(font.clone())
+                            .text_size(px(current_size.clamp(12., 20.)))
+                            .text_color(colors.text)
+                            .on_click(move |_, window, cx| {
+                                let font_name = font_name.clone();
+                                Self::update_appearance(&owner, window, cx, move |preferences| {
+                                    match role {
+                                        AppearanceFontRole::Reading => {
+                                            preferences.reading_font_family = Some(font_name)
+                                        }
+                                        AppearanceFontRole::Code => {
+                                            preferences.code_font_family = Some(font_name)
+                                        }
+                                    }
+                                });
+                            })
+                            .child(font)
+                            .into_any_element(),
+                    );
+                }
+
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .px_3()
+                            .pt_3()
+                            .pb_2()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(reading_role)
+                            .child(code_role)
+                            .child(div().flex_1())
+                            .child(size_controls),
+                    )
+                    .child(
+                        div()
+                            .mx_2()
+                            .mb_2()
+                            .min_h(px(66.))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(visuals.divider)
+                            .bg(colors.editor_background)
+                            .font_family(current_font.clone())
+                            .text_size(px(current_size))
+                            .text_color(colors.text)
+                            .child(sample),
+                    )
+                    .child(
+                        div()
+                            .px_3()
+                            .pb_1()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_ui_sm(cx)
+                                    .text_color(colors.text_muted)
+                                    .child(format!("Font family · {current_font}")),
+                            )
+                            .child(
+                                Button::new("appearance-reset-typography", "Reset")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Subtle)
+                                    .disabled(!has_custom_typography)
+                                    .on_click(move |_, window, cx| {
+                                        Self::update_appearance(
+                                            &reset_owner,
+                                            window,
+                                            cx,
+                                            HarnessPreferences::reset_typography,
+                                        )
+                                    }),
+                            ),
+                    )
+                    .children(font_rows)
+                    .into_any_element()
+            }
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .justify_end()
+            .bg(gpui::black().opacity(0.12))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.appearance_settings_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(relative(0.38))
+                    .min_w(px(420.))
+                    .max_w(px(560.))
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .border_l_1()
+                    .border_color(visuals.strong_divider)
+                    .bg(visuals.rail)
+                    .shadow_lg()
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .h(px(44.))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .border_b_1()
+                            .border_color(visuals.divider)
+                            .child(
+                                div()
+                                    .px_1()
+                                    .flex_1()
+                                    .text_ui(cx)
+                                    .text_color(colors.text)
+                                    .child("Appearance"),
+                            )
+                            .child(theme_tab)
+                            .child(typography_tab)
+                            .child(
+                                IconButton::new("close-appearance-settings", IconName::Close)
+                                    .shape(IconButtonShape::Square)
+                                    .size(ButtonSize::Default)
+                                    .style(ButtonStyle::Subtle)
+                                    .aria_label("Close appearance settings")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.appearance_settings_open = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("appearance-settings-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&scroll_handle)
+                            .child(body),
+                    )
+                    .vertical_scrollbar_for(&scroll_handle, window, cx),
+            )
             .into_any_element()
     }
 
@@ -5091,6 +5392,10 @@ impl HarnessApp {
             model_menu_handle: PopoverMenuHandle::default(),
             permission_menu_handle: PopoverMenuHandle::default(),
             settings_update_pending: false,
+            appearance_settings_open: false,
+            appearance_settings_section: AppearanceSettingsSection::Themes,
+            appearance_font_role: AppearanceFontRole::Reading,
+            appearance_scroll_handle: ScrollHandle::new(),
             thread_snapshots: ThreadSnapshotCache::default(),
             selected_thread_id: initial_thread_id,
             loaded_thread_updated_at: None,
@@ -12386,6 +12691,9 @@ impl Render for HarnessApp {
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
         let expanded_user_image = self.expanded_user_image.clone();
+        let appearance_settings = self
+            .appearance_settings_open
+            .then(|| self.render_appearance_settings(window, cx));
         let task_body = if self.replay_count.is_some() {
             div()
                 .flex_1()
@@ -13035,6 +13343,9 @@ impl Render for HarnessApp {
                         ),
                 ))
             })
+            .when_some(appearance_settings, |this, appearance_settings| {
+                this.child(deferred(appearance_settings).with_priority(2))
+            })
             .when_some(expanded_user_image, |this, image| {
                 this.child(
                     deferred(
@@ -13093,7 +13404,7 @@ impl Render for HarnessApp {
                                     ),
                             ),
                     )
-                    .with_priority(2),
+                    .with_priority(3),
                 )
             })
     }
