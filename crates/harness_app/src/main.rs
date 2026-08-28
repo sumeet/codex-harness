@@ -133,7 +133,6 @@ const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
 const MAX_COMPOSER_IMAGES: usize = 8;
 const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-const COMPOSER_ATTACHMENT_STRIP_HEIGHT: f32 = 48.;
 #[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
@@ -176,6 +175,12 @@ fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
 /// unrelated roles. Combining them made tool cards adopt the configured code
 /// family and then silently overwrite its size with a fixed UI token.
 trait HarnessStyledTypography: gpui::Styled + Sized {
+    fn font_harness_reading(self, cx: &App) -> Self {
+        let settings = ThemeSettings::get_global(cx);
+        self.font_family(settings.agent_ui_font_family().clone())
+            .text_size(settings.agent_ui_font_size(cx))
+    }
+
     fn font_harness_code(self, cx: &App) -> Self {
         let settings = ThemeSettings::get_global(cx);
         self.font_family(settings.agent_buffer_font_family().clone())
@@ -604,6 +609,34 @@ impl RichNavigationPaint {
             self.cursor_claimed.set(true);
         }
         RichMarkdownNavigationPaint { selections, cursor }
+    }
+}
+
+fn rich_navigation_slice(
+    navigation: &RichNavigationPaint,
+    source_range: Range<usize>,
+    text: &str,
+) -> RichNavigationPaint {
+    let ranges = navigation
+        .ranges
+        .iter()
+        .filter_map(|range| {
+            let start = range.start.max(source_range.start);
+            let end = range.end.min(source_range.end);
+            (start < end).then(|| start - source_range.start..end - source_range.start)
+        })
+        .collect();
+    let head = navigation.head.and_then(|head| {
+        (source_range.start <= head && head <= source_range.end)
+            .then(|| (head - source_range.start).min(text.len()))
+    });
+    RichNavigationPaint {
+        body_text: Arc::from(text),
+        ranges,
+        head,
+        visual: navigation.visual,
+        linewise: navigation.linewise,
+        cursor_claimed: navigation.cursor_claimed.clone(),
     }
 }
 
@@ -2662,6 +2695,7 @@ struct QueuedTurnSubmission {
 
 #[derive(Clone)]
 struct UserImagePreview {
+    semantic_source: model::UserImageSource,
     source: ImageSource,
     dimensions: Option<(u32, u32)>,
 }
@@ -2670,8 +2704,18 @@ fn composer_is_empty(text: &str, image_count: usize) -> bool {
     text.trim().is_empty() && image_count == 0
 }
 
-fn composer_prompt_preview(text: &str) -> String {
-    text.to_owned()
+fn composer_image_token(id: u64) -> String {
+    format!("[Image #{id}]")
+}
+
+fn composer_prompt_preview(input: &[Value]) -> String {
+    input
+        .iter()
+        .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+            Some("text" | "inputText") => block.get("text").and_then(Value::as_str),
+            _ => None,
+        })
+        .collect::<String>()
 }
 
 fn show_submission_optimistically_in_transcript(turn_active: bool) -> bool {
@@ -2734,50 +2778,72 @@ fn queued_submission_image_count(input: &Value) -> usize {
         .count()
 }
 
-fn queued_submission_images(input: &Value) -> Vec<Arc<Image>> {
-    input
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|block| {
-            if !matches!(
-                block.get("type").and_then(Value::as_str),
-                Some("image" | "inputImage")
-            ) {
-                return None;
-            }
-            let url = block
-                .get("url")
-                .or_else(|| block.get("imageUrl"))
-                .and_then(Value::as_str)?;
-            let data_url = url.strip_prefix("data:")?;
-            let (mime_info, encoded) = data_url.split_once(',')?;
-            let (mime_type, encoding) = mime_info.split_once(';')?;
-            if encoding != "base64" {
-                return None;
-            }
-            let format = ImageFormat::from_mime_type(mime_type)?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .ok()?;
-            Some(Arc::new(Image::from_bytes(format, bytes)))
-        })
-        .collect()
+fn queued_submission_image(block: &Value) -> Option<Arc<Image>> {
+    if !matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("image" | "inputImage")
+    ) {
+        return None;
+    }
+    let url = block
+        .get("url")
+        .or_else(|| block.get("imageUrl"))
+        .and_then(Value::as_str)?;
+    let data_url = url.strip_prefix("data:")?;
+    let (mime_info, encoded) = data_url.split_once(',')?;
+    let (mime_type, encoding) = mime_info.split_once(';')?;
+    if encoding != "base64" {
+        return None;
+    }
+    let format = ImageFormat::from_mime_type(mime_type)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
 fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
-    let mut input = Vec::with_capacity(images.len().saturating_add(1));
-    if !text.is_empty() {
-        input.push(json!({"type": "text", "text": text}));
-    }
-    input.extend(images.iter().map(|attachment| {
+    let image_value = |attachment: &ComposerImageAttachment| {
         let mime_type = attachment.image.format().mime_type();
         let encoded = base64::engine::general_purpose::STANDARD.encode(attachment.image.bytes());
         json!({
             "type": "image",
             "url": format!("data:{mime_type};base64,{encoded}")
         })
-    }));
+    };
+    let mut input = Vec::with_capacity(images.len().saturating_mul(2).saturating_add(1));
+    let mut cursor = 0;
+    let mut used = HashSet::new();
+    while cursor < text.len() {
+        let next = images
+            .iter()
+            .filter_map(|attachment| {
+                let token = composer_image_token(attachment.id);
+                text[cursor..]
+                    .find(&token)
+                    .map(|relative| (cursor + relative, token, attachment))
+            })
+            .min_by_key(|(offset, _, _)| *offset);
+        let Some((offset, token, attachment)) = next else {
+            break;
+        };
+        if offset > cursor {
+            input.push(json!({"type": "text", "text": &text[cursor..offset]}));
+        }
+        input.push(image_value(attachment));
+        used.insert(attachment.id);
+        cursor = offset + token.len();
+    }
+    if cursor < text.len() {
+        input.push(json!({"type": "text", "text": &text[cursor..]}));
+    }
+    // Preserve old drafts and queued submissions that predate inline markers.
+    input.extend(
+        images
+            .iter()
+            .filter(|attachment| !used.contains(&attachment.id))
+            .map(image_value),
+    );
     input
 }
 
@@ -2801,12 +2867,14 @@ fn image_dimensions(bytes: &[u8], format: ImageFormat) -> Option<(u32, u32)> {
 fn transcript_user_image_source(source: &model::UserImageSource) -> Option<UserImagePreview> {
     match source {
         model::UserImageSource::LocalPath(path) => Some(UserImagePreview {
+            semantic_source: source.clone(),
             source: PathBuf::from(path).into(),
             dimensions: image::image_dimensions(path).ok(),
         }),
         model::UserImageSource::Url(url) => {
             if !url.starts_with("data:") {
                 return Some(UserImagePreview {
+                    semantic_source: source.clone(),
                     source: url.clone().into(),
                     dimensions: None,
                 });
@@ -2823,6 +2891,7 @@ fn transcript_user_image_source(source: &model::UserImageSource) -> Option<UserI
                 .ok()?;
             let dimensions = image_dimensions(&bytes, format);
             Some(UserImagePreview {
+                semantic_source: source.clone(),
                 source: Arc::new(Image::from_bytes(format, bytes)).into(),
                 dimensions,
             })
@@ -4775,12 +4844,32 @@ impl HarnessApp {
             }
         })
         .detach();
-        cx.subscribe_in(&composer, window, |_, _, _: &LocalEditorChanged, _, cx| {
-            // The native auto-height Editor owns wrapping and intrinsic
-            // row measurement. Re-render controls when text changes, but
-            // never guess its visual height from character counts.
-            cx.notify();
-        })
+        cx.subscribe_in(
+            &composer,
+            window,
+            |this, editor, _: &LocalEditorChanged, window, cx| {
+                // The native auto-height Editor owns wrapping and intrinsic
+                // row measurement. Re-render controls when text changes, but
+                // never guess its visual height from character counts.
+                let text = editor.read(cx).text(cx);
+                this.composer_images
+                    .retain(|attachment| text.contains(&composer_image_token(attachment.id)));
+                let tokens = this
+                    .composer_images
+                    .iter()
+                    .map(|attachment| {
+                        (
+                            composer_image_token(attachment.id),
+                            attachment.image.clone(),
+                        )
+                    })
+                    .collect();
+                editor.update(cx, |editor, cx| {
+                    editor.set_inline_image_tokens(tokens, window, cx)
+                });
+                cx.notify();
+            },
+        )
         .detach();
         cx.subscribe_in(
             &composer,
@@ -6727,6 +6816,7 @@ impl HarnessApp {
         let mut added = 0;
         let mut error = None;
         let mut saw_image = false;
+        let mut inserted_tokens = Vec::new();
         for entry in clipboard.entries() {
             let ClipboardEntry::Image(image) = entry else {
                 continue;
@@ -6749,27 +6839,23 @@ impl HarnessApp {
                 id: self.next_composer_image_id,
                 image: Arc::new(image.clone()),
             });
+            inserted_tokens.push(composer_image_token(self.next_composer_image_id));
             added += 1;
         }
 
         if saw_image {
             self.composer_attachment_error = error;
+            if !inserted_tokens.is_empty() {
+                let marker = gpui::ClipboardItem::new_string(inserted_tokens.join(" "));
+                self.composer
+                    .update(cx, |editor, cx| editor.paste_item(&marker, window, cx));
+            }
             if added > 0 || self.composer_attachment_error.is_some() {
                 cx.notify();
             }
         } else {
             self.composer
                 .update(cx, |editor, cx| editor.paste_item(&clipboard, window, cx));
-        }
-    }
-
-    fn remove_composer_image(&mut self, id: u64, cx: &mut Context<Self>) {
-        let previous_len = self.composer_images.len();
-        self.composer_images
-            .retain(|attachment| attachment.id != id);
-        if self.composer_images.len() != previous_len {
-            self.composer_attachment_error = None;
-            cx.notify();
         }
     }
 
@@ -6792,7 +6878,7 @@ impl HarnessApp {
             return None;
         }
         let input = composer_app_server_input(&text, &self.composer_images);
-        let preview = composer_prompt_preview(&text);
+        let preview = composer_prompt_preview(&input);
         let client_user_message_id = Uuid::new_v4().to_string();
         let key = show_optimistically_in_transcript.then(|| {
             let (index, key) = self
@@ -7168,25 +7254,38 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let queued_text = queued_submission_text(&entry.input);
         let existing = self.composer.read(cx).text(cx);
-        let text = match (existing.trim().is_empty(), queued_text.is_empty()) {
-            (true, _) => queued_text,
-            (_, true) => existing,
-            (false, false) => format!("{existing}\n\n{queued_text}"),
-        };
+        let mut text = existing;
+        if !text.trim().is_empty() {
+            text.push_str("\n\n");
+        }
+        for block in entry.input.as_array().into_iter().flatten() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text" | "inputText") => {
+                    text.push_str(
+                        block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    );
+                }
+                Some("image" | "inputImage")
+                    if self.composer_images.len() < MAX_COMPOSER_IMAGES =>
+                {
+                    let Some(image) = queued_submission_image(block) else {
+                        continue;
+                    };
+                    self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
+                    let id = self.next_composer_image_id;
+                    self.composer_images
+                        .push(ComposerImageAttachment { id, image });
+                    text.push_str(&composer_image_token(id));
+                }
+                _ => {}
+            }
+        }
         self.composer
             .update(cx, |editor, cx| editor.set_text(&text, window, cx));
-        for image in queued_submission_images(&entry.input)
-            .into_iter()
-            .take(MAX_COMPOSER_IMAGES.saturating_sub(self.composer_images.len()))
-        {
-            self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
-            self.composer_images.push(ComposerImageAttachment {
-                id: self.next_composer_image_id,
-                image,
-            });
-        }
         self.focus_composer(window, cx);
     }
 
@@ -9532,7 +9631,7 @@ impl HarnessApp {
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .font_harness_code(cx)
+                                    .font_harness_reading(cx)
                                     .truncate()
                                     .child(clickable_path),
                             )
@@ -9543,7 +9642,8 @@ impl HarnessApp {
                                         additions,
                                         deletions,
                                     )
-                                    .label_size(LabelSize::XSmall)
+                                    .blocks()
+                                    .label_size(LabelSize::Small)
                                     .tooltip(format!(
                                         "{additions} lines added, {deletions} lines removed"
                                     )),
@@ -9654,7 +9754,7 @@ impl HarnessApp {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .font_harness_code(cx)
+                            .font_harness_reading(cx)
                             .truncate()
                             .child(clickable_path),
                     )
@@ -9671,7 +9771,8 @@ impl HarnessApp {
                                         additions,
                                         deletions,
                                     )
-                                    .label_size(LabelSize::XSmall)
+                                    .blocks()
+                                    .label_size(LabelSize::Small)
                                     .tooltip(format!(
                                         "{additions} lines added, {deletions} lines removed"
                                     )),
@@ -10786,42 +10887,137 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_user_image_previews(
-        item_key: String,
+    fn render_ordered_user_content(
+        &mut self,
+        item_key: &str,
+        blocks: Vec<model::UserContentBlock>,
         previews: Vec<UserImagePreview>,
+        search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
+        let mut text_offset = 0;
+        let mut children = Vec::new();
+        for (part_index, block) in blocks.into_iter().enumerate() {
+            match block {
+                model::UserContentBlock::Text(text) => {
+                    let source_range = text_offset..text_offset + text.len();
+                    text_offset += text.len();
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let part_navigation = navigation.map(|navigation| {
+                        rich_navigation_slice(navigation, source_range.clone(), &text)
+                    });
+                    let cache_key = format!("{item_key}:user-text:{part_index}");
+                    let markdown = self.markdown_for(
+                        &cache_key,
+                        &text,
+                        search,
+                        part_navigation.as_ref(),
+                        None,
+                        cx,
+                    );
+                    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                    style.code_block_overflow_x_scroll = true;
+                    if let Some(navigation) = part_navigation.as_ref() {
+                        style.selection_background_color =
+                            rich_navigation_markdown_highlight_background(navigation, cx);
+                    }
+                    let owner = cx.weak_entity();
+                    let logical = text.clone();
+                    let source = text.clone();
+                    let base = source_range.start;
+                    let item_key = item_key.to_owned();
+                    let element = MarkdownElement::new(markdown, style).on_source_click(
+                        move |source_offset, _, window, cx| {
+                            let body_offset = base
+                                + markdown_logical_offset_for_source(
+                                    &logical,
+                                    &source,
+                                    source_offset,
+                                );
+                            owner
+                                .update(cx, |this, cx| {
+                                    if let Some(index) = this
+                                        .model
+                                        .items
+                                        .iter()
+                                        .position(|item| item.key == item_key)
+                                    {
+                                        this.selected_item = index;
+                                        this.visual_anchor = None;
+                                        this.focus_mode = FocusMode::Buffer;
+                                        this.transcript_cursor_initialized = true;
+                                        this.list_state.pause_following_tail();
+                                        this.place_rich_cursor_in_item(
+                                            index,
+                                            body_offset,
+                                            window,
+                                            cx,
+                                        );
+                                        this.transcript_editor.focus_handle(cx).focus(window, cx);
+                                        this.transcript_editor.update(cx, |editor, cx| {
+                                            editor.enter_normal_mode(window, cx)
+                                        });
+                                        cx.notify();
+                                    }
+                                })
+                                .ok();
+                            true
+                        },
+                    );
+                    children.push(div().w_full().min_w_0().child(element).into_any_element());
+                }
+                model::UserContentBlock::Image(source) => {
+                    // Legacy transports may list the image payloads separately
+                    // and refer to them out of order via `[Image #N]` markers.
+                    // Match by semantic source rather than assuming that visual
+                    // order and payload order are identical.
+                    let preview = previews
+                        .iter()
+                        .find(|preview| preview.semantic_source == source)
+                        .cloned();
+                    let Some(preview) = preview else {
+                        continue;
+                    };
+                    let expanded_source = preview.source.clone();
+                    let (width, height) = user_image_preview_size(preview.dimensions);
+                    children.push(
+                        div()
+                            .id(format!("user-image-preview:{item_key}:{part_index}"))
+                            .w(px(width))
+                            .max_w_full()
+                            .h(px(height))
+                            .overflow_hidden()
+                            .rounded_xs()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(colors.editor_background)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.expanded_user_image = Some(expanded_source.clone());
+                                cx.notify();
+                            }))
+                            .child(
+                                gpui::img(preview.source)
+                                    .size_full()
+                                    .object_fit(ObjectFit::ScaleDown),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
         div()
+            .w_full()
             .min_w_0()
             .flex()
-            .flex_wrap()
-            .items_start()
+            .flex_col()
             .gap_2()
-            .children(previews.into_iter().enumerate().map(|(index, preview)| {
-                let expanded_source = preview.source.clone();
-                let (width, height) = user_image_preview_size(preview.dimensions);
-                div()
-                    .id(format!("user-image-preview:{item_key}:{index}"))
-                    .w(px(width))
-                    .h(px(height))
-                    .flex_none()
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.editor_background)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.expanded_user_image = Some(expanded_source.clone());
-                        cx.notify();
-                    }))
-                    .child(
-                        gpui::img(preview.source)
-                            .size_full()
-                            .object_fit(ObjectFit::ScaleDown),
-                    )
-            }))
+            .children(children)
             .into_any_element()
     }
 
@@ -11494,10 +11690,19 @@ impl HarnessApp {
                 .child(styled)
                 .into_any_element()
         });
+        let ordered_user_content = (item.kind == model::TranscriptKind::User)
+            .then(|| self.model.user_content_blocks(&item.key).to_vec())
+            .filter(|blocks| !blocks.is_empty());
+        let ordered_user_previews = self
+            .user_image_previews
+            .get(&item.key)
+            .cloned()
+            .unwrap_or_default();
         let markdown = (narrative
             && item.kind != model::TranscriptKind::Reasoning
             && item.expanded
-            && !item.content.is_empty())
+            && !item.content.is_empty()
+            && ordered_user_content.is_none())
         .then(|| {
             self.markdown_for(
                 &item.key,
@@ -11511,7 +11716,19 @@ impl HarnessApp {
         });
         let inline_turn_status = self.transient_turn_status.clone();
 
-        let body = if request_method.is_some() || !item.expanded || item.content.is_empty() {
+        let body = if request_method.is_some() || !item.expanded {
+            None
+        } else if let Some(blocks) = ordered_user_content {
+            Some(self.render_ordered_user_content(
+                &item.key,
+                blocks,
+                ordered_user_previews,
+                rich_search.as_ref(),
+                rich_navigation.as_ref(),
+                window,
+                cx,
+            ))
+        } else if item.content.is_empty() {
             None
         } else if let Some(markdown) = markdown {
             let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
@@ -11648,12 +11865,6 @@ impl HarnessApp {
                 ),
             })
         };
-        let user_image_previews = (item.kind == model::TranscriptKind::User)
-            .then(|| self.user_image_previews.get(&item.key).cloned())
-            .flatten()
-            .filter(|previews| !previews.is_empty())
-            .map(|previews| Self::render_user_image_previews(item.key.clone(), previews, cx));
-
         let header_search = render_header.then_some(rich_search.as_ref()).flatten();
         // Every expanded Rich structured body is complete and scrollable. If
         // a renderer deliberately has no glyph for a protocol-only offset,
@@ -11706,7 +11917,7 @@ impl HarnessApp {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_ui_sm(cx)
+                    .font_harness_reading(cx)
                     .text_color(colors.text_muted)
                     .child(highlighted_header_title),
             )
@@ -11779,9 +11990,6 @@ impl HarnessApp {
         });
 
         let content = if narrative {
-            let has_user_text = item.kind != model::TranscriptKind::User
-                || !item.content.trim().is_empty()
-                || raw_visible;
             let narrative_panel = div()
                 .w_full()
                 .flex()
@@ -11819,18 +12027,7 @@ impl HarnessApp {
                 .when_some(raw, |this, raw| this.child(raw))
                 .into_any_element();
 
-            if item.kind == model::TranscriptKind::User && user_image_previews.is_some() {
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .when(has_user_text, |this| this.child(narrative_panel))
-                    .when_some(user_image_previews, |this, previews| this.child(previews))
-                    .into_any_element()
-            } else {
-                narrative_panel
-            }
+            narrative_panel
         } else {
             let flush_tool_surface = matches!(
                 item.kind,
@@ -12067,7 +12264,6 @@ impl Render for HarnessApp {
             } else {
                 None
             };
-        let composer_images = self.composer_images.clone();
         let turn_active = self.turn_active();
         self.sync_turn_tail_indicator(turn_active);
         let list_state = self.list_state.clone();
@@ -12562,66 +12758,6 @@ impl Render for HarnessApp {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .when(!composer_images.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .id("composer-attachments")
-                                        .h(px(COMPOSER_ATTACHMENT_STRIP_HEIGHT))
-                                        .flex_none()
-                                        .py_1()
-                                        .flex()
-                                        .overflow_x_scroll()
-                                        .items_center()
-                                        .gap_1()
-                                        .children(composer_images.into_iter().map(|attachment| {
-                                            let attachment_id = attachment.id;
-                                            div()
-                                                .id(("composer-image", attachment_id))
-                                                .relative()
-                                                .size(px(40.))
-                                                .flex_none()
-                                                .overflow_hidden()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(colors.border_variant)
-                                                .bg(colors.element_background)
-                                                .child(
-                                                    gpui::img(attachment.image)
-                                                        .size_full()
-                                                        .object_fit(ObjectFit::Cover),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .absolute()
-                                                        .top(px(2.))
-                                                        .right(px(2.))
-                                                        .rounded_sm()
-                                                        .bg(colors.editor_background)
-                                                        .child(
-                                                            IconButton::new(
-                                                                (
-                                                                    "remove-composer-image",
-                                                                    attachment_id,
-                                                                ),
-                                                                IconName::Close,
-                                                            )
-                                                            .shape(IconButtonShape::Square)
-                                                            .size(ButtonSize::Compact)
-                                                            .style(ButtonStyle::Subtle)
-                                                            .aria_label("Remove attached image")
-                                                            .on_click(cx.listener(
-                                                                move |this, _, _, cx| {
-                                                                    this.remove_composer_image(
-                                                                        attachment_id,
-                                                                        cx,
-                                                                    )
-                                                                },
-                                                            )),
-                                                        ),
-                                                )
-                                        })),
-                                )
-                            })
                             .child(
                                 div()
                                     .relative()
@@ -16292,7 +16428,25 @@ mod tests {
             input[1],
             json!({"type": "image", "url": "data:image/png;base64,AQID"})
         );
-        assert_eq!(composer_prompt_preview("what is this?"), "what is this?");
+        assert_eq!(composer_prompt_preview(&input), "what is this?");
+    }
+
+    #[test]
+    fn composer_image_markers_preserve_multimodal_order() {
+        let images = vec![ComposerImageAttachment {
+            id: 7,
+            image: Arc::new(Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3])),
+        }];
+        let input = composer_app_server_input("before [Image #7] after", &images);
+        assert_eq!(
+            input,
+            vec![
+                json!({"type": "text", "text": "before "}),
+                json!({"type": "image", "url": "data:image/png;base64,AQID"}),
+                json!({"type": "text", "text": " after"}),
+            ]
+        );
+        assert_eq!(composer_prompt_preview(&input), "before  after");
     }
 
     #[test]
@@ -16302,6 +16456,7 @@ mod tests {
         ));
 
         let Some(UserImagePreview {
+            semantic_source,
             source: ImageSource::Image(image),
             dimensions,
         }) = source
@@ -16311,6 +16466,10 @@ mod tests {
         assert_eq!(image.format(), ImageFormat::Png);
         assert_eq!(image.bytes(), &[1, 2, 3]);
         assert_eq!(dimensions, None);
+        assert_eq!(
+            semantic_source,
+            model::UserImageSource::Url("data:image/png;base64,AQID".into())
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub struct DiffStat {
     added: usize,
     removed: usize,
     label_size: LabelSize,
+    blocks: bool,
     tooltip: Option<SharedString>,
 }
 
@@ -18,12 +19,20 @@ impl DiffStat {
             added,
             removed,
             label_size: LabelSize::Small,
+            blocks: false,
             tooltip: None,
         }
     }
 
     pub fn label_size(mut self, label_size: LabelSize) -> Self {
         self.label_size = label_size;
+        self
+    }
+
+    /// Present the two counts as quiet, GitHub-style semantic badges. This is
+    /// useful in dense file headers where color alone is easy to overlook.
+    pub fn blocks(mut self) -> Self {
+        self.blocks = true;
         self
     }
 
@@ -34,23 +43,37 @@ impl DiffStat {
 }
 
 impl RenderOnce for DiffStat {
-    fn render(self, _: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let tooltip = self.tooltip;
         let added = self.added.to_formatted_string(&Locale::en);
         let removed = self.removed.to_formatted_string(&Locale::en);
+        let success = cx.theme().status().success;
+        let error = cx.theme().status().error;
 
         h_flex()
             .id(self.id)
-            .gap_1()
+            .gap_0p5()
             .child(
-                Label::new(format!("+\u{2009}{added}"))
-                    .color(Color::Success)
-                    .size(self.label_size),
+                div()
+                    .when(self.blocks, |this| {
+                        this.px_1().py_0p5().rounded_xs().bg(success.opacity(0.12))
+                    })
+                    .child(
+                        Label::new(format!("+\u{2009}{added}"))
+                            .color(Color::Success)
+                            .size(self.label_size),
+                    ),
             )
             .child(
-                Label::new(format!("\u{2012}\u{2009}{removed}"))
-                    .color(Color::Error)
-                    .size(self.label_size),
+                div()
+                    .when(self.blocks, |this| {
+                        this.px_1().py_0p5().rounded_xs().bg(error.opacity(0.12))
+                    })
+                    .child(
+                        Label::new(format!("\u{2012}\u{2009}{removed}"))
+                            .color(Color::Error)
+                            .size(self.label_size),
+                    ),
             )
             .when_some(tooltip, |this, tooltip| {
                 this.tooltip(Tooltip::text(tooltip))

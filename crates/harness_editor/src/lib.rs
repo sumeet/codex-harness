@@ -14,7 +14,7 @@ use editor::{
     Addon, Bias, Editor, EditorEvent, Inlay, InlayHighlight, RowExt as _, RowHighlightOptions,
     RowOverlayOptions, SelectionEffects,
     display_map::{
-        BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
+        BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
         FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
     },
     scroll::Autoscroll,
@@ -22,8 +22,8 @@ use editor::{
 use gpui::{
     AnyView, App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter,
     FocusHandle, Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla,
-    IntoElement, KeyBinding, KeyContext, Pixels, Render, SharedString, TextStyle,
-    TextStyleRefinement, WeakEntity, Window, actions, div, point, prelude::*, px,
+    Image, IntoElement, KeyBinding, KeyContext, ObjectFit, Pixels, Render, SharedString, TextStyle,
+    TextStyleRefinement, WeakEntity, Window, actions, div, img, point, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -40,7 +40,7 @@ use theme_settings::ThemeSettings;
 use tree_sitter::{Query, StreamingIterator as _};
 use ui::{
     Color, DiffStat, Disclosure, Icon, IconName, IconSize, Label, LabelSize,
-    prelude::{ActiveTheme, LabelCommon as _, StyledTypography as _},
+    prelude::{ActiveTheme, LabelCommon as _},
 };
 
 pub use editor::actions::{LocalNavigationBack, LocalNavigationForward};
@@ -232,6 +232,7 @@ pub struct LocalEditor {
     editor: Entity<Editor>,
     typography_profile: TranscriptTypographyProfile,
     composer_keys: bool,
+    inline_attachment_creases: Vec<CreaseId>,
 }
 
 /// Emitted whenever a host-owned local editor's Buffer text changes.
@@ -283,6 +284,7 @@ impl LocalEditor {
             editor,
             typography_profile,
             composer_keys: true,
+            inline_attachment_creases: Vec::new(),
         }
     }
 
@@ -311,6 +313,7 @@ impl LocalEditor {
             // the same Reading/Mono choice without replacing the Editor.
             typography_profile: TranscriptTypographyProfile::Reading,
             composer_keys: false,
+            inline_attachment_creases: Vec::new(),
         }
     }
 
@@ -346,6 +349,60 @@ impl LocalEditor {
     ) {
         self.editor
             .update(cx, |editor, cx| editor.paste_item(item, window, cx));
+    }
+
+    /// Replace attachment marker bytes with line-height image chips while
+    /// leaving those bytes in the real Buffer. Anchors, undo, deletion, Vim,
+    /// and submission ordering therefore all share one source of truth.
+    pub fn set_inline_image_tokens(
+        &mut self,
+        tokens: Vec<(String, Arc<Image>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = std::mem::take(&mut self.inline_attachment_creases);
+        self.inline_attachment_creases = self.editor.update(cx, |editor, cx| {
+            editor.remove_creases(previous, cx);
+            let text = editor.text(cx);
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let mut creases = Vec::new();
+            for (token, image) in tokens {
+                for (start, _) in text.match_indices(&token) {
+                    let range = clipped_anchor_range(&snapshot, start..start + token.len());
+                    let image = image.clone();
+                    let placeholder = FoldPlaceholder {
+                        constrain_width: false,
+                        merge_adjacent: false,
+                        render: Arc::new(move |_fold_id, _range, cx| {
+                            let colors = cx.theme().colors();
+                            div()
+                                .h(px(24.))
+                                .px_0p5()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .rounded_xs()
+                                .border_1()
+                                .border_color(colors.border_variant)
+                                .bg(colors.element_background)
+                                .child(
+                                    img(image.clone())
+                                        .size(px(20.))
+                                        .rounded_xs()
+                                        .object_fit(ObjectFit::Cover),
+                                )
+                                .child(Label::new("Image").size(LabelSize::Small))
+                                .into_any_element()
+                        }),
+                        ..Default::default()
+                    };
+                    creases.push(Crease::simple(range, placeholder));
+                }
+            }
+            let ids = editor.insert_creases(creases.clone(), cx);
+            editor.fold_creases(creases, false, window, cx);
+            ids
+        });
     }
 
     pub fn set_masked(&mut self, masked: bool, cx: &mut Context<Self>) {
@@ -2099,8 +2156,12 @@ fn native_diff_file_header_block(
                     div()
                         .min_w_0()
                         .flex_1()
-                        .font_buffer(cx.app)
-                        .text_ui_sm(cx.app)
+                        .font_family(
+                            ThemeSettings::get_global(cx.app)
+                                .agent_ui_font_family()
+                                .clone(),
+                        )
+                        .text_size(ThemeSettings::get_global(cx.app).agent_ui_font_size(cx.app))
                         .truncate()
                         .child(path),
                 )
@@ -2109,7 +2170,8 @@ fn native_diff_file_header_block(
                     |this| {
                         this.child(
                             DiffStat::new(stat_id, header.additions, header.deletions)
-                                .label_size(LabelSize::XSmall),
+                                .blocks()
+                                .label_size(LabelSize::Small),
                         )
                     },
                 )

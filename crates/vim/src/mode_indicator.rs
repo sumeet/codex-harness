@@ -172,14 +172,17 @@ impl Render for ModeIndicator {
                         .when(!self.compact && bg_color != system_transparent, |el| {
                             el.px_2()
                         })
-                        // match with other icons at the bottom that use default buttons
-                        .h(ButtonSize::Default.rems())
+                        // The compact composer variant is a line of status
+                        // text, not a button. Let its UI-label metrics define
+                        // the row instead of reserving a button-sized box.
+                        .when(!self.compact, |el| el.h(ButtonSize::Default.rems()))
+                        .when(self.compact, |el| el.py_0p5())
                         .justify_center()
                         .when(!self.compact, |el| el.rounded_sm().bg(bg_color))
                         .child(
                             Label::new(mode)
                                 .size(if self.compact {
-                                    LabelSize::XSmall
+                                    LabelSize::Small
                                 } else {
                                     LabelSize::Small
                                 })

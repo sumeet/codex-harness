@@ -1497,11 +1497,20 @@ pub enum UserImageSource {
     LocalPath(String),
 }
 
+/// The original multimodal ordering of a user message. Rich presentation uses
+/// this instead of flattening all text first and appending an image gallery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UserContentBlock {
+    Text(String),
+    Image(UserImageSource),
+}
+
 #[derive(Default)]
 pub struct TranscriptModel {
     pub items: Vec<TranscriptItem>,
     item_indices: HashMap<String, usize>,
     user_image_sources: HashMap<String, Vec<UserImageSource>>,
+    user_content_blocks: HashMap<String, Vec<UserContentBlock>>,
     pub raw_events: Vec<RawEvent>,
     pub telemetry: SessionTelemetry,
     pub current_turn_id: Option<String>,
@@ -1537,6 +1546,7 @@ impl TranscriptModel {
         self.items.clear();
         self.item_indices.clear();
         self.user_image_sources.clear();
+        self.user_content_blocks.clear();
         self.raw_events.clear();
         self.telemetry = SessionTelemetry::default();
         self.next_raw_sequence = 0;
@@ -1651,6 +1661,7 @@ impl TranscriptModel {
         fresh.load_thread(thread);
         let mut fresh_items = std::mem::take(&mut fresh.items);
         let fresh_user_image_sources = std::mem::take(&mut fresh.user_image_sources);
+        let fresh_user_content_blocks = std::mem::take(&mut fresh.user_content_blocks);
         let new_len = fresh_items.len();
         let prefix_compatible = old_len <= new_len
             && self
@@ -1672,6 +1683,7 @@ impl TranscriptModel {
             }
             self.items = fresh_items;
             self.user_image_sources = fresh_user_image_sources;
+            self.user_content_blocks = fresh_user_content_blocks;
             self.rebuild_item_indices();
             return ThreadRefreshOutcome {
                 dirty: (0..new_len).collect(),
@@ -1698,6 +1710,7 @@ impl TranscriptModel {
         }
         self.items.extend(appended);
         self.user_image_sources = fresh_user_image_sources;
+        self.user_content_blocks = fresh_user_content_blocks;
         self.rebuild_item_indices();
 
         ThreadRefreshOutcome {
@@ -1789,6 +1802,7 @@ impl TranscriptModel {
     ) -> (usize, String) {
         let key = local_user_key(client_user_message_id);
         let image_sources = user_image_sources_from_blocks(content_blocks);
+        let content_projection = user_content_blocks_from_blocks(content_blocks);
         let index = self.push_without_splice(TranscriptItem {
             key: key.clone(),
             protocol_id: None,
@@ -1806,6 +1820,10 @@ impl TranscriptModel {
         });
         if !image_sources.is_empty() {
             self.user_image_sources.insert(key.clone(), image_sources);
+        }
+        if !content_projection.is_empty() {
+            self.user_content_blocks
+                .insert(key.clone(), content_projection);
         }
         (index, key)
     }
@@ -1840,6 +1858,13 @@ impl TranscriptModel {
 
     pub fn user_image_sources(&self, item_key: &str) -> &[UserImageSource] {
         self.user_image_sources
+            .get(item_key)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn user_content_blocks(&self, item_key: &str) -> &[UserContentBlock] {
+        self.user_content_blocks
             .get(item_key)
             .map(Vec::as_slice)
             .unwrap_or_default()
@@ -2452,6 +2477,9 @@ impl TranscriptModel {
         let incoming_user_image_sources = (string_at(&value, "/type") == Some("userMessage"))
             .then(|| user_image_sources_from_value(value.get("content").unwrap_or(&Value::Null)))
             .unwrap_or_default();
+        let incoming_user_content_blocks = (string_at(&value, "/type") == Some("userMessage"))
+            .then(|| user_content_blocks_from_value(value.get("content").unwrap_or(&Value::Null)))
+            .unwrap_or_default();
         let is_reasoning = string_at(&value, "/type") == Some("reasoning");
         if is_reasoning && let Some(turn_id) = turn_id {
             let aggregate_key = format!("turn-reasoning:{turn_id}");
@@ -2488,6 +2516,12 @@ impl TranscriptModel {
                     self.user_image_sources
                         .insert(protocol_id.clone(), incoming_user_image_sources);
                 }
+                if incoming_user_content_blocks.is_empty() {
+                    self.user_content_blocks.remove(&protocol_id);
+                } else {
+                    self.user_content_blocks
+                        .insert(protocol_id.clone(), incoming_user_content_blocks);
+                }
             }
             return Some(index);
         }
@@ -2508,11 +2542,16 @@ impl TranscriptModel {
             let optimistic_key = self.items[index].key.clone();
             self.item_indices.remove(&optimistic_key);
             self.user_image_sources.remove(&optimistic_key);
+            self.user_content_blocks.remove(&optimistic_key);
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
             if !incoming_user_image_sources.is_empty() {
                 self.user_image_sources
                     .insert(self.items[index].key.clone(), incoming_user_image_sources);
+            }
+            if !incoming_user_content_blocks.is_empty() {
+                self.user_content_blocks
+                    .insert(self.items[index].key.clone(), incoming_user_content_blocks);
             }
             return Some(index);
         }
@@ -2521,6 +2560,10 @@ impl TranscriptModel {
         if !incoming_user_image_sources.is_empty() {
             self.user_image_sources
                 .insert(item_key, incoming_user_image_sources);
+        }
+        if !incoming_user_content_blocks.is_empty() {
+            self.user_content_blocks
+                .insert(self.items[index].key.clone(), incoming_user_content_blocks);
         }
         Some(index)
     }
@@ -3907,31 +3950,16 @@ fn web_search_title(raw: &Value) -> String {
 }
 
 fn render_user_content(content: &Value) -> String {
-    let blocks = content.as_array().map(Vec::as_slice).unwrap_or_default();
-    let image_count = blocks
-        .iter()
-        .filter(|block| matches!(string_at(block, "/type"), Some("localImage" | "image")))
-        .count();
-    let rendered = blocks
-        .iter()
-        .filter_map(|block| match string_at(block, "/type") {
-            Some("text") => string_at(block, "/text").map(ToOwned::to_owned),
-            // Images retain their semantic source separately so Rich mode can
-            // paint the attachment itself. A fabricated text placeholder
-            // would duplicate the visual and makes optimistic reconciliation
-            // depend on presentation wording.
-            Some("localImage") | Some("image") => None,
-            Some("localAudio") | Some("audio") => Some("Attached audio".into()),
-            Some("mention") | Some("skill") => {
-                string_at(block, "/path").map(|path| format!("Mention: {path}"))
-            }
-            _ => Some(pretty_json(block)),
+    user_content_blocks_from_value(content)
+        .into_iter()
+        .filter_map(|block| match block {
+            UserContentBlock::Text(text) => Some(text),
+            UserContentBlock::Image(_) => None,
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    strip_structured_image_labels(&rendered, image_count)
+        .collect()
 }
 
+#[cfg(test)]
 fn strip_structured_image_labels(content: &str, image_count: usize) -> String {
     if image_count == 0 {
         return content.to_owned();
@@ -3979,15 +4007,122 @@ fn user_image_sources_from_blocks(content: &[Value]) -> Vec<UserImageSource> {
     content
         .iter()
         .filter_map(|block| match string_at(block, "/type") {
-            Some("image") => {
-                string_at(block, "/url").map(|url| UserImageSource::Url(url.to_owned()))
-            }
+            Some("image" | "inputImage" | "input_image") => block
+                .get("url")
+                .or_else(|| block.get("imageUrl"))
+                .or_else(|| block.get("image_url"))
+                .and_then(Value::as_str)
+                .map(|url| UserImageSource::Url(url.to_owned())),
             Some("localImage") => {
                 string_at(block, "/path").map(|path| UserImageSource::LocalPath(path.to_owned()))
             }
             _ => None,
         })
         .collect()
+}
+
+fn user_content_blocks_from_value(content: &Value) -> Vec<UserContentBlock> {
+    content
+        .as_array()
+        .map(Vec::as_slice)
+        .map(user_content_blocks_from_blocks)
+        .unwrap_or_default()
+}
+
+fn user_content_blocks_from_blocks(content: &[Value]) -> Vec<UserContentBlock> {
+    let raw = content
+        .iter()
+        .filter_map(|block| match string_at(block, "/type") {
+            Some("text" | "inputText" | "input_text") => string_at(block, "/text")
+                .filter(|text| !text.is_empty())
+                .map(|text| UserContentBlock::Text(text.to_owned())),
+            Some("image" | "inputImage" | "input_image") => block
+                .get("url")
+                .or_else(|| block.get("imageUrl"))
+                .or_else(|| block.get("image_url"))
+                .and_then(Value::as_str)
+                .map(|url| UserContentBlock::Image(UserImageSource::Url(url.to_owned()))),
+            Some("localImage") => string_at(block, "/path")
+                .map(|path| UserContentBlock::Image(UserImageSource::LocalPath(path.to_owned()))),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    normalize_structured_image_markers(raw)
+}
+
+fn normalize_structured_image_markers(blocks: Vec<UserContentBlock>) -> Vec<UserContentBlock> {
+    let images = blocks
+        .iter()
+        .filter_map(|block| match block {
+            UserContentBlock::Image(source) => Some(source.clone()),
+            UserContentBlock::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return blocks;
+    }
+    let has_markers = blocks.iter().any(|block| {
+        let UserContentBlock::Text(text) = block else {
+            return false;
+        };
+        (1..=images.len()).any(|number| text.contains(&format!("[Image #{number}]")))
+    });
+    if !has_markers {
+        return blocks;
+    }
+
+    let mut projected = Vec::new();
+    let mut used = HashSet::new();
+    for block in blocks {
+        let UserContentBlock::Text(text) = block else {
+            continue;
+        };
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let next = (1..=images.len())
+                .filter_map(|number| {
+                    let marker = format!("[Image #{number}]");
+                    text[cursor..]
+                        .find(&marker)
+                        .map(|offset| (cursor + offset, marker, number - 1))
+                })
+                .min_by_key(|(offset, _, _)| *offset);
+            let Some((offset, marker, image_index)) = next else {
+                break;
+            };
+            if offset > cursor {
+                projected.push(UserContentBlock::Text(text[cursor..offset].to_owned()));
+            }
+            projected.push(UserContentBlock::Image(images[image_index].clone()));
+            used.insert(image_index);
+            cursor = offset + marker.len();
+            // A marker on its own line replaces that line; keep the preceding
+            // newline as the text/image boundary, but do not fabricate a
+            // second blank line after the image.
+            let marker_starts_line = offset == 0 || text[..offset].ends_with('\n');
+            if marker_starts_line {
+                if text[cursor..].starts_with('\n') {
+                    cursor += 1;
+                } else {
+                    cursor += text[cursor..]
+                        .bytes()
+                        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+                        .count();
+                }
+            }
+        }
+        if cursor < text.len() {
+            projected.push(UserContentBlock::Text(text[cursor..].to_owned()));
+        }
+    }
+    projected.extend(
+        images
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| !used.contains(index))
+            .map(|(_, image)| UserContentBlock::Image(image)),
+    );
+    projected
 }
 
 fn render_hook_prompt(fragments: &Value) -> String {
@@ -6996,6 +7131,11 @@ mod tests {
             render_user_content(&content),
             "what is this?\nkeep this line"
         );
+        assert!(matches!(
+            user_content_blocks_from_value(&content).as_slice(),
+            [UserContentBlock::Image(_), UserContentBlock::Text(text)]
+                if text == "what is this?\nkeep this line"
+        ));
         assert_eq!(
             strip_structured_image_labels("[Image #2] literal reference", 1),
             "[Image #2] literal reference"
@@ -7008,6 +7148,24 @@ mod tests {
             strip_structured_image_labels("[Image #1] literal text", 0),
             "[Image #1] literal text"
         );
+    }
+
+    #[test]
+    fn user_content_blocks_preserve_direct_multimodal_order() {
+        let content = json!([
+            {"type": "text", "text": "before "},
+            {"type": "image", "url": "data:image/png;base64,AQID"},
+            {"type": "text", "text": " after"}
+        ]);
+        assert!(matches!(
+            user_content_blocks_from_value(&content).as_slice(),
+            [
+                UserContentBlock::Text(before),
+                UserContentBlock::Image(_),
+                UserContentBlock::Text(after)
+            ] if before == "before " && after == " after"
+        ));
+        assert_eq!(render_user_content(&content), "before  after");
     }
 
     #[test]
