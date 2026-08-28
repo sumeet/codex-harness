@@ -50,7 +50,10 @@ pub use vim::{
     MoveToPrevious as VimWordPrevious, MoveToPreviousMatch as VimPreviousMatch,
 };
 
-actions!(harness_editor, [SubmitComposer, InsertComposerNewline]);
+actions!(
+    harness_editor,
+    [SubmitComposer, SteerComposer, InsertComposerNewline]
+);
 
 pub fn init(cx: &mut App) -> anyhow::Result<()> {
     editor::init(cx);
@@ -109,6 +112,11 @@ pub fn init(cx: &mut App) -> anyhow::Result<()> {
         KeyBinding::new(
             "ctrl-enter",
             SubmitComposer,
+            Some("HarnessComposer && Editor"),
+        ),
+        KeyBinding::new(
+            "ctrl-shift-enter",
+            SteerComposer,
             Some("HarnessComposer && Editor"),
         ),
         KeyBinding::new(
@@ -243,8 +251,13 @@ pub struct LocalEditorChanged;
 /// winning before the host can submit the prompt.
 pub struct LocalEditorSubmitted;
 
+/// Emitted when the user explicitly asks to add the draft to the active turn
+/// instead of persisting it for the next turn.
+pub struct LocalEditorSteered;
+
 impl EventEmitter<LocalEditorChanged> for LocalEditor {}
 impl EventEmitter<LocalEditorSubmitted> for LocalEditor {}
+impl EventEmitter<LocalEditorSteered> for LocalEditor {}
 
 struct ComposerMarkdownMonospaceGeometryHighlight;
 
@@ -509,6 +522,12 @@ impl Render for LocalEditor {
                 if this.composer_keys {
                     cx.stop_propagation();
                     cx.emit(LocalEditorSubmitted);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SteerComposer, _, cx| {
+                if this.composer_keys {
+                    cx.stop_propagation();
+                    cx.emit(LocalEditorSteered);
                 }
             }))
             .on_action(cx.listener(|this, _: &InsertComposerNewline, window, cx| {
@@ -5033,7 +5052,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_owns_submit_and_newline_actions_on_its_editor_dispatch_path() {
+    fn composer_owns_submit_steer_and_newline_actions_on_its_editor_dispatch_path() {
         let production = include_str!("lib.rs")
             .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(production, _)| production)
@@ -5042,6 +5061,8 @@ mod tests {
         for key in ["enter", "ctrl-enter"] {
             assert!(production.contains(&format!("\"{key}\"")));
         }
+        assert!(production.contains("\"ctrl-shift-enter\""));
+        assert!(production.contains("cx.emit(LocalEditorSteered)"));
         for key in ["shift-enter", "alt-enter", "ctrl-j"] {
             assert!(production.contains(&format!("\"{key}\",")));
         }

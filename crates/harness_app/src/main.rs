@@ -23,11 +23,11 @@ use gpui::{
 };
 use gpui_platform::application;
 use harness_editor::{
-    LocalEditor, LocalEditorChanged, LocalEditorSubmitted, ModeIndicator, TranscriptEditor,
-    TranscriptReplacement, TranscriptSelectionChanged, TranscriptSelectionSnapshot,
-    TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch,
-    VimWordNext, VimWordPrevious, shell_capture_priority, shell_capture_ranges,
-    syntax_highlights_for_path,
+    LocalEditor, LocalEditorChanged, LocalEditorSteered, LocalEditorSubmitted, ModeIndicator,
+    TranscriptEditor, TranscriptReplacement, TranscriptSelectionChanged,
+    TranscriptSelectionSnapshot, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
+    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious, shell_capture_priority,
+    shell_capture_ranges, syntax_highlights_for_path,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -2693,6 +2693,25 @@ struct QueuedTurnSubmission {
     input: Value,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueOperation {
+    Removing,
+    Editing,
+    AddingToResponse,
+    Interrupting,
+}
+
+impl QueueOperation {
+    fn progress_label(self) -> &'static str {
+        match self {
+            Self::Removing => "Removing…",
+            Self::Editing => "Opening draft…",
+            Self::AddingToResponse => "Adding to response…",
+            Self::Interrupting => "Interrupting…",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct UserImagePreview {
     semantic_source: model::UserImageSource,
@@ -3316,7 +3335,7 @@ struct HarnessApp {
     turn_start_pending: bool,
     queue_start_pending: bool,
     queue_refresh_pending: bool,
-    queue_operation_pending: HashSet<String>,
+    queue_operations: HashMap<String, QueueOperation>,
     queued_turns: VecDeque<QueuedTurnSubmission>,
     server_task: Task<()>,
     turn_task: Task<()>,
@@ -4230,34 +4249,35 @@ impl HarnessApp {
                 .into_any_element();
         }
 
-        let (id, icon, label): (&'static str, IconName, SharedString) =
-            if state == ComposerActionState::Queue {
-                (
-                    "queue-turn",
-                    IconName::QueueMessage,
-                    "Queue prompt after the current response".into(),
-                )
-            } else {
-                (
-                    "send-turn",
-                    IconName::Send,
-                    if self.loading_thread {
-                        "Wait for task history to finish loading".into()
-                    } else if self.attaching_thread {
-                        "Wait for the live task connection".into()
-                    } else if self.settings_update_pending {
-                        "Wait for task settings to finish updating".into()
-                    } else if self.thread_read_only_reason.is_some() {
-                        "This task is open read-only".into()
-                    } else if self.client.is_none() && self.replay_count.is_none() {
-                        "Reconnect to Codex before sending".into()
-                    } else if composer_empty {
-                        "Type a prompt to send".into()
-                    } else {
-                        "Send prompt".into()
-                    },
-                )
-            };
+        let (id, icon, label): (&'static str, IconName, SharedString) = if state
+            == ComposerActionState::Queue
+        {
+            (
+                "queue-turn",
+                IconName::QueueMessage,
+                "Queue after this response · Ctrl-Shift-Enter adds to the active response".into(),
+            )
+        } else {
+            (
+                "send-turn",
+                IconName::Send,
+                if self.loading_thread {
+                    "Wait for task history to finish loading".into()
+                } else if self.attaching_thread {
+                    "Wait for the live task connection".into()
+                } else if self.settings_update_pending {
+                    "Wait for task settings to finish updating".into()
+                } else if self.thread_read_only_reason.is_some() {
+                    "This task is open read-only".into()
+                } else if self.client.is_none() && self.replay_count.is_none() {
+                    "Reconnect to Codex before sending".into()
+                } else if composer_empty {
+                    "Type a prompt to send".into()
+                } else {
+                    "Send prompt".into()
+                },
+            )
+        };
         let tooltip = label.clone();
 
         IconButton::new(id, icon)
@@ -4287,7 +4307,7 @@ impl HarnessApp {
             format!("{queue_count} queued prompts").into()
         };
         let active_turn = self.model.current_turn_id.is_some();
-        let pending = self.queue_operation_pending.clone();
+        let operations = self.queue_operations.clone();
         let weak = cx.weak_entity();
 
         Some(
@@ -4325,7 +4345,8 @@ impl HarnessApp {
                         .children(self.queued_turns.iter().enumerate().map(|(index, entry)| {
                             let client_id = entry.client_user_message_id.clone();
                             let queue_ready = entry.id.is_some();
-                            let operation_pending = pending.contains(&client_id);
+                            let operation = operations.get(&client_id).copied();
+                            let operation_pending = operation.is_some();
                             let preview = queued_submission_preview(&entry.input);
                             let image_count = queued_submission_image_count(&entry.input);
                             let weak_edit = weak.clone();
@@ -4373,18 +4394,33 @@ impl HarnessApp {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .child(
-                                            IconButton::new(
-                                                ("edit-queued-prompt", index),
-                                                IconName::Pencil,
-                                            )
-                                            .shape(IconButtonShape::Square)
-                                            .size(ButtonSize::Compact)
-                                            .style(ButtonStyle::Subtle)
-                                            .disabled(!queue_ready || operation_pending)
-                                            .aria_label("Edit queued prompt")
-                                            .on_click(
-                                                move |_, window, cx| {
+                                        .when(!queue_ready && operation.is_none(), |this| {
+                                            this.child(SpinnerLabel::new().size(LabelSize::Small))
+                                                .child(
+                                                    Label::new("Saving…")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                        })
+                                        .when_some(operation, |this, operation| {
+                                            this.child(SpinnerLabel::new().size(LabelSize::Small))
+                                                .child(
+                                                    Label::new(operation.progress_label())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                        })
+                                        .when(queue_ready && !operation_pending, |this| {
+                                            this.child(
+                                                IconButton::new(
+                                                    ("edit-queued-prompt", index),
+                                                    IconName::Pencil,
+                                                )
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .aria_label("Edit queued prompt")
+                                                .on_click(move |_, window, cx| {
                                                     let client_id = client_id.clone();
                                                     weak_edit
                                                         .update(cx, |this, cx| {
@@ -4393,40 +4429,53 @@ impl HarnessApp {
                                                             )
                                                         })
                                                         .ok();
-                                                },
-                                            ),
-                                        )
-                                        .when(active_turn, |this| {
-                                            let client_id = entry.client_user_message_id.clone();
-                                            this.child(
-                                                Button::new(
-                                                    ("steer-queued-prompt", index),
-                                                    "Steer",
-                                                )
-                                                .size(ButtonSize::Compact)
-                                                .style(ButtonStyle::Subtle)
-                                                .disabled(!queue_ready || operation_pending)
-                                                .on_click(move |_, _, cx| {
-                                                    weak_steer
-                                                        .update(cx, |this, cx| {
-                                                            this.steer_queued_turn(
-                                                                client_id.clone(),
-                                                                cx,
-                                                            )
-                                                        })
-                                                        .ok();
                                                 }),
                                             )
-                                        })
-                                        .child(
-                                            Button::new(("send-queued-prompt", index), "Send now")
+                                            .when(active_turn, |this| {
+                                                let client_id =
+                                                    entry.client_user_message_id.clone();
+                                                this.child(
+                                                    Button::new(
+                                                        ("steer-queued-prompt", index),
+                                                        "Add to response",
+                                                    )
+                                                    .size(ButtonSize::Compact)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .tooltip(Tooltip::text(
+                                                        "Add to the active response at its next input boundary · Ctrl-Shift-Enter for a draft",
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        weak_steer
+                                                            .update(cx, |this, cx| {
+                                                                this.steer_queued_turn(
+                                                                    client_id.clone(),
+                                                                    cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                    }),
+                                                )
+                                            })
+                                            .child(
+                                                Button::new(
+                                                    ("send-queued-prompt", index),
+                                                    if active_turn {
+                                                        "Interrupt & run"
+                                                    } else {
+                                                        "Start now"
+                                                    },
+                                                )
                                                 .size(ButtonSize::Compact)
                                                 .style(if index == 0 {
                                                     ButtonStyle::Outlined
                                                 } else {
                                                     ButtonStyle::Subtle
                                                 })
-                                                .disabled(!queue_ready || operation_pending)
+                                                .tooltip(Tooltip::text(if active_turn {
+                                                    "Stop the active response and start this prompt as a new turn"
+                                                } else {
+                                                    "Start this queued prompt now"
+                                                }))
                                                 .on_click({
                                                     let client_id =
                                                         entry.client_user_message_id.clone();
@@ -4441,19 +4490,17 @@ impl HarnessApp {
                                                             .ok();
                                                     }
                                                 }),
-                                        )
-                                        .child(
-                                            IconButton::new(
-                                                ("remove-queued-prompt", index),
-                                                IconName::Trash,
                                             )
-                                            .shape(IconButtonShape::Square)
-                                            .size(ButtonSize::Compact)
-                                            .style(ButtonStyle::Subtle)
-                                            .disabled(!queue_ready || operation_pending)
-                                            .aria_label("Remove queued prompt")
-                                            .on_click(
-                                                {
+                                            .child(
+                                                IconButton::new(
+                                                    ("remove-queued-prompt", index),
+                                                    IconName::Trash,
+                                                )
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .aria_label("Remove queued prompt")
+                                                .on_click({
                                                     let client_id =
                                                         entry.client_user_message_id.clone();
                                                     move |_, _, cx| {
@@ -4466,9 +4513,9 @@ impl HarnessApp {
                                                             })
                                                             .ok();
                                                     }
-                                                },
-                                            ),
-                                        ),
+                                                }),
+                                            )
+                                        }),
                                 )
                         })),
                 )
@@ -4878,6 +4925,12 @@ impl HarnessApp {
         )
         .detach();
         cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, _: &LocalEditorSteered, window, cx| this.steer(window, cx),
+        )
+        .detach();
+        cx.subscribe_in(
             &search_editor,
             window,
             |this, editor, _: &LocalEditorChanged, window, cx| match this.vim_command_line {
@@ -5111,7 +5164,7 @@ impl HarnessApp {
             turn_start_pending: false,
             queue_start_pending: false,
             queue_refresh_pending: false,
-            queue_operation_pending: HashSet::new(),
+            queue_operations: HashMap::new(),
             queued_turns: VecDeque::new(),
             server_task: Task::ready(()),
             turn_task: Task::ready(()),
@@ -5504,7 +5557,7 @@ impl HarnessApp {
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
-        self.queue_operation_pending.clear();
+        self.queue_operations.clear();
         self.settings_update_pending = false;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
@@ -6492,7 +6545,7 @@ impl HarnessApp {
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
-        self.queue_operation_pending.clear();
+        self.queue_operations.clear();
         self.queued_turns.clear();
         self.selected_thread_id = Some(thread_id.clone());
         self.loaded_thread_updated_at = None;
@@ -6773,7 +6826,7 @@ impl HarnessApp {
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
-        self.queue_operation_pending.clear();
+        self.queue_operations.clear();
         self.queued_turns.clear();
         let old_len = self.model.items.len();
         self.model.clear();
@@ -7220,18 +7273,17 @@ impl HarnessApp {
         ) else {
             return;
         };
-        if !self
-            .queue_operation_pending
-            .insert(client_user_message_id.clone())
-        {
+        if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
+        self.queue_operations
+            .insert(client_user_message_id.clone(), QueueOperation::Removing);
         cx.spawn(async move |this, cx| {
             let result = client
                 .delete_queued_turn(&thread_id, &queued_submission_id)
                 .await;
             _ = this.update(cx, |this, cx| {
-                this.queue_operation_pending.remove(&client_user_message_id);
+                this.queue_operations.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
@@ -7310,18 +7362,17 @@ impl HarnessApp {
         ) else {
             return;
         };
-        if !self
-            .queue_operation_pending
-            .insert(client_user_message_id.clone())
-        {
+        if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
+        self.queue_operations
+            .insert(client_user_message_id.clone(), QueueOperation::Editing);
         cx.spawn_in(window, async move |this, cx| {
             let result = client
                 .delete_queued_turn(&thread_id, &queued_submission_id)
                 .await;
             _ = this.update_in(cx, |this, window, cx| {
-                this.queue_operation_pending.remove(&client_user_message_id);
+                this.queue_operations.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
@@ -7356,12 +7407,13 @@ impl HarnessApp {
         ) else {
             return;
         };
-        if !self
-            .queue_operation_pending
-            .insert(client_user_message_id.clone())
-        {
+        if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
+        self.queue_operations.insert(
+            client_user_message_id.clone(),
+            QueueOperation::AddingToResponse,
+        );
         cx.spawn(async move |this, cx| {
             let deleted = client
                 .delete_queued_turn(&thread_id, &queued_submission_id)
@@ -7389,7 +7441,7 @@ impl HarnessApp {
                     .await;
             }
             _ = this.update(cx, |this, cx| {
-                this.queue_operation_pending.remove(&client_user_message_id);
+                this.queue_operations.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
@@ -7424,12 +7476,11 @@ impl HarnessApp {
         ) else {
             return;
         };
-        if !self
-            .queue_operation_pending
-            .insert(client_user_message_id.clone())
-        {
+        if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
+        self.queue_operations
+            .insert(client_user_message_id.clone(), QueueOperation::Interrupting);
         // A turn/completed notification may arrive between interrupting the
         // current turn and starting this particular queued submission. Keep
         // the ordinary queue drain from racing the explicit "Send now" path.
@@ -7447,7 +7498,7 @@ impl HarnessApp {
             .await;
             _ = this.update(cx, |this, cx| {
                 this.queue_start_pending = false;
-                this.queue_operation_pending.remove(&client_user_message_id);
+                this.queue_operations.remove(&client_user_message_id);
                 match result {
                     Ok(response) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
@@ -7477,6 +7528,28 @@ impl HarnessApp {
             self.send(window, cx);
             return;
         };
+        let draft = self.composer.read(cx).text(cx);
+        if composer_is_empty(&draft, self.composer_images.len()) {
+            // Ctrl-Shift-Enter immediately after queueing is a useful, stable
+            // promotion gesture: add the newest acknowledged queued prompt to
+            // the active response. Never guess while its queue write is still
+            // pending—the row's Saving state makes that visible.
+            if let Some(entry) = self
+                .queued_turns
+                .iter()
+                .rev()
+                .find(|entry| {
+                    entry.id.is_some()
+                        && !self
+                            .queue_operations
+                            .contains_key(&entry.client_user_message_id)
+                })
+                .cloned()
+            {
+                self.steer_queued_turn(entry.client_user_message_id, cx);
+            }
+            return;
+        }
         let Some(submission) = self.take_composer_submission(true, window, cx) else {
             return;
         };
@@ -7493,7 +7566,7 @@ impl HarnessApp {
         else {
             return;
         };
-        if let Some(index) = self.model.set_status_for_key(&key, "steering") {
+        if let Some(index) = self.model.set_status_for_key(&key, "adding to response") {
             self.list_state.splice(index..index + 1, 1);
         }
         cx.spawn(async move |this, cx| {
@@ -11648,6 +11721,14 @@ impl HarnessApp {
             && !item.expanded
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
+        let pending_user_delivery: Option<SharedString> = (item.kind
+            == model::TranscriptKind::User)
+            .then(|| match item.status.as_deref() {
+                Some("sending") => Some("Sending…".into()),
+                Some("adding to response") => Some("Adding to response…".into()),
+                _ => None,
+            })
+            .flatten();
         let visible_status = item.display_status().map(ToOwned::to_owned);
         let header_title = transcript_item_header_title(&item).to_owned();
         let has_collapsible_content = !item.content.trim().is_empty();
@@ -12024,6 +12105,18 @@ impl HarnessApp {
                 })
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
+                .when_some(pending_user_delivery, |this, label| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_ui_xs(cx)
+                            .text_color(colors.text_muted)
+                            .child(SpinnerLabel::new().size(LabelSize::Small))
+                            .child(label),
+                    )
+                })
                 .when_some(raw, |this, raw| this.child(raw))
                 .into_any_element();
 
