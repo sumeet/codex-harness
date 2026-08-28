@@ -3678,9 +3678,7 @@ impl HarnessApp {
         };
         let weak = cx.weak_entity();
         let trigger = Button::new("model-effort-selector-trigger", trigger_label)
-            .size(ButtonSize::Compact)
             .label_size(LabelSize::Small)
-            .style(ButtonStyle::Subtle)
             .color(trigger_color)
             .start_icon(
                 Icon::new(IconName::ThinkingMode)
@@ -3800,9 +3798,7 @@ impl HarnessApp {
         };
         let weak = cx.weak_entity();
         let trigger = Button::new("permission-selector-trigger", label)
-            .size(ButtonSize::Compact)
             .label_size(LabelSize::Small)
-            .style(ButtonStyle::Subtle)
             .color(trigger_color)
             .start_icon(
                 Icon::new(IconName::Lock)
@@ -3893,6 +3889,7 @@ impl HarnessApp {
             div()
                 .id("context-window-usage")
                 .size(px(18.))
+                .mr_1()
                 .flex_none()
                 .flex()
                 .items_center()
@@ -3907,10 +3904,11 @@ impl HarnessApp {
         )
     }
 
-    /// Match Zed's compact composer action: one stable control changes meaning
-    /// with the turn and draft state instead of growing into a row of textual
-    /// Queue/Stop buttons. Stopping remains the primary action while the draft
-    /// is empty; as soon as there is a draft, the same location queues it.
+    /// Match Zed's composer terminal action: one stable, normally sized control
+    /// changes meaning with the turn and draft state instead of growing into a
+    /// row of textual Queue/Stop buttons. Stopping remains the primary action
+    /// while the draft is empty; as soon as there is a draft, the same location
+    /// queues it.
     fn render_composer_action(
         &self,
         turn_active: bool,
@@ -3921,9 +3919,7 @@ impl HarnessApp {
         let state = composer_action_state(turn_active, composer_empty);
         if state == ComposerActionState::Stop {
             return IconButton::new("stop-turn", IconName::Stop)
-                .shape(IconButtonShape::Square)
-                .size(ButtonSize::Compact)
-                .style(ButtonStyle::Subtle)
+                .style(ButtonStyle::Tinted(TintColor::Error))
                 .icon_color(Color::Error)
                 .aria_label("Stop the current response")
                 .tooltip(Tooltip::text("Stop response"))
@@ -3962,9 +3958,7 @@ impl HarnessApp {
         let tooltip = label.clone();
 
         IconButton::new(id, icon)
-            .shape(IconButtonShape::Square)
-            .size(ButtonSize::Compact)
-            .style(ButtonStyle::Subtle)
+            .style(ButtonStyle::Filled)
             .disabled(send_blocked)
             .icon_color(if send_blocked {
                 Color::Muted
