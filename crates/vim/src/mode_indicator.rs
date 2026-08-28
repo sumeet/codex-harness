@@ -12,6 +12,7 @@ pub struct ModeIndicator {
     vim: Option<WeakEntity<Vim>>,
     pending_keys: Option<String>,
     vim_subscription: Option<Subscription>,
+    compact: bool,
 }
 
 impl ModeIndicator {
@@ -50,7 +51,18 @@ impl ModeIndicator {
             vim: None,
             pending_keys: None,
             vim_subscription: None,
+            compact: false,
         }
+    }
+
+    /// Construct the same native Vim mode indicator for a compact embedded
+    /// toolbar instead of Zed's global status bar. Transparent themes normally
+    /// add `--` framing so a free-floating status item remains legible; an
+    /// embedded toolbar already supplies that visual context.
+    pub fn compact(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self::new(window, cx);
+        this.compact = true;
+        this
     }
 
     fn update_pending_keys(&mut self, window: &mut Window, cx: &App) {
@@ -123,6 +135,7 @@ impl Render for ModeIndicator {
             crate::state::Mode::HelixNormal => colors.vim_helix_normal_background,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_background,
         };
+        let compact_on_transparent = self.compact && bg_color == system_transparent;
 
         let (label, mode): (SharedString, Option<SharedString>) = if let Some(label) = status_label
         {
@@ -139,7 +152,7 @@ impl Render for ModeIndicator {
                 .pending_keys
                 .as_ref()
                 .unwrap_or(&current_operators_description);
-            let mode = if bg_color != system_transparent {
+            let mode = if bg_color != system_transparent || self.compact {
                 mode_str.into()
             } else {
                 format!("-- {} --", mode_str).into()
@@ -173,7 +186,8 @@ impl Render for ModeIndicator {
                                     bg_color != system_transparent
                                         && vim_mode_text != system_transparent,
                                     |el| el.color(Color::Custom(vim_mode_text)),
-                                ),
+                                )
+                                .when(compact_on_transparent, |el| el.color(Color::Muted)),
                         ),
                 )
             })
