@@ -19,6 +19,13 @@ use pulldown_cmark::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const HARNESS_MARKDOWN_OPTIONS: MarkdownOptions = MarkdownOptions::ENABLE_STRIKETHROUGH
+    .union(MarkdownOptions::ENABLE_TABLES)
+    .union(MarkdownOptions::ENABLE_TASKLISTS)
+    .union(MarkdownOptions::ENABLE_FOOTNOTES)
+    .union(MarkdownOptions::ENABLE_MATH)
+    .union(MarkdownOptions::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS);
+
 /// Return the smallest UTF-8-safe replacement that transforms `old` into `new`.
 /// Keeping this in the protocol/document crate lets transcript streaming tests
 /// stay independent from GPUI and the Zed editor dependency graph.
@@ -769,11 +776,7 @@ fn selectable_markdown_text_with_link_destinations(
     include_link_destinations: bool,
     source_faithful_replacements: bool,
 ) -> SelectableBodyProjection {
-    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
-        | MarkdownOptions::ENABLE_TABLES
-        | MarkdownOptions::ENABLE_TASKLISTS
-        | MarkdownOptions::ENABLE_FOOTNOTES
-        | MarkdownOptions::ENABLE_MATH;
+    let options = HARNESS_MARKDOWN_OPTIONS;
     let mut output = String::with_capacity(source.len());
     let mut semantic_spans = Vec::new();
     let mut open_semantic_spans = Vec::new();
@@ -995,11 +998,7 @@ fn selectable_markdown_text_with_link_destinations(
 /// selectable, while inline and fenced code can use monospace metrics without
 /// replacing any source bytes with ornamental UI.
 pub fn markdown_monospace_source_ranges(source: &str) -> Vec<Range<usize>> {
-    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
-        | MarkdownOptions::ENABLE_TABLES
-        | MarkdownOptions::ENABLE_TASKLISTS
-        | MarkdownOptions::ENABLE_FOOTNOTES
-        | MarkdownOptions::ENABLE_MATH;
+    let options = HARNESS_MARKDOWN_OPTIONS;
     let mut ranges = MarkdownParser::new_ext(source, options)
         .into_offset_iter()
         .filter_map(|(event, range)| {
@@ -1036,11 +1035,7 @@ pub fn markdown_monospace_source_ranges(source: &str) -> Vec<Range<usize>> {
 /// editors need that effective range in order to make the otherwise-hidden
 /// state visible while the user is typing.
 pub fn markdown_block_quote_source_ranges(source: &str) -> Vec<Range<usize>> {
-    let options = MarkdownOptions::ENABLE_STRIKETHROUGH
-        | MarkdownOptions::ENABLE_TABLES
-        | MarkdownOptions::ENABLE_TASKLISTS
-        | MarkdownOptions::ENABLE_FOOTNOTES
-        | MarkdownOptions::ENABLE_MATH;
+    let options = HARNESS_MARKDOWN_OPTIONS;
     let mut ranges = MarkdownParser::new_ext(source, options)
         .into_offset_iter()
         .filter_map(|(event, range)| {
@@ -5138,12 +5133,12 @@ mod tests {
     }
 
     #[test]
-    fn markdown_block_quote_ranges_expose_lazy_commonmark_continuations() {
+    fn markdown_block_quote_ranges_require_explicit_markers() {
         let source = "> quoted\nlazy continuation\n\noutside";
         let ranges = markdown_block_quote_source_ranges(source);
 
         assert_eq!(ranges.len(), 1);
-        assert_eq!(&source[ranges[0].clone()], "> quoted\nlazy continuation");
+        assert_eq!(&source[ranges[0].clone()], "> quoted");
     }
 
     #[test]

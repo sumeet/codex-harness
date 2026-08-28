@@ -9494,7 +9494,18 @@ impl HarnessApp {
             .markdown_cache
             .entry(key.to_string())
             .or_insert_with(|| {
-                let entity = cx.new(|cx| Markdown::new(source.to_string().into(), None, None, cx));
+                let entity = cx.new(|cx| {
+                    Markdown::new_with_options(
+                        source.to_string().into(),
+                        None,
+                        None,
+                        markdown::MarkdownOptions {
+                            require_explicit_block_quote_markers: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
                 CachedMarkdown {
                     source: source.to_string(),
                     entity,

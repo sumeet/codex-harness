@@ -228,11 +228,28 @@ fn is_br_tag(html: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("br"))
 }
 
+#[cfg(test)]
 pub(crate) fn parse_markdown_with_options(
     text: &str,
     parse_html: bool,
     parse_heading_slugs: bool,
     parse_metadata_blocks: bool,
+) -> ParsedMarkdownData {
+    parse_markdown_with_options_and_extensions(
+        text,
+        parse_html,
+        parse_heading_slugs,
+        parse_metadata_blocks,
+        Options::empty(),
+    )
+}
+
+pub(crate) fn parse_markdown_with_options_and_extensions(
+    text: &str,
+    parse_html: bool,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+    extensions: Options,
 ) -> ParsedMarkdownData {
     let mut state = ParseState::default();
     let mut language_names = HashSet::default();
@@ -249,7 +266,8 @@ pub(crate) fn parse_markdown_with_options(
         PARSE_OPTIONS.union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
     } else {
         PARSE_OPTIONS
-    };
+    }
+    .union(extensions);
     let mut parser = Parser::new_ext(text, parse_options)
         .into_offset_iter()
         .peekable();
@@ -1008,7 +1026,8 @@ mod tests {
     const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
     const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
         .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+        .union(Options::ENABLE_WIKILINKS)
+        .union(Options::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS);
 
     #[test]
     fn all_options_considered() {
@@ -1019,6 +1038,31 @@ mod tests {
                 .union(CONDITIONAL_OPTIONS)
                 .union(UNWANTED_OPTIONS),
             Options::all()
+        );
+    }
+
+    #[test]
+    fn explicit_block_quote_markers_are_a_rendering_extension() {
+        let source = "> quoted\noutside";
+
+        let commonmark = parse_markdown_with_options(source, false, false, false);
+        assert_eq!(commonmark.root_block_starts, vec![0]);
+
+        let strict = parse_markdown_with_options_and_extensions(
+            source,
+            false,
+            false,
+            false,
+            Options::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS,
+        );
+        assert_eq!(strict.root_block_starts, vec![0, 9]);
+        assert_eq!(
+            strict
+                .events
+                .iter()
+                .filter(|(_, event)| matches!(event, Start(BlockQuote(_))))
+                .count(),
+            1
         );
     }
 

@@ -43,11 +43,13 @@ use gpui::{
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
 use parser::TaskListMarkerState;
+#[cfg(test)]
+use parser::parse_markdown_with_options;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    parse_markdown_with_options_and_extensions,
 };
-use pulldown_cmark::{Alignment, BlockQuoteKind};
+use pulldown_cmark::{Alignment, BlockQuoteKind, Options as PulldownOptions};
 use sum_tree::TreeMap;
 use theme::SyntaxTheme;
 use ui::{Checkbox, CopyButton, ScrollAxes, Scrollbars, Tooltip, WithScrollbar, prelude::*};
@@ -497,6 +499,10 @@ pub struct MarkdownOptions {
     pub render_mermaid_diagrams: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
+    /// Opt into Harness's explicit block-quote dialect: an unmarked line
+    /// following `> quoted` begins an ordinary paragraph instead of lazily
+    /// continuing the quote.
+    pub require_explicit_block_quote_markers: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1259,6 +1265,8 @@ impl Markdown {
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
+        let require_explicit_block_quote_markers =
+            self.options.require_explicit_block_quote_markers;
         let language_registry = self.language_registry.clone();
         let fallback = self.fallback_code_block_language.clone();
 
@@ -1281,11 +1289,17 @@ impl Markdown {
                 );
             }
 
-            let parsed = parse_markdown_with_options(
+            let parser_extensions = if require_explicit_block_quote_markers {
+                PulldownOptions::REQUIRE_EXPLICIT_BLOCK_QUOTE_MARKERS
+            } else {
+                PulldownOptions::empty()
+            };
+            let parsed = parse_markdown_with_options_and_extensions(
                 &source,
                 should_parse_html,
                 should_parse_heading_slugs,
                 should_parse_metadata_blocks,
+                parser_extensions,
             );
             let events = parsed.events;
             let language_names = parsed.language_names;
