@@ -7172,6 +7172,7 @@ impl HarnessApp {
     fn show_started_queued_submission(
         &mut self,
         submission: &QueuedTurnSubmission,
+        delivery_status: &str,
         cx: &mut Context<Self>,
     ) {
         let input = submission.input.as_array().cloned().unwrap_or_default();
@@ -7188,7 +7189,7 @@ impl HarnessApp {
             return;
         };
 
-        self.model.set_status_for_key(&key, "sent");
+        self.model.set_status_for_key(&key, delivery_status);
         self.dirty_image_surfaces.insert(key);
         self.list_state.splice(index..index, 1);
         if was_following_tail {
@@ -7221,7 +7222,7 @@ impl HarnessApp {
                     Ok(response) => {
                         if let Some(queued_entry) = queued_entry.as_ref() {
                             this.remove_queued_entry_locally(&queued_entry.client_user_message_id);
-                            this.show_started_queued_submission(queued_entry, cx);
+                            this.show_started_queued_submission(queued_entry, "sent", cx);
                         }
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
@@ -7446,7 +7447,11 @@ impl HarnessApp {
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
-                        this.show_started_queued_submission(&entry, cx);
+                        // The steer RPC only confirms that the active turn accepted
+                        // this input. Keep the optimistic user message visibly pending
+                        // until the authoritative userMessage item with the same
+                        // clientUserMessageId replaces it at an input boundary.
+                        this.show_started_queued_submission(&entry, "awaiting incorporation", cx);
                         this.error = None;
                     }
                     Err(error) => {
@@ -7503,7 +7508,7 @@ impl HarnessApp {
                 match result {
                     Ok(response) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
-                        this.show_started_queued_submission(&entry, cx);
+                        this.show_started_queued_submission(&entry, "sent", cx);
                         this.model.current_turn_id = response
                             .pointer("/turn/id")
                             .and_then(Value::as_str)
@@ -7577,7 +7582,14 @@ impl HarnessApp {
             _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(_) => {
-                        if let Some(index) = this.model.set_status_for_key(&key, "sent") {
+                        // Success means app-server accepted the steer, not that the
+                        // active model turn has incorporated it yet. item/started or
+                        // item/completed will echo clientUserMessageId and replace
+                        // this optimistic item once that boundary is actually crossed.
+                        if let Some(index) = this
+                            .model
+                            .set_status_for_key(&key, "awaiting incorporation")
+                        {
                             this.list_state.splice(index..index + 1, 1);
                         }
                         this.error = None;
@@ -11726,6 +11738,7 @@ impl HarnessApp {
             .then(|| match item.status.as_deref() {
                 Some("sending") => Some("Sending…".into()),
                 Some("adding to response") => Some("Adding to response…".into()),
+                Some("awaiting incorporation") => Some("Waiting to join response…".into()),
                 _ => None,
             })
             .flatten();

@@ -7019,7 +7019,7 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_user_message_reconciles_by_client_id_before_content() {
+    fn started_user_message_reconciles_pending_steer_by_client_id_before_content() {
         let mut model = TranscriptModel::default();
         let optimistic_blocks = json!([
             {"type": "text", "text": "local rendering can differ"},
@@ -7033,7 +7033,7 @@ mod tests {
 
         model.apply_batch(
             vec![Event::Notification {
-                method: "item/completed".into(),
+                method: "item/started".into(),
                 params: json!({
                     "threadId": "thread-1",
                     "turnId": "turn-1",
@@ -7058,6 +7058,7 @@ mod tests {
             Some("server-message-1")
         );
         assert_eq!(model.items[0].content, "canonical rendering");
+        assert_eq!(model.items[0].status.as_deref(), Some("in progress"));
         assert_eq!(
             model.user_image_sources("server-message-1"),
             &[UserImageSource::Url("data:image/png;base64,AQID".into())]
