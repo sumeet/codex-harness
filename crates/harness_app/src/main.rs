@@ -1696,52 +1696,53 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
 
 fn render_command_visual_status(
     status: model::CommandExecutionStatus,
-    item_index: usize,
-    _cx: &App,
-) -> AnyElement {
-    let (icon, color, tooltip): (IconName, Color, SharedString) = match status {
-        model::CommandExecutionStatus::Running => (
-            IconName::LoadCircle,
-            Color::Muted,
-            "Command is still running".into(),
-        ),
-        model::CommandExecutionStatus::Succeeded => (
-            IconName::Check,
-            Color::Success,
-            "Command completed successfully".into(),
-        ),
-        model::CommandExecutionStatus::Failed(Some(code)) => (
-            IconName::Close,
-            Color::Error,
-            format!("Command exited with code {code}").into(),
-        ),
-        model::CommandExecutionStatus::Failed(None) => {
-            (IconName::Close, Color::Error, "Command failed".into())
+    cx: &App,
+) -> Option<(f32, AnyElement)> {
+    match status {
+        model::CommandExecutionStatus::Running => {
+            return Some((
+                44.,
+                div()
+                    .size(px(20.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::LoadCircle)
+                            .size(IconSize::Small)
+                            .color(Color::Accent)
+                            .with_rotate_animation(2),
+                    )
+                    .into_any_element(),
+            ));
         }
-    };
-
-    if status == model::CommandExecutionStatus::Running {
-        div()
-            .size(px(18.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(
-                Icon::new(icon)
-                    .size(IconSize::Small)
-                    .color(color)
-                    .with_rotate_animation(2),
-            )
-            .into_any_element()
-    } else {
-        IconButton::new(("command-status", item_index), icon)
-            .style(ButtonStyle::Transparent)
-            .size(ButtonSize::Compact)
-            .icon_size(IconSize::Small)
-            .icon_color(color)
-            .tooltip(Tooltip::text(tooltip))
-            .into_any_element()
+        // A successful command settles back into the ordinary card state.
+        // Besides matching Zed's terminal tool treatment, rendering nothing
+        // here lets the command reclaim the status gutter completely.
+        model::CommandExecutionStatus::Succeeded => return None,
+        model::CommandExecutionStatus::Failed(exit_code) => {
+            let label = exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "failed".to_owned());
+            let reserved_width = if exit_code.is_some() { 78. } else { 68. };
+            Some((
+                reserved_width,
+                div()
+                    .h(px(20.))
+                    .px_1()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .rounded_sm()
+                    .font_harness_code(cx)
+                    .text_ui_xs(cx)
+                    .text_color(cx.theme().status().error)
+                    .bg(cx.theme().status().error_background.opacity(0.42))
+                    .child(label)
+                    .into_any_element(),
+            ))
+        }
     }
 }
 
@@ -10362,35 +10363,34 @@ impl HarnessApp {
                     logical_range,
                     Some(command_owner.clone()),
                 );
+                let visual_status = first_command_row
+                    .then_some(command_status)
+                    .flatten()
+                    .and_then(|status| render_command_visual_status(status, cx));
+                let status_padding = visual_status
+                    .as_ref()
+                    .map(|(reserved_width, _)| *reserved_width)
+                    .unwrap_or(22.);
                 div()
                     .w_full()
                     .min_w_0()
                     .min_h(harness_code_row_height(cx))
                     .relative()
                     .whitespace_normal()
-                    .when(first_command_row, |this| {
-                        this.pr(if command_status.is_some() {
-                            px(44.)
-                        } else {
-                            px(22.)
-                        })
-                    })
+                    .when(first_command_row, |this| this.pr(px(status_padding)))
                     .child(clickable)
-                    .when_some(
-                        first_command_row.then_some(command_status).flatten(),
-                        |this, status| {
-                            this.child(
-                                div()
-                                    .absolute()
-                                    .top(px(0.))
-                                    // The outer card's disclosure owns the
-                                    // rightmost 20 px. Status sits immediately
-                                    // before it, as in Zed's terminal header.
-                                    .right(px(21.))
-                                    .child(render_command_visual_status(status, index, cx)),
-                            )
-                        },
-                    )
+                    .when_some(visual_status, |this, (_, status)| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top(px(0.))
+                                // The outer card's disclosure owns the
+                                // rightmost 20 px. Status sits immediately
+                                // before it, as in Zed's terminal header.
+                                .right(px(21.))
+                                .child(status),
+                        )
+                    })
                     .when_some(cursor_marker, |this, marker| this.child(marker))
                     .into_any_element()
             })
@@ -14146,6 +14146,7 @@ fn load_harness_keymaps(cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AssetSource as _;
 
     fn cached_thread(id: &str, updated_at: i64) -> CodexThread {
         CodexThread {
@@ -14156,6 +14157,42 @@ mod tests {
             updated_at,
             turns: Vec::new(),
         }
+    }
+
+    #[test]
+    fn bundled_theme_assets_deserialize_with_unique_names() {
+        let assets = Assets;
+        let mut theme_names = HashSet::new();
+
+        for path in assets.list("themes/").expect("list bundled themes") {
+            if !path.ends_with(".json") {
+                continue;
+            }
+            let bytes = assets
+                .load(&path)
+                .expect("load bundled theme")
+                .expect("bundled theme exists");
+            let family = theme_settings::deserialize_user_theme(bytes.as_ref())
+                .unwrap_or_else(|error| panic!("invalid bundled theme {path}: {error:#}"));
+            for theme in family.themes {
+                assert!(
+                    theme_names.insert(theme.name.clone()),
+                    "duplicate bundled theme name: {}",
+                    theme.name
+                );
+            }
+        }
+
+        for expected in [
+            "Catppuccin Mocha",
+            "Tokyo Night Moon",
+            "Rosé Pine",
+            "Kanagawa Wave",
+            "Nord Dark",
+        ] {
+            assert!(theme_names.contains(expected), "missing theme {expected}");
+        }
+        assert_eq!(theme_names.len(), 31);
     }
 
     #[test]
