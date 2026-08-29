@@ -17596,6 +17596,11 @@ fn main() {
 
     application().with_assets(Assets).run(move |cx| {
         cx.set_app_identity("dev.harness.app", "Harness");
+        // Standalone Harness does not construct Zed's production Client,
+        // which ordinarily installs the process-wide HTTP implementation.
+        // Register the same native reqwest stack explicitly so catalog and
+        // extension downloads never fall through to GPUI's NoHttpClient.
+        cx.set_http_client(Arc::new(reqwest_client::ReqwestClient::new()));
         release_channel::init_test(
             semver::Version::new(0, 1, 0),
             release_channel::ReleaseChannel::Dev,

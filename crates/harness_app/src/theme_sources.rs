@@ -413,4 +413,14 @@ mod tests {
         assert!(validate_extension_id("has/slash").is_err());
         assert!(validate_extension_id("").is_err());
     }
+
+    #[test]
+    #[ignore = "contacts the live Zed extension catalog"]
+    fn native_http_client_fetches_the_live_zed_catalog() {
+        let client: Arc<dyn HttpClient> = Arc::new(reqwest_client::ReqwestClient::new());
+        let catalog = futures::executor::block_on(fetch_theme_catalog(client))
+            .expect("fetch live Zed theme catalog");
+        assert!(catalog.len() > 100, "unexpectedly small catalog");
+        assert!(catalog.iter().any(|entry| entry.id == "catppuccin"));
+    }
 }

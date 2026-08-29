@@ -8348,6 +8348,7 @@ dependencies = [
  "log",
  "markdown",
  "release_channel",
+ "reqwest_client",
  "semver",
  "serde",
  "serde_json",
