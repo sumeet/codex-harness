@@ -50,6 +50,7 @@ mod image_surface;
 mod palette;
 mod performance;
 mod request_surface;
+mod theme_sources;
 mod visual_theme;
 
 use image_surface::{
@@ -151,6 +152,7 @@ const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
 const PERFORMANCE_SCROLL_SETTLE_DURATION: Duration = Duration::from_millis(1_600);
 const PERFORMANCE_STATUS_DURATION: Duration = Duration::from_secs(5);
+const THEME_CATALOG_PAGE_SIZE: usize = 100;
 // Keep the most recently visited tasks warm. Two entries made ordinary
 // back-and-forth navigation fall through to a full app-server history request
 // far too often, while eight still keeps the cache deliberately bounded.
@@ -3270,6 +3272,13 @@ struct HarnessApp {
     appearance_settings_section: AppearanceSettingsSection,
     appearance_font_role: AppearanceFontRole,
     appearance_scroll_handle: ScrollHandle,
+    theme_catalog_filter: Entity<ui_input::InputField>,
+    theme_catalog: Vec<theme_sources::ThemeCatalogEntry>,
+    theme_catalog_loading: bool,
+    theme_catalog_error: Option<SharedString>,
+    theme_catalog_visible: usize,
+    theme_packs_installing: HashSet<String>,
+    installed_theme_packs: HashSet<String>,
     thread_snapshots: ThreadSnapshotCache,
     selected_thread_id: Option<String>,
     loaded_thread_updated_at: Option<i64>,
@@ -3383,6 +3392,7 @@ enum ComposerActionState {
 enum AppearanceSettingsSection {
     #[default]
     Themes,
+    Explore,
     Typography,
 }
 
@@ -3619,6 +3629,73 @@ impl HarnessApp {
         }
     }
 
+    fn ensure_theme_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.theme_catalog_loading || !self.theme_catalog.is_empty() {
+            return;
+        }
+        self.theme_catalog_loading = true;
+        self.theme_catalog_error = None;
+        let client = cx.http_client();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = theme_sources::fetch_theme_catalog(client).await;
+            _ = this.update(cx, |this, cx| {
+                this.theme_catalog_loading = false;
+                match result {
+                    Ok(catalog) => {
+                        this.theme_catalog = catalog;
+                        this.theme_catalog_error = None;
+                    }
+                    Err(error) => {
+                        this.theme_catalog_error =
+                            Some(format!("Could not load Zed themes: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn install_catalog_theme(&mut self, extension_id: String, cx: &mut Context<Self>) {
+        if !self.theme_packs_installing.insert(extension_id.clone()) {
+            return;
+        }
+        self.theme_catalog_error = None;
+        let client = cx.http_client();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = theme_sources::install_theme_pack(client, &extension_id).await;
+            _ = this.update(cx, |this, cx| {
+                this.theme_packs_installing.remove(&extension_id);
+                match result {
+                    Ok(installed) => {
+                        let report =
+                            theme_sources::load_external_themes(&theme::ThemeRegistry::global(cx));
+                        for error in report.errors {
+                            log::warn!("could not load installed theme: {error}");
+                        }
+                        this.installed_theme_packs.insert(extension_id.clone());
+                        this.theme_catalog_error = None;
+                        log::info!(
+                            "installed Zed theme pack {extension_id} ({} files, {} new themes)",
+                            installed.theme_files,
+                            report.themes_added
+                        );
+                    }
+                    Err(error) => {
+                        this.theme_catalog_error = Some(
+                            format!("Could not install theme pack {extension_id}: {error:#}")
+                                .into(),
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_appearance_selector(&self, cx: &Context<Self>) -> AnyElement {
         let typography = ThemeSettings::get_global(cx);
         IconButton::new("appearance-selector-trigger", IconName::Settings)
@@ -3640,6 +3717,9 @@ impl HarnessApp {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.appearance_settings_open = !this.appearance_settings_open;
                 this.appearance_scroll_handle = ScrollHandle::new();
+                if this.appearance_settings_open {
+                    this.ensure_theme_catalog(cx);
+                }
                 cx.notify();
             }))
             .into_any_element()
@@ -3671,6 +3751,22 @@ impl HarnessApp {
                     _ = owner.update(cx, |this, cx| {
                         this.appearance_settings_section = AppearanceSettingsSection::Themes;
                         this.appearance_scroll_handle = ScrollHandle::new();
+                        cx.notify();
+                    });
+                }
+            });
+        let explore_tab = Button::new("appearance-explore-tab", "Explore")
+            .size(ButtonSize::Default)
+            .style(ButtonStyle::Subtle)
+            .toggle_state(self.appearance_settings_section == AppearanceSettingsSection::Explore)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .on_click({
+                let owner = owner.clone();
+                move |_, _, cx| {
+                    _ = owner.update(cx, |this, cx| {
+                        this.appearance_settings_section = AppearanceSettingsSection::Explore;
+                        this.appearance_scroll_handle = ScrollHandle::new();
+                        this.ensure_theme_catalog(cx);
                         cx.notify();
                     });
                 }
@@ -3795,6 +3891,228 @@ impl HarnessApp {
                             .into_any_element(),
                     );
                 }
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .children(rows)
+                    .into_any_element()
+            }
+            AppearanceSettingsSection::Explore => {
+                let mut rows = Vec::new();
+                rows.push(
+                    div()
+                        .px_3()
+                        .pt_3()
+                        .pb_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().text_ui(cx).text_color(colors.text).child(
+                            if self.theme_catalog.is_empty() {
+                                "Zed theme packs".to_owned()
+                            } else {
+                                format!("{} Zed theme packs", self.theme_catalog.len())
+                            },
+                        ))
+                        .when(self.theme_catalog_loading, |this| {
+                            this.child(SpinnerLabel::new().size(LabelSize::Small))
+                        })
+                        .into_any_element(),
+                );
+                rows.push(
+                    div()
+                        .px_3()
+                        .pb_2()
+                        .child(self.theme_catalog_filter.clone())
+                        .into_any_element(),
+                );
+
+                if let Some(error) = self.theme_catalog_error.clone() {
+                    let retry_owner = owner.clone();
+                    rows.push(
+                        div()
+                            .mx_2()
+                            .mb_2()
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(cx.theme().status().error.opacity(0.45))
+                            .bg(cx.theme().status().error_background)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_ui_sm(cx)
+                                    .text_color(colors.text)
+                                    .child(error),
+                            )
+                            .child(
+                                Button::new("retry-theme-catalog", "Retry")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Subtle)
+                                    .on_click(move |_, _, cx| {
+                                        _ = retry_owner.update(cx, |this, cx| {
+                                            this.theme_catalog_error = None;
+                                            this.ensure_theme_catalog(cx);
+                                        });
+                                    }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
+                let query = self
+                    .theme_catalog_filter
+                    .read(cx)
+                    .text(cx)
+                    .trim()
+                    .to_lowercase();
+                let matching = self
+                    .theme_catalog
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, entry)| {
+                        query.is_empty()
+                            || entry.name.to_lowercase().contains(&query)
+                            || entry.description.to_lowercase().contains(&query)
+                            || entry.id.to_lowercase().contains(&query)
+                    })
+                    .collect::<Vec<_>>();
+                let visible = self.theme_catalog_visible.min(matching.len());
+                for (index, entry) in matching.iter().take(visible).copied() {
+                    let installed = self.installed_theme_packs.contains(&entry.id);
+                    let installing = self.theme_packs_installing.contains(&entry.id);
+                    let extension_id = entry.id.clone();
+                    let install_owner = owner.clone();
+                    let action = if installing {
+                        div()
+                            .h(px(28.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .child(SpinnerLabel::new().size(LabelSize::Small))
+                            .into_any_element()
+                    } else {
+                        Button::new(
+                            ("install-theme-pack", index),
+                            if installed { "Update" } else { "Get" },
+                        )
+                        .size(ButtonSize::Compact)
+                        .style(if installed {
+                            ButtonStyle::Subtle
+                        } else {
+                            ButtonStyle::Tinted(TintColor::Accent)
+                        })
+                        .on_click(move |_, _, cx| {
+                            let extension_id = extension_id.clone();
+                            _ = install_owner.update(cx, |this, cx| {
+                                this.install_catalog_theme(extension_id, cx);
+                            });
+                        })
+                        .into_any_element()
+                    };
+                    let metadata = if entry.download_count >= 1_000_000 {
+                        format!(
+                            "v{} · {:.1}m downloads",
+                            entry.version,
+                            entry.download_count as f64 / 1_000_000.
+                        )
+                    } else if entry.download_count >= 1_000 {
+                        format!(
+                            "v{} · {:.0}k downloads",
+                            entry.version,
+                            entry.download_count as f64 / 1_000.
+                        )
+                    } else {
+                        format!("v{} · {} downloads", entry.version, entry.download_count)
+                    };
+                    rows.push(
+                        div()
+                            .id(("theme-catalog-entry", index))
+                            .mx_2()
+                            .mb_1()
+                            .min_h(px(56.))
+                            .px_3()
+                            .py_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(visuals.divider)
+                            .bg(visuals.raised_surface)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_baseline()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_ui(cx)
+                                                    .text_color(colors.text)
+                                                    .child(entry.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_ui_sm(cx)
+                                                    .text_color(colors.text_muted)
+                                                    .child(metadata),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_ui_sm(cx)
+                                            .text_color(colors.text_muted)
+                                            .child(entry.description.clone()),
+                                    ),
+                            )
+                            .child(action)
+                            .into_any_element(),
+                    );
+                }
+                if visible < matching.len() {
+                    let more_owner = owner.clone();
+                    let remaining = matching.len() - visible;
+                    rows.push(
+                        div()
+                            .px_3()
+                            .py_3()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                Button::new(
+                                    "show-more-theme-packs",
+                                    format!("Show {} more", remaining.min(THEME_CATALOG_PAGE_SIZE)),
+                                )
+                                .size(ButtonSize::Default)
+                                .style(ButtonStyle::Subtle)
+                                .on_click(move |_, _, cx| {
+                                    _ = more_owner.update(cx, |this, cx| {
+                                        this.theme_catalog_visible = this
+                                            .theme_catalog_visible
+                                            .saturating_add(THEME_CATALOG_PAGE_SIZE);
+                                        cx.notify();
+                                    });
+                                }),
+                            )
+                            .into_any_element(),
+                    );
+                }
+
                 div()
                     .w_full()
                     .flex()
@@ -4093,6 +4411,7 @@ impl HarnessApp {
                                     .child("Appearance"),
                             )
                             .child(theme_tab)
+                            .child(explore_tab)
                             .child(typography_tab)
                             .child(
                                 IconButton::new("close-appearance-settings", IconName::Close)
@@ -5174,7 +5493,32 @@ impl HarnessApp {
         let mode_indicator = cx.new(|cx| ModeIndicator::compact(window, cx));
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
         let search_editor = cx.new(|cx| LocalEditor::plain_single_line("", window, cx));
+        let theme_catalog_filter = cx.new(|cx| {
+            ui_input::InputField::new(window, cx, "Search 600+ Zed theme packs…")
+                .start_icon(IconName::MagnifyingGlass)
+        });
         let transcript_editor = cx.new(|cx| TranscriptEditor::read_only(window, cx));
+        let theme_filter_owner = cx.entity().downgrade();
+        let theme_filter_for_subscription = theme_catalog_filter.clone();
+        let erased_theme_filter = theme_catalog_filter.read(cx).editor().clone();
+        erased_theme_filter
+            .subscribe(
+                Box::new(move |event, _, cx| {
+                    if event == ui_input::ErasedEditorEvent::BufferEdited {
+                        _ = theme_filter_owner.update(cx, |this, cx| {
+                            this.theme_catalog_visible = THEME_CATALOG_PAGE_SIZE;
+                            // Reading the field here makes the subscription's
+                            // dependency explicit and ensures its newest text
+                            // has reached the erased editor before repaint.
+                            _ = theme_filter_for_subscription.read(cx).text(cx);
+                            cx.notify();
+                        });
+                    }
+                }),
+                window,
+                cx,
+            )
+            .detach();
         cx.on_focus_in(
             &transcript_editor.focus_handle(cx),
             window,
@@ -5396,6 +5740,13 @@ impl HarnessApp {
             appearance_settings_section: AppearanceSettingsSection::Themes,
             appearance_font_role: AppearanceFontRole::Reading,
             appearance_scroll_handle: ScrollHandle::new(),
+            theme_catalog_filter,
+            theme_catalog: Vec::new(),
+            theme_catalog_loading: false,
+            theme_catalog_error: None,
+            theme_catalog_visible: THEME_CATALOG_PAGE_SIZE,
+            theme_packs_installing: HashSet::new(),
+            installed_theme_packs: theme_sources::installed_harness_theme_packs(),
             thread_snapshots: ThreadSnapshotCache::default(),
             selected_thread_id: initial_thread_id,
             loaded_thread_updated_at: None,
@@ -14520,10 +14871,16 @@ mod tests {
             "Rosé Pine",
             "Kanagawa Wave",
             "Nord Dark",
+            "Dracula",
+            "Everforest Dark Medium (regular)",
+            "GitHub Dark",
+            "JetBrains Islands Dark",
+            "Nightfox",
+            "VSCode Dark Modern",
         ] {
             assert!(theme_names.contains(expected), "missing theme {expected}");
         }
-        assert_eq!(theme_names.len(), 31);
+        assert_eq!(theme_names.len(), 71);
 
         // Exercise the same registry path used by the live Appearance sheet,
         // rather than proving only that the JSON files happen to deserialize.
@@ -14538,7 +14895,7 @@ mod tests {
                 "theme asset was not registered: {expected}"
             );
         }
-        assert_eq!(registered_names.len(), 31);
+        assert_eq!(registered_names.len(), 71);
     }
 
     #[test]
@@ -17170,6 +17527,18 @@ fn main() {
         // Harness to the test-only base theme. Components still consume
         // semantic Harness roles derived from the active Zed theme.
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+        let external_themes =
+            theme_sources::load_external_themes(&theme::ThemeRegistry::global(cx));
+        if !external_themes.errors.is_empty() {
+            for error in &external_themes.errors {
+                log::warn!("could not load external theme: {error}");
+            }
+        }
+        log::info!(
+            "loaded {} external theme files containing {} additional themes",
+            external_themes.files_loaded,
+            external_themes.themes_added
+        );
         if let Err(error) = Assets.load_fonts(cx) {
             log::error!("failed to load fonts: {error}");
             return;
