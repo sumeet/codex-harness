@@ -65,8 +65,8 @@ use request_surface::{
     surface_sync_decision,
 };
 use visual_theme::{
-    HarnessPreferences, HarnessVisualTheme, MAX_HARNESS_FONT_SIZE, MIN_HARNESS_FONT_SIZE,
-    preferred_preferences, remember_preferences,
+    HarnessPreferences, HarnessVisualTheme, MAX_HARNESS_FONT_SIZE, MAX_HARNESS_FONT_WEIGHT,
+    MIN_HARNESS_FONT_SIZE, MIN_HARNESS_FONT_WEIGHT, preferred_preferences, remember_preferences,
 };
 use zed_actions::command_palette::{OpenWithQuery, Toggle as ToggleCommandPalette};
 
@@ -180,12 +180,14 @@ trait HarnessStyledTypography: gpui::Styled + Sized {
     fn font_harness_reading(self, cx: &App) -> Self {
         let settings = ThemeSettings::get_global(cx);
         self.font_family(settings.agent_ui_font_family().clone())
+            .font_weight(settings.ui_font.weight)
             .text_size(settings.agent_ui_font_size(cx))
     }
 
     fn font_harness_code(self, cx: &App) -> Self {
         let settings = ThemeSettings::get_global(cx);
         self.font_family(settings.agent_buffer_font_family().clone())
+            .font_weight(settings.buffer_font.weight)
             .text_size(settings.agent_buffer_font_size(cx))
     }
 }
@@ -4122,19 +4124,25 @@ impl HarnessApp {
             }
             AppearanceSettingsSection::Typography => {
                 let role = self.appearance_font_role;
-                let (current_font, current_size, sample): (SharedString, f32, &'static str) =
-                    match role {
-                        AppearanceFontRole::Reading => (
-                            reading_font.clone(),
-                            reading_size,
-                            "Clear prose should feel effortless to read.",
-                        ),
-                        AppearanceFontRole::Code => (
-                            code_font.clone(),
-                            code_size,
-                            "let transcript = render(events);",
-                        ),
-                    };
+                let (current_font, current_size, current_weight, sample): (
+                    SharedString,
+                    f32,
+                    f32,
+                    &'static str,
+                ) = match role {
+                    AppearanceFontRole::Reading => (
+                        reading_font.clone(),
+                        reading_size,
+                        typography.ui_font.weight.0,
+                        "Clear prose should feel effortless to read.",
+                    ),
+                    AppearanceFontRole::Code => (
+                        code_font.clone(),
+                        code_size,
+                        typography.buffer_font.weight.0,
+                        "let transcript = render(events);",
+                    ),
+                };
                 let mut fonts = theme::FontFamilyCache::global(cx)
                     .try_list_font_families()
                     .unwrap_or_default();
@@ -4240,12 +4248,62 @@ impl HarnessApp {
                             }),
                     );
 
+                let weight_choices = [
+                    (100., "Thin"),
+                    (200., "Extra light"),
+                    (300., "Light"),
+                    (400., "Regular"),
+                    (500., "Medium"),
+                    (600., "Semibold"),
+                    (700., "Bold"),
+                    (800., "Extra bold"),
+                    (900., "Black"),
+                ];
+                let current_weight_name = weight_choices
+                    .iter()
+                    .min_by(|(left, _), (right, _)| {
+                        (current_weight - *left)
+                            .abs()
+                            .total_cmp(&(current_weight - *right).abs())
+                    })
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Custom");
+                let mut weight_buttons = Vec::with_capacity(weight_choices.len());
+                for (index, (weight, label)) in weight_choices.into_iter().enumerate() {
+                    let selected = (current_weight - weight).abs() < 1.;
+                    let owner = owner.clone();
+                    weight_buttons.push(
+                        Button::new(("appearance-font-weight", index), label)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .toggle_state(selected)
+                            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                            .on_click(move |_, window, cx| {
+                                Self::update_appearance(&owner, window, cx, |preferences| {
+                                    let weight = weight
+                                        .clamp(MIN_HARNESS_FONT_WEIGHT, MAX_HARNESS_FONT_WEIGHT);
+                                    match role {
+                                        AppearanceFontRole::Reading => {
+                                            preferences.reading_font_weight = Some(weight)
+                                        }
+                                        AppearanceFontRole::Code => {
+                                            preferences.code_font_weight = Some(weight)
+                                        }
+                                    }
+                                })
+                            })
+                            .into_any_element(),
+                    );
+                }
+
                 let has_custom_typography = {
                     let preferences = preferred_preferences();
                     preferences.reading_font_family.is_some()
                         || preferences.reading_font_size.is_some()
+                        || preferences.reading_font_weight.is_some()
                         || preferences.code_font_family.is_some()
                         || preferences.code_font_size.is_some()
+                        || preferences.code_font_weight.is_some()
                 };
                 let reset_owner = owner.clone();
                 let mut font_rows = Vec::with_capacity(fonts.len());
@@ -4277,6 +4335,7 @@ impl HarnessApp {
                             .hover(|style| style.bg(colors.element_hover))
                             .cursor_pointer()
                             .font_family(font.clone())
+                            .font_weight(gpui::FontWeight(current_weight))
                             .text_size(px(current_size.clamp(12., 20.)))
                             .text_color(colors.text)
                             .on_click(move |_, window, cx| {
@@ -4316,6 +4375,25 @@ impl HarnessApp {
                     )
                     .child(
                         div()
+                            .px_3()
+                            .pb_2()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .mr_1()
+                                    .text_ui_sm(cx)
+                                    .text_color(colors.text_muted)
+                                    .child(format!(
+                                        "Weight · {current_weight_name} ({current_weight:.0})"
+                                    )),
+                            )
+                            .children(weight_buttons),
+                    )
+                    .child(
+                        div()
                             .mx_2()
                             .mb_2()
                             .min_h(px(66.))
@@ -4329,6 +4407,7 @@ impl HarnessApp {
                             .border_color(visuals.divider)
                             .bg(colors.editor_background)
                             .font_family(current_font.clone())
+                            .font_weight(gpui::FontWeight(current_weight))
                             .text_size(px(current_size))
                             .text_color(colors.text)
                             .child(sample),

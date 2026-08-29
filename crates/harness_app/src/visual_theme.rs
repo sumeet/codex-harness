@@ -9,6 +9,8 @@ use theme::ThemeColors;
 pub(crate) const DEFAULT_HARNESS_THEME: &str = "One Dark";
 pub(crate) const MIN_HARNESS_FONT_SIZE: f32 = 10.;
 pub(crate) const MAX_HARNESS_FONT_SIZE: f32 = 28.;
+pub(crate) const MIN_HARNESS_FONT_WEIGHT: f32 = 100.;
+pub(crate) const MAX_HARNESS_FONT_WEIGHT: f32 = 900.;
 
 /// The deliberately small set of Harness-owned appearance preferences.
 ///
@@ -26,9 +28,13 @@ pub(crate) struct HarnessPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reading_font_size: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reading_font_weight: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) code_font_family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) code_font_size: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) code_font_weight: Option<f32>,
 }
 
 impl Default for HarnessPreferences {
@@ -37,8 +43,10 @@ impl Default for HarnessPreferences {
             theme: DEFAULT_HARNESS_THEME.to_owned(),
             reading_font_family: None,
             reading_font_size: None,
+            reading_font_weight: None,
             code_font_family: None,
             code_font_size: None,
+            code_font_weight: None,
         }
     }
 }
@@ -50,6 +58,8 @@ impl HarnessPreferences {
         self.code_font_family = self.code_font_family.and_then(nonempty);
         self.reading_font_size = self.reading_font_size.and_then(normalize_font_size);
         self.code_font_size = self.code_font_size.and_then(normalize_font_size);
+        self.reading_font_weight = self.reading_font_weight.and_then(normalize_font_weight);
+        self.code_font_weight = self.code_font_weight.and_then(normalize_font_weight);
         self
     }
 
@@ -66,6 +76,9 @@ impl HarnessPreferences {
             settings.insert("ui_font_size".to_owned(), json!(size));
             settings.insert("agent_ui_font_size".to_owned(), json!(size));
         }
+        if let Some(weight) = self.reading_font_weight {
+            settings.insert("ui_font_weight".to_owned(), json!(weight));
+        }
         if let Some(family) = &self.code_font_family {
             settings.insert("buffer_font_family".to_owned(), json!(family));
             settings.insert("agent_buffer_font_family".to_owned(), json!(family));
@@ -74,14 +87,19 @@ impl HarnessPreferences {
             settings.insert("buffer_font_size".to_owned(), json!(size));
             settings.insert("agent_buffer_font_size".to_owned(), json!(size));
         }
+        if let Some(weight) = self.code_font_weight {
+            settings.insert("buffer_font_weight".to_owned(), json!(weight));
+        }
         Value::Object(settings).to_string()
     }
 
     pub(crate) fn reset_typography(&mut self) {
         self.reading_font_family = None;
         self.reading_font_size = None;
+        self.reading_font_weight = None;
         self.code_font_family = None;
         self.code_font_size = None;
+        self.code_font_weight = None;
     }
 }
 
@@ -93,6 +111,12 @@ fn nonempty(value: String) -> Option<String> {
 fn normalize_font_size(size: f32) -> Option<f32> {
     size.is_finite()
         .then(|| size.clamp(MIN_HARNESS_FONT_SIZE, MAX_HARNESS_FONT_SIZE))
+}
+
+fn normalize_font_weight(weight: f32) -> Option<f32> {
+    weight.is_finite().then(|| {
+        (weight.clamp(MIN_HARNESS_FONT_WEIGHT, MAX_HARNESS_FONT_WEIGHT) / 100.).round() * 100.
+    })
 }
 
 fn preferences_path() -> Option<PathBuf> {
@@ -215,8 +239,10 @@ mod tests {
             theme: "Ayu Mirage".to_owned(),
             reading_font_family: Some("Inter".to_owned()),
             reading_font_size: Some(16.),
+            reading_font_weight: Some(300.),
             code_font_family: Some("Zed Mono".to_owned()),
             code_font_size: Some(15.),
+            code_font_weight: Some(500.),
         };
         let settings: Value = serde_json::from_str(&preferences.settings_json()).unwrap();
         assert_eq!(settings["ui_font_family"], "Inter");
@@ -224,7 +250,9 @@ mod tests {
         assert_eq!(settings["buffer_font_family"], "Zed Mono");
         assert_eq!(settings["agent_buffer_font_family"], "Zed Mono");
         assert_eq!(settings["ui_font_size"], 16.);
+        assert_eq!(settings["ui_font_weight"], 300.);
         assert_eq!(settings["agent_buffer_font_size"], 15.);
+        assert_eq!(settings["buffer_font_weight"], 500.);
     }
 
     #[test]
@@ -234,6 +262,15 @@ mod tests {
                 .unwrap();
         assert_eq!(preferences.reading_font_size, Some(MIN_HARNESS_FONT_SIZE));
         assert_eq!(preferences.code_font_size, Some(MAX_HARNESS_FONT_SIZE));
+    }
+
+    #[test]
+    fn font_weights_are_snapped_to_supported_css_steps() {
+        let preferences =
+            preferences_from_contents(r#"{ "reading_font_weight": 249, "code_font_weight": 950 }"#)
+                .unwrap();
+        assert_eq!(preferences.reading_font_weight, Some(200.));
+        assert_eq!(preferences.code_font_weight, Some(MAX_HARNESS_FONT_WEIGHT));
     }
 
     #[test]
