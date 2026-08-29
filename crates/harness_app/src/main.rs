@@ -14532,7 +14532,9 @@ mod tests {
         let registered_names = registry.list_names();
         for expected in theme_names {
             assert!(
-                registered_names.iter().any(|name| name == expected.as_str()),
+                registered_names
+                    .iter()
+                    .any(|name| name == expected.as_str()),
                 "theme asset was not registered: {expected}"
             );
         }
