@@ -13258,11 +13258,6 @@ impl Render for HarnessApp {
                     cx,
                 );
             let show_latest = !list_state.is_following_tail();
-            let latest_label = if turn_active {
-                "New activity"
-            } else {
-                "Latest"
-            };
             div()
                 .relative()
                 .flex_1()
@@ -13274,25 +13269,38 @@ impl Render for HarnessApp {
                 .child(rich_list)
                 .when(show_latest, |this| {
                     this.child(
-                        div().absolute().right(px(14.)).bottom(px(12.)).child(
-                            Button::new("transcript-latest", latest_label)
-                                .size(ButtonSize::Compact)
-                                .style(ButtonStyle::Outlined)
-                                .start_icon(
-                                    Icon::new(IconName::ArrowDown).size(IconSize::XSmall).color(
-                                        if turn_active {
+                        div().absolute().right(px(10.)).bottom(px(10.)).child(
+                            div()
+                                .relative()
+                                .child(
+                                    IconButton::new("transcript-latest", IconName::ArrowDown)
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Compact)
+                                        .style(ButtonStyle::Subtle)
+                                        .icon_color(if turn_active {
                                             Color::Accent
                                         } else {
                                             Color::Muted
-                                        },
-                                    ),
+                                        })
+                                        .aria_label("Return to the live transcript")
+                                        .tooltip(Tooltip::text(
+                                            "Return to the live transcript · G or Ctrl-End",
+                                        ))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.go_to_transcript_tail(window, cx)
+                                        })),
                                 )
-                                .tooltip(Tooltip::text(
-                                    "Return to the live transcript · G or Ctrl-End",
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.go_to_transcript_tail(window, cx)
-                                })),
+                                .when(turn_active, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .top(px(1.))
+                                            .right(px(1.))
+                                            .size(px(5.))
+                                            .rounded_full()
+                                            .bg(colors.text_accent),
+                                    )
+                                }),
                         ),
                     )
                 })
