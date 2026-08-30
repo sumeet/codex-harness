@@ -10,12 +10,19 @@ use gpui::{
 use serde_json::Value;
 use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize};
 
-const IMAGE_PREVIEW_ROWS: u32 = 9;
+const IMAGE_PREVIEW_MAX_WIDTH: f32 = 384.;
+const IMAGE_PREVIEW_MAX_HEIGHT: f32 = 240.;
+const IMAGE_PREVIEW_FALLBACK_WIDTH: f32 = 320.;
+const IMAGE_PREVIEW_FALLBACK_HEIGHT: f32 = 180.;
+const IMAGE_ROW_HEIGHT: f32 = 20.;
 const IMAGE_PLACEHOLDER_ROWS: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ImageAvailability {
-    Present(PathBuf),
+    Present {
+        path: PathBuf,
+        dimensions: Option<(u32, u32)>,
+    },
     MissingPath,
     MissingFile(PathBuf),
 }
@@ -74,6 +81,10 @@ impl ImageSurface {
     pub(crate) fn rows(&self) -> u32 {
         rows_for_availability(&self.availability)
     }
+
+    pub(crate) fn preview_size(&self) -> (f32, f32) {
+        preview_size_for_availability(&self.availability)
+    }
 }
 
 fn image_path(raw: &Value) -> Option<PathBuf> {
@@ -89,7 +100,10 @@ fn availability_from_raw(raw: &Value) -> ImageAvailability {
 
 fn classify_path(path: Option<PathBuf>, is_file: impl FnOnce(&Path) -> bool) -> ImageAvailability {
     match path {
-        Some(path) if is_file(&path) => ImageAvailability::Present(path),
+        Some(path) if is_file(&path) => ImageAvailability::Present {
+            dimensions: image::image_dimensions(&path).ok(),
+            path,
+        },
         Some(path) => ImageAvailability::MissingFile(path),
         None => ImageAvailability::MissingPath,
     }
@@ -97,9 +111,32 @@ fn classify_path(path: Option<PathBuf>, is_file: impl FnOnce(&Path) -> bool) -> 
 
 fn rows_for_availability(availability: &ImageAvailability) -> u32 {
     match availability {
-        ImageAvailability::Present(_) => IMAGE_PREVIEW_ROWS,
+        ImageAvailability::Present { .. } => (preview_size_for_availability(availability).1
+            / IMAGE_ROW_HEIGHT)
+            .ceil()
+            .max(1.) as u32,
         ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => {
             IMAGE_PLACEHOLDER_ROWS
+        }
+    }
+}
+
+fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
+    else {
+        return (IMAGE_PREVIEW_FALLBACK_WIDTH, IMAGE_PREVIEW_FALLBACK_HEIGHT);
+    };
+    let scale = (IMAGE_PREVIEW_MAX_WIDTH / width as f32)
+        .min(IMAGE_PREVIEW_MAX_HEIGHT / height as f32)
+        .min(1.);
+    (width as f32 * scale, height as f32 * scale)
+}
+
+fn preview_size_for_availability(availability: &ImageAvailability) -> (f32, f32) {
+    match availability {
+        ImageAvailability::Present { dimensions, .. } => preview_size(*dimensions),
+        ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => {
+            (IMAGE_PREVIEW_FALLBACK_WIDTH, IMAGE_ROW_HEIGHT * 3.)
         }
     }
 }
@@ -144,7 +181,7 @@ fn placeholder(title: impl Into<SharedString>, detail: Option<SharedString>) -> 
 impl Render for ImageSurface {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.availability {
-            ImageAvailability::Present(path) => {
+            ImageAvailability::Present { path, .. } => {
                 let unreadable_path = path_label(path);
                 gpui::img(path.clone())
                     .size_full()
@@ -200,7 +237,10 @@ mod tests {
         let present = classify_path(Some(PathBuf::from("preview.png")), |_| true);
         assert_eq!(
             present,
-            ImageAvailability::Present(PathBuf::from("preview.png"))
+            ImageAvailability::Present {
+                path: PathBuf::from("preview.png"),
+                dimensions: None,
+            }
         );
 
         let missing = classify_path(Some(PathBuf::from("missing.png")), |_| false);
@@ -217,17 +257,32 @@ mod tests {
 
     #[test]
     fn preview_height_is_bounded_and_placeholders_stay_compact() {
-        let preview = ImageAvailability::Present(PathBuf::from("preview.png"));
+        let preview = ImageAvailability::Present {
+            path: PathBuf::from("preview.png"),
+            dimensions: Some((1522, 667)),
+        };
         let missing = ImageAvailability::MissingFile(PathBuf::from("missing.png"));
 
-        assert_eq!(rows_for_availability(&preview), IMAGE_PREVIEW_ROWS);
+        assert_eq!(rows_for_availability(&preview), 9);
         assert_eq!(rows_for_availability(&missing), IMAGE_PLACEHOLDER_ROWS);
         assert_eq!(
             rows_for_availability(&ImageAvailability::MissingPath),
             IMAGE_PLACEHOLDER_ROWS
         );
-        assert!(IMAGE_PLACEHOLDER_ROWS < IMAGE_PREVIEW_ROWS);
-        assert!(IMAGE_PREVIEW_ROWS <= 16);
+        assert!(IMAGE_PLACEHOLDER_ROWS < rows_for_availability(&preview));
+        assert!(rows_for_availability(&preview) <= 16);
+    }
+
+    #[test]
+    fn viewed_image_preview_hugs_the_bitmap_aspect_ratio() {
+        let wide = preview_size(Some((1522, 667)));
+        assert_eq!(wide.0, IMAGE_PREVIEW_MAX_WIDTH);
+        assert!((wide.1 - 168.284).abs() < 0.001);
+        assert_eq!(preview_size(Some((100, 80))), (100., 80.));
+        assert_eq!(
+            preview_size(None),
+            (IMAGE_PREVIEW_FALLBACK_WIDTH, IMAGE_PREVIEW_FALLBACK_HEIGHT)
+        );
     }
 
     #[test]

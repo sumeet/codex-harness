@@ -11734,24 +11734,28 @@ impl HarnessApp {
                 cx,
             )
         });
-        let surface_height = surface
+        let surface_size = surface
             .as_ref()
-            .map(|surface| px(surface.read(cx).rows() as f32 * 20.));
+            .map(|surface| surface.read(cx).preview_size());
         div()
             .w_full()
             .flex()
             .flex_col()
             .gap_2()
-            .when_some(surface.zip(surface_height), |this, (surface, height)| {
-                this.child(
-                    div()
-                        .w_full()
-                        .h(height)
-                        .min_h(px(56.))
-                        .overflow_hidden()
-                        .child(surface),
-                )
-            })
+            .when_some(
+                surface.zip(surface_size),
+                |this, (surface, (width, height))| {
+                    this.child(
+                        div()
+                            .w(px(width))
+                            .max_w_full()
+                            .h(px(height))
+                            .overflow_hidden()
+                            .rounded_xs()
+                            .child(surface),
+                    )
+                },
+            )
             .when_some(highlighted_caption, |this, highlighted_caption| {
                 this.child(
                     div()
