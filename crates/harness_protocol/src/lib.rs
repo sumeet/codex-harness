@@ -363,16 +363,7 @@ impl TranscriptItem {
         if self.kind != TranscriptKind::Command {
             return None;
         }
-        let exit_code = [
-            "/exitCode",
-            "/exit_code",
-            "/exitStatus/code",
-            "/output/exitCode",
-            "/output/exit_code",
-        ]
-        .into_iter()
-        .find_map(|pointer| self.raw.pointer(pointer).and_then(Value::as_i64))
-        .or_else(|| {
+        let exit_code = command_exit_code(&self.raw).or_else(|| {
             self.status
                 .as_deref()?
                 .trim()
@@ -421,6 +412,18 @@ impl TranscriptItem {
             None
         }
     }
+}
+
+fn command_exit_code(raw: &Value) -> Option<i64> {
+    [
+        "/exitCode",
+        "/exit_code",
+        "/exitStatus/code",
+        "/output/exitCode",
+        "/output/exit_code",
+    ]
+    .into_iter()
+    .find_map(|pointer| raw.pointer(pointer).and_then(Value::as_i64))
 }
 
 fn is_routine_terminal_status(status: &str) -> bool {
@@ -2450,7 +2453,7 @@ impl TranscriptModel {
                 content: String::new(),
                 raw: bounded_raw_payload(params.clone()),
                 event_count: 0,
-                expanded: kind != TranscriptKind::Trace,
+                expanded: default_expanded(kind, false),
                 pending_request: None,
             })
         };
@@ -2492,7 +2495,7 @@ impl TranscriptModel {
                 content: String::new(),
                 raw: bounded_raw_payload(raw.clone()),
                 event_count: 0,
-                expanded: kind != TranscriptKind::Trace,
+                expanded: default_expanded(kind, false),
                 pending_request: None,
             })
         };
@@ -2543,7 +2546,11 @@ impl TranscriptModel {
             let pending_request = self.items[index].pending_request.clone();
             let mut item = item_from_protocol(value, completed);
             item.event_count = old_events + 1;
-            item.expanded = expanded;
+            item.expanded = expanded
+                || matches!(
+                    item.command_execution_status(),
+                    Some(CommandExecutionStatus::Failed(_))
+                );
             item.pending_request = pending_request;
             self.items[index] = item;
             if self.items[index].kind == TranscriptKind::User {
@@ -2631,7 +2638,7 @@ impl TranscriptModel {
             content,
             raw: bounded_raw_payload(raw),
             event_count: 1,
-            expanded: kind != TranscriptKind::Trace,
+            expanded: default_expanded(kind, false),
             pending_request: None,
         })
     }
@@ -3741,6 +3748,11 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
     let protocol_id = string_at(&raw, "/id").unwrap_or("unknown-item").to_string();
     let protocol_kind = string_at(&raw, "/type").unwrap_or("unknown");
     let kind = kind_from_protocol(protocol_kind);
+    let expanded = if kind == TranscriptKind::Command {
+        command_exit_code(&raw).is_some_and(|exit_code| exit_code != 0)
+    } else {
+        default_expanded(kind, completed)
+    };
     TranscriptItem {
         key: protocol_id.clone(),
         protocol_id: Some(protocol_id),
@@ -3760,7 +3772,7 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
         content: content_from_protocol(protocol_kind, &raw),
         raw: bounded_raw_payload(raw),
         event_count: 1,
-        expanded: default_expanded(kind, completed),
+        expanded,
         pending_request: None,
     }
 }
@@ -3800,13 +3812,12 @@ fn default_expanded(kind: TranscriptKind, _completed: bool) -> bool {
         | TranscriptKind::Image
         | TranscriptKind::Error
         | TranscriptKind::Approval
-        | TranscriptKind::Command
         | TranscriptKind::Tool
         | TranscriptKind::Subagent
         | TranscriptKind::Web
         | TranscriptKind::Review
         | TranscriptKind::Reasoning => true,
-        TranscriptKind::Trace => false,
+        TranscriptKind::Command | TranscriptKind::Trace => false,
     }
 }
 
@@ -6280,11 +6291,10 @@ mod tests {
     }
 
     #[test]
-    fn meaningful_items_start_expanded_even_after_completion() {
+    fn narrative_and_structured_results_start_expanded_but_commands_stay_compact() {
         for kind in [
             TranscriptKind::Reasoning,
             TranscriptKind::Plan,
-            TranscriptKind::Command,
             TranscriptKind::FileChange,
             TranscriptKind::Tool,
             TranscriptKind::Diff,
@@ -6297,7 +6307,36 @@ mod tests {
         ] {
             assert!(default_expanded(kind, true), "kind {kind:?}");
         }
+        assert!(!default_expanded(TranscriptKind::Command, false));
+        assert!(!default_expanded(TranscriptKind::Command, true));
         assert!(!default_expanded(TranscriptKind::Trace, false));
+    }
+
+    #[test]
+    fn failed_commands_open_their_details_while_successes_stay_compact() {
+        let succeeded = item_from_protocol(
+            json!({
+                "id": "success",
+                "type": "commandExecution",
+                "command": "cargo check",
+                "status": "completed",
+                "exitCode": 0
+            }),
+            true,
+        );
+        let failed = item_from_protocol(
+            json!({
+                "id": "failure",
+                "type": "commandExecution",
+                "command": "cargo check",
+                "status": "failed",
+                "exitCode": 101
+            }),
+            true,
+        );
+
+        assert!(!succeeded.expanded);
+        assert!(failed.expanded);
     }
 
     #[test]

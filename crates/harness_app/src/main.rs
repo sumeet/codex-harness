@@ -1343,18 +1343,53 @@ fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
 fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
     item.expanded
         && item.pending_request.is_none()
-        && matches!(
+        && (matches!(
             item.kind,
             model::TranscriptKind::Diff | model::TranscriptKind::FileChange
-        )
+        ) || (item.kind == model::TranscriptKind::Command && !command_has_semantic_title(item)))
 }
 
 fn transcript_item_header_title(item: &TranscriptItem) -> String {
-    item.pending_request
+    let title = item
+        .pending_request
         .as_ref()
         .and_then(|request| request_header_title(&request.method))
-        .unwrap_or(&item.title)
-        .replace(" · ", " — ")
+        .unwrap_or(&item.title);
+    if item.kind == model::TranscriptKind::Command && !command_has_semantic_title(item) {
+        item.command_transcript()
+            .and_then(|command| {
+                command
+                    .command
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .map(str::trim)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "Shell command".to_owned())
+    } else {
+        title.replace(" · ", " — ")
+    }
+}
+
+fn command_has_semantic_title(item: &TranscriptItem) -> bool {
+    item.kind == model::TranscriptKind::Command
+        && !item.title.trim().is_empty()
+        && !item.title.trim().eq_ignore_ascii_case("command")
+}
+
+fn toggle_model_item_expansion_at(
+    model: &mut TranscriptModel,
+    index: usize,
+) -> Option<(String, bool)> {
+    let item = model.items.get_mut(index)?;
+    if (!item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning)
+        || item.content.trim().is_empty()
+    {
+        return None;
+    }
+
+    item.expanded = !item.expanded;
+    Some((item.key.clone(), !item.expanded))
 }
 
 fn image_protocol_path(raw: &Value) -> Option<&str> {
@@ -2526,7 +2561,11 @@ fn rich_navigation_item_projection(
 ) -> Option<model::TranscriptItemProjection> {
     let projection = model.rich_navigation_item_projection(item_index)?;
     let item = model.items.get(item_index)?;
-    let body = rich_navigation_body_for_item(item, projection.body_text());
+    let body = if item.expanded {
+        rich_navigation_body_for_item(item, projection.body_text())
+    } else {
+        transcript_item_header_title(item)
+    };
     let projection = if body == projection.body_text() {
         projection
     } else {
@@ -3131,6 +3170,12 @@ impl Render for HybridStructuredSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors);
+        let command_fallback_title = self.item.kind == model::TranscriptKind::Command
+            && !command_has_semantic_title(&self.item);
+        let command_status = self
+            .item
+            .command_execution_status()
+            .and_then(|status| render_command_visual_status(status, cx));
         let body = self
             .item
             .expanded
@@ -3189,9 +3234,14 @@ impl Render for HybridStructuredSurface {
                     .flex_1()
                     .truncate()
                     .text_ui_sm(cx)
+                    .when(command_fallback_title, |this| this.font_harness_code(cx))
+                    .when(!command_fallback_title, |this| {
+                        this.font_harness_reading(cx)
+                    })
                     .text_color(colors.text_muted)
                     .child(transcript_item_header_title(&self.item)),
             )
+            .when_some(command_status, |this, (_, status)| this.child(status))
             .child(Disclosure::new(
                 format!("hybrid-structured-disclosure:{}", self.item.key),
                 self.item.expanded,
@@ -9745,25 +9795,34 @@ impl HarnessApp {
     }
 
     fn toggle_item_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.model.items.get_mut(index) else {
+        let Some((item_key, collapsed)) = toggle_model_item_expansion_at(&mut self.model, index)
+        else {
             return;
         };
-        if (!item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning)
-            || item.content.trim().is_empty()
-        {
-            return;
-        }
-
-        item.expanded = !item.expanded;
-        let item_key = item.key.clone();
-        let collapsed = !item.expanded;
         self.list_state.splice(index..index + 1, 1);
-        if rich_vim_experiment() {
+        if self.buffer_view {
             self.transcript_editor.update(cx, |editor, cx| {
                 editor.set_item_collapsed(&item_key, collapsed, window, cx);
             });
+        } else if rich_vim_experiment() {
+            let item_count = self.model.items.len();
+            if !self.sync_transcript_item_updates(item_count, &[index], cx) {
+                drop(self.sync_transcript_document(cx));
+            }
         }
         cx.notify();
+    }
+
+    fn toggle_item_by_key(&mut self, item_key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .model
+            .items
+            .iter()
+            .position(|item| item.key == item_key)
+        else {
+            return;
+        };
+        self.toggle_item_at(index, window, cx);
     }
 
     fn toggle_selected_output(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11114,6 +11173,7 @@ impl HarnessApp {
         let command_navigation = navigation.clone();
         let command_owner = owner.clone();
         let command_status = item.command_execution_status();
+        let show_status_in_command_body = expanded_item_uses_content_as_header(item);
         let command_rows = command_data
             .rows
             .iter()
@@ -11167,21 +11227,23 @@ impl HarnessApp {
                     logical_range,
                     Some(command_owner.clone()),
                 );
-                let visual_status = first_command_row
+                let visual_status = (first_command_row && show_status_in_command_body)
                     .then_some(command_status)
                     .flatten()
                     .and_then(|status| render_command_visual_status(status, cx));
                 let status_padding = visual_status
                     .as_ref()
                     .map(|(reserved_width, _)| *reserved_width)
-                    .unwrap_or(22.);
+                    .unwrap_or(0.);
                 div()
                     .w_full()
                     .min_w_0()
                     .min_h(harness_code_row_height(cx))
                     .relative()
                     .whitespace_normal()
-                    .when(first_command_row, |this| this.pr(px(status_padding)))
+                    .when(first_command_row && status_padding > 0., |this| {
+                        this.pr(px(status_padding))
+                    })
                     .child(clickable)
                     .when_some(visual_status, |this, (_, status)| {
                         this.child(
@@ -12539,11 +12601,18 @@ impl HarnessApp {
             .flatten();
         let visible_status = item.display_status().map(ToOwned::to_owned);
         let header_title = transcript_item_header_title(&item);
+        let header_uses_command_font =
+            item.kind == model::TranscriptKind::Command && !command_has_semantic_title(&item);
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = transcript_item_shows_header(&item);
         let headerless_expanded = show_header && expanded_item_uses_content_as_header(&item);
         let render_header = show_header && !headerless_expanded;
+        let header_command_status = (render_header && item.kind == model::TranscriptKind::Command)
+            .then(|| item.command_execution_status())
+            .flatten()
+            .and_then(|status| render_command_visual_status(status, cx));
         let disclosure_weak = cx.weak_entity();
+        let disclosure_item_key = item.key.clone();
         let is_disclosure = has_collapsible_content
             && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
         let raw_search_visible = raw_visible
@@ -12792,7 +12861,7 @@ impl HarnessApp {
             .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
 
         let header = rich_card_identity_row(cx)
-            .id(("item-header", index))
+            .id(format!("item-header:{}", item.key))
             .when(!narrative && !compact_trace, |this| {
                 this.px_1().bg(visuals.tool_header_surface)
             })
@@ -12806,7 +12875,10 @@ impl HarnessApp {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .font_harness_reading(cx)
+                    .when(header_uses_command_font, |this| this.font_harness_code(cx))
+                    .when(!header_uses_command_font, |this| {
+                        this.font_harness_reading(cx)
+                    })
                     .text_color(colors.text_muted)
                     .child(highlighted_header_title),
             )
@@ -12827,20 +12899,29 @@ impl HarnessApp {
                     )
                 },
             )
+            .when_some(header_command_status, |this, (_, status)| {
+                this.child(status)
+            })
             .when(is_disclosure, |this| {
                 this.cursor_pointer()
                     .on_click(move |_, window, cx| {
                         disclosure_weak
-                            .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                            .update(cx, |this, cx| {
+                                this.toggle_item_by_key(&disclosure_item_key, window, cx)
+                            })
                             .ok();
                     })
-                    .child(Disclosure::new(("item-disclosure", index), item.expanded))
+                    .child(Disclosure::new(
+                        format!("item-disclosure:{}", item.key),
+                        item.expanded,
+                    ))
             });
 
         let floating_disclosure = (headerless_expanded && is_disclosure).then(|| {
             let disclosure_weak = cx.weak_entity();
+            let disclosure_item_key = item.key.clone();
             div()
-                .id(("item-floating-disclosure", index))
+                .id(format!("item-floating-disclosure:{}", item.key))
                 .absolute()
                 .top(px(1.))
                 .right(px(1.))
@@ -12852,11 +12933,13 @@ impl HarnessApp {
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
                     disclosure_weak
-                        .update(cx, |this, cx| this.toggle_item_at(index, window, cx))
+                        .update(cx, |this, cx| {
+                            this.toggle_item_by_key(&disclosure_item_key, window, cx)
+                        })
                         .ok();
                 })
                 .child(Disclosure::new(
-                    ("item-floating-disclosure-icon", index),
+                    format!("item-floating-disclosure-icon:{}", item.key),
                     true,
                 ))
         });
@@ -15387,7 +15470,8 @@ mod tests {
 
     #[test]
     fn rich_navigation_bodies_contain_only_rows_painted_by_structured_renderers() {
-        let replay = TranscriptModel::replay(6);
+        let mut replay = TranscriptModel::replay(6);
+        replay.items[5].expanded = true;
         let diff = rich_navigation_item_projection(&replay, 4).unwrap();
         assert!(
             diff.body_text()
@@ -15469,7 +15553,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_diffs_replace_redundant_headers_but_commands_keep_semantic_titles() {
+    fn generic_commands_use_their_content_as_the_expanded_identity() {
         let mut replay = TranscriptModel::replay(6);
         let diff = &mut replay.items[4];
         assert!(expanded_item_uses_content_as_header(diff));
@@ -15477,16 +15561,53 @@ mod tests {
         assert!(!expanded_item_uses_content_as_header(diff));
 
         let command = &replay.items[5];
+        assert!(!command.expanded);
         assert!(!expanded_item_uses_content_as_header(command));
-        assert!(item_matches_search_query(command, "Command"));
+        assert_eq!(
+            transcript_item_header_title(command),
+            "cargo check -p harness_app"
+        );
 
-        replay.items[5].expanded = false;
-        assert!(item_matches_search_query(&replay.items[5], "Command"));
+        replay.items[5].expanded = true;
+        assert!(expanded_item_uses_content_as_header(&replay.items[5]));
+
+        replay.items[5].title = "Search for identity in crates/harness_app".into();
+        assert!(command_has_semantic_title(&replay.items[5]));
+        assert!(!expanded_item_uses_content_as_header(&replay.items[5]));
+    }
+
+    #[test]
+    fn collapsed_command_navigation_contains_only_its_painted_identity() {
+        let replay = TranscriptModel::replay(6);
+        let command = &replay.items[5];
+        assert!(!command.expanded);
+
+        let projection = rich_navigation_item_projection(&replay, 5).unwrap();
+        assert_eq!(projection.body_text(), "cargo check -p harness_app");
+        assert!(!projection.text.contains("Finished replay frame"));
+    }
+
+    #[test]
+    fn toggling_one_command_never_changes_a_sibling_command() {
+        let mut replay = TranscriptModel::replay(6);
+        let mut sibling = replay.items[5].clone();
+        sibling.key = "fixture-command-sibling".into();
+        sibling.protocol_id = Some("fixture-command-sibling".into());
+        replay.items.push(sibling);
+
+        let (item_key, collapsed) =
+            toggle_model_item_expansion_at(&mut replay, 5).expect("command should toggle");
+
+        assert_eq!(item_key, "replay:5");
+        assert!(!collapsed);
+        assert!(replay.items[5].expanded);
+        assert!(!replay.items[6].expanded);
     }
 
     #[test]
     fn virtual_command_rows_preserve_the_navigation_document() {
-        let replay = TranscriptModel::replay(6);
+        let mut replay = TranscriptModel::replay(6);
+        replay.items[5].expanded = true;
         let item = &replay.items[5];
         let data = rich_command_data(item).expect("replay command should be structured");
         let projection = rich_navigation_item_projection(&replay, 5)
@@ -15529,7 +15650,8 @@ mod tests {
 
     #[test]
     fn rich_navigation_document_has_no_unpainted_terminal_row() {
-        let replay = TranscriptModel::replay(6);
+        let mut replay = TranscriptModel::replay(6);
+        replay.items[5].expanded = true;
         let document = rich_navigation_document(&replay);
         let last = document.segments.last().unwrap();
 
@@ -15555,7 +15677,8 @@ mod tests {
         let before = rich_navigation_document(&before_model);
         assert!(!before.text.ends_with('\n'));
 
-        let after_model = TranscriptModel::replay(6);
+        let mut after_model = TranscriptModel::replay(6);
+        after_model.items[5].expanded = true;
         let previous_last = rich_navigation_item_projection(&after_model, 4).unwrap();
         let appended = rich_navigation_item_projection(&after_model, 5).unwrap();
         assert!(previous_last.text.ends_with('\n'));
