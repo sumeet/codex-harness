@@ -13286,7 +13286,11 @@ impl Render for HarnessApp {
             .flex()
             .bg(visuals.canvas)
             .text_color(colors.text)
-            .font_ui(cx)
+            // Reading typography is the inherited prose/UI role. Individual
+            // code surfaces override it with `font_harness_code`, while plain
+            // transcript fallbacks and compact activity text now honor the
+            // same configured weight as rich Markdown.
+            .font_harness_reading(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
             .on_action(

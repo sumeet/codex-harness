@@ -218,6 +218,8 @@ impl MarkdownStyle {
             font_family: Some(body_font_family),
             font_fallbacks: theme_settings.ui_font.fallbacks.clone(),
             font_features: Some(theme_settings.ui_font.features.clone()),
+            font_weight: Some(theme_settings.ui_font.weight),
+            font_style: Some(theme_settings.ui_font.style),
             font_size: Some(if is_preview {
                 rems(1.0).into()
             } else {
@@ -6650,6 +6652,25 @@ mod tests {
                 "preview container font size must be rem-based, got {:?}",
                 style.container_style.text.font_size
             );
+        });
+    }
+
+    #[gpui::test]
+    fn test_agent_body_uses_configured_ui_font_weight(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.theme.ui_font_weight = Some(300.0.into());
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        cx.update(|window, cx| {
+            let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+            assert_eq!(style.base_text_style.font_weight, FontWeight(300.0));
         });
     }
 
