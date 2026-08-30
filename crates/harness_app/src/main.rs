@@ -369,6 +369,19 @@ fn turn_tail_list_splice(
     Some((0..current_count, desired_count))
 }
 
+/// Resolve the final selectable Rich/Editor position, deliberately ignoring
+/// protocol-only and header-only transcript items. The document owns the
+/// canonical projection, so tail navigation never guesses from the visible
+/// list index or lands in the activity sentinel after the final real glyph.
+fn transcript_tail_target(document: &model::TranscriptDocument) -> Option<(usize, usize)> {
+    document.segments.last().map(|segment| {
+        (
+            segment.item_index,
+            segment.body_range.end - segment.body_range.start,
+        )
+    })
+}
+
 fn transcript_has_inline_activity(transcript: &TranscriptModel) -> bool {
     transcript.items.iter().rev().any(|item| {
         item.kind == model::TranscriptKind::Agent
@@ -8975,6 +8988,43 @@ impl HarnessApp {
         placed
     }
 
+    /// Make every representation of the transcript agree that the user is at
+    /// the live edge. Rich mode has a native Editor for Vim state and a
+    /// virtualized List for presentation; updating just one is what made `G`
+    /// appear to do nothing (or immediately snap back) while a response grew.
+    fn go_to_transcript_tail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let document = self.sync_transcript_document(cx);
+        if let Some((item_index, body_offset)) = document.as_ref().and_then(transcript_tail_target)
+        {
+            self.selected_item = item_index;
+            self.visual_anchor = None;
+            self.place_rich_cursor_in_item(item_index, body_offset, window, cx);
+            self.transcript_cursor_initialized = true;
+        } else {
+            self.selected_item = self.model.items.len().saturating_sub(1);
+        }
+
+        // Keep the native text projection ready for streaming and pin the
+        // visible Rich list past its final real item, including the transient
+        // activity row. List Tail mode will disengage on an upward gesture and
+        // re-engage when a manual scroll reaches the bottom again.
+        self.transcript_editor
+            .update(cx, |editor, cx| editor.reveal_tail(cx));
+        self.list_state.set_follow_mode(FollowMode::Tail);
+        self.list_state.scroll_to_end();
+
+        // A streaming row can change height in the same frame. Reassert the
+        // item-count anchor after that layout rather than revealing only the
+        // last measured line from the preceding frame.
+        cx.defer_in(window, |this, _, cx| {
+            if this.list_state.is_following_tail() {
+                this.list_state.scroll_to_end();
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+
     fn show_rich_transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rich_cursor = (rich_vim_experiment() && self.buffer_view)
             .then(|| {
@@ -13207,6 +13257,12 @@ impl Render for HarnessApp {
                     window,
                     cx,
                 );
+            let show_latest = !list_state.is_following_tail();
+            let latest_label = if turn_active {
+                "New activity"
+            } else {
+                "Latest"
+            };
             div()
                 .relative()
                 .flex_1()
@@ -13216,6 +13272,30 @@ impl Render for HarnessApp {
                 .overflow_hidden()
                 .bg(visuals.transcript)
                 .child(rich_list)
+                .when(show_latest, |this| {
+                    this.child(
+                        div().absolute().right(px(14.)).bottom(px(12.)).child(
+                            Button::new("transcript-latest", latest_label)
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Outlined)
+                                .start_icon(
+                                    Icon::new(IconName::ArrowDown).size(IconSize::XSmall).color(
+                                        if turn_active {
+                                            Color::Accent
+                                        } else {
+                                            Color::Muted
+                                        },
+                                    ),
+                                )
+                                .tooltip(Tooltip::text(
+                                    "Return to the live transcript · G or Ctrl-End",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.go_to_transcript_tail(window, cx)
+                                })),
+                        ),
+                    )
+                })
                 .when(rich_vim_experiment(), |this| {
                     // Keep the native Editor fully laid out so its Vim action
                     // handlers and motion state remain real, but position it
@@ -13391,13 +13471,12 @@ impl Render for HarnessApp {
                 }
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &GoBottom, _, cx| {
+            .on_action(cx.listener(|this, _: &GoBottom, window, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = this.threads.len().saturating_sub(1);
                     this.task_list_state.scroll_to_bottom();
                 } else {
-                    this.selected_item = this.model.items.len().saturating_sub(1);
-                    this.list_state.set_follow_mode(FollowMode::Tail);
+                    this.go_to_transcript_tail(window, cx);
                 }
                 cx.notify();
             }))
@@ -14803,6 +14882,20 @@ fn load_harness_keymaps(cx: &mut App) {
             GoBottom,
             Some("HarnessTranscript || HarnessTasks"),
         ),
+        // Rich mode deliberately keeps the real Vim Editor focused behind the
+        // structured projection. Override only its Normal-mode document-end
+        // command so both that Editor and the visible List reach the same live
+        // edge atomically.
+        KeyBinding::new(
+            "shift-g",
+            GoBottom,
+            Some("HarnessBuffer && Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "ctrl-end",
+            GoBottom,
+            Some("HarnessTranscript || HarnessBuffer"),
+        ),
         KeyBinding::new("ctrl-u", PageUp, Some("HarnessTranscript")),
         KeyBinding::new("ctrl-d", PageDown, Some("HarnessTranscript")),
         KeyBinding::new("enter", ToggleOutput, Some("HarnessTranscript")),
@@ -15853,6 +15946,36 @@ mod tests {
             Some((0..7, 4)),
             "thread replacement must reconcile stale list furniture atomically"
         );
+    }
+
+    #[test]
+    fn transcript_tail_targets_the_final_real_body_not_list_furniture() {
+        let document = model::TranscriptDocument {
+            text: "first\nfinal glyph".into(),
+            item_rows: vec![Some(0), None, Some(1), None],
+            segments: vec![
+                model::TranscriptDocumentSegment {
+                    item_index: 0,
+                    item_key: "first".into(),
+                    kind: model::TranscriptKind::Agent,
+                    whole_range: 0..6,
+                    header_range: 0..0,
+                    body_range: 0..5,
+                    semantic_spans: Vec::new(),
+                },
+                model::TranscriptDocumentSegment {
+                    item_index: 2,
+                    item_key: "final".into(),
+                    kind: model::TranscriptKind::Agent,
+                    whole_range: 6..17,
+                    header_range: 6..6,
+                    body_range: 6..17,
+                    semantic_spans: Vec::new(),
+                },
+            ],
+        };
+
+        assert_eq!(transcript_tail_target(&document), Some((2, 11)));
     }
 
     #[test]
