@@ -1345,17 +1345,16 @@ fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
         && item.pending_request.is_none()
         && matches!(
             item.kind,
-            model::TranscriptKind::Command
-                | model::TranscriptKind::Diff
-                | model::TranscriptKind::FileChange
+            model::TranscriptKind::Diff | model::TranscriptKind::FileChange
         )
 }
 
-fn transcript_item_header_title(item: &TranscriptItem) -> &str {
+fn transcript_item_header_title(item: &TranscriptItem) -> String {
     item.pending_request
         .as_ref()
         .and_then(|request| request_header_title(&request.method))
         .unwrap_or(&item.title)
+        .replace(" · ", " — ")
 }
 
 fn image_protocol_path(raw: &Value) -> Option<&str> {
@@ -1401,7 +1400,7 @@ fn rich_item_defers_navigation_claim(item: &TranscriptItem) -> bool {
 fn item_matches_search_query(item: &TranscriptItem, query: &str) -> bool {
     (transcript_item_shows_header(item)
         && !expanded_item_uses_content_as_header(item)
-        && search_contains(transcript_item_header_title(item), query))
+        && search_contains(&transcript_item_header_title(item), query))
         || search_contains(transcript_item_searchable_body(item), query)
         || item
             .display_status()
@@ -2263,7 +2262,7 @@ fn rich_search_query_is_visible(
     query: &str,
 ) -> bool {
     if (transcript_item_shows_header(item)
-        && search_contains(transcript_item_header_title(item), query))
+        && search_contains(&transcript_item_header_title(item), query))
         || item
             .display_status()
             .is_some_and(|status| search_contains(status, query))
@@ -3191,7 +3190,7 @@ impl Render for HybridStructuredSurface {
                     .truncate()
                     .text_ui_sm(cx)
                     .text_color(colors.text_muted)
-                    .child(transcript_item_header_title(&self.item).to_owned()),
+                    .child(transcript_item_header_title(&self.item)),
             )
             .child(Disclosure::new(
                 format!("hybrid-structured-disclosure:{}", self.item.key),
@@ -12539,7 +12538,7 @@ impl HarnessApp {
             })
             .flatten();
         let visible_status = item.display_status().map(ToOwned::to_owned);
-        let header_title = transcript_item_header_title(&item).to_owned();
+        let header_title = transcript_item_header_title(&item);
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = transcript_item_shows_header(&item);
         let headerless_expanded = show_header && expanded_item_uses_content_as_header(&item);
@@ -15470,7 +15469,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_command_and_diff_cards_let_content_replace_generic_headers() {
+    fn expanded_diffs_replace_redundant_headers_but_commands_keep_semantic_titles() {
         let mut replay = TranscriptModel::replay(6);
         let diff = &mut replay.items[4];
         assert!(expanded_item_uses_content_as_header(diff));
@@ -15478,8 +15477,8 @@ mod tests {
         assert!(!expanded_item_uses_content_as_header(diff));
 
         let command = &replay.items[5];
-        assert!(expanded_item_uses_content_as_header(command));
-        assert!(!item_matches_search_query(command, "Command"));
+        assert!(!expanded_item_uses_content_as_header(command));
+        assert!(item_matches_search_query(command, "Command"));
 
         replay.items[5].expanded = false;
         assert!(item_matches_search_query(&replay.items[5], "Command"));
@@ -16102,6 +16101,26 @@ mod tests {
         );
         assert_eq!(icon_for_item(&tool("Apply patch")), IconName::ToolPencil);
         assert_eq!(icon_for_item(&tool("Unknown MCP")), IconName::ToolHammer);
+    }
+
+    #[test]
+    fn visible_card_titles_never_use_interpunct_separators() {
+        let item = TranscriptItem {
+            key: "tool-title".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Tool,
+            title: "App Server · thread/read".into(),
+            status: None,
+            content: String::new(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+        assert_eq!(
+            transcript_item_header_title(&item),
+            "App Server — thread/read"
+        );
     }
 
     #[test]

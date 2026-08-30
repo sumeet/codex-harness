@@ -3924,27 +3924,40 @@ fn content_from_protocol(kind: &str, raw: &Value) -> String {
 
 fn command_title(raw: &Value) -> String {
     let actions = raw.get("commandActions").and_then(Value::as_array);
-    if let Some([action]) = actions.map(Vec::as_slice) {
-        let title = match string_at(action, "/type") {
-            Some("read") => string_at(action, "/path").map(|path| format!("Read · {path}")),
-            Some("listFiles") => Some(match string_at(action, "/path") {
-                Some(path) => format!("List files · {path}"),
-                None => "List files".into(),
-            }),
-            Some("search") => {
-                let query = string_at(action, "/query").unwrap_or("text");
-                Some(match string_at(action, "/path") {
-                    Some(path) => format!("Search · {query} · {path}"),
-                    None => format!("Search · {query}"),
-                })
-            }
-            _ => None,
-        };
-        if let Some(title) = title {
-            return title;
+    if let Some(actions) = actions.filter(|actions| !actions.is_empty()) {
+        let titles = actions
+            .iter()
+            .filter_map(command_action_title)
+            .collect::<Vec<_>>();
+        if let Some(first) = titles.first() {
+            return if actions.len() == 1 {
+                first.clone()
+            } else {
+                format!("{first} and {} more", actions.len() - 1)
+            };
         }
     }
     "Command".into()
+}
+
+fn command_action_title(action: &Value) -> Option<String> {
+    match string_at(action, "/type") {
+        Some("read") => string_at(action, "/path").map(|path| format!("Read {path}")),
+        Some("listFiles") => Some(match string_at(action, "/path") {
+            Some(path) => format!("List files in {path}"),
+            None => "List files".into(),
+        }),
+        Some("search") => {
+            let query = string_at(action, "/query").unwrap_or("text");
+            Some(match string_at(action, "/path") {
+                Some(path) => format!("Search for {query} in {path}"),
+                None => format!("Search for {query}"),
+            })
+        }
+        _ => string_at(action, "/name")
+            .or_else(|| string_at(action, "/type"))
+            .map(humanize_identifier),
+    }
 }
 
 fn mcp_tool_title(raw: &Value) -> String {
@@ -5287,7 +5300,27 @@ mod tests {
                 "path": "/workspace/src/main.rs"
             }]
         });
-        assert_eq!(command_title(&command), "Read · /workspace/src/main.rs");
+        assert_eq!(command_title(&command), "Read /workspace/src/main.rs");
+
+        let search = json!({
+            "commandActions": [{
+                "type": "search",
+                "query": "command_title",
+                "path": "crates/harness_protocol"
+            }]
+        });
+        assert_eq!(
+            command_title(&search),
+            "Search for command_title in crates/harness_protocol"
+        );
+
+        let multiple = json!({
+            "commandActions": [
+                {"type": "read", "path": "one.rs"},
+                {"type": "read", "path": "two.rs"}
+            ]
+        });
+        assert_eq!(command_title(&multiple), "Read one.rs and 1 more");
 
         let subagent = json!({
             "tool": "spawnAgent",
