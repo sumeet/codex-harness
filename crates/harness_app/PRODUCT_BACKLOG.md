@@ -21,13 +21,13 @@ must survive conversation compaction and hand-offs.
 
 ## In flight
 
-- Move command lifecycle onto the terminal glyph: animated while running,
-  quiet-success, error-colored failure, and a plain exit code only when known.
-- Persist the selected root/child and one text-only workspace draft atomically
-  so a full Harness restart restores local view state without duplicating
-  App Server-owned work.
-- Live-verify cross-surface mouse drag selection and then add native
-  double/triple-click plus Shift-extension semantics to the shared pointer host.
+- Live-accept the optimized slice: warm daemon reattach before history catch-up,
+  command glyph lifecycle, cross-surface drag selection, double/triple click,
+  Shift extension, detached-viewport submission, and installed-theme switching.
+- Finish managed-daemon version/update/crash recovery UX; the window-independent
+  daemon foundation and warm reattach path are implemented.
+- Decide the durable representation for **Later** and global queue pause; Codex
+  Queue is server-owned, but held work is not yet represented by App Server.
 
 ## Now
 
@@ -47,12 +47,12 @@ must survive conversation compaction and hand-offs.
   merge explicit tasks, attach multiple execution attempts, and retain outcome,
   status, acceptance criteria, dependencies, material updates, artifacts,
   checkpoints, and source thread/turn identity across restart and compaction.
-- [ ] Replace Harness-owned `app-server --listen stdio://` with Codex's managed
+- [x] Replace Harness-owned `app-server --listen stdio://` with Codex's managed
   daemon plus a reconnectable local transport. Closing the window must leave
   the daemon PID and active turns untouched; reopening must resume the saved
   thread, replay pending interaction, reload Queue and hierarchy, and reconcile
   missed output without duplicate transcript rows.
-- [ ] Keep cached-history reconnects thin: attach with `excludeTurns: true`,
+- [x] Keep cached-history reconnects thin: attach with `excludeTurns: true`,
   retain the local semantic transcript, reload Queue/hierarchy/settings, and
   never automatically fall back to a full multi-GB `thread/read`. Detect an
   abnormal repeated attach death and remain explicitly cached/read-only rather
@@ -106,6 +106,10 @@ must survive conversation compaction and hand-offs.
   document-like transcript while keeping its structure easy to scan.
 - [x] Add persistent in-app theme selection with immediate live application;
   components remain independent of any particular dark theme.
+- [x] Audit the installed Zed theme pack as semantic color themes rather than
+  syntax-only skins, and exclude sibling `icon_themes` JSON from color-theme
+  parsing. Harness maps canvas/editor/panel/surface/text/muted/accent/status and
+  syntax roles directly from the selected Zed theme.
 - [x] Port Zed's composer composition rather than only its buttons: a compact
   auto-height draft surface, one contextual Send/Queue/Stop control, a native
   context ring, and consistent model/effort and permission selectors in a
@@ -116,6 +120,8 @@ must survive conversation compaction and hand-offs.
 - [ ] Treat composer content as a durable draft whose destination can change
   without retyping: **Send**, **Queue**, **Later**, **Steer**, **Delegate**, or
   **Fork thread**.
+- [x] Persist text-only drafts per task (plus a new-task draft), restore them on
+  task switches/restart, and never persist orphaned inline image tokens.
 - [ ] Keep the default action effortless (Enter/click), and expose alternatives
   from the same send control plus keyboard-accessible commands.
 - [ ] Split pending work into two explicit lanes:
@@ -140,7 +146,7 @@ must survive conversation compaction and hand-offs.
 - [ ] Prefer server-owned durable pending state so Queue/Later works across
   machines. If App Server cannot represent held drafts, use an explicit,
   versioned sidecar rather than hidden text or overloaded IDs.
-- [ ] Make queued rows compact: no dedicated tall header or redundant per-row
+- [x] Make queued rows compact: no dedicated tall header or redundant per-row
   queue icon, inline 22–24 px image thumbnails only when an image exists,
   prompt-first width, and separators instead of cards. Keep the steering,
   interrupt-and-run, edit, and remove actions icon-only with unambiguous custom
@@ -221,12 +227,12 @@ must survive conversation compaction and hand-offs.
 
 ### Tool calls, diffs, and structured content
 
-- [ ] Give Bash command and output distinct selectable regions; trim trailing
+- [x] Give Bash command and output distinct selectable regions; trim trailing
   blank output, syntax-highlight the command, wrap long commands, and use the
   terminal glyph rather than a fake selectable `$ ` prompt. Omit
   `/usr/bin/bash -lc` ceremony only when protocol structure proves that wrapper
   is synthetic.
-- [ ] Preserve the same shell syntax-highlight spans in compact one-line
+- [x] Preserve the same shell syntax-highlight spans in compact one-line
   command activity rows; compactness may clip/wrap evidence but must not reduce
   a command to unstructured label text.
 - [ ] Use consistent compact headers (or no redundant header) across tool
@@ -244,15 +250,15 @@ must survive conversation compaction and hand-offs.
   identity row, a bounded high-value preview, exact evidence immediately
   expandable, and raw protocol only as diagnostics. Never replace evidence
   with an incomplete generic summary or `Unknown`.
-- [ ] Reconcile command completion in place even when later assistant prose has
+- [x] Reconcile command completion in place even when later assistant prose has
   already streamed; keep success quiet, active state visible, and show the
   nonzero exit code on failure.
-- [ ] Stack consecutive low-level command, search, and read activity into one
+- [x] Stack consecutive low-level command, search, and read activity into one
   consistently aligned surface with hairline row separators. Expanding one row
   reveals its body beneath that row without changing the stack's outer gutter;
   semantic diffs, images, approvals, and user-input requests remain independent
   blocks.
-- [ ] Give plans and reasoning lightweight document treatment and verify their
+- [x] Give plans and reasoning lightweight document treatment and verify their
   current compact layouts in a real long transcript.
 
 ### App Server and settings

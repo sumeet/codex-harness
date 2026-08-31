@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
+    fs,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -8,12 +9,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{
     Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus, CodexTurn,
     Event as AppServerEvent, SortDirection, ThreadItemEntry, ThreadOpenResponse,
-    ThreadResumeInitialTurnsPageParams, ThreadTurnsListParams, TurnItemsView,
+    ThreadTurnsListParams, TurnItemsView,
 };
 use file_icons::FileIcons;
 use gpui::{
@@ -36,17 +38,18 @@ use harness_editor::{
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle, SourcePointerPhase};
 use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use settings::{Settings as _, SettingsStore};
 use theme_settings::ThemeSettings;
 use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
-    Color, CommonAnimationExt, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure,
-    DocumentationSide, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
-    LabelCommon, LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes,
-    Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip,
-    WithScrollbar, right_click_menu,
+    Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
+    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
+    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
+    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
+    right_click_menu,
 };
 use uuid::Uuid;
 
@@ -228,6 +231,42 @@ fn rich_card_identity_icon(icon: IconName, size: IconSize, color: Color) -> gpui
         .items_center()
         .justify_center()
         .child(Icon::new(icon).size(size).color(color))
+}
+
+fn rich_command_identity_icon(
+    id: impl Into<SharedString>,
+    status: Option<model::CommandExecutionStatus>,
+) -> gpui::Div {
+    let id = id.into();
+    let color = match status {
+        Some(model::CommandExecutionStatus::Running) => Color::Accent,
+        Some(model::CommandExecutionStatus::Failed(_)) => Color::Error,
+        Some(model::CommandExecutionStatus::Succeeded) | None => Color::Muted,
+    };
+    let icon = div().child(
+        Icon::new(IconName::ToolTerminal)
+            .size(IconSize::Small)
+            .color(color),
+    );
+    let icon = if matches!(status, Some(model::CommandExecutionStatus::Running)) {
+        icon.with_animation(
+            format!("command-running-{id}"),
+            gpui::Animation::new(Duration::from_millis(1200))
+                .repeat_synced()
+                .with_easing(gpui::pulsating_between(0.42, 1.)),
+            |icon, delta| icon.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        icon.into_any_element()
+    };
+    div()
+        .w(px(RICH_CARD_LEADING_WIDTH))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon)
 }
 
 /// Use the same icon-theme lookup as Zed's agent edit cards. A semantic
@@ -567,7 +606,11 @@ struct RichPointerGesture {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RichPointerUpdate {
-    Begin(RichPointerPosition),
+    Begin {
+        position: RichPointerPosition,
+        click_count: usize,
+        extend_existing: bool,
+    },
     Extend {
         anchor: RichPointerPosition,
         head: RichPointerPosition,
@@ -579,6 +622,7 @@ fn rich_pointer_update(
     item_index: usize,
     body_offset: usize,
     phase: SourcePointerPhase,
+    modifiers: Modifiers,
 ) -> Option<RichPointerUpdate> {
     let head = RichPointerPosition {
         item_index,
@@ -587,8 +631,12 @@ fn rich_pointer_update(
     match phase {
         SourcePointerPhase::Down {
             button: MouseButton::Left,
-            ..
-        } => Some(RichPointerUpdate::Begin(head)),
+            click_count,
+        } => Some(RichPointerUpdate::Begin {
+            position: head,
+            click_count,
+            extend_existing: modifiers.shift,
+        }),
         SourcePointerPhase::Drag {
             button: MouseButton::Left,
         }
@@ -599,6 +647,95 @@ fn rich_pointer_update(
         SourcePointerPhase::Down { .. }
         | SourcePointerPhase::Drag { .. }
         | SourcePointerPhase::Up { .. } => None,
+    }
+}
+
+fn rich_pointer_click_range(body: &str, offset: usize, click_count: usize) -> Range<usize> {
+    let mut offset = offset.min(body.len());
+    while !body.is_char_boundary(offset) {
+        offset = offset.saturating_sub(1);
+    }
+    if click_count <= 1 || body.is_empty() {
+        return offset..offset;
+    }
+    if click_count >= 3 {
+        let start = body[..offset].rfind('\n').map_or(0, |index| index + 1);
+        let end = body[offset..]
+            .find('\n')
+            .map_or(body.len(), |index| offset + index);
+        return start..end;
+    }
+
+    let character_at = |index: usize| body[index..].chars().next();
+    let seed = if offset < body.len() {
+        offset
+    } else {
+        body.char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index)
+    };
+    let class = |character: char| {
+        if character.is_alphanumeric() || character == '_' {
+            0
+        } else if character.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let Some(seed_character) = character_at(seed) else {
+        return offset..offset;
+    };
+    let seed_class = class(seed_character);
+    let mut start = seed;
+    while start > 0 {
+        let Some((previous, character)) = body[..start].char_indices().next_back() else {
+            break;
+        };
+        if class(character) != seed_class {
+            break;
+        }
+        start = previous;
+    }
+    let mut end = seed + seed_character.len_utf8();
+    while end < body.len() {
+        let Some(character) = character_at(end) else {
+            break;
+        };
+        if class(character) != seed_class {
+            break;
+        }
+        end += character.len_utf8();
+    }
+    start..end
+}
+
+fn rich_pointer_existing_anchor(
+    snapshot: &TranscriptSelectionSnapshot,
+) -> Option<RichPointerPosition> {
+    if !snapshot.visual {
+        let item = snapshot.items.iter().find(|item| item.head.is_some())?;
+        return Some(RichPointerPosition {
+            item_index: item.item_index,
+            body_offset: item.head?,
+        });
+    }
+    if snapshot.reversed {
+        let item = snapshot
+            .items
+            .iter()
+            .rev()
+            .find(|item| !item.ranges.is_empty())?;
+        Some(RichPointerPosition {
+            item_index: item.item_index,
+            body_offset: item.ranges.iter().map(|range| range.end).max()?,
+        })
+    } else {
+        let item = snapshot.items.iter().find(|item| !item.ranges.is_empty())?;
+        Some(RichPointerPosition {
+            item_index: item.item_index,
+            body_offset: item.ranges.iter().map(|range| range.start).min()?,
+        })
     }
 }
 
@@ -1311,6 +1448,8 @@ fn rich_pointer_styled_text(
                 item_index,
                 body_offset: logical_offset_for_rendered_index(&down_range, rendered_index),
             };
+            let click_count = event.click_count;
+            let extend_existing = event.modifiers.shift;
             if !allow_simple_click {
                 cx.stop_propagation();
                 window.prevent_default();
@@ -1330,7 +1469,13 @@ fn rich_pointer_styled_text(
                             editor.enter_normal_mode(window, cx);
                         });
                     } else {
-                        this.begin_rich_pointer_selection(position, window, cx);
+                        this.begin_rich_pointer_selection(
+                            position,
+                            click_count,
+                            extend_existing,
+                            window,
+                            cx,
+                        );
                     }
                 })
                 .ok();
@@ -1993,24 +2138,9 @@ fn render_command_visual_status(
     cx: &App,
 ) -> Option<(f32, AnyElement)> {
     match status {
-        model::CommandExecutionStatus::Running => {
-            return Some((
-                44.,
-                div()
-                    .size(px(20.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::new(IconName::LoadCircle)
-                            .size(IconSize::Small)
-                            .color(Color::Accent)
-                            .with_rotate_animation(2),
-                    )
-                    .into_any_element(),
-            ));
-        }
+        // Activity lives on the terminal glyph itself, keeping the right edge
+        // stable and avoiding a second, visually unrelated spinner.
+        model::CommandExecutionStatus::Running => return None,
         // A successful command settles back into the ordinary card state.
         // Besides matching Zed's terminal tool treatment, rendering nothing
         // here lets the command reclaim the status gutter completely.
@@ -3028,6 +3158,41 @@ struct ComposerSubmission {
     input: Value,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+struct ComposerDraftStore {
+    drafts: HashMap<String, String>,
+}
+
+const NEW_TASK_DRAFT_KEY: &str = "__new_task__";
+
+fn composer_draft_key(thread_id: Option<&str>) -> &str {
+    thread_id.unwrap_or(NEW_TASK_DRAFT_KEY)
+}
+
+fn composer_drafts_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("harness").join("drafts.json"))
+}
+
+fn load_composer_drafts() -> ComposerDraftStore {
+    composer_drafts_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn persist_composer_drafts(store: &ComposerDraftStore) -> anyhow::Result<()> {
+    let path = composer_drafts_path().context("no user configuration directory is available")?;
+    let parent = path
+        .parent()
+        .context("Harness drafts path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(store)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 #[derive(Clone)]
 struct QueuedTurnSubmission {
     id: Option<String>,
@@ -3040,6 +3205,7 @@ struct QueuedTurnSubmission {
 enum QueueOperation {
     Removing,
     Editing,
+    Reordering,
     AddingToResponse,
     Interrupting,
 }
@@ -3049,6 +3215,7 @@ impl QueueOperation {
         match self {
             Self::Removing => "Removing…",
             Self::Editing => "Opening draft…",
+            Self::Reordering => "Moving…",
             Self::AddingToResponse => "Adding to response…",
             Self::Interrupting => "Interrupting…",
         }
@@ -3328,13 +3495,8 @@ fn should_reattach_cached_thread(
     cached_item_count > 0 && selected_thread_id == Some(requested_thread_id)
 }
 
-fn oversized_cached_thread_should_attach(
-    had_local_content: bool,
-    persisted_transcript_bytes: Option<u64>,
-) -> bool {
-    had_local_content
-        && persisted_transcript_bytes
-            .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
+fn cached_thread_should_attach(can_accept_direct_input: bool, had_local_content: bool) -> bool {
+    can_accept_direct_input && had_local_content
 }
 
 fn child_inspection_blocked(read_only_child: bool, has_unresolved_live_request: bool) -> bool {
@@ -3584,11 +3746,19 @@ impl Render for HybridStructuredSurface {
                     })
                     .ok();
             })
-            .child(rich_card_identity_icon(
-                icon_for_item(&self.item),
-                IconSize::Small,
-                Color::Muted,
-            ))
+            .when(self.item.kind == model::TranscriptKind::Command, |this| {
+                this.child(rich_command_identity_icon(
+                    self.item.key.clone(),
+                    self.item.command_execution_status(),
+                ))
+            })
+            .when(self.item.kind != model::TranscriptKind::Command, |this| {
+                this.child(rich_card_identity_icon(
+                    icon_for_item(&self.item),
+                    IconSize::Small,
+                    Color::Muted,
+                ))
+            })
             .child(
                 div()
                     .min_w_0()
@@ -3733,6 +3903,9 @@ struct HarnessApp {
     transcript_checkpoint_scheduled: bool,
     transcript_checkpoint_generation: u64,
     composer: Entity<LocalEditor>,
+    composer_drafts: ComposerDraftStore,
+    composer_draft_thread_id: Option<String>,
+    composer_draft_generation: u64,
     composer_images: Vec<ComposerImageAttachment>,
     next_composer_image_id: u64,
     composer_attachment_error: Option<SharedString>,
@@ -5951,11 +6124,21 @@ impl HarnessApp {
     ) -> AnyElement {
         let state = composer_action_state(turn_active, composer_empty);
         if state == ComposerActionState::Stop {
+            let stop_ready = self.model.current_turn_id.is_some();
             return IconButton::new("stop-turn", IconName::Stop)
                 .style(ButtonStyle::Subtle)
-                .icon_color(Color::Error)
+                .disabled(!stop_ready)
+                .icon_color(if stop_ready {
+                    Color::Error
+                } else {
+                    Color::Muted
+                })
                 .aria_label("Stop the current response")
-                .tooltip(Tooltip::text("Stop response"))
+                .tooltip(Tooltip::text(if stop_ready {
+                    "Stop response"
+                } else {
+                    "Restoring active-turn controls…"
+                }))
                 .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
                 .into_any_element();
         }
@@ -6017,7 +6200,8 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let queue_count = self.queued_turns.len();
-        let active_turn = self.model.current_turn_id.is_some();
+        let active_turn = self.turn_active();
+        let active_turn_control_ready = self.model.current_turn_id.is_some();
         let operations = self.queue_operations.clone();
         let weak = cx.weak_entity();
 
@@ -6051,6 +6235,8 @@ impl HarnessApp {
                                 index + 1
                             );
                             let weak_edit = weak.clone();
+                            let weak_move_up = weak.clone();
+                            let weak_move_down = weak.clone();
                             let weak_steer = weak.clone();
                             let weak_send = weak.clone();
                             let weak_remove = weak.clone();
@@ -6072,8 +6258,8 @@ impl HarnessApp {
                                         .flex_none()
                                         .tooltip(Tooltip::text(position_tooltip))
                                         .child(
-                                            Icon::new(IconName::QueueMessage)
-                                                .size(IconSize::XSmall)
+                                            Label::new(format!("{}", index + 1))
+                                                .size(LabelSize::XSmall)
                                                 .color(Color::Muted),
                                         ),
                                 )
@@ -6143,7 +6329,63 @@ impl HarnessApp {
                                                 )
                                         })
                                         .when(queue_ready && !operation_pending, |this| {
-                                            this.when(active_turn, |this| {
+                                            this.when(index > 0, |this| {
+                                                let client_id =
+                                                    entry.client_user_message_id.clone();
+                                                this.child(
+                                                    IconButton::new(
+                                                        ("move-queued-prompt-up", index),
+                                                        IconName::ArrowUp,
+                                                    )
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .aria_label("Move queued prompt earlier")
+                                                    .tooltip(Tooltip::text(
+                                                        "Move queued prompt earlier",
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        weak_move_up
+                                                            .update(cx, |this, cx| {
+                                                                this.move_queued_turn(
+                                                                    client_id.clone(),
+                                                                    -1,
+                                                                    cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                    }),
+                                                )
+                                            })
+                                            .when(index + 1 < queue_count, |this| {
+                                                let client_id =
+                                                    entry.client_user_message_id.clone();
+                                                this.child(
+                                                    IconButton::new(
+                                                        ("move-queued-prompt-down", index),
+                                                        IconName::ArrowDown,
+                                                    )
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .aria_label("Move queued prompt later")
+                                                    .tooltip(Tooltip::text(
+                                                        "Move queued prompt later",
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        weak_move_down
+                                                            .update(cx, |this, cx| {
+                                                                this.move_queued_turn(
+                                                                    client_id.clone(),
+                                                                    1,
+                                                                    cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                    }),
+                                                )
+                                            })
+                                            .when(active_turn_control_ready, |this| {
                                                 let client_id =
                                                     entry.client_user_message_id.clone();
                                                 this.child(
@@ -6180,6 +6422,7 @@ impl HarnessApp {
                                                 .shape(IconButtonShape::Square)
                                                 .size(ButtonSize::Compact)
                                                 .style(ButtonStyle::Subtle)
+                                                .disabled(active_turn && !active_turn_control_ready)
                                                 .aria_label(if active_turn {
                                                     "Interrupt response and run queued prompt"
                                                 } else {
@@ -6254,6 +6497,61 @@ impl HarnessApp {
                                         }),
                                 )
                         })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_pending_outbound_proxy(
+        &self,
+        following_tail: bool,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if following_tail {
+            return None;
+        }
+        let pending = self.model.items.iter().rev().find(|item| {
+            item.kind == model::TranscriptKind::User
+                && matches!(
+                    item.status.as_deref(),
+                    Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
+                )
+        })?;
+        let colors = cx.theme().colors().clone();
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
+        let preview = pending.content.lines().next().unwrap_or_default().trim();
+        let label: SharedString = if preview.is_empty() {
+            "Image prompt".into()
+        } else {
+            preview.to_owned().into()
+        };
+        let weak = cx.weak_entity();
+        Some(
+            div()
+                .id("pending-outbound-proxy")
+                .cursor_pointer()
+                .tooltip(Tooltip::text("View submitted prompt at the live tail"))
+                .on_click(move |_, window, cx| {
+                    weak.update(cx, |this, cx| this.go_to_transcript_tail(window, cx))
+                        .ok();
+                })
+                .h(px(30.))
+                .flex_none()
+                .px_2p5()
+                .flex()
+                .items_center()
+                .border_t_1()
+                .border_color(visuals.divider)
+                .bg(visuals.pending_surface)
+                .opacity(0.58)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_sm()
+                        .text_color(colors.text)
+                        .child(label),
                 )
                 .into_any_element(),
         )
@@ -6635,6 +6933,15 @@ impl HarnessApp {
         .detach();
         let mode_indicator = cx.new(|cx| ModeIndicator::compact(window, cx));
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
+        let composer_drafts = load_composer_drafts();
+        let composer_draft_thread_id = initial_thread_id.clone();
+        if let Some(draft) = composer_drafts
+            .drafts
+            .get(composer_draft_key(composer_draft_thread_id.as_deref()))
+            .filter(|draft| !draft.is_empty())
+        {
+            composer.update(cx, |editor, cx| editor.restore_text(draft.clone(), cx));
+        }
         let search_editor = cx.new(|cx| LocalEditor::plain_single_line("", window, cx));
         let theme_catalog_filter = cx.new(|cx| {
             ui_input::InputField::new(window, cx, "Search 600+ Zed theme packs…")
@@ -6688,6 +6995,7 @@ impl HarnessApp {
                 // row measurement. Re-render controls when text changes, but
                 // never guess its visual height from character counts.
                 let text = editor.read(cx).text(cx);
+                this.update_composer_draft(&text, cx);
                 this.composer_images
                     .retain(|attachment| text.contains(&composer_image_token(attachment.id)));
                 let tokens = this
@@ -6936,6 +7244,9 @@ impl HarnessApp {
             transcript_checkpoint_scheduled: false,
             transcript_checkpoint_generation: 0,
             composer,
+            composer_drafts,
+            composer_draft_thread_id,
+            composer_draft_generation: 0,
             composer_images: Vec::new(),
             next_composer_image_id: 0,
             composer_attachment_error: None,
@@ -7479,12 +7790,12 @@ impl HarnessApp {
         self.error = None;
         self.thread_open_task = cx.spawn(async move |this, cx| {
             let attach_started_at = Instant::now();
-            let attached = client
-                .attach_thread_with_initial_turns_page(
-                    &thread_id,
-                    ThreadResumeInitialTurnsPageParams::latest_turn_state(),
-                )
-                .await;
+            // Rejoining a loaded managed-daemon thread is a fast subscription
+            // operation. Do not ask App Server to project even one historical
+            // turn here: on multi-gigabyte rollouts that turns a ~100ms warm
+            // reconnect into a 30-60s history scan. Historical continuity is
+            // recovered independently below.
+            let attached = client.attach_thread_with_settings(&thread_id).await;
             let attach_elapsed = attach_started_at.elapsed();
             if attach_elapsed >= Duration::from_secs(2) {
                 log::warn!(
@@ -7535,8 +7846,7 @@ impl HarnessApp {
             };
 
             let active_turn_id = active_open_turn_id(&attached).map(ToOwned::to_owned);
-            let authoritative_turn_state_loaded = active_turn_id.is_some()
-                || !matches!(&attached.thread.status, CodexThreadStatus::Active { .. });
+            let authoritative_turn_state_loaded = true;
             // `thread/items/list` is present in the generated 0.151 schema but
             // the running daemon returns "not supported yet". Start at the
             // newest complete turn page instead. This also recovers items
@@ -7552,9 +7862,13 @@ impl HarnessApp {
                     {
                         return false;
                     }
-                    // The bounded initial page restores lifecycle authority
-                    // immediately; older semantic history can catch up in the
-                    // background without hiding Stop or sidebar activity.
+                    // `thread/resume` already returned authoritative active vs
+                    // idle state and subscribed this connection. Older
+                    // semantic history can catch up without blocking the
+                    // composer or hiding sidebar activity. An active turn may
+                    // not have exposed its exact id yet, so Stop remains
+                    // unavailable until a live event or history page supplies
+                    // that identity.
                     this.loaded_thread_updated_at = Some(attached.thread.updated_at);
                     if let Some(turn_id) = active_turn_id.clone() {
                         this.model.current_turn_id = Some(turn_id);
@@ -7570,6 +7884,7 @@ impl HarnessApp {
                     this.apply_thread_open_settings(&attached);
                     this.load_server_options(cx);
                     this.attach_cache_bytes = None;
+                    this.attaching_thread = false;
                     this.thread_read_only_reason = None;
                     this.reconnect_attempts = 0;
                     this.error = None;
@@ -7584,6 +7899,7 @@ impl HarnessApp {
                 return;
             }
 
+            let history_started_at = Instant::now();
             let mut turns_desc = Vec::new();
             let mut seen_turn_ids = HashSet::new();
             let mut seen_cursors = HashSet::new();
@@ -7742,6 +8058,11 @@ impl HarnessApp {
                 this.history_hydrating = false;
                 this.attaching_thread = false;
                 this.attach_cache_bytes = None;
+                log::info!(
+                    "task history hydration finished thread={thread_id} elapsed_ms={:.1} complete={}",
+                    history_started_at.elapsed().as_secs_f64() * 1_000.,
+                    this.transcript_history_complete,
+                );
                 cx.notify();
             });
         });
@@ -9038,6 +9359,7 @@ impl HarnessApp {
         ) {
             self.reject_pending_requests(cx);
         }
+        self.switch_composer_draft_context(Some(thread_id.clone()), cx);
         self.read_only_refresh_task = Task::ready(());
         if !preserve_background_work {
             self.turn_task = Task::ready(());
@@ -9115,11 +9437,9 @@ impl HarnessApp {
             self.refresh_queued_turns(cx);
         }
 
-        if can_accept_direct_input
-            && oversized_cached_thread_should_attach(had_local_content, persisted_transcript_bytes)
-        {
+        if cached_thread_should_attach(can_accept_direct_input, had_local_content) {
             log::info!(
-                "attaching cached task without replaying turns thread={thread_id} cache_bytes={}",
+                "attaching cached task before background history hydration thread={thread_id} cache_bytes={}",
                 persisted_transcript_bytes.unwrap_or_default(),
             );
             self.reattach_cached_thread(&thread_id, cx);
@@ -9393,7 +9713,68 @@ impl HarnessApp {
         }
     }
 
+    fn update_composer_draft(&mut self, text: &str, cx: &mut Context<Self>) {
+        let key = composer_draft_key(self.composer_draft_thread_id.as_deref()).to_owned();
+        // Image bytes remain owned by the live composer; never persist an
+        // orphaned inline token that would reopen as literal prompt text.
+        let mut persisted_text = text.to_owned();
+        for attachment in &self.composer_images {
+            persisted_text = persisted_text.replace(&composer_image_token(attachment.id), "");
+        }
+        if persisted_text.trim().is_empty() {
+            self.composer_drafts.drafts.remove(&key);
+        } else {
+            self.composer_drafts.drafts.insert(key, persisted_text);
+        }
+        self.composer_draft_generation = self.composer_draft_generation.wrapping_add(1);
+        let generation = self.composer_draft_generation;
+        let store = self.composer_drafts.clone();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            let current = this
+                .update(cx, |this, _| this.composer_draft_generation == generation)
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let result = cx
+                .background_executor()
+                .spawn(async move { persist_composer_drafts(&store) })
+                .await;
+            if let Err(error) = result {
+                log::warn!("could not persist composer drafts: {error:#}");
+            }
+        })
+        .detach();
+    }
+
+    fn switch_composer_draft_context(
+        &mut self,
+        next_thread_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.composer_draft_thread_id == next_thread_id {
+            return;
+        }
+        let current = self.composer.read(cx).text(cx);
+        self.update_composer_draft(&current, cx);
+        self.composer_draft_thread_id = next_thread_id;
+        self.composer_images.clear();
+        self.composer_attachment_error = None;
+        let draft = self
+            .composer_drafts
+            .drafts
+            .get(composer_draft_key(self.composer_draft_thread_id.as_deref()))
+            .cloned()
+            .unwrap_or_default();
+        self.composer
+            .update(cx, |editor, cx| editor.restore_text(draft, cx));
+    }
+
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.switch_composer_draft_context(None, cx);
         self.reject_pending_requests(cx);
         self.thread_open_task = Task::ready(());
         self.read_only_refresh_task = Task::ready(());
@@ -9518,16 +9899,23 @@ impl HarnessApp {
         let input = composer_app_server_input(&text, &self.composer_images);
         let preview = composer_prompt_preview(&input);
         let client_user_message_id = Uuid::new_v4().to_string();
+        let was_following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            self.list_state.is_following_tail()
+        };
         let key = show_optimistically_in_transcript.then(|| {
             let (index, key) = self
                 .model
                 .push_local_user(&client_user_message_id, preview, &input);
             self.dirty_image_surfaces.insert(key.clone());
             self.list_state.splice(index..index, 1);
-            self.selected_item = index;
-            self.list_state.set_follow_mode(FollowMode::Tail);
+            if was_following_tail {
+                self.selected_item = index;
+                self.list_state.set_follow_mode(FollowMode::Tail);
+            }
             let document = self.sync_transcript_document(cx);
-            if self.buffer_view {
+            if self.buffer_view && was_following_tail {
                 let row = document
                     .as_ref()
                     .and_then(|document| document.item_rows.get(index))
@@ -9654,7 +10042,10 @@ impl HarnessApp {
                     }
                     match result {
                         Ok((thread_id, opened_thread, response)) => {
-                            this.selected_thread_id = Some(thread_id);
+                            this.selected_thread_id = Some(thread_id.clone());
+                            if opened_thread.is_some() {
+                                this.switch_composer_draft_context(Some(thread_id), cx);
+                            }
                             if let Some(opened_thread) = opened_thread.as_ref() {
                                 this.apply_thread_open_settings(opened_thread);
                                 this.load_server_options(cx);
@@ -9826,6 +10217,7 @@ impl HarnessApp {
         if self.queue_start_pending
             || self.turn_start_pending
             || self.model.current_turn_id.is_some()
+            || self.selected_thread_reported_active()
             || self.has_unresolved_live_request()
             || self.queued_turns.is_empty()
             || !queue_state_is_visible(
@@ -9910,6 +10302,71 @@ impl HarnessApp {
         {
             self.queued_turns.remove(index);
         }
+    }
+
+    fn move_queued_turn(
+        &mut self,
+        client_user_message_id: String,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self
+            .queued_turns
+            .iter()
+            .position(|entry| entry.client_user_message_id == client_user_message_id)
+        else {
+            return;
+        };
+        let target = index.saturating_add_signed(delta);
+        if target >= self.queued_turns.len()
+            || target == index
+            || self.queue_operations.contains_key(&client_user_message_id)
+        {
+            return;
+        }
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        let mut reordered = self.queued_turns.clone();
+        reordered.swap(index, target);
+        let Some(ids) = reordered
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        self.queue_operations
+            .insert(client_user_message_id.clone(), QueueOperation::Reordering);
+        cx.spawn(async move |this, cx| {
+            let result = client.reorder_queued_turns(&thread_id, ids).await;
+            _ = this.update(cx, |this, cx| {
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
+                this.queue_operations.remove(&client_user_message_id);
+                match result {
+                    Ok(_) => {
+                        this.queued_turns = reordered;
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.refresh_queued_turns(cx);
+                        this.error =
+                            Some(format!("Could not reorder queued prompts: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn cancel_queued_turn(&mut self, client_user_message_id: String, cx: &mut Context<Self>) {
@@ -10984,23 +11441,57 @@ impl HarnessApp {
     fn begin_rich_pointer_selection(
         &mut self,
         position: RichPointerPosition,
+        click_count: usize,
+        extend_existing: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let existing_anchor = extend_existing
+            .then(|| {
+                self.transcript_editor
+                    .update(cx, |editor, cx| editor.selection_snapshot(cx))
+            })
+            .as_ref()
+            .and_then(rich_pointer_existing_anchor);
+        let click_range = self
+            .model
+            .items
+            .get(position.item_index)
+            .and_then(|_| rich_navigation_item_projection(&self.model, position.item_index))
+            .map(|projection| {
+                rich_pointer_click_range(projection.body_text(), position.body_offset, click_count)
+            })
+            .unwrap_or(position.body_offset..position.body_offset);
+        let anchor = existing_anchor.unwrap_or(RichPointerPosition {
+            item_index: position.item_index,
+            body_offset: click_range.start,
+        });
+        let head = RichPointerPosition {
+            item_index: position.item_index,
+            body_offset: if existing_anchor.is_some() {
+                position.body_offset
+            } else {
+                click_range.end
+            },
+        };
         // Install the guard before changing the native selection:
         // TranscriptSelectionChanged is emitted synchronously by the Editor.
-        self.rich_pointer_gesture = Some(RichPointerGesture {
-            anchor: position,
-            head: position,
-        });
-        self.note_rich_pointer_position(position);
-        self.selected_item = position.item_index;
+        self.rich_pointer_gesture = Some(RichPointerGesture { anchor, head });
+        self.note_rich_pointer_position(head);
+        self.selected_item = head.item_index;
         self.visual_anchor = None;
         self.focus_mode = FocusMode::Buffer;
         self.transcript_cursor_initialized = true;
         self.list_state.pause_following_tail();
         let placed = self.transcript_editor.update(cx, |editor, cx| {
-            editor.set_pointer_cursor_in_item(position.item_index, position.body_offset, window, cx)
+            editor.set_pointer_selection(
+                anchor.item_index,
+                anchor.body_offset,
+                head.item_index,
+                head.body_offset,
+                window,
+                cx,
+            )
         });
         if !placed {
             self.rich_pointer_gesture = None;
@@ -11082,12 +11573,17 @@ impl HarnessApp {
         item_index: usize,
         body_offset: usize,
         phase: SourcePointerPhase,
+        modifiers: Modifiers,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(update) =
-            rich_pointer_update(self.rich_pointer_gesture, item_index, body_offset, phase)
-        else {
+        let Some(update) = rich_pointer_update(
+            self.rich_pointer_gesture,
+            item_index,
+            body_offset,
+            phase,
+            modifiers,
+        ) else {
             return;
         };
         if let Some(cached) = self.markdown_cache.get_mut(markdown_key) {
@@ -11098,9 +11594,17 @@ impl HarnessApp {
         }
 
         match update {
-            RichPointerUpdate::Begin(anchor) => {
-                self.begin_rich_pointer_selection(anchor, window, cx)
-            }
+            RichPointerUpdate::Begin {
+                position,
+                click_count,
+                extend_existing,
+            } => self.begin_rich_pointer_selection(
+                position,
+                click_count,
+                extend_existing,
+                window,
+                cx,
+            ),
             RichPointerUpdate::Extend { head, .. } => {
                 self.extend_rich_pointer_selection(head, window, cx)
             }
@@ -12332,7 +12836,21 @@ impl HarnessApp {
     }
 
     fn turn_active(&self) -> bool {
-        self.model.current_turn_id.is_some() || self.turn_start_pending || self.queue_start_pending
+        self.model.current_turn_id.is_some()
+            || self.selected_thread_reported_active()
+            || self.turn_start_pending
+            || self.queue_start_pending
+    }
+
+    fn selected_thread_reported_active(&self) -> bool {
+        let Some(thread_id) = self.selected_thread_id.as_deref() else {
+            return false;
+        };
+        self.threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .or_else(|| self.child_threads.get(thread_id))
+            .is_some_and(|thread| matches!(thread.status, CodexThreadStatus::Active { .. }))
     }
 
     fn sync_turn_tail_indicator(&self, turn_active: bool) {
@@ -13437,10 +13955,9 @@ impl HarnessApp {
                         this.pr(px(status_padding))
                     })
                     .when(first_command_row, |this| {
-                        this.child(rich_card_identity_icon(
-                            IconName::ToolTerminal,
-                            IconSize::Small,
-                            Color::Muted,
+                        this.child(rich_command_identity_icon(
+                            format!("rich-{index}"),
+                            command_status,
                         ))
                     })
                     .child(div().min_w_0().flex_1().child(clickable))
@@ -13469,6 +13986,7 @@ impl HarnessApp {
         let output_rows = list(output_list_state.clone(), move |row_index, _, cx| {
             let row = &output_data.rows[output_row_offset + row_index];
             let line = &output_data.output[row.source_range.clone()];
+            let compact_blank_line = line.trim().is_empty();
             let logical_range = rich_command_row_logical_range(&output_data, row);
             let highlighted = navigation_searchable_styled_text(
                 line.to_owned(),
@@ -13500,7 +14018,11 @@ impl HarnessApp {
             div()
                 .w_full()
                 .min_w_0()
-                .min_h(harness_code_row_height(cx))
+                .min_h(if compact_blank_line {
+                    px(7.)
+                } else {
+                    harness_code_row_height(cx)
+                })
                 .relative()
                 .whitespace_nowrap()
                 .child(clickable)
@@ -13697,10 +14219,9 @@ impl HarnessApp {
                         .font_harness_code(cx)
                         .line_height(relative(1.35))
                         .whitespace_normal()
-                        .child(rich_card_identity_icon(
-                            IconName::ToolTerminal,
-                            IconSize::Small,
-                            Color::Muted,
+                        .child(rich_command_identity_icon(
+                            format!("preview-{index}"),
+                            item.command_execution_status(),
                         ))
                         .child(div().min_w_0().flex_1().child(clickable_command)),
                 )
@@ -14155,6 +14676,7 @@ impl HarnessApp {
                                             index,
                                             body_offset,
                                             event.phase,
+                                            event.modifiers,
                                             window,
                                             cx,
                                         );
@@ -14996,6 +15518,7 @@ impl HarnessApp {
                                 index,
                                 body_offset,
                                 event.phase,
+                                event.modifiers,
                                 window,
                                 cx,
                             );
@@ -15175,11 +15698,19 @@ impl HarnessApp {
                     this.bg(visuals.tool_header_surface)
                 })
             })
-            .child(rich_card_identity_icon(
-                icon,
-                IconSize::Small,
-                transcript_icon_color(item.kind),
-            ))
+            .when(item.kind == model::TranscriptKind::Command, |this| {
+                this.child(rich_command_identity_icon(
+                    item.key.clone(),
+                    item.command_execution_status(),
+                ))
+            })
+            .when(item.kind != model::TranscriptKind::Command, |this| {
+                this.child(rich_card_identity_icon(
+                    icon,
+                    IconSize::Small,
+                    transcript_icon_color(item.kind),
+                ))
+            })
             .child(
                 div()
                     .flex_1()
@@ -15810,6 +16341,12 @@ impl Render for HarnessApp {
         let permission_selector = self.render_permission_selector(cx);
         let composer_action =
             self.render_composer_action(turn_active, composer_empty, send_blocked, cx);
+        let following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            list_state.is_following_tail()
+        };
+        let pending_outbound_proxy = self.render_pending_outbound_proxy(following_tail, cx);
         let queued_turns = self.render_queued_turns(cx);
 
         div()
@@ -16133,6 +16670,7 @@ impl Render for HarnessApp {
                                 }),
                         )
                     })
+                    .when_some(pending_outbound_proxy, |this, proxy| this.child(proxy))
                     .when_some(queued_turns, |this, queued_turns| this.child(queued_turns))
                     .child(
                         div()
@@ -18498,9 +19036,15 @@ mod tests {
                 button: MouseButton::Left,
                 click_count: 1,
             },
+            Modifiers::default(),
         )
         .unwrap();
-        let RichPointerUpdate::Begin(anchor) = begin else {
+        let RichPointerUpdate::Begin {
+            position: anchor,
+            click_count: 1,
+            extend_existing: false,
+        } = begin
+        else {
             panic!("left down must begin a pointer selection")
         };
         assert_eq!(
@@ -18522,6 +19066,7 @@ mod tests {
                 SourcePointerPhase::Drag {
                     button: MouseButton::Left,
                 },
+                Modifiers::default(),
             ),
             Some(RichPointerUpdate::Extend {
                 anchor,
@@ -18544,6 +19089,7 @@ mod tests {
                 9,
                 23,
                 SourcePointerPhase::Move,
+                Modifiers::default(),
             ),
             Some(RichPointerUpdate::Extend {
                 anchor,
@@ -18555,7 +19101,7 @@ mod tests {
             "a passive Move becomes a drag update while another surface owns the gesture"
         );
         assert_eq!(
-            rich_pointer_update(None, 3, 9, SourcePointerPhase::Move),
+            rich_pointer_update(None, 3, 9, SourcePointerPhase::Move, Modifiers::default(),),
             None
         );
         assert_eq!(
@@ -18567,12 +19113,20 @@ mod tests {
                     button: MouseButton::Left,
                     click_count: 3,
                 },
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
             ),
-            Some(RichPointerUpdate::Begin(RichPointerPosition {
-                item_index: 3,
-                body_offset: 9,
-            })),
-            "double/triple click expansion is outside the character-drag bridge"
+            Some(RichPointerUpdate::Begin {
+                position: RichPointerPosition {
+                    item_index: 3,
+                    body_offset: 9,
+                },
+                click_count: 3,
+                extend_existing: true,
+            }),
+            "click count and Shift intent must reach the canonical selection bridge"
         );
         assert_eq!(
             rich_pointer_update(
@@ -18583,6 +19137,7 @@ mod tests {
                     button: MouseButton::Right,
                     click_count: 1,
                 },
+                Modifiers::default(),
             ),
             None,
             "non-left buttons remain available to Markdown and its context menu"
@@ -18610,8 +19165,8 @@ mod tests {
                 "the legacy click bridge prevents Markdown pointer drag delegation"
             );
             assert!(
-                !renderer.contains("event.modifiers"),
-                "Shift extension remains outside this character-drag integration"
+                renderer.contains("event.modifiers"),
+                "Shift extension must use the same cross-surface pointer integration"
             );
         }
 
@@ -18621,7 +19176,6 @@ mod tests {
             .map(|(method, _)| method)
             .expect("renderer-neutral pointer host must remain auditable");
         for required in [
-            "set_pointer_cursor_in_item(",
             "set_pointer_selection(",
             "pause_following_tail()",
             "focus_handle(cx).focus(window, cx)",
@@ -18719,6 +19273,42 @@ mod tests {
                 "Rich structured pointer path must not call {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn rich_pointer_clicks_select_unicode_words_and_lines() {
+        let body = "alpha café_2!\nsecond line";
+        let cafe = body.find("café").unwrap() + 2;
+        let word = rich_pointer_click_range(body, cafe, 2);
+        assert_eq!(&body[word], "café_2");
+
+        let line = rich_pointer_click_range(body, body.find("line").unwrap(), 3);
+        assert_eq!(&body[line], "second line");
+
+        let cursor = rich_pointer_click_range(body, cafe, 1);
+        assert_eq!(cursor, cafe..cafe);
+    }
+
+    #[test]
+    fn shift_pointer_extension_retains_the_native_selection_anchor() {
+        let snapshot = TranscriptSelectionSnapshot {
+            visual: true,
+            linewise: false,
+            reversed: false,
+            items: vec![harness_editor::TranscriptItemSelection {
+                item_index: 4,
+                body_text: Arc::from("selected"),
+                ranges: vec![2..7],
+                head: Some(7),
+            }],
+        };
+        assert_eq!(
+            rich_pointer_existing_anchor(&snapshot),
+            Some(RichPointerPosition {
+                item_index: 4,
+                body_offset: 2,
+            })
+        );
     }
 
     #[test]
@@ -19742,9 +20332,10 @@ mod tests {
         assert!(hybrid.contains("transcript_header_styled_text("));
         assert!(item_renderer.contains("transcript_header_styled_text("));
         assert!(command_renderer.contains("shell_highlights(line, cx)"));
-        assert!(command_renderer.contains("IconName::ToolTerminal"));
-        assert!(command_renderer.contains("Color::Muted"));
-        assert!(command_status.contains("CommandExecutionStatus::Running"));
+        assert!(command_renderer.contains("rich_command_identity_icon("));
+        assert!(source.contains("IconName::ToolTerminal"));
+        assert!(source.contains("pulsating_between(0.42, 1.)"));
+        assert!(command_status.contains("CommandExecutionStatus::Running => return None"));
         assert!(command_status.contains("CommandExecutionStatus::Succeeded => return None"));
         assert!(command_status.contains("format!(\"exit {code}\")"));
         assert!(item_renderer.contains(".when(!compact_trace && !routine_activity"));
@@ -21185,20 +21776,57 @@ mod tests {
     }
 
     #[test]
-    fn oversized_persisted_transcript_uses_thin_attach_after_cold_restore() {
-        assert!(oversized_cached_thread_should_attach(
-            true,
-            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
-        ));
-        assert!(!oversized_cached_thread_should_attach(
-            true,
-            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES - 1)
-        ));
-        assert!(!oversized_cached_thread_should_attach(
-            false,
-            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES * 2)
-        ));
-        assert!(!oversized_cached_thread_should_attach(true, None));
+    fn every_cached_writable_task_uses_fast_attach_before_history_hydration() {
+        assert!(cached_thread_should_attach(true, true));
+        assert!(!cached_thread_should_attach(true, false));
+        assert!(!cached_thread_should_attach(false, true));
+    }
+
+    #[test]
+    fn warm_reattach_does_not_request_history_on_the_interactive_path() {
+        let source = include_str!("main.rs");
+        let reattach = source
+            .split_once("fn reattach_cached_thread(")
+            .and_then(|(_, after)| after.split_once("fn handle_server_disconnect("))
+            .map(|(body, _)| body)
+            .expect("cached-thread reattach must remain auditable");
+        let live_ready = reattach
+            .split_once("let history_started_at = Instant::now();")
+            .map(|(body, _)| body)
+            .expect("history hydration must remain a separate phase");
+
+        assert!(live_ready.contains("attach_thread_with_settings(&thread_id)"));
+        assert!(!live_ready.contains("attach_thread_with_initial_turns_page"));
+        assert!(live_ready.contains("this.attaching_thread = false"));
+        assert!(live_ready.contains("this.refresh_queued_turns(cx)"));
+    }
+
+    #[test]
+    fn optimistic_submission_preserves_a_detached_transcript_viewport() {
+        let source = include_str!("main.rs");
+        let submission = source
+            .split_once("fn take_composer_submission(")
+            .and_then(|(_, after)| after.split_once("fn send("))
+            .map(|(body, _)| body)
+            .expect("composer submission must remain auditable");
+
+        assert!(submission.contains("let was_following_tail = if self.buffer_view"));
+        assert!(submission.contains("if was_following_tail {"));
+        assert!(submission.contains("self.list_state.set_follow_mode(FollowMode::Tail)"));
+        assert!(submission.contains("if self.buffer_view && was_following_tail"));
+        assert!(!submission.contains("scroll_to_reveal_item"));
+    }
+
+    #[test]
+    fn composer_drafts_have_stable_per_task_keys_and_round_trip() {
+        assert_eq!(composer_draft_key(None), NEW_TASK_DRAFT_KEY);
+        assert_eq!(composer_draft_key(Some("thread-a")), "thread-a");
+
+        let mut store = ComposerDraftStore::default();
+        store.drafts.insert("thread-a".into(), "unfinished".into());
+        let encoded = serde_json::to_vec(&store).unwrap();
+        let decoded: ComposerDraftStore = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.drafts.get("thread-a").unwrap(), "unfinished");
     }
 
     #[test]

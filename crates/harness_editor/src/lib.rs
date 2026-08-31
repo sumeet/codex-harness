@@ -353,6 +353,20 @@ impl LocalEditor {
         });
     }
 
+    /// Restore a persisted draft while no window event is being handled.
+    ///
+    /// Task switches can originate in async App Server callbacks, where a
+    /// `Window` borrow is intentionally unavailable. Updating the singleton
+    /// buffer still emits the ordinary BufferEdited event, so Markdown
+    /// semantics, auto-height layout, and the host's draft bookkeeping remain
+    /// synchronized. Draft restoration is not an undoable user edit.
+    pub fn restore_text(&mut self, text: impl Into<Arc<str>>, cx: &mut Context<Self>) {
+        let buffer = self.editor.read(cx).buffer().read(cx).as_singleton();
+        if let Some(buffer) = buffer {
+            buffer.update(cx, |buffer, cx| buffer.set_text(text, cx));
+        }
+    }
+
     /// Insert a real Editor newline so composer-specific key bindings retain
     /// normal undo, indentation, selection, and Vim insert-mode semantics.
     pub fn insert_newline(&mut self, window: &mut Window, cx: &mut Context<Self>) {

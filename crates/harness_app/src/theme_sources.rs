@@ -338,6 +338,9 @@ fn collect_theme_json(directory: &Path, depth: usize, output: &mut Vec<PathBuf>)
             && path
                 .components()
                 .any(|component| component.as_os_str() == "themes")
+            && !path
+                .components()
+                .any(|component| component.as_os_str() == "icon_themes")
         {
             output.push(path);
         }
@@ -376,6 +379,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("harness-theme-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("preferences.json"), b"{}").unwrap();
+        // Harness installs the extension catalog under its own `themes`
+        // directory, so a component test for `themes` alone also matches the
+        // sibling Zed `icon_themes` payload unless it is excluded explicitly.
+        let icon_themes = root.join("themes").join("min-theme").join("icon_themes");
+        fs::create_dir_all(&icon_themes).unwrap();
+        fs::write(
+            icon_themes.join("min-icon-theme.json"),
+            br#"{"name":"Min Icons","themes":[]}"#,
+        )
+        .unwrap();
 
         let registry = ThemeRegistry::new(Box::new(()));
         let report = load_external_theme_roots(&registry, [root.clone()]);
