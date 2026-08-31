@@ -21,13 +21,13 @@ must survive conversation compaction and hand-offs.
 
 ## In flight
 
-- Reconcile the verified protocol, compaction, and compact-queue slices and
-  push a private checkpoint.
-- Verify the live child-thread registry and collapsed completed-task history in
-  a restarted Harness without allowing inherited prompt previews to reappear.
-- Define and apply one systematic lightness/density hierarchy across narrative,
-  routine activity stacks, and semantic artifacts instead of tuning each card
-  independently.
+- Replace the window-owned embedded App Server with Codex's managed daemon and
+  reconnectable proxy transport; preserve the embedded path only as an explicit
+  compatibility API rather than a silent fallback.
+- Apply the first systematic lightness/density slice to routine activity:
+  syntax-aware compact commands, truthful identities, and consecutive stacks.
+- Extend the no-scroll Markdown pointer bridge across structured transcript
+  surfaces, multi-click/Shift selection, and adjacent mounted items.
 
 ## Now
 
@@ -263,7 +263,7 @@ must survive conversation compaction and hand-offs.
   if the installed App Server cannot attach by cursor/checkpoint, continue in a
   new live thread with an explicit semantic handoff instead of hiding minutes of
   work behind `Connecting live…`.
-- [ ] Expose Codex Fast mode as an explicit selectable and deselectable task/turn
+- [x] Expose Codex Fast mode as an explicit selectable and deselectable task/turn
   setting, display the App Server's resolved `serviceTier`, and send `default`
   when Fast is off rather than inferring it from model or reasoning effort.
 - [ ] Show at most one context-compaction landmark for each actual compaction;
