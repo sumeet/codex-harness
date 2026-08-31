@@ -177,6 +177,12 @@ fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
     px((size.as_f32() * 1.25).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
 }
 
+fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
+    px(harness_code_row_height(cx)
+        .as_f32()
+        .max(harness_reading_row_height(cx).as_f32()))
+}
+
 /// Apply Harness's semantic code role as one indivisible family/size choice.
 ///
 /// Zed's `font_buffer` and `text_ui_sm` helpers intentionally represent two
@@ -1403,15 +1409,42 @@ fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
     )
 }
 
-fn transcript_item_is_compact_activity(item: &TranscriptItem) -> bool {
-    !item.expanded
-        && !matches!(
+fn transcript_item_is_routine_activity(item: &TranscriptItem) -> bool {
+    item.pending_request.is_none()
+        && matches!(
             item.kind,
-            model::TranscriptKind::User
-                | model::TranscriptKind::Agent
-                | model::TranscriptKind::Reasoning
-                | model::TranscriptKind::Plan
+            model::TranscriptKind::Command
+                | model::TranscriptKind::Tool
+                | model::TranscriptKind::Web
         )
+}
+
+fn adjacent_visible_item(
+    items: &[TranscriptItem],
+    index: usize,
+    direction: isize,
+) -> Option<&TranscriptItem> {
+    let mut candidate = index.checked_add_signed(direction)?;
+    loop {
+        let item = items.get(candidate)?;
+        if item.is_presentationally_visible() {
+            return Some(item);
+        }
+        candidate = candidate.checked_add_signed(direction)?;
+    }
+}
+
+fn routine_activity_run_neighbors(items: &[TranscriptItem], index: usize) -> (bool, bool) {
+    if !items
+        .get(index)
+        .is_some_and(transcript_item_is_routine_activity)
+    {
+        return (false, false);
+    }
+    (
+        adjacent_visible_item(items, index, -1).is_some_and(transcript_item_is_routine_activity),
+        adjacent_visible_item(items, index, 1).is_some_and(transcript_item_is_routine_activity),
+    )
 }
 
 fn plan_progress(raw: &Value) -> Option<(usize, usize)> {
@@ -1458,13 +1491,73 @@ fn transcript_item_header_title(item: &TranscriptItem) -> String {
                     .map(str::trim)
                     .map(ToOwned::to_owned)
             })
-            .unwrap_or_else(|| "Shell command".to_owned())
+            .unwrap_or_else(|| transcript_item_fallback_identity(item))
     } else if item.kind == model::TranscriptKind::Web {
         web_search_presentation(&item.raw)
             .queries
             .into_iter()
             .next()
-            .unwrap_or_else(|| title.replace(" · ", " — "))
+            .unwrap_or_else(|| concrete_or_fallback_title(item, title))
+    } else {
+        concrete_or_fallback_title(item, title)
+    }
+}
+
+fn title_is_generic_or_unknown(title: &str) -> bool {
+    let normalized = title.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || normalized.contains("unknown")
+        || matches!(
+            normalized.as_str(),
+            "command" | "shell command" | "tool" | "tool call" | "activity" | "protocol event"
+        )
+}
+
+fn concrete_identity_at(item: &TranscriptItem, pointer: &str) -> Option<String> {
+    item.raw
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !title_is_generic_or_unknown(value))
+        .map(ToOwned::to_owned)
+}
+
+fn transcript_item_fallback_identity(item: &TranscriptItem) -> String {
+    let app = concrete_identity_at(item, "/appContext/appName");
+    let action = concrete_identity_at(item, "/appContext/actionName");
+    if let Some(action) = action {
+        return app.map_or(action.clone(), |app| format!("{app} — {action}"));
+    }
+
+    for pointer in [
+        "/tool",
+        "/action/name",
+        "/action/type",
+        "/method",
+        "/name",
+        "/type",
+    ] {
+        if let Some(identity) = concrete_identity_at(item, pointer) {
+            return identity;
+        }
+    }
+    item.pending_request
+        .as_ref()
+        .map(|request| request.method.trim())
+        .filter(|method| !title_is_generic_or_unknown(method))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| match item.kind {
+            model::TranscriptKind::Command => "Shell activity".into(),
+            model::TranscriptKind::Tool => "Tool activity".into(),
+            model::TranscriptKind::Web => "Web activity".into(),
+            model::TranscriptKind::Trace => "Protocol activity".into(),
+            _ => "Activity".into(),
+        })
+}
+
+fn concrete_or_fallback_title(item: &TranscriptItem, title: &str) -> String {
+    if title_is_generic_or_unknown(title) {
+        transcript_item_fallback_identity(item)
     } else {
         title.replace(" · ", " — ")
     }
@@ -2756,6 +2849,20 @@ fn shell_highlights(command: &str, cx: &App) -> Vec<(Range<usize>, gpui::Highlig
     highlights
 }
 
+fn transcript_header_styled_text(
+    item: &TranscriptItem,
+    title: String,
+    search: Option<&RichSearchPaint>,
+    cx: &App,
+) -> StyledText {
+    let highlights = if item.kind == model::TranscriptKind::Command {
+        shell_highlights(&title, cx)
+    } else {
+        Vec::new()
+    };
+    searchable_styled_text(title, highlights, search, cx)
+}
+
 fn json_highlights(content: &str, cx: &App) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
     let syntax = cx.theme().syntax();
     let colors = cx.theme().colors();
@@ -3370,6 +3477,7 @@ impl Render for HybridStructuredSurface {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let command_fallback_title = command_uses_raw_identity(&self.item);
+        let routine_activity = transcript_item_is_routine_activity(&self.item);
         let command_status = self
             .item
             .command_execution_status()
@@ -3403,8 +3511,14 @@ impl Render for HybridStructuredSurface {
             .flatten();
         let item_key = self.item.key.clone();
         let owner = self.owner.clone();
+        let header_title = transcript_item_header_title(&self.item);
+        let highlighted_header_title =
+            transcript_header_styled_text(&self.item, header_title, None, cx);
         let header = rich_card_identity_row(cx)
             .id(format!("hybrid-structured-header:{}", self.item.key))
+            .when(command_fallback_title, |this| {
+                this.h(harness_routine_activity_row_height(cx))
+            })
             .cursor_pointer()
             .on_click(move |_, _, cx| {
                 owner
@@ -3437,7 +3551,7 @@ impl Render for HybridStructuredSurface {
                         this.font_harness_reading(cx)
                     })
                     .text_color(colors.text_muted)
-                    .child(transcript_item_header_title(&self.item)),
+                    .child(highlighted_header_title),
             )
             .when_some(command_status, |this, (_, status)| this.child(status))
             .child(Disclosure::new(
@@ -3445,22 +3559,31 @@ impl Render for HybridStructuredSurface {
                 self.item.expanded,
             ));
 
-        div().size_full().min_w_0().py_1().child(
-            div()
-                .size_full()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .rounded_sm()
-                .border_1()
-                .border_color(visuals.divider)
-                .bg(visuals.raised_surface)
-                .px_2()
-                .py_1()
-                .child(header)
-                .when_some(body, |this, body| this.child(body)),
-        )
+        div()
+            .size_full()
+            .min_w_0()
+            .when(!routine_activity, |this| this.py_1())
+            .child(
+                div()
+                    .size_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .when(!routine_activity, |this| {
+                        this.rounded_sm()
+                            .border_1()
+                            .border_color(visuals.divider)
+                            .bg(visuals.raised_surface)
+                            .px_2()
+                            .py_1()
+                    })
+                    .when(routine_activity, |this| {
+                        this.border_l_1().border_color(visuals.divider).px_1()
+                    })
+                    .child(header)
+                    .when_some(body, |this, body| this.child(body)),
+            )
     }
 }
 
@@ -12824,6 +12947,9 @@ impl HarnessApp {
                     .w_full()
                     .min_w_0()
                     .min_h(harness_code_row_height(cx))
+                    .when(first_command_row, |this| {
+                        this.min_h(harness_routine_activity_row_height(cx))
+                    })
                     .relative()
                     .flex()
                     .items_start()
@@ -12980,9 +13106,8 @@ impl HarnessApp {
                     div()
                         .w_full()
                         .min_w_0()
-                        .p_1p5()
-                        .bg(HarnessVisualTheme::from_zed(&colors, cx.theme().status())
-                            .tool_header_surface)
+                        .px_1()
+                        .py_0p5()
                         .child(command_region),
                 )
                 .when_some(output_region, |this, output| this.child(output))
@@ -13082,6 +13207,7 @@ impl HarnessApp {
                     div()
                         .w_full()
                         .min_w_0()
+                        .min_h(harness_routine_activity_row_height(cx))
                         .pr_5()
                         .flex()
                         .items_start()
@@ -14083,16 +14209,9 @@ impl HarnessApp {
             });
         let raw_visible = self.raw_visible.contains(&item.key);
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
-        let compact_activity = transcript_item_is_compact_activity(&item);
-        let compact_activity_above = index
-            .checked_sub(1)
-            .and_then(|index| self.model.items.get(index))
-            .is_some_and(transcript_item_is_compact_activity);
-        let compact_activity_below = self
-            .model
-            .items
-            .get(index + 1)
-            .is_some_and(transcript_item_is_compact_activity);
+        let routine_activity = transcript_item_is_routine_activity(&item);
+        let (routine_activity_above, routine_activity_below) =
+            routine_activity_run_neighbors(&self.model.items, index);
         let request_method = item
             .pending_request
             .as_ref()
@@ -14485,16 +14604,31 @@ impl HarnessApp {
                 )]
             })
             .unwrap_or_default();
-        let highlighted_header_title =
-            searchable_styled_text(header_title, header_highlights, header_search, cx);
+        let highlighted_header_title = if header_highlights.is_empty() {
+            transcript_header_styled_text(&item, header_title, header_search, cx)
+        } else {
+            let semantic_highlights = if item.kind == model::TranscriptKind::Command {
+                shell_highlights(&header_title, cx)
+            } else {
+                Vec::new()
+            };
+            let highlights =
+                gpui::combine_highlights(semantic_highlights, header_highlights).collect();
+            searchable_styled_text(header_title, highlights, header_search, cx)
+        };
         let highlighted_status = visible_status
             .as_ref()
             .map(|status| searchable_styled_text(status.clone(), Vec::new(), header_search, cx));
 
         let header = rich_card_identity_row(cx)
             .id(format!("item-header:{}", item.key))
+            .when(routine_activity, |this| {
+                this.h(harness_routine_activity_row_height(cx))
+            })
             .when(!narrative && !compact_trace, |this| {
-                this.px_1().bg(visuals.tool_header_surface)
+                this.px_1().when(!routine_activity, |this| {
+                    this.bg(visuals.tool_header_surface)
+                })
             })
             .child(rich_card_identity_icon(
                 icon,
@@ -14652,11 +14786,16 @@ impl HarnessApp {
                 .relative()
                 .flex()
                 .flex_col()
-                .when(!compact_trace, |this| {
+                .when(!compact_trace && !routine_activity, |this| {
                     this.rounded_md()
                         .border_1()
                         .border_color(colors.border.opacity(0.6))
                         .bg(colors.editor_background)
+                        .overflow_hidden()
+                })
+                .when(routine_activity, |this| {
+                    this.border_l_1()
+                        .border_color(visuals.divider)
                         .overflow_hidden()
                 })
                 .when(
@@ -14685,7 +14824,15 @@ impl HarnessApp {
                     if flush_tool_surface || compact_trace {
                         this.child(body)
                     } else {
-                        this.child(div().px_2().py_1().child(body))
+                        this.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .when(routine_activity, |this| {
+                                    this.border_t_1().border_color(visuals.divider)
+                                })
+                                .child(body),
+                        )
                     }
                 })
                 .when_some(raw, |this, raw| this.child(div().px_2().pb_1().child(raw)))
@@ -14728,13 +14875,13 @@ impl HarnessApp {
             .id(("transcript-item", index))
             .w_full()
             .px(if narrow { px(10.) } else { px(18.) })
-            .pt(if compact_activity && compact_activity_above {
+            .pt(if routine_activity && routine_activity_above {
                 px(0.)
             } else {
                 normal_vertical_padding
             })
-            .pb(if compact_activity && compact_activity_below {
-                px(1.)
+            .pb(if routine_activity && routine_activity_below {
+                px(0.)
             } else {
                 normal_vertical_padding
             })
@@ -18693,10 +18840,148 @@ mod tests {
     }
 
     #[test]
-    fn only_collapsed_activity_rows_form_compact_stacks() {
-        let replay = TranscriptModel::replay(6);
-        assert!(!transcript_item_is_compact_activity(&replay.items[0]));
-        assert!(transcript_item_is_compact_activity(&replay.items[5]));
+    fn routine_activity_stacks_are_semantic_not_expansion_driven() {
+        let activity = |kind| TranscriptItem {
+            key: format!("{kind:?}"),
+            protocol_id: None,
+            kind,
+            title: "Activity".into(),
+            status: None,
+            content: "evidence".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: false,
+            pending_request: None,
+        };
+
+        for kind in [
+            model::TranscriptKind::Command,
+            model::TranscriptKind::Tool,
+            model::TranscriptKind::Web,
+        ] {
+            let mut item = activity(kind);
+            assert!(transcript_item_is_routine_activity(&item));
+            item.expanded = true;
+            assert!(transcript_item_is_routine_activity(&item));
+        }
+        for kind in [
+            model::TranscriptKind::Diff,
+            model::TranscriptKind::FileChange,
+            model::TranscriptKind::Image,
+            model::TranscriptKind::Approval,
+        ] {
+            assert!(!transcript_item_is_routine_activity(&activity(kind)));
+        }
+
+        let mut requested_tool = activity(model::TranscriptKind::Tool);
+        requested_tool.pending_request = Some(model::PendingRequest {
+            id: json!(1),
+            method: "item/tool/requestUserInput".into(),
+            resolved: false,
+        });
+        assert!(!transcript_item_is_routine_activity(&requested_tool));
+
+        let hidden_reasoning = TranscriptItem {
+            content: String::new(),
+            ..activity(model::TranscriptKind::Reasoning)
+        };
+        let items = vec![
+            activity(model::TranscriptKind::Command),
+            hidden_reasoning,
+            activity(model::TranscriptKind::Web),
+            activity(model::TranscriptKind::Diff),
+        ];
+        assert_eq!(routine_activity_run_neighbors(&items, 0), (false, true));
+        assert_eq!(routine_activity_run_neighbors(&items, 2), (true, false));
+        assert_eq!(routine_activity_run_neighbors(&items, 3), (false, false));
+    }
+
+    #[test]
+    fn generic_titles_fall_back_to_the_most_concrete_protocol_identity() {
+        let mut item = TranscriptItem {
+            key: "generic-tool".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Tool,
+            title: "Unknown MCP".into(),
+            status: None,
+            content: String::new(),
+            raw: json!({
+                "method": "fallback/method",
+                "tool": "thread/read",
+                "appContext": {
+                    "appName": "GitHub",
+                    "actionName": "searchRepositories"
+                }
+            }),
+            event_count: 1,
+            expanded: false,
+            pending_request: None,
+        };
+        assert_eq!(
+            transcript_item_header_title(&item),
+            "GitHub — searchRepositories"
+        );
+
+        item.raw = json!({"method": "fallback/method", "tool": "thread/read"});
+        assert_eq!(transcript_item_header_title(&item), "thread/read");
+
+        item.raw = json!({"method": "fallback/method", "action": {"name": "openPage"}});
+        assert_eq!(transcript_item_header_title(&item), "openPage");
+
+        item.raw = Value::Null;
+        assert_eq!(transcript_item_header_title(&item), "Tool activity");
+        assert!(!transcript_item_header_title(&item).contains("Unknown"));
+
+        item.kind = model::TranscriptKind::Command;
+        item.title = "Command".into();
+        item.raw = json!({"command": "", "method": "process/run"});
+        assert_eq!(transcript_item_header_title(&item), "process/run");
+    }
+
+    #[test]
+    fn routine_activity_renderers_share_syntax_and_unboxed_stack_contracts() {
+        let source = include_str!("main.rs");
+        let hybrid = source
+            .split_once("impl Render for HybridStructuredSurface")
+            .and_then(|(_, after)| after.split_once("fn hybrid_structured_rows"))
+            .map(|(renderer, _)| renderer)
+            .expect("hybrid structured renderer must remain auditable");
+        let item_renderer = source
+            .split_once("fn render_item(")
+            .and_then(|(_, after)| after.split_once("fn render_transcript_list_item("))
+            .map(|(renderer, _)| renderer)
+            .expect("transcript item renderer must remain auditable");
+        let command_renderer = source
+            .split_once("fn render_rich_command_content(")
+            .and_then(|(_, after)| after.split_once("fn render_command_content("))
+            .map(|(renderer, _)| renderer)
+            .expect("rich command renderer must remain auditable");
+        let command_status = source
+            .split_once("fn render_command_visual_status(")
+            .and_then(|(_, after)| after.split_once("fn rich_command_row_logical_range("))
+            .map(|(renderer, _)| renderer)
+            .expect("command status renderer must remain auditable");
+        let web_renderer = source
+            .split_once("fn render_web_search(")
+            .and_then(|(_, after)| after.split_once("fn render_reasoning("))
+            .map(|(renderer, _)| renderer)
+            .expect("web search renderer must remain auditable");
+
+        assert!(hybrid.contains("transcript_header_styled_text("));
+        assert!(item_renderer.contains("transcript_header_styled_text("));
+        assert!(command_renderer.contains("shell_highlights(line, cx)"));
+        assert!(command_renderer.contains("IconName::ToolTerminal"));
+        assert!(command_renderer.contains("Color::Muted"));
+        assert!(command_status.contains("CommandExecutionStatus::Running"));
+        assert!(command_status.contains("CommandExecutionStatus::Succeeded => return None"));
+        assert!(command_status.contains("format!(\"exit {code}\")"));
+        assert!(item_renderer.contains(".when(!compact_trace && !routine_activity"));
+        assert!(item_renderer.contains(".when(routine_activity, |this|"));
+        assert!(item_renderer.contains("this.border_l_1()"));
+        assert!(item_renderer.contains("routine_activity && routine_activity_above"));
+        assert!(item_renderer.contains("routine_activity && routine_activity_below"));
+        assert!(web_renderer.contains("query.clone(),\n                    Vec::new(),"));
+        assert!(!web_renderer.contains("shell_highlights(query"));
     }
 
     #[test]
