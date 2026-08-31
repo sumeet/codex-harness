@@ -7161,7 +7161,7 @@ impl HarnessApp {
             .or_else(|| std::env::var("HARNESS_OPEN_THREAD").ok());
         self.server_task = cx.spawn(async move |this, cx| {
             let result = async {
-                let client = Rc::new(Client::launch("codex")?);
+                let client = Rc::new(Client::launch_managed("codex").await?);
                 client
                     .initialize("harness", "Harness", env!("CARGO_PKG_VERSION"))
                     .await?;
