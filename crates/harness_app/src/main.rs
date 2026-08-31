@@ -3114,6 +3114,14 @@ fn composer_send_blocked(
         || !transport_available
 }
 
+fn should_reattach_cached_thread(
+    selected_thread_id: Option<&str>,
+    requested_thread_id: &str,
+    cached_item_count: usize,
+) -> bool {
+    cached_item_count > 0 && selected_thread_id == Some(requested_thread_id)
+}
+
 fn child_inspection_blocked(read_only_child: bool, has_unresolved_live_request: bool) -> bool {
     read_only_child && has_unresolved_live_request
 }
@@ -3460,6 +3468,7 @@ struct HarnessApp {
     threads: Vec<CodexThread>,
     child_threads: ChildThreadRegistry,
     sidebar_threads: Vec<SidebarThreadRow>,
+    expanded_child_history_roots: HashSet<String>,
     available_models: Vec<ModelChoice>,
     permission_profiles: Vec<PermissionProfileChoice>,
     model_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -3576,10 +3585,31 @@ struct ChildThreadRegistry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum SidebarThreadRowKind {
+    Thread {
+        thread_id: String,
+        root_index: Option<usize>,
+    },
+    CompletedHistory {
+        root_thread_id: String,
+        completed_count: usize,
+        expanded: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SidebarThreadRow {
-    thread_id: String,
     depth: usize,
-    root_index: Option<usize>,
+    kind: SidebarThreadRowKind,
+}
+
+impl SidebarThreadRow {
+    fn thread_id(&self) -> Option<&str> {
+        match &self.kind {
+            SidebarThreadRowKind::Thread { thread_id, .. } => Some(thread_id),
+            SidebarThreadRowKind::CompletedHistory { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -3827,11 +3857,46 @@ impl ChildThreadRegistry {
 fn sidebar_thread_rows(
     roots: &[CodexThread],
     children: &ChildThreadRegistry,
+    selected_thread_id: Option<&str>,
+    expanded_history_roots: &HashSet<String>,
 ) -> Vec<SidebarThreadRow> {
+    fn is_actionable(thread: &CodexThread) -> bool {
+        matches!(
+            thread.status,
+            CodexThreadStatus::Active { .. } | CodexThreadStatus::SystemError
+        )
+    }
+
+    fn has_visible_descendant(
+        thread_id: &str,
+        children_by_parent: &HashMap<String, Vec<&CodexThread>>,
+        selected_thread_id: Option<&str>,
+    ) -> bool {
+        let mut pending = vec![thread_id];
+        let mut visited = HashSet::from([thread_id]);
+        while let Some(parent_id) = pending.pop() {
+            let Some(children) = children_by_parent.get(parent_id) else {
+                continue;
+            };
+            for child in children {
+                if !visited.insert(child.id.as_str()) {
+                    continue;
+                }
+                if is_actionable(child) || selected_thread_id == Some(child.id.as_str()) {
+                    return true;
+                }
+                pending.push(&child.id);
+            }
+        }
+        false
+    }
+
     fn append_children(
         parent_id: &str,
         depth: usize,
         children_by_parent: &HashMap<String, Vec<&CodexThread>>,
+        selected_thread_id: Option<&str>,
+        expanded: bool,
         visited: &mut HashSet<String>,
         rows: &mut Vec<SidebarThreadRow>,
     ) {
@@ -3839,15 +3904,29 @@ fn sidebar_thread_rows(
             return;
         };
         for child in children {
-            if !visited.insert(child.id.clone()) {
+            let visible = expanded
+                || is_actionable(child)
+                || selected_thread_id == Some(child.id.as_str())
+                || has_visible_descendant(&child.id, children_by_parent, selected_thread_id);
+            if !visible || !visited.insert(child.id.clone()) {
                 continue;
             }
             rows.push(SidebarThreadRow {
-                thread_id: child.id.clone(),
                 depth,
-                root_index: None,
+                kind: SidebarThreadRowKind::Thread {
+                    thread_id: child.id.clone(),
+                    root_index: None,
+                },
             });
-            append_children(&child.id, depth + 1, children_by_parent, visited, rows);
+            append_children(
+                &child.id,
+                depth + 1,
+                children_by_parent,
+                selected_thread_id,
+                expanded,
+                visited,
+                rows,
+            );
         }
     }
 
@@ -3872,15 +3951,66 @@ fn sidebar_thread_rows(
     let mut rows = Vec::with_capacity(roots.len() + children.by_id.len());
     let mut visited = HashSet::new();
     for (root_index, root) in roots.iter().enumerate() {
-        visited.insert(root.id.clone());
+        if root.id.is_empty()
+            || root.effective_parent_thread_id().is_some()
+            || children.by_id.contains_key(&root.id)
+            || !visited.insert(root.id.clone())
+        {
+            continue;
+        }
         rows.push(SidebarThreadRow {
-            thread_id: root.id.clone(),
             depth: 0,
-            root_index: Some(root_index),
+            kind: SidebarThreadRowKind::Thread {
+                thread_id: root.id.clone(),
+                root_index: Some(root_index),
+            },
         });
-        append_children(&root.id, 1, &children_by_parent, &mut visited, &mut rows);
+        let expanded = expanded_history_roots.contains(&root.id);
+        append_children(
+            &root.id,
+            1,
+            &children_by_parent,
+            selected_thread_id,
+            expanded,
+            &mut visited,
+            &mut rows,
+        );
+        let completed_count = descendants_of(&root.id, &children_by_parent)
+            .filter(|child| !is_actionable(child))
+            .count();
+        if completed_count > 0 {
+            rows.push(SidebarThreadRow {
+                depth: 1,
+                kind: SidebarThreadRowKind::CompletedHistory {
+                    root_thread_id: root.id.clone(),
+                    completed_count,
+                    expanded,
+                },
+            });
+        }
     }
     rows
+}
+
+fn descendants_of<'a>(
+    parent_id: &'a str,
+    children_by_parent: &'a HashMap<String, Vec<&'a CodexThread>>,
+) -> impl Iterator<Item = &'a CodexThread> {
+    let mut descendants = Vec::new();
+    let mut pending = vec![parent_id];
+    let mut visited = HashSet::from([parent_id]);
+    while let Some(parent_id) = pending.pop() {
+        if let Some(children) = children_by_parent.get(parent_id) {
+            for child in children {
+                if !visited.insert(child.id.as_str()) {
+                    continue;
+                }
+                descendants.push(*child);
+                pending.push(&child.id);
+            }
+        }
+    }
+    descendants.into_iter()
 }
 
 fn sidebar_selection_index(
@@ -3891,7 +4021,7 @@ fn sidebar_selection_index(
     selected_thread_id
         .and_then(|selected_id| {
             rows.iter()
-                .position(|row| row.thread_id.as_str() == selected_id)
+                .position(|row| row.thread_id() == Some(selected_id))
         })
         .unwrap_or_else(|| fallback.min(rows.len().saturating_sub(1)))
 }
@@ -5602,19 +5732,18 @@ impl HarnessApp {
                                                 let client_id =
                                                     entry.client_user_message_id.clone();
                                                 this.child(
-                                                    Button::new(
+                                                    IconButton::new(
                                                         ("steer-queued-prompt", index),
-                                                        "Add",
+                                                        IconName::SteeringWheel,
                                                     )
-                                                    .start_icon(
-                                                        Icon::new(IconName::SteeringWheel)
-                                                            .size(IconSize::XSmall),
-                                                    )
+                                                    .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
-                                                    .aria_label("Add queued prompt to response")
+                                                    .aria_label(
+                                                        "Steer queued prompt into the active response",
+                                                    )
                                                     .tooltip(Tooltip::text(
-                                                        "Add to the active response at its next input boundary · Ctrl-Shift-Enter for a draft",
+                                                        "Steer at the active response's next input boundary · Ctrl-Shift-Enter for a draft",
                                                     ))
                                                     .on_click(move |_, _, cx| {
                                                         weak_steer
@@ -5629,20 +5758,13 @@ impl HarnessApp {
                                                 )
                                             })
                                             .child(
-                                                Button::new(
+                                                IconButton::new(
                                                     ("send-queued-prompt", index),
-                                                    if active_turn { "Run now" } else { "Run" },
+                                                    IconName::InterruptAndRun,
                                                 )
-                                                .start_icon(
-                                                    Icon::new(IconName::InterruptAndRun)
-                                                        .size(IconSize::XSmall),
-                                                )
+                                                .shape(IconButtonShape::Square)
                                                 .size(ButtonSize::Compact)
-                                                .style(if index == 0 {
-                                                    ButtonStyle::Outlined
-                                                } else {
-                                                    ButtonStyle::Subtle
-                                                })
+                                                .style(ButtonStyle::Subtle)
                                                 .aria_label(if active_turn {
                                                     "Interrupt response and run queued prompt"
                                                 } else {
@@ -6323,6 +6445,7 @@ impl HarnessApp {
             threads: Vec::new(),
             child_threads: ChildThreadRegistry::default(),
             sidebar_threads: Vec::new(),
+            expanded_child_history_roots: HashSet::new(),
             available_models,
             permission_profiles,
             model_menu_handle: PopoverMenuHandle::default(),
@@ -6665,9 +6788,16 @@ impl HarnessApp {
     }
 
     fn sidebar_thread(&self, row: &SidebarThreadRow) -> Option<&CodexThread> {
-        row.root_index
+        let SidebarThreadRowKind::Thread {
+            thread_id,
+            root_index,
+        } = &row.kind
+        else {
+            return None;
+        };
+        root_index
             .and_then(|index| self.threads.get(index))
-            .or_else(|| self.child_threads.get(&row.thread_id))
+            .or_else(|| self.child_threads.get(thread_id))
     }
 
     fn sidebar_thread_by_id(&self, thread_id: &str) -> Option<&CodexThread> {
@@ -6678,7 +6808,12 @@ impl HarnessApp {
     }
 
     fn rebuild_sidebar_threads(&mut self, preferred_thread_id: Option<&str>) {
-        self.sidebar_threads = sidebar_thread_rows(&self.threads, &self.child_threads);
+        self.sidebar_threads = sidebar_thread_rows(
+            &self.threads,
+            &self.child_threads,
+            preferred_thread_id.or(self.selected_thread_id.as_deref()),
+            &self.expanded_child_history_roots,
+        );
         self.selected_task = sidebar_selection_index(
             &self.sidebar_threads,
             preferred_thread_id.or(self.selected_thread_id.as_deref()),
@@ -6689,7 +6824,8 @@ impl HarnessApp {
     fn selected_sidebar_thread_id(&self) -> Option<String> {
         self.sidebar_threads
             .get(self.selected_task)
-            .map(|row| row.thread_id.clone())
+            .and_then(SidebarThreadRow::thread_id)
+            .map(ToOwned::to_owned)
     }
 
     fn connect(&mut self, cx: &mut Context<Self>) {
@@ -6732,9 +6868,9 @@ impl HarnessApp {
                             this.child_threads.reconcile(child_threads);
                             this.rebuild_sidebar_threads(None);
                             this.connecting = false;
-                            this.reconnect_attempts = 0;
                             this.error = None;
                             this.load_server_options(cx);
+                            let mut reattaching_cached_thread = false;
                             if let Some(query) = initial_thread_query.as_deref() {
                                 let query = query.to_lowercase();
                                 let thread_id = this
@@ -6747,8 +6883,24 @@ impl HarnessApp {
                                     })
                                     .map(|thread| thread.id.clone());
                                 if let Some(thread_id) = thread_id {
-                                    this.open_thread_by_id(&thread_id, cx);
+                                    reattaching_cached_thread = should_reattach_cached_thread(
+                                        this.selected_thread_id.as_deref(),
+                                        &thread_id,
+                                        this.model.items.len(),
+                                    );
+                                    if reattaching_cached_thread {
+                                        this.reattach_cached_thread(&thread_id, cx);
+                                    } else {
+                                        this.open_thread_by_id(&thread_id, cx);
+                                    }
                                 }
+                            }
+                            // A fresh transport is not healthy for the selected
+                            // task until its cached transcript has been attached
+                            // to live events. Resetting here would turn a repeated
+                            // OOM/crash during attach into an endless 1s retry.
+                            if !reattaching_cached_thread {
+                                this.reconnect_attempts = 0;
                             }
                             cx.notify();
                         })
@@ -6827,6 +6979,63 @@ impl HarnessApp {
         });
     }
 
+    fn reattach_cached_thread(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let thread_id = thread_id.to_owned();
+        self.loading_thread = false;
+        self.attaching_thread = true;
+        self.thread_read_only_reason = None;
+        self.error = None;
+        self.thread_open_task = cx.spawn(async move |this, cx| {
+            let attached = client.attach_thread_with_settings(&thread_id).await;
+            _ = this.update(cx, |this, cx| {
+                if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
+                    || !this
+                        .client
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &client))
+                {
+                    return;
+                }
+                match attached {
+                    Ok(attached) => {
+                        // `excludeTurns: true` deliberately leaves the locally
+                        // rendered transcript untouched. Only live authority and
+                        // resolved settings cross this reconnect boundary.
+                        this.loaded_thread_updated_at = Some(attached.thread.updated_at);
+                        if let Some(turn_id) = active_thread_turn_id(&attached.thread) {
+                            this.model.current_turn_id = Some(turn_id.to_owned());
+                        }
+                        this.apply_thread_open_settings(&attached);
+                        this.load_server_options(cx);
+                        this.attaching_thread = false;
+                        this.thread_read_only_reason = None;
+                        this.reconnect_attempts = 0;
+                        this.error = None;
+                        this.refresh_queued_turns(cx);
+                        this.schedule_child_hierarchy_refresh(cx);
+                        this.complete_thread_open_request_routing(true, cx);
+                    }
+                    Err(error) => {
+                        // Never fall back to a full read here: for a multi-GB
+                        // rollout that can repeat the very OOM which caused the
+                        // disconnect. Keep the cached transcript truthful and
+                        // read-only until the user retries or starts a new task.
+                        this.attaching_thread = false;
+                        this.thread_read_only_reason = Some(
+                            "Could not restore the live connection. Cached history is read-only."
+                                .into(),
+                        );
+                        this.error = Some(format!("Could not reattach task: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
     fn handle_server_disconnect(
         &mut self,
         disconnected_client: &Rc<Client>,
@@ -6862,6 +7071,8 @@ impl HarnessApp {
         self.child_hierarchy_generation = self.child_hierarchy_generation.wrapping_add(1);
         self.read_only_refresh_task = Task::ready(());
         self.turn_task = Task::ready(());
+        self.loading_thread = false;
+        self.attaching_thread = false;
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
@@ -7937,14 +8148,47 @@ impl HarnessApp {
     }
 
     fn open_thread(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(thread_id) = self
-            .sidebar_threads
-            .get(index)
-            .map(|row| row.thread_id.clone())
-        else {
+        let Some(row) = self.sidebar_threads.get(index).cloned() else {
             return;
         };
-        self.open_thread_by_id(&thread_id, cx);
+        match row.kind {
+            SidebarThreadRowKind::Thread { thread_id, .. } => {
+                self.open_thread_by_id(&thread_id, cx)
+            }
+            SidebarThreadRowKind::CompletedHistory {
+                root_thread_id,
+                expanded,
+                ..
+            } => {
+                if expanded {
+                    self.expanded_child_history_roots.remove(&root_thread_id);
+                } else {
+                    self.expanded_child_history_roots
+                        .insert(root_thread_id.clone());
+                }
+                let selected_thread_id = self.selected_thread_id.clone();
+                self.rebuild_sidebar_threads(selected_thread_id.as_deref());
+                self.selected_task = self
+                    .sidebar_threads
+                    .iter()
+                    .position(|row| {
+                        matches!(
+                            &row.kind,
+                            SidebarThreadRowKind::CompletedHistory {
+                                root_thread_id: row_root_id,
+                                ..
+                            } if row_root_id == &root_thread_id
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        self.selected_task
+                            .min(self.sidebar_threads.len().saturating_sub(1))
+                    });
+                self.task_list_state
+                    .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
+                cx.notify();
+            }
+        }
     }
 
     fn has_unresolved_live_request(&self) -> bool {
@@ -11179,6 +11423,45 @@ impl HarnessApp {
         let Some(row) = self.sidebar_threads.get(index).cloned() else {
             return div().into_any_element();
         };
+        if let SidebarThreadRowKind::CompletedHistory {
+            completed_count,
+            expanded,
+            ..
+        } = &row.kind
+        {
+            let weak = cx.weak_entity();
+            let label = if *completed_count == 1 {
+                "1 completed task".to_owned()
+            } else {
+                format!("{completed_count} completed tasks")
+            };
+            return div()
+                .w_full()
+                .pl(px((row.depth.min(6) as f32) * 12.))
+                .child(
+                    ListItem::new(format!("completed-child-history-{index}"))
+                        .spacing(ListItemSpacing::ExtraDense)
+                        .focused(self.focus_mode == FocusMode::Tasks && self.selected_task == index)
+                        .start_slot(
+                            Icon::new(if *expanded {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(label)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |this, cx| this.open_thread(index, cx)).ok();
+                        }),
+                )
+                .into_any_element();
+        }
         let Some(thread) = self.sidebar_thread(&row).cloned() else {
             return div().into_any_element();
         };
@@ -11190,7 +11473,11 @@ impl HarnessApp {
         };
         let selected = self.selected_thread_id.as_deref() == Some(thread.id.as_str());
         let cursor = self.focus_mode == FocusMode::Tasks && self.selected_task == index;
-        let title = thread_title(&thread);
+        let title = if row.depth == 0 {
+            thread_title(&thread)
+        } else {
+            child_thread_title(&thread)
+        };
         let project = if row.depth == 0 {
             Path::new(&thread.cwd)
                 .file_name()
@@ -15846,6 +16133,16 @@ fn thread_title(thread: &CodexThread) -> String {
         .replace('\n', " ")
 }
 
+fn child_thread_title(thread: &CodexThread) -> String {
+    child_agent_path(thread)
+        .and_then(|path| path.rsplit('/').find(|segment| !segment.is_empty()))
+        .map(|task| task.replace(['_', '-'], " "))
+        .or_else(|| thread.agent_role.clone())
+        .or_else(|| thread.agent_nickname.clone())
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| "Subagent task".into())
+}
+
 fn child_thread_identity(thread: &CodexThread) -> String {
     let mut identity = subagent_identity(thread);
     if thread.can_accept_direct_input == Some(false) {
@@ -16276,43 +16573,124 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_thread_rows_nest_typed_descendants_beneath_roots() {
+    fn sidebar_thread_rows_show_actionable_children_and_collapse_completed_history() {
         let roots = vec![cached_thread("root-a", 1), cached_thread("root-b", 2)];
         let mut registry = ChildThreadRegistry::default();
-        registry.reconcile(vec![
-            child_thread("older-child", "root-a", 10),
-            child_thread("newer-child", "root-a", 20),
-            child_thread("grandchild", "older-child", 30),
-            child_thread("orphan", "missing-root", 40),
-        ]);
+        let completed = child_thread("completed", "root-a", 10);
+        let mut active = child_thread("active", "root-a", 20);
+        active.status = CodexThreadStatus::Active {
+            active_flags: vec!["running".into()],
+        };
+        registry.reconcile(vec![completed, active]);
 
-        let rows = sidebar_thread_rows(&roots, &registry);
+        let rows = sidebar_thread_rows(&roots, &registry, None, &HashSet::new());
         assert_eq!(
-            rows.iter()
-                .map(|row| (row.thread_id.as_str(), row.depth, row.root_index))
-                .collect::<Vec<_>>(),
+            rows,
             vec![
-                ("root-a", 0, Some(0)),
-                ("newer-child", 1, None),
-                ("older-child", 1, None),
-                ("grandchild", 2, None),
-                ("root-b", 0, Some(1)),
+                SidebarThreadRow {
+                    depth: 0,
+                    kind: SidebarThreadRowKind::Thread {
+                        thread_id: "root-a".into(),
+                        root_index: Some(0),
+                    },
+                },
+                SidebarThreadRow {
+                    depth: 1,
+                    kind: SidebarThreadRowKind::Thread {
+                        thread_id: "active".into(),
+                        root_index: None,
+                    },
+                },
+                SidebarThreadRow {
+                    depth: 1,
+                    kind: SidebarThreadRowKind::CompletedHistory {
+                        root_thread_id: "root-a".into(),
+                        completed_count: 1,
+                        expanded: false,
+                    },
+                },
+                SidebarThreadRow {
+                    depth: 0,
+                    kind: SidebarThreadRowKind::Thread {
+                        thread_id: "root-b".into(),
+                        root_index: Some(1),
+                    },
+                },
             ]
         );
+    }
+
+    #[test]
+    fn sidebar_thread_rows_expand_completed_history_and_keep_selected_children_visible() {
+        let roots = vec![cached_thread("root", 1)];
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![
+            child_thread("older", "root", 10),
+            child_thread("newer", "root", 20),
+        ]);
+
+        let collapsed = sidebar_thread_rows(&roots, &registry, Some("older"), &HashSet::new());
+        assert!(collapsed.iter().any(|row| row.thread_id() == Some("older")));
+        assert!(!collapsed.iter().any(|row| row.thread_id() == Some("newer")));
+
+        let expanded_roots = HashSet::from(["root".to_owned()]);
+        let expanded = sidebar_thread_rows(&roots, &registry, None, &expanded_roots);
+        assert_eq!(
+            expanded
+                .iter()
+                .filter_map(SidebarThreadRow::thread_id)
+                .collect::<Vec<_>>(),
+            vec!["root", "newer", "older"]
+        );
+        assert!(matches!(
+            expanded.last().map(|row| &row.kind),
+            Some(SidebarThreadRowKind::CompletedHistory { expanded: true, .. })
+        ));
+    }
+
+    #[test]
+    fn sidebar_thread_rows_use_legacy_source_parent_and_deduplicate_children_from_roots() {
+        let root = cached_thread("root", 1);
+        let mut child = cached_thread("child", 2);
+        child.status = CodexThreadStatus::SystemError;
+        child.source = CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(
+            codex_app_server_client::CodexThreadSpawnSource {
+                parent_thread_id: "root".into(),
+                depth: 1,
+                agent_nickname: None,
+                agent_role: None,
+                agent_path: Some("/root/audit".into()),
+            },
+        ));
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![child.clone()]);
+
+        let rows = sidebar_thread_rows(&[child, root], &registry, None, &HashSet::new());
+        assert_eq!(
+            rows.iter()
+                .filter_map(SidebarThreadRow::thread_id)
+                .collect::<Vec<_>>(),
+            vec!["root", "child"]
+        );
+        assert_eq!(rows[1].depth, 1);
     }
 
     #[test]
     fn sidebar_selection_tracks_child_ids_and_clamps_when_they_disappear() {
         let rows = vec![
             SidebarThreadRow {
-                thread_id: "root".into(),
                 depth: 0,
-                root_index: Some(0),
+                kind: SidebarThreadRowKind::Thread {
+                    thread_id: "root".into(),
+                    root_index: Some(0),
+                },
             },
             SidebarThreadRow {
-                thread_id: "child".into(),
                 depth: 1,
-                root_index: None,
+                kind: SidebarThreadRowKind::Thread {
+                    thread_id: "child".into(),
+                    root_index: None,
+                },
             },
         ];
 
@@ -16432,6 +16810,31 @@ mod tests {
             },
         ));
         assert_eq!(child_thread_identity(&child), "/root/atlas");
+    }
+
+    #[test]
+    fn child_title_uses_task_metadata_and_never_inherited_preview() {
+        let mut child = child_thread("child", "root", 2);
+        child.preview = "an unrelated inherited conversation prompt".into();
+        child.agent_nickname = Some("Atlas".into());
+        child.agent_role = Some("researcher".into());
+        child.source = CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(
+            codex_app_server_client::CodexThreadSpawnSource {
+                parent_thread_id: "root".into(),
+                depth: 1,
+                agent_nickname: Some("Atlas".into()),
+                agent_role: Some("researcher".into()),
+                agent_path: Some("/root/sidebar_root_audit".into()),
+            },
+        ));
+        assert_eq!(child_thread_title(&child), "sidebar root audit");
+
+        child.source = CodexSessionSource::Unknown(Value::Null);
+        assert_eq!(child_thread_title(&child), "researcher");
+        child.agent_role = None;
+        assert_eq!(child_thread_title(&child), "Atlas");
+        child.agent_nickname = None;
+        assert_eq!(child_thread_title(&child), "Subagent task");
     }
 
     #[test]
@@ -19154,6 +19557,26 @@ mod tests {
         assert!(!composer_send_blocked(
             false, false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn cached_selected_task_uses_thin_reattach_only_for_the_same_thread() {
+        assert!(should_reattach_cached_thread(
+            Some("thread-a"),
+            "thread-a",
+            8
+        ));
+        assert!(!should_reattach_cached_thread(
+            Some("thread-a"),
+            "thread-b",
+            8
+        ));
+        assert!(!should_reattach_cached_thread(
+            Some("thread-a"),
+            "thread-a",
+            0
+        ));
+        assert!(!should_reattach_cached_thread(None, "thread-a", 8));
     }
 
     #[test]

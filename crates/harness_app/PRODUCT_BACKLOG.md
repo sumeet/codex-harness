@@ -52,6 +52,14 @@ must survive conversation compaction and hand-offs.
   the daemon PID and active turns untouched; reopening must resume the saved
   thread, replay pending interaction, reload Queue and hierarchy, and reconcile
   missed output without duplicate transcript rows.
+- [ ] Keep cached-history reconnects thin: attach with `excludeTurns: true`,
+  retain the local semantic transcript, reload Queue/hierarchy/settings, and
+  never automatically fall back to a full multi-GB `thread/read`. Detect an
+  abnormal repeated attach death and remain explicitly cached/read-only rather
+  than entering an OOM restart loop.
+- [ ] Report App Server child exit status/signal instead of flattening every
+  stdout EOF to `app-server closed stdout`; distinguish a clean shutdown,
+  crash, and SIGKILL, and mention likely OOM only when OS/cgroup evidence exists.
 - [ ] Add a versioned transactional workspace-state store for the selected
   root/child, composer draft, private durable attachment copies, optimistic
   outbound journal, partial request answers, and practical scroll/Vim/fold
@@ -134,10 +142,10 @@ must survive conversation compaction and hand-offs.
   versioned sidecar rather than hidden text or overloaded IDs.
 - [ ] Make queued rows compact: no dedicated tall header or redundant per-row
   queue icon, inline 22–24 px image thumbnails only when an image exists,
-  prompt-first width, and separators instead of cards. Use the native
-  steering-wheel glyph with the literal **Steer** label; keep familiar
-  edit/remove glyphs, and expose the disruptive **Interrupt & run** operation
-  with explicit language rather than an ambiguous bordered Play button.
+  prompt-first width, and separators instead of cards. Keep the steering,
+  interrupt-and-run, edit, and remove actions icon-only with unambiguous custom
+  glyphs, accessible labels, and explicit tooltips; do not single out one row
+  with an arbitrary bordered action.
 - [ ] Track one outbound item by `clientUserMessageId` through submitting,
   queued/start/steer acknowledgement, model incorporation, and
   completed/cancelled states. Queue IDs, server item IDs, and turn IDs are
@@ -156,6 +164,9 @@ must survive conversation compaction and hand-offs.
   worktrees for risky or overlapping implementation.
 - [ ] Make concurrent edits and ownership visible enough that parent and child
   agents do not silently invalidate each other's assumptions.
+- [ ] Default implementation workers to a bounded explicit task packet with no
+  inherited transcript. Make full-history forks an intentional opt-in with a
+  size warning; a large parent must not be copied into every child rollout.
 
 ### Composer and sending
 

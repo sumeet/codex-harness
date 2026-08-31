@@ -673,13 +673,29 @@ impl Client {
         &self,
         thread_id: &str,
     ) -> Result<ThreadOpenResponse, Error> {
+        self.resume_thread_with_exclude_turns(thread_id, false)
+            .await
+    }
+
+    /// Attach this connection to an existing thread's live events without
+    /// returning its historical turns. This is intended for reconnect paths
+    /// that already retain the rendered transcript.
+    pub async fn attach_thread_with_settings(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadOpenResponse, Error> {
+        self.resume_thread_with_exclude_turns(thread_id, true).await
+    }
+
+    async fn resume_thread_with_exclude_turns(
+        &self,
+        thread_id: &str,
+        exclude_turns: bool,
+    ) -> Result<ThreadOpenResponse, Error> {
         let response = self
             .request(
                 "thread/resume",
-                json!({
-                    "excludeTurns": false,
-                    "threadId": thread_id,
-                }),
+                thread_resume_params(thread_id, exclude_turns),
             )
             .await?;
         decode_thread_open_response(response)
@@ -890,6 +906,13 @@ fn thread_list_params(
         params["sourceKinds"] = source_kinds.into();
     }
     params
+}
+
+fn thread_resume_params(thread_id: &str, exclude_turns: bool) -> Value {
+    json!({
+        "excludeTurns": exclude_turns,
+        "threadId": thread_id,
+    })
 }
 
 fn turn_start_params(thread_id: &str, input: Value, client_user_message_id: Option<&str>) -> Value {
@@ -1223,6 +1246,24 @@ mod tests {
                 "sortDirection": "desc",
                 "sortKey": "recency_at",
                 "sourceKinds": ["subAgentThreadSpawn"],
+            })
+        );
+    }
+
+    #[test]
+    fn resume_and_attach_use_distinct_turn_history_flags_on_the_wire() {
+        assert_eq!(
+            thread_resume_params("thread-1", false),
+            json!({
+                "excludeTurns": false,
+                "threadId": "thread-1",
+            })
+        );
+        assert_eq!(
+            thread_resume_params("thread-1", true),
+            json!({
+                "excludeTurns": true,
+                "threadId": "thread-1",
             })
         );
     }
@@ -1570,6 +1611,45 @@ mod tests {
                 .and_then(|profile| profile.get("id"))
                 .and_then(Value::as_str),
             Some(":workspace")
+        );
+    }
+
+    #[test]
+    fn decodes_turnless_attach_response_with_extra_settings() {
+        let response = decode_thread_open_response(json!({
+            "thread": {
+                "id": "thread_3",
+                "preview": "Already rendered",
+                "cwd": "/work/harness",
+                "updatedAt": 43,
+                "turns": []
+            },
+            "cwd": "/work/harness",
+            "model": "gpt-5.6",
+            "modelProvider": "openai",
+            "reasoningEffort": "high",
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"},
+            "activePermissionProfile": {"id": ":full"},
+            "serviceTier": "priority"
+        }))
+        .expect("turnless attach response should retain effective settings");
+
+        assert_eq!(response.thread.id, "thread_3");
+        assert!(response.thread.turns.is_empty());
+        assert_eq!(response.cwd, "/work/harness");
+        assert_eq!(response.model, "gpt-5.6");
+        assert_eq!(response.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(response.approval_policy, json!("never"));
+        assert_eq!(response.sandbox, json!({"type": "dangerFullAccess"}));
+        assert_eq!(response.service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            response
+                .active_permission_profile
+                .as_ref()
+                .and_then(|profile| profile.get("id"))
+                .and_then(Value::as_str),
+            Some(":full")
         );
     }
 }
