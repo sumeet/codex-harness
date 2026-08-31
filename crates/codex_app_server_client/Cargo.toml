@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 async-channel.workspace = true
 async-process.workspace = true
+async-tungstenite.workspace = true
 futures.workspace = true
 futures-lite.workspace = true
 log.workspace = true

@@ -1,23 +1,31 @@
-//! Async client for the local Codex app-server stdio transport.
+//! Async client for local Codex app-server transports.
 //!
-//! Codex app-server speaks newline-delimited JSON messages shaped like JSON-RPC
-//! 2.0 with the `jsonrpc` field omitted. This crate owns the child process,
-//! correlates responses with requests, and exposes notifications and
-//! server-initiated requests as an event stream.
+//! The embedded transport speaks newline-delimited JSON over a directly owned
+//! app-server child. The managed transport speaks WebSocket text frames through
+//! an owned proxy child connected to a separately managed app-server daemon.
+//! Both transports carry messages shaped like JSON-RPC 2.0 with the `jsonrpc`
+//! field omitted. This crate correlates responses with requests and exposes
+//! notifications and server-initiated requests as an event stream.
 
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    io,
+    path::PathBuf,
+    pin::Pin,
     process::Stdio,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    task::{Context, Poll},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use async_process::{Child, Command};
+use async_process::{Child, ChildStdin, ChildStdout, Command};
+use async_tungstenite::tungstenite::Message as WebSocketMessage;
 use futures::channel::oneshot;
+use futures::io::{AsyncRead, AsyncWrite};
 use futures_lite::{
     StreamExt,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -334,6 +342,16 @@ pub enum Error {
     ResponseChannelClosed,
     #[error("app-server emitted invalid JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("failed to run `codex app-server daemon start`: {0}")]
+    DaemonStart(#[source] std::io::Error),
+    #[error("`codex app-server daemon start` exited with {status}: {stderr}")]
+    DaemonStartFailed { status: String, stderr: String },
+    #[error("invalid app-server daemon lifecycle response: {0}")]
+    InvalidDaemonLifecycle(String),
+    #[error("failed to launch codex app-server proxy: {0}")]
+    ProxySpawn(#[source] std::io::Error),
+    #[error("failed to connect to app-server proxy WebSocket: {0}")]
+    WebSocketHandshake(String),
     #[error("invalid app-server message: {0}")]
     InvalidMessage(String),
     #[error("app-server returned error {code}: {message}")]
@@ -342,6 +360,74 @@ pub enum Error {
         message: String,
         data: Option<Value>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+// Require every lifecycle invariant we rely on, but allow newer Codex releases
+// to add informational fields without making an otherwise compatible daemon
+// impossible to attach to.
+#[serde(rename_all = "camelCase")]
+struct DaemonLifecycleOutput {
+    status: DaemonLifecycleStatus,
+    backend: DaemonBackend,
+    pid: u32,
+    managed_codex_path: PathBuf,
+    managed_codex_version: String,
+    socket_path: PathBuf,
+    cli_version: String,
+    app_server_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum DaemonLifecycleStatus {
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DaemonBackend {
+    Pid,
+}
+
+struct SplitDuplex<R, W> {
+    reader: R,
+    writer: W,
+}
+
+impl<R, W> SplitDuplex<R, W> {
+    fn new(reader: R, writer: W) -> Self {
+        Self { reader, writer }
+    }
+}
+
+impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for SplitDuplex<R, W> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.reader).poll_read(cx, buffer)
+    }
+}
+
+impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for SplitDuplex<R, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(cx, buffer)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(cx)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.writer).poll_close(cx)
+    }
 }
 
 pub struct Client {
@@ -440,74 +526,10 @@ impl Client {
                     }
                 };
 
-                match incoming {
-                    Incoming::Response { id, result, error } => {
-                        let request_id = id.as_u64();
-                        let responder = request_id.and_then(|id| reader_pending.lock().remove(&id));
-                        if let Some(responder) = responder {
-                            let response = error.map_or_else(
-                                || Ok(result.unwrap_or(Value::Null)),
-                                |error| {
-                                    Err(Error::Rpc {
-                                        code: error.code,
-                                        message: error.message,
-                                        data: error.data,
-                                    })
-                                },
-                            );
-                            if responder.send(response).is_err() {
-                                log::debug!("app-server request future was dropped");
-                            }
-                        } else {
-                            if reader_events
-                                .send(Event::UnmatchedResponse { id, result, error })
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                        }
-                    }
-                    Incoming::ServerRequest { id, method, params } => {
-                        let current_time_at = if method == "currentTime/read" {
-                            current_unix_seconds()
-                        } else {
-                            0
-                        };
-                        if let Some(response) =
-                            automatic_server_request_response(&id, &method, current_time_at)
-                        {
-                            log::debug!(
-                                "automatically answered app-server request {method} with id {id}"
-                            );
-                            if reader_outbound.try_send(response).is_err() {
-                                disconnect(
-                                    &reader_pending,
-                                    &reader_events,
-                                    "app-server writer queue closed".into(),
-                                )
-                                .await;
-                                return;
-                            }
-                            continue;
-                        }
-                        if reader_events
-                            .send(Event::ServerRequest { id, method, params })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Incoming::Notification { method, params } => {
-                        if reader_events
-                            .send(Event::Notification { method, params })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
+                if !dispatch_incoming(incoming, &reader_pending, &reader_events, &reader_outbound)
+                    .await
+                {
+                    return;
                 }
             }
 
@@ -517,6 +539,134 @@ impl Client {
                 "app-server closed stdout".into(),
             )
             .await;
+        });
+
+        Ok(Self {
+            outbound: outbound_tx,
+            events: event_rx,
+            pending,
+            next_id: AtomicU64::new(0),
+            _child: child,
+            _reader_task: reader_task,
+            _writer_task: writer_task,
+        })
+    }
+
+    /// Connect through Codex's restart-safe app-server daemon.
+    ///
+    /// The daemon start command is idempotent and is fully reaped before an
+    /// owned stdio proxy is launched. Dropping this client terminates only the
+    /// proxy; daemon socket and process lifecycle remain owned by Codex.
+    pub async fn launch_managed(codex: impl AsRef<OsStr>) -> Result<Self, Error> {
+        let codex = codex.as_ref();
+        let socket_path = start_managed_daemon(codex).await?;
+
+        let mut command = Command::new(codex);
+        command
+            .args(["app-server", "proxy", "--sock"])
+            .arg(socket_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(Error::ProxySpawn)?;
+        let stdin = child.stdin.take().ok_or(Error::MissingStdio)?;
+        let stdout = child.stdout.take().ok_or(Error::MissingStdio)?;
+        let duplex = SplitDuplex::<ChildStdout, ChildStdin>::new(stdout, stdin);
+        let (websocket, _) = async_tungstenite::client_async("ws://localhost/rpc", duplex)
+            .await
+            .map_err(|error| Error::WebSocketHandshake(error.to_string()))?;
+        let (mut websocket_writer, mut websocket_reader) = futures::StreamExt::split(websocket);
+
+        let (outbound_tx, outbound_rx) = async_channel::unbounded::<Value>();
+        let (event_tx, event_rx) = async_channel::unbounded::<Event>();
+        let pending = PendingRequests::default();
+
+        let writer_pending = pending.clone();
+        let writer_events = event_tx.clone();
+        let writer_task = smol::spawn(async move {
+            while let Ok(message) = outbound_rx.recv().await {
+                let payload = match serde_json::to_string(&message) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        disconnect(
+                            &writer_pending,
+                            &writer_events,
+                            format!("failed to encode app-server message: {error}"),
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                if let Err(error) = futures::SinkExt::send(
+                    &mut websocket_writer,
+                    WebSocketMessage::Text(payload.into()),
+                )
+                .await
+                {
+                    disconnect(
+                        &writer_pending,
+                        &writer_events,
+                        format!("failed to write to app-server WebSocket: {error}"),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        });
+
+        let reader_pending = pending.clone();
+        let reader_events = event_tx;
+        let reader_outbound = outbound_tx.clone();
+        let reader_task = smol::spawn(async move {
+            let trace = app_server_trace_enabled();
+            let disconnect_reason = loop {
+                let read_started_at = trace.then(Instant::now);
+                let message = futures::StreamExt::next(&mut websocket_reader).await;
+                let read_elapsed = read_started_at.map(|started_at| started_at.elapsed());
+                let text = match message {
+                    Some(Ok(WebSocketMessage::Text(text))) => text,
+                    Some(Ok(WebSocketMessage::Close(frame))) => {
+                        break format!("app-server closed WebSocket: {frame:?}");
+                    }
+                    Some(Ok(WebSocketMessage::Ping(_) | WebSocketMessage::Pong(_))) => continue,
+                    Some(Ok(WebSocketMessage::Binary(_))) => {
+                        break "app-server emitted an unexpected binary WebSocket frame".into();
+                    }
+                    Some(Ok(WebSocketMessage::Frame(_))) => {
+                        break "app-server emitted an unexpected raw WebSocket frame".into();
+                    }
+                    Some(Err(error)) => {
+                        break format!("failed to read from app-server WebSocket: {error}");
+                    }
+                    None => break "app-server proxy closed WebSocket".into(),
+                };
+
+                let decode_started_at = trace.then(Instant::now);
+                let incoming = decode_line(text.as_str());
+                let decode_elapsed = decode_started_at.map(|started_at| started_at.elapsed());
+                if let (Some(read_elapsed), Some(decode_elapsed)) = (read_elapsed, decode_elapsed) {
+                    eprintln!(
+                        "app-server-frame bytes={} wait_read_ms={:.1} decode_ms={:.1}",
+                        text.len(),
+                        read_elapsed.as_secs_f64() * 1_000.,
+                        decode_elapsed.as_secs_f64() * 1_000.,
+                    );
+                }
+
+                let incoming = match incoming {
+                    Ok(incoming) => incoming,
+                    Err(error) => break error.to_string(),
+                };
+                if !dispatch_incoming(incoming, &reader_pending, &reader_events, &reader_outbound)
+                    .await
+                {
+                    return;
+                }
+            };
+
+            disconnect(&reader_pending, &reader_events, disconnect_reason).await;
         });
 
         Ok(Self {
@@ -874,6 +1024,128 @@ impl Client {
     }
 }
 
+async fn start_managed_daemon(codex: &OsStr) -> Result<PathBuf, Error> {
+    let output = Command::new(codex)
+        .args(["app-server", "daemon", "start"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(Error::DaemonStart)?;
+
+    if !output.status.success() {
+        return Err(Error::DaemonStartFailed {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    parse_daemon_lifecycle(&output.stdout)
+}
+
+fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<PathBuf, Error> {
+    let lifecycle: DaemonLifecycleOutput = serde_json::from_slice(stdout)
+        .map_err(|error| Error::InvalidDaemonLifecycle(error.to_string()))?;
+
+    // Deserializing the closed enums above verifies the accepted status and
+    // managed PID backend. Validate the remaining cross-field invariants here.
+    let _ = (&lifecycle.status, &lifecycle.backend);
+    if lifecycle.pid == 0 {
+        return Err(Error::InvalidDaemonLifecycle(
+            "managed daemon pid must be non-zero".into(),
+        ));
+    }
+    if lifecycle.managed_codex_path.as_os_str().is_empty() {
+        return Err(Error::InvalidDaemonLifecycle(
+            "managedCodexPath must not be empty".into(),
+        ));
+    }
+    if !lifecycle.socket_path.is_absolute() {
+        return Err(Error::InvalidDaemonLifecycle(
+            "socketPath must be absolute".into(),
+        ));
+    }
+    if lifecycle.cli_version.is_empty()
+        || lifecycle.managed_codex_version.is_empty()
+        || lifecycle.app_server_version.is_empty()
+    {
+        return Err(Error::InvalidDaemonLifecycle(
+            "cliVersion, managedCodexVersion, and appServerVersion must be present".into(),
+        ));
+    }
+    if lifecycle.cli_version != lifecycle.managed_codex_version
+        || lifecycle.cli_version != lifecycle.app_server_version
+    {
+        return Err(Error::InvalidDaemonLifecycle(format!(
+            "version mismatch: cliVersion={}, managedCodexVersion={}, appServerVersion={}",
+            lifecycle.cli_version, lifecycle.managed_codex_version, lifecycle.app_server_version,
+        )));
+    }
+
+    Ok(lifecycle.socket_path)
+}
+
+async fn dispatch_incoming(
+    incoming: Incoming,
+    pending: &PendingRequests,
+    events: &async_channel::Sender<Event>,
+    outbound: &async_channel::Sender<Value>,
+) -> bool {
+    match incoming {
+        Incoming::Response { id, result, error } => {
+            let request_id = id.as_u64();
+            let responder = request_id.and_then(|id| pending.lock().remove(&id));
+            if let Some(responder) = responder {
+                let response = error.map_or_else(
+                    || Ok(result.unwrap_or(Value::Null)),
+                    |error| {
+                        Err(Error::Rpc {
+                            code: error.code,
+                            message: error.message,
+                            data: error.data,
+                        })
+                    },
+                );
+                if responder.send(response).is_err() {
+                    log::debug!("app-server request future was dropped");
+                }
+                true
+            } else {
+                events
+                    .send(Event::UnmatchedResponse { id, result, error })
+                    .await
+                    .is_ok()
+            }
+        }
+        Incoming::ServerRequest { id, method, params } => {
+            let current_time_at = if method == "currentTime/read" {
+                current_unix_seconds()
+            } else {
+                0
+            };
+            if let Some(response) = automatic_server_request_response(&id, &method, current_time_at)
+            {
+                log::debug!("automatically answered app-server request {method} with id {id}");
+                if outbound.try_send(response).is_err() {
+                    disconnect(pending, events, "app-server writer queue closed".into()).await;
+                    return false;
+                }
+                true
+            } else {
+                events
+                    .send(Event::ServerRequest { id, method, params })
+                    .await
+                    .is_ok()
+            }
+        }
+        Incoming::Notification { method, params } => events
+            .send(Event::Notification { method, params })
+            .await
+            .is_ok(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadListRelationship<'a> {
     DirectChildren(&'a str),
@@ -1050,7 +1322,7 @@ async fn disconnect(
     if events.send(Event::Disconnected { reason }).await.is_err() {
         log::debug!("app-server event receiver was dropped during disconnect");
     }
-    // Disconnection is terminal for this stdio session. Closing the channel is
+    // Disconnection is terminal for this transport session. Closing the channel is
     // what lets hosts retire the Client after consuming the final semantic
     // event; otherwise the writer task's Sender can keep `recv()` pending
     // forever after stdout has already closed.
@@ -1121,6 +1393,98 @@ fn parse_rpc_error(value: &Value) -> Result<RpcError, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn daemon_lifecycle_json(status: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "status": status,
+            "backend": "pid",
+            "pid": 4242,
+            "managedCodexPath": "/opt/codex/bin/codex",
+            "managedCodexVersion": "0.151.0",
+            "socketPath": "/tmp/codex/app-server-control.sock",
+            "cliVersion": "0.151.0",
+            "appServerVersion": "0.151.0"
+        }))
+        .expect("lifecycle fixture should encode")
+    }
+
+    #[test]
+    fn accepts_started_and_already_running_managed_daemons() {
+        for status in ["started", "alreadyRunning"] {
+            assert_eq!(
+                parse_daemon_lifecycle(&daemon_lifecycle_json(status))
+                    .expect("managed lifecycle should validate"),
+                PathBuf::from("/tmp/codex/app-server-control.sock")
+            );
+        }
+
+        let mut newer_lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        newer_lifecycle["newInformationalField"] = json!("forward-compatible");
+        assert!(
+            parse_daemon_lifecycle(&serde_json::to_vec(&newer_lifecycle).unwrap()).is_ok(),
+            "new informational fields must not break a compatible daemon"
+        );
+    }
+
+    #[test]
+    fn rejects_unmanaged_or_incompatible_daemon_lifecycles() {
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        lifecycle["backend"] = Value::Null;
+        assert!(parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap()).is_err());
+
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        lifecycle["status"] = json!("stopped");
+        assert!(parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap()).is_err());
+
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        lifecycle["socketPath"] = json!("relative.sock");
+        assert!(
+            parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        lifecycle["appServerVersion"] = json!("0.152.0");
+        assert!(
+            parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap())
+                .unwrap_err()
+                .to_string()
+                .contains("version mismatch")
+        );
+
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
+        lifecycle
+            .as_object_mut()
+            .unwrap()
+            .remove("managedCodexVersion");
+        assert!(parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap()).is_err());
+    }
+
+    #[test]
+    fn split_duplex_delegates_reads_and_writes_to_separate_halves() {
+        smol::block_on(async {
+            use futures_lite::io::AsyncReadExt;
+
+            let mut duplex = SplitDuplex::new(
+                futures_lite::io::Cursor::new(b"incoming".to_vec()),
+                futures_lite::io::Cursor::new(Vec::new()),
+            );
+            let mut incoming = String::new();
+            duplex.read_to_string(&mut incoming).await.unwrap();
+            duplex.write_all(b"outgoing").await.unwrap();
+
+            assert_eq!(incoming, "incoming");
+            assert_eq!(duplex.writer.into_inner(), b"outgoing");
+        });
+    }
 
     #[test]
     fn disconnect_event_is_terminal_for_the_event_stream() {
