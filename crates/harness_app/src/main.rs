@@ -6273,8 +6273,12 @@ impl HarnessApp {
             .into_any_element()
     }
 
-    fn render_queued_turns(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.queued_turns.is_empty()
+    fn render_outbound_tray(
+        &self,
+        pending_outbound: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if (self.queued_turns.is_empty() && pending_outbound.is_none())
             || !queue_state_is_visible(
                 self.selected_thread_id.as_deref(),
                 self.preserved_work_thread_id.as_deref(),
@@ -6292,20 +6296,22 @@ impl HarnessApp {
 
         Some(
             div()
-                .id("queued-prompts")
+                .id("outbound-tray")
                 .flex_none()
-                .max_h(px(160.))
+                .max_h(px(192.))
                 .border_t_1()
                 .border_color(visuals.divider)
                 .bg(visuals.pending_surface)
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .id("queued-prompt-list")
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .children(self.queued_turns.iter().enumerate().map(|(index, entry)| {
+                .when_some(pending_outbound, |this, pending| this.child(pending))
+                .when(!self.queued_turns.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .id("queued-prompt-list")
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .children(self.queued_turns.iter().enumerate().map(|(index, entry)| {
                             let client_id = entry.client_user_message_id.clone();
                             let queue_ready = entry.id.is_some();
                             let operation = operations.get(&client_id).copied();
@@ -6575,8 +6581,9 @@ impl HarnessApp {
                                             )
                                         }),
                                 )
-                        })),
-                )
+                            })),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -6586,52 +6593,85 @@ impl HarnessApp {
         following_tail: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
-        if following_tail {
-            return None;
-        }
         let pending = self.model.items.iter().rev().find(|item| {
             item.kind == model::TranscriptKind::User
+                && item.protocol_id.is_none()
                 && matches!(
                     item.status.as_deref(),
                     Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
                 )
         })?;
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let preview = pending.content.lines().next().unwrap_or_default().trim();
         let label: SharedString = if preview.is_empty() {
             "Image prompt".into()
         } else {
             preview.to_owned().into()
         };
+        let status_tooltip = match pending.status.as_deref() {
+            Some("adding to response" | "awaiting incorporation") => {
+                "Submitted prompt · waiting for the active response to incorporate it"
+            }
+            _ => "Submitted prompt · waiting for the live transcript",
+        };
         let weak = cx.weak_entity();
+        let weak_jump = weak.clone();
         Some(
             div()
                 .id("pending-outbound-proxy")
-                .cursor_pointer()
-                .tooltip(Tooltip::text("View submitted prompt at the live tail"))
-                .on_click(move |_, window, cx| {
-                    weak.update(cx, |this, cx| this.go_to_transcript_tail(window, cx))
-                        .ok();
+                .tooltip(Tooltip::text(status_tooltip))
+                .when(!following_tail, |this| {
+                    this.cursor_pointer().on_click(move |_, window, cx| {
+                        weak.update(cx, |this, cx| this.go_to_transcript_tail(window, cx))
+                            .ok();
+                    })
                 })
-                .h(px(30.))
+                .h(px(32.))
                 .flex_none()
                 .px_2p5()
                 .flex()
                 .items_center()
-                .border_t_1()
-                .border_color(visuals.divider)
-                .bg(visuals.pending_surface)
-                .opacity(0.58)
+                .gap_1()
+                .when(!self.queued_turns.is_empty(), |this| {
+                    this.border_b_1().border_color(colors.border_variant)
+                })
+                .child(
+                    div()
+                        .w(px(20.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            SpinnerLabel::dots()
+                                .size(LabelSize::Small)
+                                .color(Color::Accent),
+                        ),
+                )
                 .child(
                     div()
                         .min_w_0()
                         .flex_1()
                         .truncate()
                         .text_sm()
-                        .text_color(colors.text)
+                        .text_color(colors.text_muted)
                         .child(label),
                 )
+                .when(!following_tail, |this| {
+                    this.child(
+                        IconButton::new("pending-outbound-tail", IconName::ArrowDown)
+                            .shape(IconButtonShape::Square)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .aria_label("View submitted prompt at the live tail")
+                            .tooltip(Tooltip::text("View at live tail"))
+                            .on_click(move |_, window, cx| {
+                                weak_jump
+                                    .update(cx, |this, cx| this.go_to_transcript_tail(window, cx))
+                                    .ok();
+                            }),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -16551,7 +16591,7 @@ impl Render for HarnessApp {
         let composer_actions =
             self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
         let pending_outbound_proxy = self.render_pending_outbound_proxy(following_tail, cx);
-        let queued_turns = self.render_queued_turns(cx);
+        let outbound_tray = self.render_outbound_tray(pending_outbound_proxy, cx);
 
         div()
             .key_context(self.key_context())
@@ -16884,8 +16924,7 @@ impl Render for HarnessApp {
                                 }),
                         )
                     })
-                    .when_some(pending_outbound_proxy, |this, proxy| this.child(proxy))
-                    .when_some(queued_turns, |this, queued_turns| this.child(queued_turns))
+                    .when_some(outbound_tray, |this, tray| this.child(tray))
                     .child(
                         div()
                             .flex_none()
@@ -19232,7 +19271,7 @@ mod tests {
     fn queued_prompt_rows_use_drag_handles_without_ordinal_or_arrow_chrome() {
         let source = include_str!("main.rs");
         let renderer = source
-            .split_once("fn render_queued_turns(")
+            .split_once("fn render_outbound_tray(")
             .and_then(|(_, after)| after.split_once("fn render_pending_outbound_proxy("))
             .map(|(body, _)| body)
             .expect("queued prompt renderer must remain auditable");
@@ -19241,9 +19280,32 @@ mod tests {
         assert!(renderer.contains(".on_drag("));
         assert!(renderer.contains(".drag_over::<DraggedQueuedTurn>"));
         assert!(renderer.contains(".on_drop("));
+        assert!(renderer.contains(".id(\"outbound-tray\")"));
+        assert!(renderer.contains(".when_some(pending_outbound"));
+        assert!(renderer.contains("IconName::SteeringWheel"));
+        assert!(renderer.contains("IconName::InterruptAndRun"));
         assert!(!renderer.contains("queued-prompt-position"));
         assert!(!renderer.contains("move-queued-prompt-up"));
         assert!(!renderer.contains("move-queued-prompt-down"));
+    }
+
+    #[test]
+    fn pending_submission_is_a_row_in_the_shared_outbound_tray() {
+        let source = include_str!("main.rs");
+        let proxy = source
+            .split_once("fn render_pending_outbound_proxy(")
+            .and_then(|(_, after)| after.split_once("fn rich_nested_scroll_binding("))
+            .map(|(body, _)| body)
+            .expect("pending outbound renderer must remain auditable");
+
+        assert!(proxy.contains("SpinnerLabel::dots()"));
+        assert!(proxy.contains("pending-outbound-tail"));
+        assert!(proxy.contains("item.protocol_id.is_none()"));
+        assert!(proxy.contains(".when(!following_tail"));
+        assert!(!proxy.contains("if following_tail"));
+        assert!(!proxy.contains(".border_t_1()"));
+        assert!(!proxy.contains(".bg("));
+        assert!(!proxy.contains(".opacity("));
     }
 
     #[test]
@@ -22185,7 +22247,7 @@ mod tests {
         let source = include_str!("main.rs");
         let renderer = source
             .split_once("fn render_composer_actions(")
-            .and_then(|(_, after)| after.split_once("fn render_queued_turns("))
+            .and_then(|(_, after)| after.split_once("fn render_outbound_tray("))
             .map(|(body, _)| body)
             .expect("composer actions must remain auditable");
         assert!(renderer.contains("let stop_action = IconButton::new"));

@@ -291,7 +291,15 @@ impl TranscriptItem {
     pub fn is_presentationally_visible(&self) -> bool {
         let visible_trace = self.kind != TranscriptKind::Trace
             || string_at(&self.raw, "/type") == Some("contextCompaction");
+        let locally_pending_user = self.kind == TranscriptKind::User
+            && self.protocol_id.is_none()
+            && self.key.starts_with("local-user:")
+            && matches!(
+                self.status.as_deref(),
+                Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
+            );
         visible_trace
+            && !locally_pending_user
             && (self.kind != TranscriptKind::Reasoning
                 || !self.content.trim().is_empty()
                 || self.pending_request.is_some()
@@ -2277,10 +2285,11 @@ impl TranscriptModel {
         (index, key)
     }
 
-    /// Ensure a successfully started queued submission has a visible user
-    /// item even when its authoritative item notification is late or absent.
-    /// A later authoritative item still reconciles through the stable client
-    /// id instead of duplicating it.
+    /// Ensure a successfully started queued submission has one durable local
+    /// identity while its authoritative item notification is late. Harness
+    /// presents this state in the sticky outbound tray; a later authoritative
+    /// item reconciles through the client id and promotes the same identity
+    /// into the transcript instead of duplicating it.
     pub fn ensure_local_user(
         &mut self,
         client_user_message_id: &str,
@@ -7628,6 +7637,24 @@ mod tests {
             &document.text[segment.whole_range.clone()],
             "A compact message\n"
         );
+    }
+
+    #[test]
+    fn optimistic_user_message_stays_out_of_transcript_until_authoritative() {
+        let mut model = TranscriptModel::default();
+        let (index, _) = model.push_local_user(
+            "client-message-1",
+            "Keep this prompt sticky".into(),
+            &[json!({"type": "text", "text": "Keep this prompt sticky"})],
+        );
+
+        assert!(!model.items[index].is_presentationally_visible());
+        assert!(model.full_document().text.is_empty());
+
+        model.items[index].protocol_id = Some("server-item-1".into());
+        model.items[index].status = Some("completed".into());
+        assert!(model.items[index].is_presentationally_visible());
+        assert_eq!(model.full_document().text, "Keep this prompt sticky\n");
     }
 
     #[test]
