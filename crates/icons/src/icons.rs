@@ -106,6 +106,7 @@ pub enum IconName {
     DiffUnified,
     Disconnected,
     Download,
+    DragHandle,
     EditorAtom,
     EditorCursor,
     EditorEmacs,

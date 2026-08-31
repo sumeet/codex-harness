@@ -3202,6 +3202,45 @@ struct QueuedTurnSubmission {
     preview_images: Vec<Arc<Image>>,
 }
 
+#[derive(Clone, Debug)]
+struct DraggedQueuedTurn {
+    client_user_message_id: String,
+    source_index: usize,
+    preview: SharedString,
+}
+
+impl Render for DraggedQueuedTurn {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(480.))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(cx.theme().colors().drop_target_border)
+            .bg(cx.theme().colors().panel_background)
+            .font_harness_reading(cx)
+            .text_sm()
+            .text_color(cx.theme().colors().text)
+            .shadow_md()
+            .truncate()
+            .child(self.preview.clone())
+    }
+}
+
+fn move_queue_item<T>(items: &mut VecDeque<T>, source_index: usize, target_index: usize) -> bool {
+    if source_index >= items.len() || target_index >= items.len() || source_index == target_index {
+        return false;
+    }
+    let Some(item) = items.remove(source_index) else {
+        return false;
+    };
+    // `target_index` is measured before removal. Inserting at that same index
+    // places a downward drag after the target and an upward drag before it.
+    items.insert(target_index, item);
+    true
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QueueOperation {
     Removing,
@@ -6272,20 +6311,52 @@ impl HarnessApp {
                             let operation = operations.get(&client_id).copied();
                             let operation_pending = operation.is_some();
                             let preview = queued_submission_preview(&entry.input);
+                            let display_preview: SharedString = if preview.is_empty() {
+                                "Image prompt".into()
+                            } else {
+                                preview.into()
+                            };
                             let image_count = queued_submission_image_count(&entry.input);
                             let preview_image_count = entry.preview_images.len();
                             let remaining_image_count =
                                 image_count.saturating_sub(preview_image_count);
-                            let position_tooltip = format!(
-                                "Queued prompt {} of {queue_count}",
-                                index + 1
-                            );
                             let weak_edit = weak.clone();
-                            let weak_move_up = weak.clone();
-                            let weak_move_down = weak.clone();
                             let weak_steer = weak.clone();
                             let weak_send = weak.clone();
                             let weak_remove = weak.clone();
+                            let weak_drop = weak.clone();
+                            let target_client_id = entry.client_user_message_id.clone();
+                            let can_drag = queue_ready && !operation_pending;
+                            let drag_handle = if can_drag {
+                                let dragged = DraggedQueuedTurn {
+                                    client_user_message_id: client_id.clone(),
+                                    source_index: index,
+                                    preview: display_preview.clone(),
+                                };
+                                div()
+                                    .id(("queued-prompt-drag-handle", index))
+                                    .size(px(20.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_grab()
+                                    .tooltip(Tooltip::text("Drag to reorder queued prompt"))
+                                    .child(
+                                        Icon::new(IconName::DragHandle)
+                                            .size(IconSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .on_drag(dragged, |dragged, _, _, cx| {
+                                        cx.new(|_| dragged.clone())
+                                    })
+                                    .into_any_element()
+                            } else {
+                                div().size(px(20.)).flex_none().into_any_element()
+                            };
+                            let drag_style_target = target_client_id.clone();
+                            let drop_predicate_target = target_client_id.clone();
+                            let drop_target = target_client_id.clone();
                             div()
                                 .id(("queued-prompt", index))
                                 .group("queued-prompt")
@@ -6298,17 +6369,39 @@ impl HarnessApp {
                                 .when(index + 1 < queue_count, |this| {
                                     this.border_b_1().border_color(colors.border_variant)
                                 })
-                                .child(
-                                    div()
-                                        .id(("queued-prompt-position", index))
-                                        .flex_none()
-                                        .tooltip(Tooltip::text(position_tooltip))
-                                        .child(
-                                            Label::new(format!("{}", index + 1))
-                                                .size(LabelSize::XSmall)
-                                                .color(Color::Muted),
-                                        ),
-                                )
+                                .drag_over::<DraggedQueuedTurn>(move |style, dragged, _, cx| {
+                                    if dragged.client_user_message_id == drag_style_target {
+                                        return style;
+                                    }
+                                    let style = style
+                                        .bg(cx.theme().colors().drop_target_background)
+                                        .border_color(cx.theme().colors().drop_target_border);
+                                    if index < dragged.source_index {
+                                        style.border_t_2()
+                                    } else {
+                                        style.border_b_2()
+                                    }
+                                })
+                                .can_drop(move |dragged, _, _| {
+                                    dragged
+                                        .downcast_ref::<DraggedQueuedTurn>()
+                                        .is_some_and(|dragged| {
+                                            dragged.client_user_message_id
+                                                != drop_predicate_target
+                                        })
+                                })
+                                .on_drop(move |dragged: &DraggedQueuedTurn, _, cx| {
+                                    weak_drop
+                                        .update(cx, |this, cx| {
+                                            this.reorder_queued_turn(
+                                                dragged.client_user_message_id.clone(),
+                                                drop_target.clone(),
+                                                cx,
+                                            )
+                                        })
+                                        .ok();
+                                })
+                                .child(drag_handle)
                                 .children(entry.preview_images.iter().map(|image| {
                                     div()
                                         .size(px(22.))
@@ -6346,11 +6439,7 @@ impl HarnessApp {
                                         .truncate()
                                         .text_sm()
                                         .text_color(colors.text)
-                                        .child(if preview.is_empty() {
-                                            "Image prompt".to_owned()
-                                        } else {
-                                            preview
-                                        }),
+                                        .child(display_preview),
                                 )
                                 .child(
                                     div()
@@ -6375,63 +6464,7 @@ impl HarnessApp {
                                                 )
                                         })
                                         .when(queue_ready && !operation_pending, |this| {
-                                            this.when(index > 0, |this| {
-                                                let client_id =
-                                                    entry.client_user_message_id.clone();
-                                                this.child(
-                                                    IconButton::new(
-                                                        ("move-queued-prompt-up", index),
-                                                        IconName::ArrowUp,
-                                                    )
-                                                    .shape(IconButtonShape::Square)
-                                                    .size(ButtonSize::Compact)
-                                                    .style(ButtonStyle::Subtle)
-                                                    .aria_label("Move queued prompt earlier")
-                                                    .tooltip(Tooltip::text(
-                                                        "Move queued prompt earlier",
-                                                    ))
-                                                    .on_click(move |_, _, cx| {
-                                                        weak_move_up
-                                                            .update(cx, |this, cx| {
-                                                                this.move_queued_turn(
-                                                                    client_id.clone(),
-                                                                    -1,
-                                                                    cx,
-                                                                )
-                                                            })
-                                                            .ok();
-                                                    }),
-                                                )
-                                            })
-                                            .when(index + 1 < queue_count, |this| {
-                                                let client_id =
-                                                    entry.client_user_message_id.clone();
-                                                this.child(
-                                                    IconButton::new(
-                                                        ("move-queued-prompt-down", index),
-                                                        IconName::ArrowDown,
-                                                    )
-                                                    .shape(IconButtonShape::Square)
-                                                    .size(ButtonSize::Compact)
-                                                    .style(ButtonStyle::Subtle)
-                                                    .aria_label("Move queued prompt later")
-                                                    .tooltip(Tooltip::text(
-                                                        "Move queued prompt later",
-                                                    ))
-                                                    .on_click(move |_, _, cx| {
-                                                        weak_move_down
-                                                            .update(cx, |this, cx| {
-                                                                this.move_queued_turn(
-                                                                    client_id.clone(),
-                                                                    1,
-                                                                    cx,
-                                                                )
-                                                            })
-                                                            .ok();
-                                                    }),
-                                                )
-                                            })
-                                            .when(active_turn_control_ready, |this| {
+                                            this.when(active_turn_control_ready, |this| {
                                                 let client_id =
                                                     entry.client_user_message_id.clone();
                                                 this.child(
@@ -10442,22 +10475,27 @@ impl HarnessApp {
         }
     }
 
-    fn move_queued_turn(
+    fn reorder_queued_turn(
         &mut self,
         client_user_message_id: String,
-        delta: isize,
+        target_client_user_message_id: String,
         cx: &mut Context<Self>,
     ) {
-        let Some(index) = self
+        let Some(source_index) = self
             .queued_turns
             .iter()
             .position(|entry| entry.client_user_message_id == client_user_message_id)
         else {
             return;
         };
-        let target = index.saturating_add_signed(delta);
-        if target >= self.queued_turns.len()
-            || target == index
+        let Some(target_index) = self
+            .queued_turns
+            .iter()
+            .position(|entry| entry.client_user_message_id == target_client_user_message_id)
+        else {
+            return;
+        };
+        if source_index == target_index
             || self.queue_operations.contains_key(&client_user_message_id)
         {
             return;
@@ -10468,7 +10506,9 @@ impl HarnessApp {
             return;
         };
         let mut reordered = self.queued_turns.clone();
-        reordered.swap(index, target);
+        if !move_queue_item(&mut reordered, source_index, target_index) {
+            return;
+        }
         let Some(ids) = reordered
             .iter()
             .map(|entry| entry.id.clone())
@@ -10478,6 +10518,9 @@ impl HarnessApp {
         };
         self.queue_operations
             .insert(client_user_message_id.clone(), QueueOperation::Reordering);
+        // The drag should feel completed when the user drops it. The server
+        // remains authoritative; a rejection refreshes the queue below.
+        self.queued_turns = reordered.clone();
         cx.spawn(async move |this, cx| {
             let result = client.reorder_queued_turns(&thread_id, ids).await;
             _ = this.update(cx, |this, cx| {
@@ -10491,7 +10534,6 @@ impl HarnessApp {
                 this.queue_operations.remove(&client_user_message_id);
                 match result {
                     Ok(_) => {
-                        this.queued_turns = reordered;
                         this.error = None;
                     }
                     Err(error) => {
@@ -19142,6 +19184,36 @@ mod tests {
         );
         assert_eq!(queued_submission_image_count(&queued[0].input), 1);
         assert_eq!(queued[0].preview_images.len(), 1);
+    }
+
+    #[test]
+    fn drag_reorder_places_downward_drops_after_and_upward_drops_before() {
+        let mut downward = VecDeque::from(["a", "b", "c", "d"]);
+        assert!(move_queue_item(&mut downward, 0, 2));
+        assert_eq!(downward, ["b", "c", "a", "d"]);
+
+        let mut upward = VecDeque::from(["a", "b", "c", "d"]);
+        assert!(move_queue_item(&mut upward, 3, 1));
+        assert_eq!(upward, ["a", "d", "b", "c"]);
+        assert!(!move_queue_item(&mut upward, 1, 1));
+    }
+
+    #[test]
+    fn queued_prompt_rows_use_drag_handles_without_ordinal_or_arrow_chrome() {
+        let source = include_str!("main.rs");
+        let renderer = source
+            .split_once("fn render_queued_turns(")
+            .and_then(|(_, after)| after.split_once("fn render_pending_outbound_proxy("))
+            .map(|(body, _)| body)
+            .expect("queued prompt renderer must remain auditable");
+
+        assert!(renderer.contains("IconName::DragHandle"));
+        assert!(renderer.contains(".on_drag("));
+        assert!(renderer.contains(".drag_over::<DraggedQueuedTurn>"));
+        assert!(renderer.contains(".on_drop("));
+        assert!(!renderer.contains("queued-prompt-position"));
+        assert!(!renderer.contains("move-queued-prompt-up"));
+        assert!(!renderer.contains("move-queued-prompt-down"));
     }
 
     #[test]
