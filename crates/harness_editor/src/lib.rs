@@ -270,6 +270,7 @@ struct ComposerMarkdownHeadingHighlight;
 struct ComposerMarkdownStrongHighlight;
 struct ComposerMarkdownEmphasisHighlight;
 struct ComposerMarkdownStrikethroughHighlight;
+struct ComposerMarkdownBlockQuoteHighlight;
 struct ComposerMarkdownBlockQuoteRows;
 
 impl LocalEditor {
@@ -604,6 +605,18 @@ impl LocalEditor {
                         thickness: px(1.),
                         color: Some(strikethrough_color),
                     }),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownBlockQuoteHighlight,
+                >()),
+                anchors(block_quote_ranges.clone()),
+                HighlightStyle {
+                    color: Some(cx.theme().colors().text_muted),
+                    font_style: Some(gpui::FontStyle::Italic),
                     ..HighlightStyle::default()
                 },
                 cx,

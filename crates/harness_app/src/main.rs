@@ -4901,28 +4901,64 @@ impl HarnessApp {
         let body = match self.appearance_settings_section {
             AppearanceSettingsSection::Themes => {
                 let current_theme = cx.theme().name.clone();
+                let query = self
+                    .theme_catalog_filter
+                    .read(cx)
+                    .text(cx)
+                    .trim()
+                    .to_lowercase();
                 let mut themes = theme::ThemeRegistry::global(cx).list();
+                let matching_theme_count = themes
+                    .iter()
+                    .filter(|theme| query.is_empty() || theme.name.to_lowercase().contains(&query))
+                    .count();
+                themes.retain(|theme| {
+                    theme.name == current_theme
+                        || query.is_empty()
+                        || theme.name.to_lowercase().contains(&query)
+                });
                 themes.sort_unstable_by(|left, right| {
-                    left.appearance
-                        .is_light()
-                        .cmp(&right.appearance.is_light())
+                    (right.name == current_theme)
+                        .cmp(&(left.name == current_theme))
+                        .then(left.appearance.is_light().cmp(&right.appearance.is_light()))
                         .then(left.name.cmp(&right.name))
                 });
                 let registry = theme::ThemeRegistry::global(cx);
-                let mut rows = Vec::with_capacity(themes.len() + 2);
+                let mut rows = Vec::with_capacity(themes.len() + 3);
                 let mut rendering_light_themes = false;
-                rows.push(
-                    div()
-                        .px_3()
-                        .pt_2()
-                        .pb_1()
-                        .text_ui_sm(cx)
-                        .text_color(colors.text_muted)
-                        .child("Dark")
-                        .into_any_element(),
-                );
+                let mut rendered_current_theme = false;
                 for (index, theme) in themes.into_iter().enumerate() {
-                    if theme.appearance.is_light() && !rendering_light_themes {
+                    let selected = theme.name == current_theme;
+                    if selected && !rendered_current_theme {
+                        rendered_current_theme = true;
+                        rows.push(
+                            div()
+                                .px_3()
+                                .pt_2()
+                                .pb_1()
+                                .text_ui_sm(cx)
+                                .text_color(colors.text_muted)
+                                .child("Current theme")
+                                .into_any_element(),
+                        );
+                    } else if !selected && !rendering_light_themes {
+                        rows.push(
+                            div()
+                                .px_3()
+                                .pt_3()
+                                .pb_1()
+                                .text_ui_sm(cx)
+                                .text_color(colors.text_muted)
+                                .child(if theme.appearance.is_light() {
+                                    "Light themes"
+                                } else {
+                                    "Dark themes"
+                                })
+                                .into_any_element(),
+                        );
+                        rendering_light_themes = theme.appearance.is_light();
+                    }
+                    if !selected && theme.appearance.is_light() && !rendering_light_themes {
                         rendering_light_themes = true;
                         rows.push(
                             div()
@@ -4931,11 +4967,10 @@ impl HarnessApp {
                                 .pb_1()
                                 .text_ui_sm(cx)
                                 .text_color(colors.text_muted)
-                                .child("Light")
+                                .child("Light themes")
                                 .into_any_element(),
                         );
                     }
-                    let selected = theme.name == current_theme;
                     let theme_name = theme.name.clone();
                     let theme_colors = registry
                         .get(&theme.name)
@@ -5002,6 +5037,17 @@ impl HarnessApp {
                             .into_any_element(),
                     );
                 }
+                if !query.is_empty() && matching_theme_count == 0 {
+                    rows.push(
+                        div()
+                            .px_3()
+                            .py_4()
+                            .text_ui(cx)
+                            .text_color(colors.text_muted)
+                            .child("No installed themes match this search.")
+                            .into_any_element(),
+                    );
+                }
                 div()
                     .w_full()
                     .flex()
@@ -5029,13 +5075,6 @@ impl HarnessApp {
                         .when(self.theme_catalog_loading, |this| {
                             this.child(SpinnerLabel::new().size(LabelSize::Small))
                         })
-                        .into_any_element(),
-                );
-                rows.push(
-                    div()
-                        .px_3()
-                        .pb_2()
-                        .child(self.theme_catalog_filter.clone())
                         .into_any_element(),
                 );
 
@@ -5554,12 +5593,16 @@ impl HarnessApp {
             }
         };
 
+        let show_theme_search = matches!(
+            self.appearance_settings_section,
+            AppearanceSettingsSection::Themes | AppearanceSettingsSection::Explore
+        );
+
         div()
             .absolute()
             .inset_0()
             .flex()
             .justify_end()
-            .bg(gpui::black().opacity(0.12))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -5569,9 +5612,9 @@ impl HarnessApp {
             )
             .child(
                 div()
-                    .w(relative(0.38))
-                    .min_w(px(420.))
-                    .max_w(px(560.))
+                    .w(relative(0.44))
+                    .min_w(px(440.))
+                    .max_w(px(680.))
                     .h_full()
                     .flex()
                     .flex_col()
@@ -5582,43 +5625,79 @@ impl HarnessApp {
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(
                         div()
-                            .h(px(44.))
                             .flex_none()
-                            .px_2()
                             .flex()
-                            .items_center()
-                            .gap_1()
+                            .flex_col()
                             .border_b_1()
                             .border_color(visuals.divider)
                             .child(
                                 div()
-                                    .px_1()
-                                    .flex_1()
-                                    .text_ui(cx)
-                                    .text_color(colors.text)
-                                    .child("Appearance"),
+                                    .h(px(42.))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_baseline()
+                                            .gap_2()
+                                            .text_ui(cx)
+                                            .text_color(colors.text)
+                                            .child("Appearance")
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_ui_sm(cx)
+                                                    .text_color(colors.text_muted)
+                                                    .child(cx.theme().name.clone()),
+                                            ),
+                                    )
+                                    .child(
+                                        IconButton::new(
+                                            "close-appearance-settings",
+                                            IconName::Close,
+                                        )
+                                        .shape(IconButtonShape::Square)
+                                        .size(ButtonSize::Default)
+                                        .style(ButtonStyle::Subtle)
+                                        .aria_label("Close appearance settings")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.appearance_settings_open = false;
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    ),
                             )
-                            .child(theme_tab)
-                            .child(explore_tab)
-                            .child(typography_tab)
                             .child(
-                                IconButton::new("close-appearance-settings", IconName::Close)
-                                    .shape(IconButtonShape::Square)
-                                    .size(ButtonSize::Default)
-                                    .style(ButtonStyle::Subtle)
-                                    .aria_label("Close appearance settings")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.appearance_settings_open = false;
-                                        cx.notify();
-                                    })),
-                            ),
+                                div()
+                                    .h(px(38.))
+                                    .px_2()
+                                    .pb_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(theme_tab)
+                                    .child(explore_tab)
+                                    .child(typography_tab)
+                                    .child(div().flex_1()),
+                            )
+                            .when(show_theme_search, |this| {
+                                this.child(
+                                    div().px_3().pb_2().child(self.theme_catalog_filter.clone()),
+                                )
+                            }),
                     )
                     .child(
                         div()
                             .id("appearance-settings-scroll")
                             .flex_1()
                             .min_h_0()
+                            .pr_2()
                             .overflow_y_scroll()
+                            .restrict_scroll_to_axis()
                             .track_scroll(&scroll_handle)
                             .child(body),
                     )
@@ -7064,7 +7143,7 @@ impl HarnessApp {
         }
         let search_editor = cx.new(|cx| LocalEditor::plain_single_line("", window, cx));
         let theme_catalog_filter = cx.new(|cx| {
-            ui_input::InputField::new(window, cx, "Search 600+ Zed theme packs…")
+            ui_input::InputField::new(window, cx, "Search installed themes and theme packs…")
                 .start_icon(IconName::MagnifyingGlass)
         });
         let transcript_editor = cx.new(|cx| TranscriptEditor::read_only(window, cx));
@@ -13177,6 +13256,10 @@ impl HarnessApp {
             .project_name(project)
             .timestamp(relative_time(thread.updated_at))
             .status(status)
+            // Harness's narrow task rail should clip cleanly. ThreadItem's
+            // opaque-window truncation uses a gradient mask which made every
+            // title look faded and distorted the selected theme's colors.
+            .is_truncated(false)
             .selected(selected)
             .focused(cursor)
             .base_bg(colors.panel_background)
