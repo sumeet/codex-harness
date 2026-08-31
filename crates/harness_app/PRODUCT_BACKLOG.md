@@ -42,11 +42,31 @@ must survive conversation compaction and hand-offs.
   parent breadcrumbs, and independently openable transcripts.
 - [ ] Expose safe delegate, follow-up, wait, interrupt, and fork workflows while
   keeping supervised child agents distinct from independent thread forks.
-- [ ] Make the product backlog itself visible and actionable enough to queue,
-  hold, delegate, inspect, and resume work without relying on conversation
-  memory.
-- [ ] Validate unattended App Server lifetime, reconnect/reload behavior, and
-  whether a tray/background service is needed for work to outlive the window.
+- [ ] Build a workspace-wide durable task ledger, distinct from the live
+  subagent hierarchy: capture every user submission in an inbox, promote or
+  merge explicit tasks, attach multiple execution attempts, and retain outcome,
+  status, acceptance criteria, dependencies, material updates, artifacts,
+  checkpoints, and source thread/turn identity across restart and compaction.
+- [ ] Replace Harness-owned `app-server --listen stdio://` with Codex's managed
+  daemon plus a reconnectable local transport. Closing the window must leave
+  the daemon PID and active turns untouched; reopening must resume the saved
+  thread, replay pending interaction, reload Queue and hierarchy, and reconcile
+  missed output without duplicate transcript rows.
+- [ ] Add a versioned transactional workspace-state store for the selected
+  root/child, composer draft, private durable attachment copies, optimistic
+  outbound journal, partial request answers, and practical scroll/Vim/fold
+  anchors. Flush atomically on mutation/shutdown and recover from an interrupted
+  write without corrupting prior state.
+- [ ] Expose the resolved Codex binary path plus installed and running App
+  Server versions; refuse or prominently gate a stale managed daemon, detect an
+  available update, and provide a controlled restart. Never restart while any
+  thread is active or awaiting interaction without explicit user override.
+- [ ] Surface multi-agent capacity and allocation failures truthfully enough to
+  distinguish an App Server/protocol limitation from the outer Codex
+  orchestration runtime and from exhausted local child slots.
+- [ ] Paginate both root and spawned-child thread listings instead of treating
+  the first bounded page as a complete hierarchy; preserve visible descendants
+  while later pages are loading and make truncation explicit on failure.
 
 ### Visual system and overall aesthetic
 
@@ -61,6 +81,12 @@ must survive conversation compaction and hand-offs.
   keep reconnecting state nearby without turning either into a status banner.
 - [ ] Normalize typography, padding, borders, radii, identity rows, and density
   across user messages, tool calls, diffs, images, queue rows, and the composer.
+- [ ] Make Markdown inline code consume the complete configured code typography
+  role, including size. GPUI currently lays out a `StyledText` line at one
+  uniform size, so Markdown's inline-code size refinement is discarded while
+  family and weight survive. Add geometry-correct mixed-size text runs rather
+  than splitting prose into flex fragments; preserve wrapping, baseline/line
+  height, source hit-testing, Vim cursor bounds, and selection.
 - [ ] Apply three deliberate visual weights: nearly chrome-free narrative,
   separator-stacked routine activity, and one unnested surface for semantic
   artifacts. Preserve comfortable reading sizes; achieve density by removing
@@ -88,7 +114,8 @@ must survive conversation compaction and hand-offs.
   - **Queue**: runnable in order when the active turn finishes.
   - **Later**: held/paused indefinitely and never auto-started.
 - [ ] Let every pending item be edited, deleted, reordered, paused/resumed,
-  sent now, steered into the active turn, delegated, or forked.
+  steered at the active turn's next safe input boundary, used to interrupt the
+  active turn and start a new one, delegated, or forked.
 - [ ] Add a global queue pause without conflating it with stopping the active
   turn.
 - [ ] Show queued/held messages in the transcript exactly once when they are
@@ -105,12 +132,17 @@ must survive conversation compaction and hand-offs.
 - [ ] Prefer server-owned durable pending state so Queue/Later works across
   machines. If App Server cannot represent held drafts, use an explicit,
   versioned sidecar rather than hidden text or overloaded IDs.
-- [ ] Make queued rows compact: no dedicated tall header, inline 22–24 px image
-  thumbnails, prompt-first width, separators instead of cards, and icon-first
-  edit/steer/run/remove actions with precise tooltips.
-- [ ] Track queued input through queued, acknowledged, incorporated/started,
-  and completed/cancelled states; App Server acceptance must not be painted as
-  model consumption.
+- [ ] Make queued rows compact: no dedicated tall header or redundant per-row
+  queue icon, inline 22–24 px image thumbnails only when an image exists,
+  prompt-first width, and separators instead of cards. Use the native
+  steering-wheel glyph with the literal **Steer** label; keep familiar
+  edit/remove glyphs, and expose the disruptive **Interrupt & run** operation
+  with explicit language rather than an ambiguous bordered Play button.
+- [ ] Track one outbound item by `clientUserMessageId` through submitting,
+  queued/start/steer acknowledgement, model incorporation, and
+  completed/cancelled states. Queue IDs, server item IDs, and turn IDs are
+  aliases with separate meanings; App Server acceptance must not be painted as
+  model consumption, and stale RPC callbacks must not regress newer authority.
 
 ## Next
 
@@ -133,8 +165,9 @@ must survive conversation compaction and hand-offs.
 - [ ] Keep the composer caret and final line visible at every height.
 - [ ] Show attachments compactly, render submitted images once, and reconcile
   optimistic user messages using protocol identity.
-- [ ] Distinguish queued user input from user steering that should interrupt or
-  redirect the current turn.
+- [ ] Distinguish ordinary queued input, non-interrupting **Steer** delivery at
+  the active turn's next safe input boundary, and **Interrupt & run**, which
+  terminates that turn and starts the queued input as a new turn.
 
 ### Vim transcript correctness
 
@@ -151,6 +184,12 @@ must survive conversation compaction and hand-offs.
 
 ### Scrolling and performance
 
+- [ ] Replace the detached far-right latest arrow with one tail-aware sticky
+  affordance aligned to the transcript activity/content gutter above the
+  composer. At the live tail, show only the ordinary inline activity marker.
+  While scrolled away, show activity plus a down arrow during streaming, then
+  an unread dot plus the arrow after completion; click and `G` both return to
+  and follow the live tail, and the proxy disappears once there.
 - [ ] Measure event-to-presentation latency and sustain 120 Hz scrolling under
   realistic long-thread load; keep input handling independent of transcript
   layout, parsing, and syntax highlighting.

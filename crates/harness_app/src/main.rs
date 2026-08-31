@@ -10,7 +10,10 @@ use std::{
 
 use assets::Assets;
 use base64::Engine as _;
-use codex_app_server_client::{Client, CodexThread, Event as AppServerEvent, ThreadOpenResponse};
+use codex_app_server_client::{
+    Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus,
+    Event as AppServerEvent, ThreadOpenResponse,
+};
 use file_icons::FileIcons;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
@@ -127,6 +130,7 @@ const THREAD_LIMIT: usize = 300;
 const STREAM_FRAME: Duration = Duration::from_millis(32);
 const READ_ONLY_ACTIVE_REFRESH: Duration = Duration::from_millis(900);
 const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
+const CHILD_HIERARCHY_REFRESH_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
@@ -536,6 +540,14 @@ struct RichFileChangeSurface {
 struct RichMarkdownNavigationPaint {
     selections: Vec<Range<usize>>,
     cursor: Option<usize>,
+}
+
+fn changed_markdown_cursor(
+    previous: Option<&RichMarkdownNavigationPaint>,
+    next: Option<&RichMarkdownNavigationPaint>,
+) -> Option<usize> {
+    let next_cursor = next.and_then(|navigation| navigation.cursor)?;
+    (previous.and_then(|navigation| navigation.cursor) != Some(next_cursor)).then_some(next_cursor)
 }
 
 impl RichNavigationPaint {
@@ -2765,6 +2777,7 @@ enum RequestReply {
 #[derive(Clone, Debug, PartialEq)]
 enum RequestRoute {
     Interactive,
+    ReturnToThread(String),
     Immediate(RequestReply),
 }
 
@@ -3101,6 +3114,38 @@ fn composer_send_blocked(
         || !transport_available
 }
 
+fn child_inspection_blocked(read_only_child: bool, has_unresolved_live_request: bool) -> bool {
+    read_only_child && has_unresolved_live_request
+}
+
+fn callback_origin_is_visible(origin_thread_id: &str, selected_thread_id: Option<&str>) -> bool {
+    selected_thread_id == Some(origin_thread_id)
+}
+
+fn queue_state_belongs_to_thread(
+    origin_thread_id: &str,
+    selected_thread_id: Option<&str>,
+    preserved_work_thread_id: Option<&str>,
+) -> bool {
+    preserved_work_thread_id == Some(origin_thread_id)
+        || (preserved_work_thread_id.is_none() && selected_thread_id == Some(origin_thread_id))
+}
+
+fn queue_state_is_visible(
+    selected_thread_id: Option<&str>,
+    preserved_work_thread_id: Option<&str>,
+) -> bool {
+    selected_thread_id.is_some()
+        && preserved_work_thread_id.is_none_or(|parent| selected_thread_id == Some(parent))
+}
+
+fn reject_pending_requests_on_switch(
+    preserve_background_work: bool,
+    leaving_child_with_live_request: bool,
+) -> bool {
+    !preserve_background_work || leaving_child_with_live_request
+}
+
 fn request_should_take_focus(
     newly_mounted: bool,
     is_live: bool,
@@ -3413,6 +3458,8 @@ struct HarnessApp {
     replay_count: Option<usize>,
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
+    child_threads: ChildThreadRegistry,
+    sidebar_threads: Vec<SidebarThreadRow>,
     available_models: Vec<ModelChoice>,
     permission_profiles: Vec<PermissionProfileChoice>,
     model_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -3499,11 +3546,20 @@ struct HarnessApp {
     turn_start_pending: bool,
     queue_start_pending: bool,
     queue_refresh_pending: bool,
+    turn_start_generation: u64,
+    queue_start_generation: u64,
+    queue_refresh_generation: u64,
     queue_operations: HashMap<String, QueueOperation>,
     queued_turns: VecDeque<QueuedTurnSubmission>,
     server_task: Task<()>,
     turn_task: Task<()>,
-    request_task: Task<()>,
+    thread_list_task: Task<()>,
+    thread_open_task: Task<()>,
+    child_hierarchy_task: Task<()>,
+    child_hierarchy_generation: u64,
+    deferred_server_requests: Vec<AppServerEvent>,
+    background_parent_thread_id: Option<String>,
+    preserved_work_thread_id: Option<String>,
     reconnect_task: Task<()>,
     read_only_refresh_task: Task<()>,
     reconnect_attempts: u8,
@@ -3512,6 +3568,24 @@ struct HarnessApp {
 #[derive(Default)]
 struct ThreadSnapshotCache {
     entries: VecDeque<CodexThread>,
+}
+
+#[derive(Default)]
+struct ChildThreadRegistry {
+    by_id: HashMap<String, CodexThread>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SidebarThreadRow {
+    thread_id: String,
+    depth: usize,
+    root_index: Option<usize>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SubagentActivityPresentation {
+    title: String,
+    content: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3729,6 +3803,232 @@ fn compact_token_count(tokens: i64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+impl ChildThreadRegistry {
+    fn reconcile(&mut self, threads: Vec<CodexThread>) -> bool {
+        let next = threads
+            .into_iter()
+            .filter(|thread| !thread.id.is_empty() && thread.effective_parent_thread_id().is_some())
+            .map(|thread| (thread.id.clone(), thread))
+            .collect();
+        if self.by_id == next {
+            return false;
+        }
+        self.by_id = next;
+        true
+    }
+
+    fn get(&self, thread_id: &str) -> Option<&CodexThread> {
+        self.by_id.get(thread_id)
+    }
+}
+
+fn sidebar_thread_rows(
+    roots: &[CodexThread],
+    children: &ChildThreadRegistry,
+) -> Vec<SidebarThreadRow> {
+    fn append_children(
+        parent_id: &str,
+        depth: usize,
+        children_by_parent: &HashMap<String, Vec<&CodexThread>>,
+        visited: &mut HashSet<String>,
+        rows: &mut Vec<SidebarThreadRow>,
+    ) {
+        let Some(children) = children_by_parent.get(parent_id) else {
+            return;
+        };
+        for child in children {
+            if !visited.insert(child.id.clone()) {
+                continue;
+            }
+            rows.push(SidebarThreadRow {
+                thread_id: child.id.clone(),
+                depth,
+                root_index: None,
+            });
+            append_children(&child.id, depth + 1, children_by_parent, visited, rows);
+        }
+    }
+
+    let mut children_by_parent: HashMap<String, Vec<&CodexThread>> = HashMap::new();
+    for child in children.by_id.values() {
+        if let Some(parent_id) = child.effective_parent_thread_id() {
+            children_by_parent
+                .entry(parent_id.to_owned())
+                .or_default()
+                .push(child);
+        }
+    }
+    for siblings in children_by_parent.values_mut() {
+        siblings.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
+    let mut rows = Vec::with_capacity(roots.len() + children.by_id.len());
+    let mut visited = HashSet::new();
+    for (root_index, root) in roots.iter().enumerate() {
+        visited.insert(root.id.clone());
+        rows.push(SidebarThreadRow {
+            thread_id: root.id.clone(),
+            depth: 0,
+            root_index: Some(root_index),
+        });
+        append_children(&root.id, 1, &children_by_parent, &mut visited, &mut rows);
+    }
+    rows
+}
+
+fn sidebar_selection_index(
+    rows: &[SidebarThreadRow],
+    selected_thread_id: Option<&str>,
+    fallback: usize,
+) -> usize {
+    selected_thread_id
+        .and_then(|selected_id| {
+            rows.iter()
+                .position(|row| row.thread_id.as_str() == selected_id)
+        })
+        .unwrap_or_else(|| fallback.min(rows.len().saturating_sub(1)))
+}
+
+fn child_agent_path(thread: &CodexThread) -> Option<&str> {
+    let CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(spawn)) = &thread.source
+    else {
+        return None;
+    };
+    spawn
+        .agent_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn subagent_thread_ids(raw: &Value) -> Vec<String> {
+    fn push_unique(ids: &mut Vec<String>, thread_id: &str) {
+        if !thread_id.is_empty() && !ids.iter().any(|existing| existing == thread_id) {
+            ids.push(thread_id.to_owned());
+        }
+    }
+
+    let mut ids = Vec::new();
+    for value in [raw, raw.get("result").unwrap_or(&Value::Null)] {
+        if let Some(states) = value.get("agentsStates").and_then(Value::as_object) {
+            for thread_id in states.keys() {
+                push_unique(&mut ids, thread_id);
+            }
+        }
+        for field in ["receiverThreadIds", "threadIds"] {
+            if let Some(thread_ids) = value.get(field).and_then(Value::as_array) {
+                for thread_id in thread_ids.iter().filter_map(Value::as_str) {
+                    push_unique(&mut ids, thread_id);
+                }
+            }
+        }
+        for field in ["agentThreadId", "childThreadId"] {
+            if let Some(thread_id) = value.get(field).and_then(Value::as_str) {
+                push_unique(&mut ids, thread_id);
+            }
+        }
+    }
+    ids
+}
+
+fn subagent_identity(thread: &CodexThread) -> String {
+    [
+        thread.agent_nickname.as_deref(),
+        thread.agent_role.as_deref(),
+        child_agent_path(thread),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|identity| !identity.is_empty())
+    .unwrap_or(&thread.id)
+    .to_owned()
+}
+
+fn subagent_activity_presentation(
+    item: &TranscriptItem,
+    children: &ChildThreadRegistry,
+) -> Option<SubagentActivityPresentation> {
+    if item.kind != model::TranscriptKind::Subagent {
+        return None;
+    }
+
+    let thread_ids = subagent_thread_ids(&item.raw);
+    if thread_ids.is_empty() {
+        let action = item
+            .raw
+            .get("tool")
+            .or_else(|| item.raw.get("kind"))
+            .and_then(Value::as_str);
+        let is_idless_wait = action.is_some_and(|action| action.eq_ignore_ascii_case("wait"))
+            && item.content.trim() == "Subagent state unavailable";
+        return is_idless_wait.then(|| SubagentActivityPresentation {
+            title: "Subagent coordination · Wait".into(),
+            content: String::new(),
+        });
+    }
+
+    let identities = thread_ids
+        .iter()
+        .filter_map(|thread_id| {
+            children
+                .get(thread_id)
+                .map(|thread| (thread_id, subagent_identity(thread)))
+        })
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return None;
+    }
+
+    // Keep the event-local action, status, message, prompt, kind, path, and
+    // body exactly as the protocol rendered them. The registry contributes a
+    // compact title identity only; its current status must not rewrite history
+    // or change the selectable body text.
+    let mut title = item.title.clone();
+    let mut identity_names = identities
+        .iter()
+        .map(|(_, identity)| identity.as_str())
+        .collect::<Vec<_>>();
+    identity_names.dedup();
+    let identity = if identity_names.len() > 3 {
+        format!(
+            "{} +{}",
+            identity_names[..3].join(", "),
+            identity_names.len() - 3
+        )
+    } else {
+        identity_names.join(", ")
+    };
+    if !identity.is_empty() && !title.contains(&identity) {
+        title.push_str(" · ");
+        title.push_str(&identity);
+    }
+    (title != item.title).then_some(SubagentActivityPresentation {
+        title,
+        content: item.content.clone(),
+    })
+}
+
+fn event_refreshes_child_hierarchy(event: &AppServerEvent) -> bool {
+    let AppServerEvent::Notification { method, params } = event else {
+        return false;
+    };
+    let item = params.get("item").unwrap_or(params);
+    let kind = item
+        .get("type")
+        .or_else(|| item.get("kind"))
+        .and_then(Value::as_str);
+    let method = method.to_ascii_lowercase();
+    matches!(kind, Some("collabAgentToolCall" | "subAgentActivity"))
+        || method.contains("subagent")
+        || method.contains("collab")
 }
 
 impl ThreadSnapshotCache {
@@ -4715,7 +5015,12 @@ impl HarnessApp {
     }
 
     fn refresh_queued_turns(&mut self, cx: &mut Context<Self>) {
-        if self.queue_refresh_pending {
+        if self.queue_refresh_pending
+            || !queue_state_is_visible(
+                self.selected_thread_id.as_deref(),
+                self.preserved_work_thread_id.as_deref(),
+            )
+        {
             return;
         }
         let (Some(client), Some(thread_id)) =
@@ -4724,13 +5029,24 @@ impl HarnessApp {
             return;
         };
         self.queue_refresh_pending = true;
+        self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
+        let generation = self.queue_refresh_generation;
         cx.spawn(async move |this, cx| {
             let result = client.list_queued_turns(&thread_id).await;
             _ = this.update(cx, |this, cx| {
-                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                if this.queue_refresh_generation != generation {
                     return;
                 }
                 this.queue_refresh_pending = false;
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(response) => {
                         let pending = this
@@ -4748,7 +5064,9 @@ impl HarnessApp {
                             }
                         }
                         this.queued_turns = queued;
-                        this.error = None;
+                        if origin_is_visible {
+                            this.error = None;
+                        }
                     }
                     Err(error) => log::warn!("could not refresh queued prompts: {error}"),
                 }
@@ -5143,7 +5461,12 @@ impl HarnessApp {
     }
 
     fn render_queued_turns(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.queued_turns.is_empty() {
+        if self.queued_turns.is_empty()
+            || !queue_state_is_visible(
+                self.selected_thread_id.as_deref(),
+                self.preserved_work_thread_id.as_deref(),
+            )
+        {
             return None;
         }
         let colors = cx.theme().colors().clone();
@@ -5279,11 +5602,14 @@ impl HarnessApp {
                                                 let client_id =
                                                     entry.client_user_message_id.clone();
                                                 this.child(
-                                                    IconButton::new(
+                                                    Button::new(
                                                         ("steer-queued-prompt", index),
-                                                        IconName::ForwardArrowUp,
+                                                        "Add",
                                                     )
-                                                    .shape(IconButtonShape::Square)
+                                                    .start_icon(
+                                                        Icon::new(IconName::SteeringWheel)
+                                                            .size(IconSize::XSmall),
+                                                    )
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
                                                     .aria_label("Add queued prompt to response")
@@ -5303,11 +5629,14 @@ impl HarnessApp {
                                                 )
                                             })
                                             .child(
-                                                IconButton::new(
+                                                Button::new(
                                                     ("send-queued-prompt", index),
-                                                    IconName::PlayFilled,
+                                                    if active_turn { "Run now" } else { "Run" },
                                                 )
-                                                .shape(IconButtonShape::Square)
+                                                .start_icon(
+                                                    Icon::new(IconName::InterruptAndRun)
+                                                        .size(IconSize::XSmall),
+                                                )
                                                 .size(ButtonSize::Compact)
                                                 .style(if index == 0 {
                                                     ButtonStyle::Outlined
@@ -5627,16 +5956,18 @@ impl HarnessApp {
         let Some(item) = self.model.items.get(item_index) else {
             return;
         };
-        if item.kind != model::TranscriptKind::Command {
-            self.list_state.scroll_to_reveal_item(item_index);
-            return;
-        }
-
         let viewport = self.list_state.viewport_bounds();
         let item_is_visible = self
             .list_state
             .bounds_for_item(item_index)
             .is_some_and(|bounds| bounds.intersects(&viewport));
+        if item.kind != model::TranscriptKind::Command {
+            if !item_is_visible {
+                self.list_state.scroll_to_reveal_item(item_index);
+            }
+            return;
+        }
+
         if item_is_visible {
             // The cursor-line marker in the selected nested row will perform
             // exact inner-then-outer autoscroll during prepaint. Revealing the
@@ -5712,6 +6043,8 @@ impl HarnessApp {
             return false;
         }
         if cached.navigation != next_navigation {
+            let autoscroll_cursor =
+                changed_markdown_cursor(cached.navigation.as_ref(), next_navigation.as_ref());
             cached.navigation = next_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
                 let navigation = next_navigation.as_ref();
@@ -5719,7 +6052,10 @@ impl HarnessApp {
                     navigation.map(|navigation| navigation.selections.clone()),
                     navigation.and_then(|navigation| navigation.cursor),
                     cx,
-                )
+                );
+                if let Some(source_index) = autoscroll_cursor {
+                    markdown.request_autoscroll_to_source_index(source_index, cx);
+                }
             });
         }
         true
@@ -5985,6 +6321,8 @@ impl HarnessApp {
             replay_count,
             client: None,
             threads: Vec::new(),
+            child_threads: ChildThreadRegistry::default(),
+            sidebar_threads: Vec::new(),
             available_models,
             permission_profiles,
             model_menu_handle: PopoverMenuHandle::default(),
@@ -6075,11 +6413,20 @@ impl HarnessApp {
             turn_start_pending: false,
             queue_start_pending: false,
             queue_refresh_pending: false,
+            turn_start_generation: 0,
+            queue_start_generation: 0,
+            queue_refresh_generation: 0,
             queue_operations: HashMap::new(),
             queued_turns: VecDeque::new(),
             server_task: Task::ready(()),
             turn_task: Task::ready(()),
-            request_task: Task::ready(()),
+            thread_list_task: Task::ready(()),
+            thread_open_task: Task::ready(()),
+            child_hierarchy_task: Task::ready(()),
+            child_hierarchy_generation: 0,
+            deferred_server_requests: Vec::new(),
+            background_parent_thread_id: None,
+            preserved_work_thread_id: None,
             reconnect_task: Task::ready(()),
             read_only_refresh_task: Task::ready(()),
             reconnect_attempts: 0,
@@ -6317,6 +6664,34 @@ impl HarnessApp {
         this
     }
 
+    fn sidebar_thread(&self, row: &SidebarThreadRow) -> Option<&CodexThread> {
+        row.root_index
+            .and_then(|index| self.threads.get(index))
+            .or_else(|| self.child_threads.get(&row.thread_id))
+    }
+
+    fn sidebar_thread_by_id(&self, thread_id: &str) -> Option<&CodexThread> {
+        self.threads
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .or_else(|| self.child_threads.get(thread_id))
+    }
+
+    fn rebuild_sidebar_threads(&mut self, preferred_thread_id: Option<&str>) {
+        self.sidebar_threads = sidebar_thread_rows(&self.threads, &self.child_threads);
+        self.selected_task = sidebar_selection_index(
+            &self.sidebar_threads,
+            preferred_thread_id.or(self.selected_thread_id.as_deref()),
+            self.selected_task,
+        );
+    }
+
+    fn selected_sidebar_thread_id(&self) -> Option<String> {
+        self.sidebar_threads
+            .get(self.selected_task)
+            .map(|row| row.thread_id.clone())
+    }
+
     fn connect(&mut self, cx: &mut Context<Self>) {
         if self.connecting || self.client.is_some() || self.replay_count.is_some() {
             return;
@@ -6334,27 +6709,45 @@ impl HarnessApp {
                     .initialize("harness", "Harness", env!("CARGO_PKG_VERSION"))
                     .await?;
                 let threads = client.list_threads(THREAD_LIMIT, None).await?.data;
-                anyhow::Ok((client, threads))
+                let child_threads = match client
+                    .list_spawned_subagent_threads(THREAD_LIMIT, None)
+                    .await
+                {
+                    Ok(response) => response.data,
+                    Err(error) => {
+                        log::debug!("could not list spawned child threads: {error}");
+                        Vec::new()
+                    }
+                };
+                anyhow::Ok((client, threads, child_threads))
             }
             .await;
 
             let client = match result {
-                Ok((client, threads)) => {
+                Ok((client, threads, child_threads)) => {
                     if this
                         .update(cx, |this, cx| {
                             this.client = Some(client.clone());
                             this.threads = threads;
+                            this.child_threads.reconcile(child_threads);
+                            this.rebuild_sidebar_threads(None);
                             this.connecting = false;
                             this.reconnect_attempts = 0;
                             this.error = None;
                             this.load_server_options(cx);
                             if let Some(query) = initial_thread_query.as_deref() {
                                 let query = query.to_lowercase();
-                                if let Some(index) = this.threads.iter().position(|thread| {
-                                    thread_title(thread).to_lowercase().contains(&query)
-                                        || thread.id == query
-                                }) {
-                                    this.open_thread(index, cx);
+                                let thread_id = this
+                                    .sidebar_threads
+                                    .iter()
+                                    .filter_map(|row| this.sidebar_thread(row))
+                                    .find(|thread| {
+                                        thread_title(thread).to_lowercase().contains(&query)
+                                            || thread.id.eq_ignore_ascii_case(&query)
+                                    })
+                                    .map(|thread| thread.id.clone());
+                                if let Some(thread_id) = thread_id {
+                                    this.open_thread_by_id(&thread_id, cx);
                                 }
                             }
                             cx.notify();
@@ -6463,17 +6856,27 @@ impl HarnessApp {
             .collect::<Vec<_>>();
         self.client = None;
         self.connecting = false;
+        self.thread_list_task = Task::ready(());
+        self.thread_open_task = Task::ready(());
+        self.child_hierarchy_task = Task::ready(());
+        self.child_hierarchy_generation = self.child_hierarchy_generation.wrapping_add(1);
         self.read_only_refresh_task = Task::ready(());
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
+        self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
+        self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
+        self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
         self.queue_operations.clear();
         self.settings_update_pending = false;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
         self.transient_turn_status = None;
         self.thread_read_only_reason = None;
+        self.deferred_server_requests.clear();
+        self.background_parent_thread_id = None;
+        self.preserved_work_thread_id = None;
         self.error = Some("Codex app server disconnected.".into());
         self.retire_all_request_surfaces();
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
@@ -6491,6 +6894,7 @@ impl HarnessApp {
     }
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
+        let refresh_child_hierarchy = events.iter().any(event_refreshes_child_hierarchy);
         let queue_changed = events.iter().any(|event| {
             matches!(
                 event,
@@ -6501,7 +6905,6 @@ impl HarnessApp {
             )
         });
         let (events, live_request_ids) = self.dispatch_server_requests(events, cx);
-        let had_active_turn = self.model.current_turn_id.is_some();
         let was_following_tail = if self.buffer_view {
             self.transcript_editor.read(cx).is_following_tail()
         } else {
@@ -6511,14 +6914,20 @@ impl HarnessApp {
         let outcome = self
             .model
             .apply_batch(events, self.selected_thread_id.as_deref());
-        if self.model.current_turn_id.is_some() {
+        if self.model.current_turn_id.is_some()
+            && queue_state_is_visible(
+                self.selected_thread_id.as_deref(),
+                self.preserved_work_thread_id.as_deref(),
+            )
+        {
             self.turn_start_pending = false;
         }
-        let completed_turn = had_active_turn && self.model.current_turn_id.is_none();
+        let completed_turn = lifecycle_ended_active_turn(&outcome.turn_lifecycle);
         let new_len = self.model.items.len();
-        let document_changed = new_len != old_len || !outcome.dirty.is_empty();
         let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
         dirty_items.sort_unstable();
+        dirty_items.dedup();
+        let document_changed = new_len != old_len || !dirty_items.is_empty();
         if new_len > old_len {
             self.list_state.splice(old_len..old_len, new_len - old_len);
             if was_following_tail {
@@ -6546,6 +6955,8 @@ impl HarnessApp {
                 self.persist_transcript_in_background(&thread_id, cx);
             }
             self.refresh_threads(cx);
+        } else if refresh_child_hierarchy {
+            self.schedule_child_hierarchy_refresh(cx);
         }
         if !self.search_query.is_empty() && !self.search_returns_to_buffer {
             self.update_search_matches_for_changes(old_len, &dirty_items);
@@ -6567,7 +6978,7 @@ impl HarnessApp {
     }
 
     fn dispatch_server_requests(
-        &self,
+        &mut self,
         events: Vec<AppServerEvent>,
         cx: &mut Context<Self>,
     ) -> (Vec<AppServerEvent>, Vec<Value>) {
@@ -6578,10 +6989,28 @@ impl HarnessApp {
                 forwarded.push(event);
                 continue;
             };
-            match route_server_request(&method, &params, self.selected_thread_id.as_deref()) {
+            match route_server_request_with_background(
+                &method,
+                &params,
+                self.selected_thread_id.as_deref(),
+                self.background_parent_thread_id.as_deref(),
+            ) {
                 RequestRoute::Interactive => {
-                    live_request_ids.push(id.clone());
-                    forwarded.push(AppServerEvent::ServerRequest { id, method, params })
+                    let request = AppServerEvent::ServerRequest { id, method, params };
+                    if self.loading_thread {
+                        self.deferred_server_requests.push(request);
+                    } else {
+                        let AppServerEvent::ServerRequest { id, .. } = &request else {
+                            unreachable!();
+                        };
+                        live_request_ids.push(id.clone());
+                        forwarded.push(request);
+                    }
+                }
+                RequestRoute::ReturnToThread(thread_id) => {
+                    self.deferred_server_requests
+                        .push(AppServerEvent::ServerRequest { id, method, params });
+                    self.open_thread_by_id(&thread_id, cx);
                 }
                 RequestRoute::Immediate(reply) => {
                     self.send_immediate_request_reply(id, method, reply, cx);
@@ -6589,6 +7018,30 @@ impl HarnessApp {
             }
         }
         (forwarded, live_request_ids)
+    }
+
+    fn replay_deferred_requests_for_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(selected_thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        let mut matching = Vec::new();
+        let mut remaining = Vec::new();
+        for event in std::mem::take(&mut self.deferred_server_requests) {
+            let matches_selected = matches!(
+                &event,
+                AppServerEvent::ServerRequest { params, .. }
+                    if request_matches_thread(params, Some(&selected_thread_id))
+            );
+            if matches_selected {
+                matching.push(event);
+            } else {
+                remaining.push(event);
+            }
+        }
+        self.deferred_server_requests = remaining;
+        if !matching.is_empty() {
+            self.apply_event_batch(matching, cx);
+        }
     }
 
     fn send_immediate_request_reply(
@@ -7214,15 +7667,17 @@ impl HarnessApp {
             return;
         };
         self.connecting = true;
-        self.request_task = cx.spawn(async move |this, cx| {
-            let result = client.list_threads(THREAD_LIMIT, None).await;
+        self.thread_list_task = cx.spawn(async move |this, cx| {
+            let roots = client.list_threads(THREAD_LIMIT, None).await;
             if this
                 .update(cx, |this, cx| {
                     this.connecting = false;
-                    match result {
+                    let preferred_thread_id = this.selected_sidebar_thread_id();
+                    match roots {
                         Ok(response) => {
                             this.threads = response.data;
                             this.error = None;
+                            this.rebuild_sidebar_threads(preferred_thread_id.as_deref());
                         }
                         Err(error) => {
                             this.error = Some(format!("Refresh failed: {error}").into());
@@ -7234,6 +7689,57 @@ impl HarnessApp {
             {
                 return;
             }
+        });
+        self.schedule_child_hierarchy_refresh(cx);
+    }
+
+    fn schedule_child_hierarchy_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.child_hierarchy_generation = self.child_hierarchy_generation.wrapping_add(1);
+        let generation = self.child_hierarchy_generation;
+        self.child_hierarchy_task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(CHILD_HIERARCHY_REFRESH_DEBOUNCE)
+                .await;
+            let Ok(still_current) = this.update(cx, |this, _| {
+                this.child_hierarchy_generation == generation
+                    && this
+                        .client
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &client))
+            }) else {
+                return;
+            };
+            if !still_current {
+                return;
+            }
+            let children = client
+                .list_spawned_subagent_threads(THREAD_LIMIT, None)
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if this.child_hierarchy_generation != generation
+                    || !this
+                        .client
+                        .as_ref()
+                        .is_some_and(|current| Rc::ptr_eq(current, &client))
+                {
+                    return;
+                }
+                match children {
+                    Ok(response) => {
+                        let preferred_thread_id = this.selected_sidebar_thread_id();
+                        if this.child_threads.reconcile(response.data) {
+                            this.rebuild_sidebar_threads(preferred_thread_id.as_deref());
+                            cx.notify();
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!("could not refresh spawned child threads: {error}");
+                    }
+                }
+            });
         });
     }
 
@@ -7253,32 +7759,35 @@ impl HarnessApp {
                     })
                     .await;
 
-                let Ok((still_selected, loaded_updated_at)) = this.update(cx, |this, _| {
-                    (
-                        this.selected_thread_id.as_deref() == Some(thread_id.as_str())
-                            && this.thread_read_only_reason.is_some()
-                            && this
-                                .client
-                                .as_ref()
-                                .is_some_and(|current| Rc::ptr_eq(current, &client)),
-                        this.loaded_thread_updated_at,
-                    )
-                }) else {
+                let Ok((still_selected, loaded_updated_at, selected_is_child)) =
+                    this.update(cx, |this, _| {
+                        (
+                            this.selected_thread_id.as_deref() == Some(thread_id.as_str())
+                                && this.thread_read_only_reason.is_some()
+                                && this
+                                    .client
+                                    .as_ref()
+                                    .is_some_and(|current| Rc::ptr_eq(current, &client)),
+                            this.loaded_thread_updated_at,
+                            this.child_threads.get(&thread_id).is_some(),
+                        )
+                    })
+                else {
                     return;
                 };
                 if !still_selected {
                     return;
                 }
 
-                if !active {
-                    let response = match client.list_threads(THREAD_LIMIT, None).await {
+                if !active && !selected_is_child {
+                    let root_response = match client.list_threads(THREAD_LIMIT, None).await {
                         Ok(response) => response,
                         Err(error) => {
                             log::debug!("could not check read-only task freshness: {error}");
                             continue;
                         }
                     };
-                    let selected_updated_at = response
+                    let selected_updated_at = root_response
                         .data
                         .iter()
                         .find(|thread| thread.id == thread_id)
@@ -7291,22 +7800,13 @@ impl HarnessApp {
                         {
                             return false;
                         }
-                        if this.threads != response.data {
-                            let selected_task_id = this
-                                .threads
-                                .get(this.selected_task)
-                                .map(|thread| thread.id.clone());
-                            this.threads = response.data;
-                            this.selected_task = selected_task_id
-                                .as_deref()
-                                .and_then(|selected_id| {
-                                    this.threads
-                                        .iter()
-                                        .position(|thread| thread.id == selected_id)
-                                })
-                                .unwrap_or_else(|| {
-                                    this.selected_task.min(this.threads.len().saturating_sub(1))
-                                });
+                        let selected_task_id = this.selected_sidebar_thread_id();
+                        let roots_changed = this.threads != root_response.data;
+                        if roots_changed {
+                            this.threads = root_response.data;
+                        }
+                        if roots_changed {
+                            this.rebuild_sidebar_threads(selected_task_id.as_deref());
                             cx.notify();
                         }
                         true
@@ -7373,8 +7873,10 @@ impl HarnessApp {
         }
 
         let outcome = self.model.refresh_thread(&thread);
+        self.model.current_turn_id = active_thread_turn_id(thread).map(ToOwned::to_owned);
         let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
         dirty_items.sort_unstable();
+        dirty_items.dedup();
         if !outcome.reset && outcome.old_len == outcome.new_len && dirty_items.is_empty() {
             return;
         }
@@ -7435,35 +7937,121 @@ impl HarnessApp {
     }
 
     fn open_thread(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(thread) = self.threads.get(index) else {
+        let Some(thread_id) = self
+            .sidebar_threads
+            .get(index)
+            .map(|row| row.thread_id.clone())
+        else {
+            return;
+        };
+        self.open_thread_by_id(&thread_id, cx);
+    }
+
+    fn has_unresolved_live_request(&self) -> bool {
+        self.model.items.iter().any(|item| {
+            self.live_request_keys.contains(&item.key)
+                && item
+                    .pending_request
+                    .as_ref()
+                    .is_some_and(|request| !request.resolved)
+        })
+    }
+
+    fn complete_thread_open_request_routing(
+        &mut self,
+        authoritative_turn_state_loaded: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.background_parent_thread_id.as_deref() == self.selected_thread_id.as_deref() {
+            self.background_parent_thread_id = None;
+        }
+        if self.preserved_work_thread_id.as_deref() == self.selected_thread_id.as_deref() {
+            self.preserved_work_thread_id = None;
+        }
+        self.replay_deferred_requests_for_selected(cx);
+        if authoritative_turn_state_loaded {
+            self.start_next_queued_turn(cx);
+        }
+    }
+
+    fn open_thread_by_id(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.sidebar_thread_by_id(thread_id).cloned() else {
             return;
         };
         let thread_id = thread.id.clone();
+        let is_child = self.child_threads.get(&thread_id).is_some();
+        let can_accept_direct_input = thread.can_accept_direct_input.unwrap_or(true);
+        let observational_child = is_child && !can_accept_direct_input;
+        if child_inspection_blocked(observational_child, self.has_unresolved_live_request()) {
+            self.error =
+                Some("Answer the open request before inspecting this read-only child task.".into());
+            cx.notify();
+            return;
+        }
         if self.selected_thread_id.as_deref() == Some(thread_id.as_str())
             && (self.loading_thread || !self.model.items.is_empty())
         {
             return;
         }
+        let returning_to_background =
+            self.background_parent_thread_id.as_deref() == Some(thread_id.as_str());
+        let returning_to_preserved_work =
+            self.preserved_work_thread_id.as_deref() == Some(thread_id.as_str());
+        let leaving_child_with_live_request = returning_to_background
+            && self
+                .selected_thread_id
+                .as_deref()
+                .is_some_and(|selected| self.child_threads.get(selected).is_some())
+            && self.has_unresolved_live_request();
+        if is_child {
+            let selected_root = self.selected_thread_id.as_ref().filter(|selected| {
+                selected.as_str() != thread_id && self.child_threads.get(selected).is_none()
+            });
+            self.background_parent_thread_id = selected_root
+                .cloned()
+                .or_else(|| self.background_parent_thread_id.clone())
+                .or_else(|| thread.effective_parent_thread_id().map(ToOwned::to_owned));
+            if observational_child {
+                self.preserved_work_thread_id = self.background_parent_thread_id.clone();
+            } else {
+                self.preserved_work_thread_id = None;
+            }
+        } else if !returning_to_background {
+            self.background_parent_thread_id = None;
+            self.preserved_work_thread_id = None;
+        }
+        let preserve_background_work = observational_child || returning_to_preserved_work;
         let cached_thread = self.thread_snapshots.take(&thread_id);
         let load_started_at = thread_load_diagnostics_enabled().then(Instant::now);
         let Some(client) = self.client.clone() else {
             return;
         };
 
-        self.reject_pending_requests(cx);
+        if reject_pending_requests_on_switch(
+            preserve_background_work,
+            leaving_child_with_live_request,
+        ) {
+            self.reject_pending_requests(cx);
+        }
         self.read_only_refresh_task = Task::ready(());
-        self.turn_task = Task::ready(());
-        self.turn_start_pending = false;
-        self.queue_start_pending = false;
-        self.queue_refresh_pending = false;
-        self.queue_operations.clear();
-        self.queued_turns.clear();
+        if !preserve_background_work {
+            self.turn_task = Task::ready(());
+            self.turn_start_pending = false;
+            self.queue_start_pending = false;
+            self.queue_refresh_pending = false;
+            self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
+            self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
+            self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
+            self.queue_operations.clear();
+            self.queued_turns.clear();
+        }
         self.selected_thread_id = Some(thread_id.clone());
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
-        self.attaching_thread = true;
+        self.attaching_thread = can_accept_direct_input;
         self.settings_update_pending = false;
-        self.thread_read_only_reason = None;
+        self.thread_read_only_reason = (!can_accept_direct_input)
+            .then(|| "This child task does not accept direct input.".into());
         self.transient_turn_status = None;
         self.error = None;
         let old_len = self.model.items.len();
@@ -7485,7 +8073,6 @@ impl HarnessApp {
         if let Some(cached_thread) = cached_thread {
             self.load_thread(&cached_thread, cx);
             self.thread_snapshots.insert(cached_thread);
-            self.loading_thread = false;
             had_local_content = true;
             if thread_load_diagnostics_enabled() {
                 eprintln!("thread-load cache-hit thread={thread_id}");
@@ -7499,7 +8086,6 @@ impl HarnessApp {
                     self.selected_item = restored.saturating_sub(1);
                     self.list_state.set_follow_mode(FollowMode::Tail);
                     drop(self.sync_transcript_document(cx));
-                    self.loading_thread = false;
                     had_local_content = true;
                     if thread_load_diagnostics_enabled() {
                         eprintln!(
@@ -7515,9 +8101,59 @@ impl HarnessApp {
             }
         }
         cx.notify();
-        self.refresh_queued_turns(cx);
+        if !observational_child {
+            self.refresh_queued_turns(cx);
+        }
 
-        self.request_task = cx.spawn(async move |this, cx| {
+        self.thread_open_task = cx.spawn(async move |this, cx| {
+            if !can_accept_direct_input {
+                match client.read_thread(&thread_id).await {
+                    Ok(thread) => {
+                        let active = thread_has_active_turn(&thread);
+                        this.update(cx, |this, cx| {
+                            if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                                return;
+                            }
+                            if had_local_content {
+                                this.apply_loaded_thread_refresh(&thread, cx);
+                            } else {
+                                this.load_thread(&thread, cx);
+                            }
+                            this.thread_snapshots.insert(thread);
+                            this.loading_thread = false;
+                            this.attaching_thread = false;
+                            this.thread_read_only_reason = Some(
+                                "This child task does not accept direct input.".into(),
+                            );
+                            this.schedule_read_only_refresh(active, cx);
+                            this.error = None;
+                            this.complete_thread_open_request_routing(true, cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                    Err(error) => {
+                        this.update(cx, |this, cx| {
+                            if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                                return;
+                            }
+                            this.loading_thread = false;
+                            this.attaching_thread = false;
+                            this.thread_read_only_reason = Some(
+                                "This child task does not accept direct input.".into(),
+                            );
+                            this.error = Some(
+                                format!("Could not open child task history: {error}").into(),
+                            );
+                            this.complete_thread_open_request_routing(false, cx);
+                            cx.notify();
+                        })
+                        .ok();
+                    }
+                }
+                return;
+            }
+
             // `thread/resume` already returns every turn as well as attaching
             // this connection to future events. Reading first duplicated the
             // complete history transfer on every successful open.
@@ -7573,6 +8209,7 @@ impl HarnessApp {
                                 );
                                 this.schedule_read_only_refresh(active, cx);
                                 this.error = None;
+                                this.complete_thread_open_request_routing(true, cx);
                                 cx.notify();
                             })
                             .ok();
@@ -7597,6 +8234,7 @@ impl HarnessApp {
                                     )
                                     .into(),
                                 );
+                                this.complete_thread_open_request_routing(false, cx);
                                 cx.notify();
                             })
                             .ok();
@@ -7624,6 +8262,7 @@ impl HarnessApp {
                 this.attaching_thread = false;
                 this.thread_read_only_reason = None;
                 this.error = None;
+                this.complete_thread_open_request_routing(true, cx);
                 cx.notify();
                 if thread_load_diagnostics_enabled() {
                     eprintln!(
@@ -7649,6 +8288,7 @@ impl HarnessApp {
         }
         let model_started_at = Instant::now();
         self.model.load_thread(thread);
+        self.model.current_turn_id = active_thread_turn_id(thread).map(ToOwned::to_owned);
         let model_elapsed = model_started_at.elapsed();
         let persisted_started_at = Instant::now();
         match self.model.merge_persisted_transcript(&thread.id) {
@@ -7732,11 +8372,15 @@ impl HarnessApp {
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reject_pending_requests(cx);
+        self.thread_open_task = Task::ready(());
         self.read_only_refresh_task = Task::ready(());
         self.turn_task = Task::ready(());
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
+        self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
+        self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
+        self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
         self.queue_operations.clear();
         self.queued_turns.clear();
         let old_len = self.model.items.len();
@@ -7759,6 +8403,9 @@ impl HarnessApp {
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
         self.thread_read_only_reason = None;
+        self.deferred_server_requests.clear();
+        self.background_parent_thread_id = None;
+        self.preserved_work_thread_id = None;
         self.error = None;
         self.list_state.set_follow_mode(FollowMode::Tail);
         drop(self.sync_transcript_document(cx));
@@ -7935,9 +8582,12 @@ impl HarnessApp {
             input,
         } = submission;
         let existing_thread_id = self.selected_thread_id.clone();
+        let origin_thread_id = existing_thread_id.clone();
         let cwd = self.cwd.clone();
         self.transient_turn_status = None;
         self.turn_start_pending = true;
+        self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
+        let generation = self.turn_start_generation;
         self.turn_task = cx.spawn(async move |this, cx| {
             let result = async {
                 let (thread_id, opened_thread) = match existing_thread_id {
@@ -7959,7 +8609,22 @@ impl HarnessApp {
             .await;
             if this
                 .update(cx, |this, cx| {
+                    if this.turn_start_generation != generation {
+                        return;
+                    }
                     this.turn_start_pending = false;
+                    let origin_is_visible = origin_thread_id.as_deref().map_or_else(
+                        || this.selected_thread_id.is_none(),
+                        |origin| {
+                            callback_origin_is_visible(origin, this.selected_thread_id.as_deref())
+                        },
+                    );
+                    if !origin_is_visible {
+                        if result.is_ok() {
+                            this.refresh_threads(cx);
+                        }
+                        return;
+                    }
                     match result {
                         Ok((thread_id, opened_thread, response)) => {
                             this.selected_thread_id = Some(thread_id);
@@ -8019,6 +8684,15 @@ impl HarnessApp {
                 .queue_turn(&thread_id, input.clone(), &client_user_message_id)
                 .await;
             _ = this.update(cx, |this, cx| {
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(response) => {
                         if let Some(queued) = response
@@ -8032,29 +8706,40 @@ impl HarnessApp {
                             } else {
                                 this.queued_turns.push_back(queued);
                             }
-                        } else {
+                        } else if origin_is_visible {
                             this.refresh_queued_turns(cx);
                         }
-                        this.error = None;
-                        if this.model.current_turn_id.is_none() && !this.turn_start_pending {
+                        if origin_is_visible {
+                            this.error = None;
+                        }
+                        if origin_is_visible
+                            && this.model.current_turn_id.is_none()
+                            && !this.turn_start_pending
+                        {
                             this.start_next_queued_turn(cx);
                         }
                     }
                     Err(error) => {
                         this.queued_turns
                             .retain(|entry| entry.client_user_message_id != client_user_message_id);
-                        this.show_failed_queued_submission(
-                            &ComposerSubmission {
-                                key: None,
-                                client_user_message_id: client_user_message_id.clone(),
-                                input: input.clone(),
-                            },
-                            cx,
-                        );
-                        this.error = Some(format!("Could not queue prompt: {error}").into());
+                        if origin_is_visible {
+                            this.show_failed_queued_submission(
+                                &ComposerSubmission {
+                                    key: None,
+                                    client_user_message_id: client_user_message_id.clone(),
+                                    input: input.clone(),
+                                },
+                                cx,
+                            );
+                            this.error = Some(format!("Could not queue prompt: {error}").into());
+                        } else {
+                            log::warn!("could not queue background prompt: {error}");
+                        }
                     }
                 }
-                drop(this.sync_transcript_document(cx));
+                if origin_is_visible {
+                    drop(this.sync_transcript_document(cx));
+                }
                 cx.notify();
             });
         })
@@ -8114,7 +8799,12 @@ impl HarnessApp {
         if self.queue_start_pending
             || self.turn_start_pending
             || self.model.current_turn_id.is_some()
+            || self.has_unresolved_live_request()
             || self.queued_turns.is_empty()
+            || !queue_state_is_visible(
+                self.selected_thread_id.as_deref(),
+                self.preserved_work_thread_id.as_deref(),
+            )
         {
             return;
         }
@@ -8125,35 +8815,60 @@ impl HarnessApp {
         };
         let queued_entry = self.queued_turns.front().cloned();
         self.queue_start_pending = true;
+        self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
+        let generation = self.queue_start_generation;
         self.turn_task = cx.spawn(async move |this, cx| {
             let result = client.start_next_queued_turn(&thread_id).await;
             _ = this.update(cx, |this, cx| {
+                if this.queue_start_generation != generation {
+                    return;
+                }
                 this.queue_start_pending = false;
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(response) => {
                         if let Some(queued_entry) = queued_entry.as_ref() {
                             this.remove_queued_entry_locally(&queued_entry.client_user_message_id);
-                            this.show_started_queued_submission(queued_entry, "sent", cx);
+                            if origin_is_visible {
+                                this.show_started_queued_submission(queued_entry, "sent", cx);
+                            }
                         }
-                        this.model.current_turn_id = response
-                            .pointer("/turn/id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        this.error = None;
+                        if origin_is_visible {
+                            this.model.current_turn_id = response
+                                .pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            this.error = None;
+                        }
                     }
                     Err(error) => {
                         let already_started = error
                             .to_string()
                             .to_ascii_lowercase()
                             .contains("active or pending turn");
-                        this.refresh_queued_turns(cx);
-                        if this.model.current_turn_id.is_none() && !already_started {
+                        if origin_is_visible {
+                            this.refresh_queued_turns(cx);
+                        }
+                        if origin_is_visible
+                            && this.model.current_turn_id.is_none()
+                            && !already_started
+                        {
                             this.error =
                                 Some(format!("Could not start queued prompt: {error}").into());
                         }
                     }
                 }
-                drop(this.sync_transcript_document(cx));
+                if origin_is_visible {
+                    drop(this.sync_transcript_document(cx));
+                }
                 cx.notify();
             });
         });
@@ -8186,6 +8901,12 @@ impl HarnessApp {
         ) else {
             return;
         };
+        if !queue_state_is_visible(
+            self.selected_thread_id.as_deref(),
+            self.preserved_work_thread_id.as_deref(),
+        ) {
+            return;
+        }
         if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
@@ -8196,14 +8917,30 @@ impl HarnessApp {
                 .delete_queued_turn(&thread_id, &queued_submission_id)
                 .await;
             _ = this.update(cx, |this, cx| {
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
                 this.queue_operations.remove(&client_user_message_id);
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
-                        this.error = None;
+                        if origin_is_visible {
+                            this.error = None;
+                        }
                     }
                     Err(error) => {
-                        this.error = Some(format!("Could not remove queued prompt: {error}").into())
+                        if origin_is_visible {
+                            this.error =
+                                Some(format!("Could not remove queued prompt: {error}").into())
+                        } else {
+                            log::warn!("could not remove background queued prompt: {error}");
+                        }
                     }
                 }
                 cx.notify();
@@ -8275,6 +9012,12 @@ impl HarnessApp {
         ) else {
             return;
         };
+        if !queue_state_is_visible(
+            self.selected_thread_id.as_deref(),
+            self.preserved_work_thread_id.as_deref(),
+        ) {
+            return;
+        }
         if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
@@ -8285,15 +9028,31 @@ impl HarnessApp {
                 .delete_queued_turn(&thread_id, &queued_submission_id)
                 .await;
             _ = this.update_in(cx, |this, window, cx| {
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
                 this.queue_operations.remove(&client_user_message_id);
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
-                        this.place_queued_turn_in_composer(&entry, window, cx);
-                        this.error = None;
+                        if origin_is_visible {
+                            this.place_queued_turn_in_composer(&entry, window, cx);
+                            this.error = None;
+                        }
                     }
                     Err(error) => {
-                        this.error = Some(format!("Could not edit queued prompt: {error}").into())
+                        if origin_is_visible {
+                            this.error =
+                                Some(format!("Could not edit queued prompt: {error}").into())
+                        } else {
+                            log::warn!("could not edit background queued prompt: {error}");
+                        }
                     }
                 }
                 cx.notify();
@@ -8320,6 +9079,12 @@ impl HarnessApp {
         ) else {
             return;
         };
+        if !queue_state_is_visible(
+            self.selected_thread_id.as_deref(),
+            self.preserved_work_thread_id.as_deref(),
+        ) {
+            return;
+        }
         if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
@@ -8354,7 +9119,16 @@ impl HarnessApp {
                     .await;
             }
             _ = this.update(cx, |this, cx| {
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
                 this.queue_operations.remove(&client_user_message_id);
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(_) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
@@ -8362,12 +9136,23 @@ impl HarnessApp {
                         // this input. Keep the optimistic user message visibly pending
                         // until the authoritative userMessage item with the same
                         // clientUserMessageId replaces it at an input boundary.
-                        this.show_started_queued_submission(&entry, "awaiting incorporation", cx);
-                        this.error = None;
+                        if origin_is_visible {
+                            this.show_started_queued_submission(
+                                &entry,
+                                "awaiting incorporation",
+                                cx,
+                            );
+                            this.error = None;
+                        }
                     }
                     Err(error) => {
-                        this.refresh_queued_turns(cx);
-                        this.error = Some(format!("Could not steer queued prompt: {error}").into());
+                        if origin_is_visible {
+                            this.refresh_queued_turns(cx);
+                            this.error =
+                                Some(format!("Could not steer queued prompt: {error}").into());
+                        } else {
+                            log::warn!("could not steer background queued prompt: {error}");
+                        }
                     }
                 }
                 cx.notify();
@@ -8393,6 +9178,12 @@ impl HarnessApp {
         ) else {
             return;
         };
+        if !queue_state_is_visible(
+            self.selected_thread_id.as_deref(),
+            self.preserved_work_thread_id.as_deref(),
+        ) {
+            return;
+        }
         if self.queue_operations.contains_key(&client_user_message_id) {
             return;
         }
@@ -8402,6 +9193,8 @@ impl HarnessApp {
         // current turn and starting this particular queued submission. Keep
         // the ordinary queue drain from racing the explicit "Send now" path.
         self.queue_start_pending = true;
+        self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
+        let generation = self.queue_start_generation;
         let active_turn_id = self.model.current_turn_id.clone();
         cx.spawn(async move |this, cx| {
             let result = async {
@@ -8414,25 +9207,45 @@ impl HarnessApp {
             }
             .await;
             _ = this.update(cx, |this, cx| {
+                if this.queue_start_generation != generation {
+                    return;
+                }
                 this.queue_start_pending = false;
+                if !queue_state_belongs_to_thread(
+                    &thread_id,
+                    this.selected_thread_id.as_deref(),
+                    this.preserved_work_thread_id.as_deref(),
+                ) {
+                    return;
+                }
                 this.queue_operations.remove(&client_user_message_id);
+                let origin_is_visible =
+                    callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref());
                 match result {
                     Ok(response) => {
                         this.remove_queued_entry_locally(&client_user_message_id);
-                        this.show_started_queued_submission(&entry, "sent", cx);
-                        this.model.current_turn_id = response
-                            .pointer("/turn/id")
-                            .and_then(Value::as_str)
-                            .map(ToOwned::to_owned);
-                        this.error = None;
+                        if origin_is_visible {
+                            this.show_started_queued_submission(&entry, "sent", cx);
+                            this.model.current_turn_id = response
+                                .pointer("/turn/id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            this.error = None;
+                        }
                     }
                     Err(error) => {
-                        this.refresh_queued_turns(cx);
-                        this.error =
-                            Some(format!("Could not send queued prompt now: {error}").into());
+                        if origin_is_visible {
+                            this.refresh_queued_turns(cx);
+                            this.error =
+                                Some(format!("Could not send queued prompt now: {error}").into());
+                        } else {
+                            log::warn!("could not send background queued prompt now: {error}");
+                        }
                     }
                 }
-                drop(this.sync_transcript_document(cx));
+                if origin_is_visible {
+                    drop(this.sync_transcript_document(cx));
+                }
                 cx.notify();
             });
         })
@@ -8491,6 +9304,12 @@ impl HarnessApp {
                 .steer_turn(&thread_id, &turn_id, input, &client_user_message_id)
                 .await;
             _ = this.update(cx, |this, cx| {
+                if !callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref()) {
+                    if let Err(error) = &result {
+                        log::warn!("could not steer background turn: {error}");
+                    }
+                    return;
+                }
                 match result {
                     Ok(_) => {
                         // Success means app-server accepted the steer, not that the
@@ -8533,8 +9352,15 @@ impl HarnessApp {
             if let Err(error) = result {
                 if this
                     .update(cx, |this, cx| {
-                        this.error = Some(format!("Could not stop turn: {error}").into());
-                        cx.notify();
+                        if callback_origin_is_visible(
+                            &thread_id,
+                            this.selected_thread_id.as_deref(),
+                        ) {
+                            this.error = Some(format!("Could not stop turn: {error}").into());
+                            cx.notify();
+                        } else {
+                            log::warn!("could not stop background turn: {error}");
+                        }
                     })
                     .is_err()
                 {
@@ -9745,16 +10571,14 @@ impl HarnessApp {
             self.sidebar_user_override = true;
         }
         self.focus_mode = FocusMode::Tasks;
-        if let Some(index) = self
-            .threads
-            .iter()
-            .position(|thread| self.selected_thread_id.as_deref() == Some(thread.id.as_str()))
-        {
-            self.selected_task = index;
-        }
+        self.selected_task = sidebar_selection_index(
+            &self.sidebar_threads,
+            self.selected_thread_id.as_deref(),
+            self.selected_task,
+        );
         self.transcript_focus.focus(window, cx);
-        if !self.threads.is_empty() {
-            self.selected_task = self.selected_task.min(self.threads.len() - 1);
+        if !self.sidebar_threads.is_empty() {
+            self.selected_task = self.selected_task.min(self.sidebar_threads.len() - 1);
             self.task_list_state
                 .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
         }
@@ -9828,13 +10652,13 @@ impl HarnessApp {
     }
 
     fn move_task_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.threads.is_empty() {
+        if self.sidebar_threads.is_empty() {
             return;
         }
         self.selected_task = self
             .selected_task
             .saturating_add_signed(delta)
-            .min(self.threads.len() - 1);
+            .min(self.sidebar_threads.len() - 1);
         self.task_list_state
             .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
         cx.notify();
@@ -10352,7 +11176,12 @@ impl HarnessApp {
 
     fn render_task(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let thread = &self.threads[index];
+        let Some(row) = self.sidebar_threads.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        let Some(thread) = self.sidebar_thread(&row).cloned() else {
+            return div().into_any_element();
+        };
         let thread_id = thread.id.clone();
         let thread_cwd = if thread.cwd.is_empty() {
             self.cwd.clone()
@@ -10361,11 +11190,15 @@ impl HarnessApp {
         };
         let selected = self.selected_thread_id.as_deref() == Some(thread.id.as_str());
         let cursor = self.focus_mode == FocusMode::Tasks && self.selected_task == index;
-        let title = thread_title(thread);
-        let project = Path::new(&thread.cwd)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Codex".into());
+        let title = thread_title(&thread);
+        let project = if row.depth == 0 {
+            Path::new(&thread.cwd)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Codex".into())
+        } else {
+            child_thread_identity(&thread)
+        };
         let status = if selected
             && self.model.items.iter().any(|item| {
                 item.pending_request
@@ -10377,11 +11210,14 @@ impl HarnessApp {
             AgentThreadStatus::Running
         } else if selected && self.error.is_some() {
             AgentThreadStatus::Error
+        } else if row.depth > 0 {
+            listed_thread_status(&thread)
         } else {
             AgentThreadStatus::Completed
         };
         let weak = cx.weak_entity();
-        let thread_item = ThreadItem::new(("task", index), title)
+        let open_thread_id = thread_id.clone();
+        let thread_item = ThreadItem::new(format!("task-{thread_id}"), title)
             .icon(IconName::AiOpenAi)
             .project_name(project)
             .timestamp(relative_time(thread.updated_at))
@@ -10391,14 +11227,18 @@ impl HarnessApp {
             .base_bg(colors.panel_background)
             .on_click(move |_, _, cx| {
                 weak.update(cx, |this, cx| {
-                    this.selected_task = index;
-                    this.open_thread(index, cx);
+                    this.selected_task = sidebar_selection_index(
+                        &this.sidebar_threads,
+                        Some(&open_thread_id),
+                        index,
+                    );
+                    this.open_thread_by_id(&open_thread_id, cx);
                 })
                 .ok();
             })
             .into_any_element();
 
-        right_click_menu(format!("thread-context-menu-{index}"))
+        let thread_item = right_click_menu(format!("thread-context-menu-{thread_id}"))
             .trigger(move |_, _, _| thread_item)
             .menu(move |window, cx| {
                 let thread_id = thread_id.clone();
@@ -10419,6 +11259,12 @@ impl HarnessApp {
                     }))
                 })
             })
+            .into_any_element();
+
+        div()
+            .w_full()
+            .pl(px((row.depth.min(6) as f32) * 12.))
+            .child(thread_item)
             .into_any_element()
     }
 
@@ -10491,6 +11337,8 @@ impl HarnessApp {
         let markdown_navigation =
             navigation.map(|navigation| navigation.markdown_source_navigation(source));
         if cached.navigation != markdown_navigation {
+            let autoscroll_cursor =
+                changed_markdown_cursor(cached.navigation.as_ref(), markdown_navigation.as_ref());
             cached.navigation = markdown_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
                 let navigation = markdown_navigation.as_ref();
@@ -10498,7 +11346,10 @@ impl HarnessApp {
                     navigation.map(|navigation| navigation.selections.clone()),
                     navigation.and_then(|navigation| navigation.cursor),
                     cx,
-                )
+                );
+                if let Some(source_index) = autoscroll_cursor {
+                    markdown.request_autoscroll_to_source_index(source_index, cx);
+                }
             });
         }
 
@@ -11967,6 +12818,8 @@ impl HarnessApp {
                     let logical = text.clone();
                     let source = text.clone();
                     let base = source_range.start;
+                    let click_boundary_id =
+                        format!("rich-user-markdown-click:{item_key}:{part_index}");
                     let item_key = item_key.to_owned();
                     let element = MarkdownElement::new(markdown, style).on_source_click(
                         move |source_offset, _, window, cx| {
@@ -12006,7 +12859,15 @@ impl HarnessApp {
                             true
                         },
                     );
-                    children.push(div().w_full().min_w_0().child(element).into_any_element());
+                    children.push(
+                        div()
+                            .id(click_boundary_id)
+                            .w_full()
+                            .min_w_0()
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(element)
+                            .into_any_element(),
+                    );
                 }
                 model::UserContentBlock::Image(source) => {
                     // Legacy transports may list the image payloads separately
@@ -12557,7 +13418,11 @@ impl HarnessApp {
     ) -> AnyElement {
         let render_started_at = slow_list_diagnostics().then(std::time::Instant::now);
         let clone_started_at = slow_list_diagnostics().then(std::time::Instant::now);
-        let item = self.model.items[index].clone();
+        let mut item = self.model.items[index].clone();
+        if let Some(presentation) = subagent_activity_presentation(&item, &self.child_threads) {
+            item.title = presentation.title;
+            item.content = presentation.content;
+        }
         if let Some(started_at) = clone_started_at {
             let elapsed = started_at.elapsed();
             if elapsed >= slow_list_item_threshold() {
@@ -12865,7 +13730,17 @@ impl HarnessApp {
             } else {
                 element.into_any_element()
             };
-            Some(div().w_full().min_w_0().child(element).into_any_element())
+            Some(
+                div()
+                    .id(format!("rich-markdown-click:{}", item.key))
+                    .w_full()
+                    .min_w_0()
+                    .when(rich_vim_experiment(), |this| {
+                        this.on_click(|_, _, cx| cx.stop_propagation())
+                    })
+                    .child(element)
+                    .into_any_element(),
+            )
         } else {
             Some(match item.kind {
                 model::TranscriptKind::User
@@ -13390,7 +14265,7 @@ impl Render for HarnessApp {
                 .min_h_0()
                 .child(self.render_replay_task(cx))
                 .into_any_element()
-        } else if self.threads.is_empty() {
+        } else if self.sidebar_threads.is_empty() {
             div()
                 .flex_1()
                 .min_h_0()
@@ -13413,7 +14288,7 @@ impl Render for HarnessApp {
                 .child(
                     uniform_list(
                         "tasks",
-                        self.threads.len(),
+                        self.sidebar_threads.len(),
                         cx.processor(|this, range: Range<usize>, _, cx| {
                             range.map(|index| this.render_task(index, cx)).collect()
                         }),
@@ -13694,7 +14569,7 @@ impl Render for HarnessApp {
             }))
             .on_action(cx.listener(|this, _: &GoBottom, window, cx| {
                 if this.focus_mode == FocusMode::Tasks {
-                    this.selected_task = this.threads.len().saturating_sub(1);
+                    this.selected_task = this.sidebar_threads.len().saturating_sub(1);
                     this.task_list_state.scroll_to_bottom();
                 } else {
                     this.go_to_transcript_tail(window, cx);
@@ -14158,6 +15033,7 @@ fn request_supplement_key(item_key: &str) -> String {
     format!("request-surface:{item_key}")
 }
 
+#[cfg(test)]
 fn route_server_request(
     method: &str,
     params: &Value,
@@ -14167,6 +15043,30 @@ fn route_server_request(
         return RequestRoute::Immediate(safe_request_rejection(method, params));
     }
 
+    route_matching_server_request(method, params)
+}
+
+fn route_server_request_with_background(
+    method: &str,
+    params: &Value,
+    selected_thread_id: Option<&str>,
+    background_parent_thread_id: Option<&str>,
+) -> RequestRoute {
+    if request_matches_thread(params, selected_thread_id) {
+        return route_matching_server_request(method, params);
+    }
+    if let Some(parent_thread_id) = background_parent_thread_id
+        && request_matches_thread(params, Some(parent_thread_id))
+    {
+        return match route_matching_server_request(method, params) {
+            RequestRoute::Interactive => RequestRoute::ReturnToThread(parent_thread_id.into()),
+            route => route,
+        };
+    }
+    RequestRoute::Immediate(safe_request_rejection(method, params))
+}
+
+fn route_matching_server_request(method: &str, params: &Value) -> RequestRoute {
     match method {
         "item/commandExecution/requestApproval" => {
             if command_approval_decisions(params).is_empty() {
@@ -14946,21 +15846,92 @@ fn thread_title(thread: &CodexThread) -> String {
         .replace('\n', " ")
 }
 
+fn child_thread_identity(thread: &CodexThread) -> String {
+    let mut identity = subagent_identity(thread);
+    if thread.can_accept_direct_input == Some(false) {
+        identity.push_str(" · Read only");
+    }
+    identity
+}
+
+fn listed_thread_status(thread: &CodexThread) -> AgentThreadStatus {
+    match &thread.status {
+        CodexThreadStatus::Active { active_flags } => {
+            if active_flags
+                .iter()
+                .any(|flag| status_requires_user_confirmation(flag))
+            {
+                AgentThreadStatus::WaitingForConfirmation
+            } else {
+                AgentThreadStatus::Running
+            }
+        }
+        CodexThreadStatus::SystemError => AgentThreadStatus::Error,
+        CodexThreadStatus::NotLoaded | CodexThreadStatus::Idle => AgentThreadStatus::Completed,
+        CodexThreadStatus::Unknown(value) => {
+            let status = value
+                .as_str()
+                .or_else(|| value.get("type").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if status.contains("error") || status.contains("fail") {
+                AgentThreadStatus::Error
+            } else if status_requires_user_confirmation(&status) {
+                AgentThreadStatus::WaitingForConfirmation
+            } else if status.contains("active")
+                || status.contains("running")
+                || status.contains("progress")
+                || status.contains("wait")
+            {
+                AgentThreadStatus::Running
+            } else {
+                AgentThreadStatus::Completed
+            }
+        }
+    }
+}
+
+fn status_requires_user_confirmation(status: &str) -> bool {
+    let status = status.to_ascii_lowercase();
+    status.contains("approval")
+        || status.contains("confirm")
+        || status.contains("request_user_input")
+        || status.contains("user_input")
+        || status.contains("user input")
+        || status.contains("userinput")
+}
+
+fn active_thread_turn_id(thread: &CodexThread) -> Option<&str> {
+    thread.turns.iter().rev().find_map(|turn| {
+        let status = turn
+            .status
+            .as_str()
+            .or_else(|| turn.status.get("type").and_then(Value::as_str))
+            .or_else(|| turn.status.get("status").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(
+            status.as_str(),
+            "active" | "inprogress" | "in_progress" | "running" | "streaming"
+        )
+        .then_some(turn.id.as_str())
+    })
+}
+
 fn thread_has_active_turn(thread: &CodexThread) -> bool {
-    let Some(turn) = thread.turns.last() else {
-        return false;
-    };
-    let status = turn
-        .status
-        .as_str()
-        .or_else(|| turn.status.get("type").and_then(Value::as_str))
-        .or_else(|| turn.status.get("status").and_then(Value::as_str))
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        status.as_str(),
-        "active" | "inprogress" | "in_progress" | "running" | "streaming"
-    )
+    active_thread_turn_id(thread).is_some()
+}
+
+fn lifecycle_ended_active_turn(events: &[model::TurnLifecycleEvent]) -> bool {
+    events.iter().fold(false, |ended, event| match event {
+        model::TurnLifecycleEvent::Started { .. } => false,
+        model::TurnLifecycleEvent::Completed {
+            was_active: true, ..
+        } => true,
+        model::TurnLifecycleEvent::Completed {
+            was_active: false, ..
+        } => ended,
+    })
 }
 
 fn relative_time(timestamp: i64) -> String {
@@ -15237,6 +16208,373 @@ mod tests {
             turns: Vec::new(),
             ..CodexThread::default()
         }
+    }
+
+    fn child_thread(id: &str, parent_id: &str, updated_at: i64) -> CodexThread {
+        CodexThread {
+            id: id.into(),
+            parent_thread_id: Some(parent_id.into()),
+            updated_at,
+            ..CodexThread::default()
+        }
+    }
+
+    fn subagent_item(title: &str, content: &str, raw: Value) -> TranscriptItem {
+        TranscriptItem {
+            key: "subagent-item".into(),
+            protocol_id: Some("subagent-item".into()),
+            kind: model::TranscriptKind::Subagent,
+            title: title.into(),
+            status: Some("waiting".into()),
+            content: content.into(),
+            raw,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        }
+    }
+
+    #[test]
+    fn child_thread_registry_reconciles_by_thread_id() {
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![
+            child_thread("child-a", "root", 1),
+            child_thread("child-b", "root", 2),
+        ]);
+
+        registry.reconcile(vec![
+            child_thread("child-a", "root", 9),
+            child_thread("child-c", "root", 3),
+            cached_thread("not-a-child", 4),
+        ]);
+
+        assert_eq!(registry.by_id.len(), 2);
+        assert_eq!(registry.get("child-a").unwrap().updated_at, 9);
+        assert!(registry.get("child-b").is_none());
+        assert!(registry.get("child-c").is_some());
+        assert!(registry.get("not-a-child").is_none());
+    }
+
+    #[test]
+    fn unchanged_registry_and_render_projection_do_not_mutate_history() {
+        let child = child_thread("child", "root", 2);
+        let mut registry = ChildThreadRegistry::default();
+        assert!(registry.reconcile(vec![child.clone()]));
+        assert!(!registry.reconcile(vec![child]));
+
+        let item = subagent_item(
+            "Subagent · Wait",
+            "Agents\nchild · Waiting",
+            json!({"tool": "wait", "receiverThreadIds": ["child"]}),
+        );
+        let original = (item.title.clone(), item.content.clone(), item.event_count);
+        let _ = subagent_activity_presentation(&item, &registry);
+        assert_eq!(
+            (item.title.clone(), item.content.clone(), item.event_count),
+            original
+        );
+    }
+
+    #[test]
+    fn sidebar_thread_rows_nest_typed_descendants_beneath_roots() {
+        let roots = vec![cached_thread("root-a", 1), cached_thread("root-b", 2)];
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![
+            child_thread("older-child", "root-a", 10),
+            child_thread("newer-child", "root-a", 20),
+            child_thread("grandchild", "older-child", 30),
+            child_thread("orphan", "missing-root", 40),
+        ]);
+
+        let rows = sidebar_thread_rows(&roots, &registry);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.thread_id.as_str(), row.depth, row.root_index))
+                .collect::<Vec<_>>(),
+            vec![
+                ("root-a", 0, Some(0)),
+                ("newer-child", 1, None),
+                ("older-child", 1, None),
+                ("grandchild", 2, None),
+                ("root-b", 0, Some(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn sidebar_selection_tracks_child_ids_and_clamps_when_they_disappear() {
+        let rows = vec![
+            SidebarThreadRow {
+                thread_id: "root".into(),
+                depth: 0,
+                root_index: Some(0),
+            },
+            SidebarThreadRow {
+                thread_id: "child".into(),
+                depth: 1,
+                root_index: None,
+            },
+        ];
+
+        assert_eq!(sidebar_selection_index(&rows, Some("child"), 0), 1);
+        assert_eq!(sidebar_selection_index(&rows[..1], Some("child"), 8), 0);
+        assert_eq!(sidebar_selection_index(&[], Some("child"), 8), 0);
+    }
+
+    #[test]
+    fn subagent_activity_projects_compact_identity_without_rewriting_event_status() {
+        let mut child = child_thread("child", "root", 2);
+        child.agent_nickname = Some("Atlas".into());
+        child.agent_role = Some("researcher".into());
+        child.status = CodexThreadStatus::Active {
+            active_flags: vec!["running".into()],
+        };
+        child.source = CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(
+            codex_app_server_client::CodexThreadSpawnSource {
+                parent_thread_id: "root".into(),
+                depth: 1,
+                agent_nickname: Some("Atlas".into()),
+                agent_role: Some("researcher".into()),
+                agent_path: Some("/root/atlas".into()),
+            },
+        ));
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![child]);
+        let item = subagent_item(
+            "Subagent · Wait",
+            "Agents\nchild · Responding\nFound the protocol fields",
+            json!({
+                "tool": "wait",
+                "agentsStates": {
+                    "child": {"status": "responding", "message": "Found the protocol fields"}
+                }
+            }),
+        );
+
+        let presentation = subagent_activity_presentation(&item, &registry).unwrap();
+        assert_eq!(presentation.title, "Subagent · Wait · Atlas");
+        assert_eq!(
+            presentation.content,
+            "Agents\nchild · Responding\nFound the protocol fields"
+        );
+        assert!(!presentation.content.contains("Running"));
+    }
+
+    #[test]
+    fn unidentified_subagent_wait_becomes_quiet_parent_coordination() {
+        let item = subagent_item(
+            "Subagent · Wait",
+            "Subagent state unavailable",
+            json!({"tool": "wait"}),
+        );
+
+        let presentation =
+            subagent_activity_presentation(&item, &ChildThreadRegistry::default()).unwrap();
+        assert_eq!(presentation.title, "Subagent coordination · Wait");
+        assert!(presentation.content.is_empty());
+        assert!(!presentation.content.contains("unavailable"));
+    }
+
+    #[test]
+    fn agent_path_only_activity_survives_without_registry_identity() {
+        let item = subagent_item(
+            "Subagent · Message",
+            "/root/researcher",
+            json!({"type": "subAgentActivity", "kind": "message", "agentPath": "/root/researcher"}),
+        );
+
+        assert!(subagent_activity_presentation(&item, &ChildThreadRegistry::default()).is_none());
+        assert_eq!(item.title, "Subagent · Message");
+        assert_eq!(item.content, "/root/researcher");
+    }
+
+    #[test]
+    fn collaboration_actions_keep_their_historical_titles() {
+        let mut child = child_thread("child", "root", 2);
+        child.agent_nickname = Some("Atlas".into());
+        let mut registry = ChildThreadRegistry::default();
+        registry.reconcile(vec![child]);
+
+        for action in ["Spawn", "Wait", "Send input", "Close"] {
+            let item = subagent_item(
+                &format!("Subagent · {action}"),
+                "Agents\nchild · Completed",
+                json!({"tool": action, "receiverThreadIds": ["child"]}),
+            );
+            let presentation = subagent_activity_presentation(&item, &registry).unwrap();
+            assert!(presentation.title.contains(action));
+            assert!(presentation.title.contains("Atlas"));
+            assert_eq!(presentation.content, "Agents\nchild · Completed");
+        }
+    }
+
+    #[test]
+    fn child_identity_prefers_nickname_then_role_then_typed_path() {
+        let mut child = child_thread("child", "root", 2);
+        child.agent_nickname = Some("Atlas".into());
+        child.agent_role = Some("researcher".into());
+        assert_eq!(child_thread_identity(&child), "Atlas");
+
+        child.agent_nickname = None;
+        assert_eq!(child_thread_identity(&child), "researcher");
+
+        child.agent_nickname = Some("   ".into());
+        assert_eq!(child_thread_identity(&child), "researcher");
+
+        child.agent_role = None;
+        child.source = CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(
+            codex_app_server_client::CodexThreadSpawnSource {
+                parent_thread_id: "root".into(),
+                depth: 1,
+                agent_nickname: None,
+                agent_role: None,
+                agent_path: Some("/root/atlas".into()),
+            },
+        ));
+        assert_eq!(child_thread_identity(&child), "/root/atlas");
+    }
+
+    #[test]
+    fn ordinary_wait_flags_are_running_not_confirmation() {
+        let mut child = child_thread("child", "root", 2);
+        child.status = CodexThreadStatus::Active {
+            active_flags: vec!["waiting".into()],
+        };
+        assert_eq!(listed_thread_status(&child), AgentThreadStatus::Running);
+
+        child.status = CodexThreadStatus::Active {
+            active_flags: vec!["waiting_for_approval".into()],
+        };
+        assert_eq!(
+            listed_thread_status(&child),
+            AgentThreadStatus::WaitingForConfirmation
+        );
+    }
+
+    #[test]
+    fn collaboration_notifications_request_hierarchy_refresh() {
+        assert!(event_refreshes_child_hierarchy(
+            &AppServerEvent::Notification {
+                method: "item/started".into(),
+                params: json!({"item": {"type": "collabAgentToolCall", "tool": "spawnAgent"}}),
+            }
+        ));
+        assert!(event_refreshes_child_hierarchy(
+            &AppServerEvent::Notification {
+                method: "item/completed".into(),
+                params: json!({"item": {"type": "subAgentActivity", "agentPath": "/root/a"}}),
+            }
+        ));
+        assert!(!event_refreshes_child_hierarchy(
+            &AppServerEvent::Notification {
+                method: "item/completed".into(),
+                params: json!({"item": {"type": "commandExecution"}}),
+            }
+        ));
+    }
+
+    #[test]
+    fn read_only_child_inspection_blocks_only_live_unresolved_requests() {
+        assert!(child_inspection_blocked(true, true));
+        assert!(!child_inspection_blocked(true, false));
+        assert!(!child_inspection_blocked(false, true));
+    }
+
+    #[test]
+    fn inspected_child_hides_parent_queue_and_rejects_child_owned_callbacks() {
+        assert!(queue_state_belongs_to_thread(
+            "parent",
+            Some("child"),
+            Some("parent")
+        ));
+        assert!(!queue_state_belongs_to_thread(
+            "child",
+            Some("child"),
+            Some("parent")
+        ));
+        assert!(!queue_state_is_visible(Some("child"), Some("parent")));
+        assert!(!callback_origin_is_visible("parent", Some("child")));
+
+        assert!(
+            queue_state_is_visible(Some("parent"), Some("parent")),
+            "the preserved queue becomes visible again only on its owning parent"
+        );
+        assert!(callback_origin_is_visible("parent", Some("parent")));
+    }
+
+    #[test]
+    fn writable_child_uses_its_own_queue_instead_of_preserving_parent_queue() {
+        assert!(queue_state_is_visible(Some("writable-child"), None));
+        assert!(queue_state_belongs_to_thread(
+            "writable-child",
+            Some("writable-child"),
+            None
+        ));
+        assert!(!queue_state_belongs_to_thread(
+            "parent",
+            Some("writable-child"),
+            None
+        ));
+    }
+
+    #[test]
+    fn leaving_a_child_resolves_its_live_request_even_when_parent_work_is_preserved() {
+        assert!(reject_pending_requests_on_switch(true, true));
+        assert!(!reject_pending_requests_on_switch(true, false));
+        assert!(reject_pending_requests_on_switch(false, false));
+    }
+
+    #[test]
+    fn resumed_thread_reconstructs_only_its_latest_active_turn() {
+        let mut thread = cached_thread("parent", 1);
+        thread.turns = vec![
+            codex_app_server_client::CodexTurn {
+                id: "turn-a".into(),
+                status: json!("completed"),
+                items: Vec::new(),
+            },
+            codex_app_server_client::CodexTurn {
+                id: "turn-b".into(),
+                status: json!({"type": "inProgress"}),
+                items: Vec::new(),
+            },
+        ];
+
+        assert_eq!(active_thread_turn_id(&thread), Some("turn-b"));
+        assert!(thread_has_active_turn(&thread));
+        thread.turns[1].status = json!("completed");
+        assert_eq!(active_thread_turn_id(&thread), None);
+    }
+
+    #[test]
+    fn queue_drain_requires_the_active_completion_to_be_last_lifecycle_effect() {
+        use model::TurnLifecycleEvent::{Completed, Started};
+
+        assert!(!lifecycle_ended_active_turn(&[
+            Started {
+                turn_id: "turn-b".into(),
+            },
+            Completed {
+                turn_id: "turn-a".into(),
+                status: "completed".into(),
+                was_active: false,
+            },
+        ]));
+        assert!(lifecycle_ended_active_turn(&[Completed {
+            turn_id: "turn-b".into(),
+            status: "completed".into(),
+            was_active: true,
+        }]));
+        assert!(!lifecycle_ended_active_turn(&[
+            Completed {
+                turn_id: "turn-b".into(),
+                status: "completed".into(),
+                was_active: true,
+            },
+            Started {
+                turn_id: "turn-c".into(),
+            },
+        ]));
     }
 
     #[test]
@@ -16938,6 +18276,33 @@ mod tests {
     }
 
     #[test]
+    fn markdown_cursor_autoscroll_tracks_exact_source_changes_only() {
+        let at_120 = RichMarkdownNavigationPaint {
+            selections: Vec::new(),
+            cursor: Some(120),
+        };
+        let same_cursor_with_selection = RichMarkdownNavigationPaint {
+            selections: vec![100..140],
+            cursor: Some(120),
+        };
+        let at_240 = RichMarkdownNavigationPaint {
+            selections: Vec::new(),
+            cursor: Some(240),
+        };
+
+        assert_eq!(changed_markdown_cursor(None, Some(&at_120)), Some(120));
+        assert_eq!(
+            changed_markdown_cursor(Some(&at_120), Some(&same_cursor_with_selection)),
+            None
+        );
+        assert_eq!(
+            changed_markdown_cursor(Some(&at_120), Some(&at_240)),
+            Some(240)
+        );
+        assert_eq!(changed_markdown_cursor(Some(&at_240), None), None);
+    }
+
+    #[test]
     fn rich_search_index_and_context_include_semantic_web_fields_and_status() {
         let item = TranscriptItem {
             key: "web-search".into(),
@@ -17352,6 +18717,45 @@ mod tests {
             ),
             RequestRoute::Immediate(RequestReply::Result(json!({"decision": "decline"})))
         );
+    }
+
+    #[test]
+    fn background_parent_request_returns_to_parent_before_becoming_interactive() {
+        let params = json!({"threadId": "parent", "permissions": {}});
+        assert_eq!(
+            route_server_request_with_background(
+                "item/permissions/requestApproval",
+                &params,
+                Some("read-only-child"),
+                Some("parent"),
+            ),
+            RequestRoute::ReturnToThread("parent".into())
+        );
+
+        // After the parent transcript is loaded, replay follows the ordinary
+        // selected-thread route and preserves the request as interactive.
+        assert_eq!(
+            route_server_request_with_background(
+                "item/permissions/requestApproval",
+                &params,
+                Some("parent"),
+                Some("parent"),
+            ),
+            RequestRoute::Interactive
+        );
+    }
+
+    #[test]
+    fn malformed_background_parent_request_is_resolved_without_navigation() {
+        assert!(matches!(
+            route_server_request_with_background(
+                "item/tool/requestUserInput",
+                &json!({"threadId": "parent", "questions": []}),
+                Some("read-only-child"),
+                Some("parent"),
+            ),
+            RequestRoute::Immediate(RequestReply::Error { code: -32602, .. })
+        ));
     }
 
     #[test]

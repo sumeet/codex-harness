@@ -264,6 +264,12 @@ impl PreparedTranscriptSnapshot {
 }
 
 impl TranscriptItem {
+    pub fn client_user_message_id(&self) -> Option<&str> {
+        (self.kind == TranscriptKind::User)
+            .then(|| client_user_message_id_at(&self.raw))
+            .flatten()
+    }
+
     pub fn display_status(&self) -> Option<&str> {
         match self.status.as_deref()? {
             status
@@ -1515,12 +1521,26 @@ pub struct BatchOutcome {
     pub renamed_thread: Option<String>,
     pub transport_error: Option<String>,
     pub transient_turn_status: Option<TransientTurnStatusUpdate>,
+    pub turn_lifecycle: Vec<TurnLifecycleEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TransientTurnStatusUpdate {
     Set(String),
     Clear,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TurnLifecycleEvent {
+    Started {
+        turn_id: String,
+    },
+    Completed {
+        turn_id: String,
+        status: String,
+        /// Whether this completion ended the model's tracked active turn.
+        was_active: bool,
+    },
 }
 
 #[derive(Default)]
@@ -1850,6 +1870,9 @@ impl TranscriptModel {
             title: "You".into(),
             status: Some("sending".into()),
             raw: json!({
+                "type": "userMessage",
+                "clientId": client_user_message_id,
+                "clientUserMessageId": client_user_message_id,
                 "content": content,
                 "imageCount": image_sources.len(),
             }),
@@ -1871,7 +1894,7 @@ impl TranscriptModel {
     /// Ensure a successfully started queued submission has a visible user
     /// item even when its authoritative item notification is late or absent.
     /// A later authoritative item still reconciles through the stable client
-    /// id (or the existing legacy content fallback) instead of duplicating it.
+    /// id instead of duplicating it.
     pub fn ensure_local_user(
         &mut self,
         client_user_message_id: &str,
@@ -1880,15 +1903,10 @@ impl TranscriptModel {
     ) -> Option<(usize, String)> {
         let local_key = local_user_key(client_user_message_id);
         if self.item_indices.contains_key(&local_key)
-            || self.items.iter().any(|item| {
-                item.kind == TranscriptKind::User
-                    && string_at(&item.raw, "/clientId") == Some(client_user_message_id)
-            })
-            || self.items.iter().rev().take(64).any(|item| {
-                item.kind == TranscriptKind::User
-                    && string_at(&item.raw, "/clientId").is_none()
-                    && optimistic_user_content_matches(&item.content, &content)
-            })
+            || self
+                .items
+                .iter()
+                .any(|item| item.client_user_message_id() == Some(client_user_message_id))
         {
             return None;
         }
@@ -2131,7 +2149,11 @@ impl TranscriptModel {
                         let turn_id = string_at(&turn, "/id").unwrap_or("unknown");
                         if method == "turn/started" {
                             self.current_turn_id = Some(turn_id.to_string());
+                            outcome.turn_lifecycle.push(TurnLifecycleEvent::Started {
+                                turn_id: turn_id.to_string(),
+                            });
                         } else {
+                            let was_active = self.current_turn_id.as_deref() == Some(turn_id);
                             if let Some(items) = turn.get("items").and_then(Value::as_array) {
                                 for item in items {
                                     if let Some(index) =
@@ -2142,12 +2164,19 @@ impl TranscriptModel {
                                 }
                             }
 
-                            self.current_turn_id = None;
+                            if was_active {
+                                self.current_turn_id = None;
+                            }
                             outcome.refresh_threads = true;
 
                             let status = string_at(&turn, "/status")
                                 .unwrap_or("completed")
                                 .to_string();
+                            outcome.turn_lifecycle.push(TurnLifecycleEvent::Completed {
+                                turn_id: turn_id.to_string(),
+                                status: status.clone(),
+                                was_active,
+                            });
                             if matches!(status.as_str(), "failed" | "interrupted") {
                                 let kind = if status == "failed" {
                                     TranscriptKind::Error
@@ -2546,7 +2575,15 @@ impl TranscriptModel {
             let stable_key = self.items[index].key.clone();
             let expanded = self.items[index].expanded;
             let pending_request = self.items[index].pending_request.clone();
+            let stable_client_user_message_id = self.items[index]
+                .client_user_message_id()
+                .map(ToOwned::to_owned);
             let mut item = item_from_protocol(value, completed);
+            if item.client_user_message_id().is_none()
+                && let Some(client_user_message_id) = stable_client_user_message_id
+            {
+                insert_client_user_message_id(&mut item.raw, &client_user_message_id);
+            }
             // Optimistic user rows keep their local presentation identity
             // after the authoritative server id arrives. Replacing the key
             // remounted Markdown/images and caused a visible disappear/reappear
@@ -2594,30 +2631,44 @@ impl TranscriptModel {
             return Some(index);
         }
 
-        let client_user_message_id = string_at(&value, "/clientId").map(ToOwned::to_owned);
+        let client_user_message_id = client_user_message_id_at(&value).map(ToOwned::to_owned);
         let mut item = item_from_protocol(value, completed);
-        if item.kind == TranscriptKind::User
-            && let Some(index) = client_user_message_id
-                .as_deref()
-                .and_then(|client_id| self.item_indices.get(&local_user_key(client_id)).copied())
-                .or_else(|| {
-                    self.items.iter().rposition(|candidate| {
-                        candidate.key.starts_with("local-user:")
-                            && optimistic_user_content_matches(&candidate.content, &item.content)
-                    })
-                })
-        {
+        // A present client id is authoritative even when its content matches a
+        // different pending row. Content is only safe for legacy events when
+        // exactly one still-unmatched optimistic row could own it.
+        let optimistic_user_index = (item.kind == TranscriptKind::User)
+            .then(|| {
+                if let Some(client_user_message_id) = client_user_message_id.as_deref() {
+                    self.item_indices
+                        .get(&local_user_key(client_user_message_id))
+                        .copied()
+                } else {
+                    unique_legacy_user_candidate(&self.items, &item.content)
+                }
+            })
+            .flatten();
+        if let Some(index) = optimistic_user_index {
             let optimistic_key = self.items[index].key.clone();
+            let old_events = self.items[index].event_count;
+            let expanded = self.items[index].expanded;
+            let pending_request = self.items[index].pending_request.clone();
             item.key = optimistic_key.clone();
+            item.event_count = old_events.saturating_add(1);
+            item.expanded = expanded;
+            item.pending_request = pending_request;
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
-            if !incoming_user_image_sources.is_empty() {
+            if incoming_user_image_sources.is_empty() {
+                self.user_image_sources.remove(&optimistic_key);
+            } else {
                 self.user_image_sources
-                    .insert(self.items[index].key.clone(), incoming_user_image_sources);
+                    .insert(optimistic_key.clone(), incoming_user_image_sources);
             }
-            if !incoming_user_content_blocks.is_empty() {
+            if incoming_user_content_blocks.is_empty() {
+                self.user_content_blocks.remove(&optimistic_key);
+            } else {
                 self.user_content_blocks
-                    .insert(self.items[index].key.clone(), incoming_user_content_blocks);
+                    .insert(optimistic_key, incoming_user_content_blocks);
             }
             return Some(index);
         }
@@ -2698,6 +2749,44 @@ impl TranscriptModel {
 
 fn local_user_key(client_user_message_id: &str) -> String {
     format!("local-user:{client_user_message_id}")
+}
+
+fn client_user_message_id_at(value: &Value) -> Option<&str> {
+    string_at(value, "/clientId").or_else(|| string_at(value, "/clientUserMessageId"))
+}
+
+fn insert_client_user_message_id(raw: &mut Value, client_user_message_id: &str) {
+    let Some(raw) = raw.as_object_mut() else {
+        return;
+    };
+    if raw.get("clientId").and_then(Value::as_str).is_none() {
+        raw.insert(
+            "clientId".into(),
+            Value::String(client_user_message_id.to_string()),
+        );
+    }
+    if raw
+        .get("clientUserMessageId")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        raw.insert(
+            "clientUserMessageId".into(),
+            Value::String(client_user_message_id.to_string()),
+        );
+    }
+}
+
+fn unique_legacy_user_candidate(items: &[TranscriptItem], content: &str) -> Option<usize> {
+    let mut candidates = items.iter().enumerate().filter_map(|(index, candidate)| {
+        (candidate.kind == TranscriptKind::User
+            && candidate.protocol_id.is_none()
+            && candidate.key.starts_with("local-user:")
+            && optimistic_user_content_matches(&candidate.content, content))
+        .then_some(index)
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
 }
 
 fn optimistic_user_content_matches(local: &str, authoritative: &str) -> bool {
@@ -3486,6 +3575,13 @@ fn merge_snapshot_items(
                 remaining
                     .iter()
                     .position(|fresh_item| items_are_semantically_equal(persisted_item, fresh_item))
+            })
+            .or_else(|| {
+                unique_one_sided_user_identity_match(
+                    persisted_item,
+                    &persisted[persisted_index..],
+                    remaining,
+                )
             });
         if let Some(relative_index) = relative_index {
             let fresh_index = next_fresh + relative_index;
@@ -3636,7 +3732,51 @@ fn originates_from_raw_response(item: &TranscriptItem) -> bool {
 }
 
 fn items_are_semantically_equal(left: &TranscriptItem, right: &TranscriptItem) -> bool {
-    left.kind == right.kind && left.content.trim() == right.content.trim()
+    if left.kind != right.kind {
+        return false;
+    }
+    if left.kind == TranscriptKind::User {
+        match (
+            left.client_user_message_id(),
+            right.client_user_message_id(),
+        ) {
+            (Some(left), Some(right)) => return left == right,
+            (Some(_), None) | (None, Some(_)) => return false,
+            (None, None) => {}
+        }
+    }
+    left.content.trim() == right.content.trim()
+}
+
+fn unique_one_sided_user_identity_match(
+    persisted: &TranscriptItem,
+    remaining_persisted: &[TranscriptItem],
+    fresh: &[TranscriptItem],
+) -> Option<usize> {
+    let mut candidates = fresh.iter().enumerate().filter_map(|(index, candidate)| {
+        one_sided_user_identity_matches(persisted, candidate).then_some(index)
+    });
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    let fresh_candidate = fresh.get(candidate)?;
+    let possible_persisted_owners = remaining_persisted
+        .iter()
+        .filter(|candidate| {
+            candidate.key == fresh_candidate.key
+                || items_are_semantically_equal(candidate, fresh_candidate)
+                || one_sided_user_identity_matches(candidate, fresh_candidate)
+        })
+        .count();
+    (possible_persisted_owners == 1).then_some(candidate)
+}
+
+fn one_sided_user_identity_matches(left: &TranscriptItem, right: &TranscriptItem) -> bool {
+    left.kind == TranscriptKind::User
+        && right.kind == TranscriptKind::User
+        && left.client_user_message_id().is_some() != right.client_user_message_id().is_some()
+        && left.content.trim() == right.content.trim()
 }
 
 fn thread_snapshot_items_equal(left: &TranscriptItem, right: &TranscriptItem) -> bool {
@@ -4597,6 +4737,13 @@ fn humanize_identifier(value: &str) -> String {
 
 fn render_plan(params: &Value) -> String {
     let mut output = String::new();
+    if let Some(explanation) = string_at(params, "/explanation")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        output.push_str(explanation);
+        output.push_str("\n\n");
+    }
     if let Some(steps) = params.get("plan").and_then(Value::as_array) {
         for step in steps {
             let status = string_at(step, "/status").unwrap_or("pending");
@@ -4616,11 +4763,8 @@ fn render_plan(params: &Value) -> String {
 }
 
 fn plan_title(params: &Value) -> String {
-    string_at(params, "/explanation")
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .unwrap_or("Plan")
-        .to_string()
+    let _ = params;
+    "Plan".into()
 }
 
 fn render_turn_completion(turn: &Value, status: &str) -> String {
@@ -5735,7 +5879,7 @@ mod tests {
     #[test]
     fn plan_status_is_encoded_by_the_task_marker_not_appended_as_prose() {
         let rendered = render_plan(&json!({
-            "explanation": "This belongs in the compact plan header.",
+            "explanation": "This belongs in the wrapped plan body.",
             "plan": [
                 {"step": "Done", "status": "completed"},
                 {"step": "Working", "status": "inProgress"},
@@ -5743,13 +5887,16 @@ mod tests {
             ]
         }));
 
-        assert_eq!(rendered, "- [x] Done\n- [~] Working\n- [ ] Later\n");
+        assert_eq!(
+            rendered,
+            "This belongs in the wrapped plan body.\n\n- [x] Done\n- [~] Working\n- [ ] Later\n"
+        );
         assert!(!rendered.contains("(pending)"));
         assert!(!rendered.contains("(inProgress)"));
-        assert!(!rendered.contains("compact plan header"));
+        assert!(rendered.contains("wrapped plan body"));
         assert_eq!(
             plan_title(&json!({"explanation": "  Coordinate the work.  "})),
-            "Coordinate the work."
+            "Plan"
         );
     }
 
@@ -5833,6 +5980,128 @@ mod tests {
         );
         assert_eq!(merged[3].content, "fresh final");
         assert_eq!(merged[3].status.as_deref(), Some("fresh status"));
+    }
+
+    #[test]
+    fn snapshot_merge_uses_client_identity_for_reordered_identical_user_prompts() {
+        let mut persisted_first = replay_item(
+            0,
+            TranscriptKind::User,
+            "You",
+            "same prompt",
+            json!({"clientId": "client-message-1"}),
+        );
+        persisted_first.key = "persisted-user-1".into();
+        let cached_only = replay_item(
+            1,
+            TranscriptKind::Command,
+            "Command",
+            "cached output",
+            json!(null),
+        );
+        let mut persisted_second = replay_item(
+            2,
+            TranscriptKind::User,
+            "You",
+            "same prompt",
+            json!({"clientId": "client-message-2"}),
+        );
+        persisted_second.key = "persisted-user-2".into();
+
+        let mut fresh_second = persisted_second.clone();
+        fresh_second.key = "server-user-2".into();
+        let mut fresh_first = persisted_first.clone();
+        fresh_first.key = "server-user-1".into();
+
+        let (merged, restored) = merge_snapshot_items(
+            vec![fresh_second, fresh_first],
+            vec![persisted_first, cached_only, persisted_second],
+        );
+
+        assert_eq!(restored, 0);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>(),
+            ["server-user-2", "server-user-1"]
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .map(TranscriptItem::client_user_message_id)
+                .collect::<Vec<_>>(),
+            [Some("client-message-2"), Some("client-message-1")]
+        );
+    }
+
+    #[test]
+    fn snapshot_merge_matches_persisted_client_identity_to_legacy_fresh_user() {
+        let mut persisted_user = replay_item(
+            0,
+            TranscriptKind::User,
+            "You",
+            "same prompt",
+            json!({"clientId": "client-message-1"}),
+        );
+        persisted_user.key = "persisted-user".into();
+        let mut persisted_anchor = replay_item(
+            1,
+            TranscriptKind::Agent,
+            "Codex",
+            "later answer",
+            json!(null),
+        );
+        persisted_anchor.key = "persisted-anchor".into();
+
+        let mut fresh_user = persisted_user.clone();
+        fresh_user.key = "server-user".into();
+        fresh_user.raw = json!(null);
+        let mut fresh_anchor = persisted_anchor.clone();
+        fresh_anchor.key = "server-anchor".into();
+
+        let (merged, restored) = merge_snapshot_items(
+            vec![fresh_user, fresh_anchor],
+            vec![persisted_user, persisted_anchor],
+        );
+
+        assert_eq!(restored, 0);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].key, "server-user");
+        assert!(merged[0].client_user_message_id().is_none());
+        assert_eq!(merged[1].key, "server-anchor");
+    }
+
+    #[test]
+    fn snapshot_merge_matches_legacy_persisted_user_to_fresh_client_identity() {
+        let mut persisted_user =
+            replay_item(0, TranscriptKind::User, "You", "same prompt", json!(null));
+        persisted_user.key = "persisted-user".into();
+        let mut persisted_anchor = replay_item(
+            1,
+            TranscriptKind::Agent,
+            "Codex",
+            "later answer",
+            json!(null),
+        );
+        persisted_anchor.key = "persisted-anchor".into();
+
+        let mut fresh_user = persisted_user.clone();
+        fresh_user.key = "server-user".into();
+        fresh_user.raw = json!({"clientId": "client-message-1"});
+        let mut fresh_anchor = persisted_anchor.clone();
+        fresh_anchor.key = "server-anchor".into();
+
+        let (merged, restored) = merge_snapshot_items(
+            vec![fresh_user, fresh_anchor],
+            vec![persisted_user, persisted_anchor],
+        );
+
+        assert_eq!(restored, 0);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].key, "server-user");
+        assert_eq!(merged[0].client_user_message_id(), Some("client-message-1"));
+        assert_eq!(merged[1].key, "server-anchor");
     }
 
     #[test]
@@ -7271,7 +7540,7 @@ mod tests {
     #[test]
     fn turn_lifecycle_is_session_state_not_a_transcript_item() {
         let mut model = TranscriptModel::default();
-        model.apply_batch(
+        let outcome = model.apply_batch(
             vec![
                 Event::Notification {
                     method: "turn/started".into(),
@@ -7294,6 +7563,76 @@ mod tests {
         assert!(model.items.is_empty());
         assert!(model.current_turn_id.is_none());
         assert_eq!(model.raw_events.len(), 2);
+        assert_eq!(
+            outcome.turn_lifecycle,
+            vec![
+                TurnLifecycleEvent::Started {
+                    turn_id: "turn-1".into(),
+                },
+                TurnLifecycleEvent::Completed {
+                    turn_id: "turn-1".into(),
+                    status: "completed".into(),
+                    was_active: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_turn_completion_does_not_clear_a_newer_active_turn() {
+        let mut model = TranscriptModel {
+            current_turn_id: Some("turn-a".into()),
+            ..Default::default()
+        };
+        let outcome = model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "turn/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-b", "status": "inProgress"}
+                    }),
+                },
+                Event::Notification {
+                    method: "turn/completed".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turn": {"id": "turn-a", "status": "interrupted"}
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.current_turn_id.as_deref(), Some("turn-b"));
+        assert_eq!(
+            outcome.turn_lifecycle,
+            vec![
+                TurnLifecycleEvent::Started {
+                    turn_id: "turn-b".into(),
+                },
+                TurnLifecycleEvent::Completed {
+                    turn_id: "turn-a".into(),
+                    status: "interrupted".into(),
+                    was_active: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn local_user_carries_client_identity_in_typed_and_raw_forms() {
+        let mut model = TranscriptModel::default();
+        let (index, local_key) = model.push_local_user("client-message-1", "hello".into(), &[]);
+
+        let item = &model.items[index];
+        assert_eq!(local_key, "local-user:client-message-1");
+        assert_eq!(item.client_user_message_id(), Some("client-message-1"));
+        assert_eq!(string_at(&item.raw, "/clientId"), Some("client-message-1"));
+        assert_eq!(
+            string_at(&item.raw, "/clientUserMessageId"),
+            Some("client-message-1")
+        );
     }
 
     #[test]
@@ -7341,6 +7680,176 @@ mod tests {
             model.user_image_sources(&local_key),
             &[UserImageSource::Url("data:image/png;base64,AQID".into())]
         );
+        assert_eq!(model.item_indices.get(&local_key), Some(&0));
+        assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+    }
+
+    #[test]
+    fn identical_user_prompts_reconcile_by_distinct_client_ids() {
+        let mut model = TranscriptModel::default();
+        let blocks = json!([{"type": "text", "text": "same prompt"}]);
+        let blocks = blocks
+            .as_array()
+            .expect("fixture content should be an array");
+        let (_, first_key) =
+            model.push_local_user("client-message-1", "same prompt".into(), blocks);
+        let (_, second_key) =
+            model.push_local_user("client-message-2", "same prompt".into(), blocks);
+
+        model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-message-2",
+                            "clientId": "client-message-2",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "same prompt"}]
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-message-1",
+                            "clientId": "client-message-1",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "same prompt"}]
+                        }
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 2);
+        assert_eq!(model.items[0].key, first_key);
+        assert_eq!(
+            model.items[0].protocol_id.as_deref(),
+            Some("server-message-1")
+        );
+        assert_eq!(model.items[1].key, second_key);
+        assert_eq!(
+            model.items[1].protocol_id.as_deref(),
+            Some("server-message-2")
+        );
+        assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
+        assert_eq!(model.item_indices.get("server-message-2"), Some(&1));
+    }
+
+    #[test]
+    fn unknown_present_client_id_does_not_content_match_an_optimistic_user() {
+        let mut model = TranscriptModel::default();
+        let (_, local_key) = model.push_local_user("known-client", "same prompt".into(), &[]);
+
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "unknown-server-message",
+                        "clientId": "unknown-client",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "same prompt"}]
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 2);
+        assert_eq!(model.items[0].key, local_key);
+        assert!(model.items[0].protocol_id.is_none());
+        assert_eq!(model.items[1].key, "unknown-server-message");
+        assert_eq!(
+            model.items[1].client_user_message_id(),
+            Some("unknown-client")
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_user_message_preserves_separate_rows() {
+        let mut model = TranscriptModel::default();
+        model.push_local_user("client-message-1", "same prompt".into(), &[]);
+        model.push_local_user("client-message-2", "same prompt".into(), &[]);
+
+        model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "legacy-server-message",
+                        "type": "userMessage",
+                        "content": [{"type": "text", "text": "same prompt"}]
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 3);
+        assert!(model.items[0].protocol_id.is_none());
+        assert!(model.items[1].protocol_id.is_none());
+        assert_eq!(model.items[2].key, "legacy-server-message");
+    }
+
+    #[test]
+    fn user_item_started_and_completed_keep_local_alias_and_client_identity() {
+        let mut model = TranscriptModel::default();
+        let (_, local_key) = model.push_local_user("client-message-1", "same prompt".into(), &[]);
+
+        model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-message-1",
+                            "clientId": "client-message-1",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "same prompt"}]
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/completed".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-message-1",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "same prompt"}]
+                        }
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, local_key);
+        assert_eq!(
+            model.items[0].protocol_id.as_deref(),
+            Some("server-message-1")
+        );
+        assert_eq!(
+            model.items[0].client_user_message_id(),
+            Some("client-message-1")
+        );
+        assert_eq!(model.items[0].event_count, 3);
         assert_eq!(model.item_indices.get(&local_key), Some(&0));
         assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
     }
