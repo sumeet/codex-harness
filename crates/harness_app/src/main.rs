@@ -241,7 +241,8 @@ fn rich_command_identity_icon(
     let color = match status {
         Some(model::CommandExecutionStatus::Running) => Color::Accent,
         Some(model::CommandExecutionStatus::Failed(_)) => Color::Error,
-        Some(model::CommandExecutionStatus::Succeeded) | None => Color::Muted,
+        Some(model::CommandExecutionStatus::Succeeded) => Color::Success,
+        None => Color::Muted,
     };
     let icon = div().child(
         Icon::new(IconName::ToolTerminal)
@@ -15609,6 +15610,10 @@ impl HarnessApp {
                 item.status.as_deref(),
                 Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
             );
+        let command_succeeded = matches!(
+            item.command_execution_status(),
+            Some(model::CommandExecutionStatus::Succeeded)
+        );
         let visible_status = item.display_status().map(ToOwned::to_owned);
         let header_activity_summary: Option<SharedString> = match item.kind {
             model::TranscriptKind::Web => Some({
@@ -16099,6 +16104,10 @@ impl HarnessApp {
                         .border_color(visuals.divider)
                         .overflow_hidden()
                 })
+                .when(routine_activity && command_succeeded, |this| {
+                    this.border_color(cx.theme().status().success.opacity(0.42))
+                        .bg(cx.theme().status().success_background.opacity(0.07))
+                })
                 .when(
                     matches!(
                         item.command_execution_status(),
@@ -16321,11 +16330,6 @@ impl Render for HarnessApp {
                 Some((status, Color::Muted))
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
-            } else if self.history_hydrating && self.attach_cache_bytes.is_none() {
-                Some((
-                    "Live · syncing missed history in background…".into(),
-                    Color::Muted,
-                ))
             } else if self.attaching_thread {
                 Some((
                     if self
@@ -16338,7 +16342,10 @@ impl Render for HarnessApp {
                     },
                     Color::Muted,
                 ))
-            } else if self.selected_thread_id.is_some() && !self.transcript_history_complete {
+            } else if self.selected_thread_id.is_some()
+                && !self.transcript_history_complete
+                && !self.history_hydrating
+            {
                 Some((
                     "Task history incomplete · refresh to retry".into(),
                     Color::Warning,
@@ -20495,6 +20502,20 @@ mod tests {
     }
 
     #[test]
+    fn healthy_background_history_repair_is_silent() {
+        let source = include_str!("main.rs");
+        let status = source
+            .split_once("let composer_status: Option<(SharedString, Color)> =")
+            .and_then(|(_, after)| after.split_once("let turn_active ="))
+            .map(|(body, _)| body)
+            .expect("composer status policy must remain auditable");
+
+        assert!(!status.contains("syncing missed history"));
+        assert!(status.contains("!self.history_hydrating"));
+        assert!(status.contains("Task history incomplete · refresh to retry"));
+    }
+
+    #[test]
     fn read_only_refresh_rate_follows_the_latest_turn_state() {
         use codex_app_server_client::CodexTurn;
 
@@ -20744,12 +20765,14 @@ mod tests {
         assert!(command_renderer.contains("rich_command_identity_icon("));
         assert!(source.contains("IconName::ToolTerminal"));
         assert!(source.contains("pulsating_between(0.42, 1.)"));
+        assert!(source.contains("CommandExecutionStatus::Succeeded) => Color::Success"));
         assert!(command_status.contains("CommandExecutionStatus::Running => return None"));
         assert!(command_status.contains("CommandExecutionStatus::Succeeded => return None"));
         assert!(command_status.contains("format!(\"exit {code}\")"));
         assert!(item_renderer.contains(".when(!compact_trace && !routine_activity"));
         assert!(item_renderer.contains(".when(routine_activity, |this|"));
         assert!(item_renderer.contains("this.border_l_1()"));
+        assert!(item_renderer.contains("success_background.opacity(0.07)"));
         assert!(item_renderer.contains("routine_activity && routine_activity_above"));
         assert!(item_renderer.contains("routine_activity && routine_activity_below"));
         assert!(web_renderer.contains("query.clone(),\n                    Vec::new(),"));
