@@ -1552,7 +1552,7 @@ pub struct ThreadRefreshOutcome {
 }
 
 /// Result of merging a chronological window returned by
-/// `thread/items/list` into the semantic transcript.
+/// a paginated App Server history endpoint into the semantic transcript.
 ///
 /// Unlike `thread/read`, a paginated window is not complete authority for the
 /// whole thread. The merge therefore retains items on both sides of the
@@ -1908,6 +1908,7 @@ impl TranscriptModel {
                 {
                     insert_client_user_message_id(&mut incoming.raw, client_user_message_id);
                 }
+                preserve_durable_history_identity(existing, &mut incoming);
                 incoming.key = stable_key.clone();
                 incoming.expanded = existing.expanded
                     || matches!(
@@ -2041,6 +2042,7 @@ impl TranscriptModel {
                 {
                     insert_client_user_message_id(&mut incoming.raw, client_user_message_id);
                 }
+                preserve_durable_history_identity(existing, &mut incoming);
                 incoming.key = stable_key.clone();
                 incoming.expanded = existing.expanded
                     || matches!(
@@ -3981,28 +3983,136 @@ fn ordered_history_matches(
     existing: &[TranscriptItem],
     incoming: &[TranscriptItem],
 ) -> Vec<Option<usize>> {
+    let mut matches = vec![None; incoming.len()];
     let mut claimed = HashSet::new();
-    incoming
-        .iter()
-        .map(|incoming| {
+    let mut anchors = Vec::new();
+    let mut next_existing = 0;
+
+    // Tool and operation ids (`exec-…`, `call_…`, UUIDs, and canonical
+    // message ids) are the durable authority. Numeric `item-N` ids emitted by
+    // turn history are projection-local and can restart after a daemon
+    // relaunch, so they must never anchor two unrelated transcript regions.
+    for (incoming_index, incoming_item) in incoming.iter().enumerate() {
+        let Some(existing_index) =
             existing
                 .iter()
                 .enumerate()
-                .find_map(|(index, existing)| {
-                    (!claimed.contains(&index) && history_items_share_identity(existing, incoming))
+                .skip(next_existing)
+                .find_map(|(index, existing_item)| {
+                    history_items_share_stable_identity(existing_item, incoming_item)
                         .then_some(index)
                 })
-                .inspect(|index| {
-                    claimed.insert(*index);
-                })
-        })
-        .collect()
+        else {
+            continue;
+        };
+        matches[incoming_index] = Some(existing_index);
+        claimed.insert(existing_index);
+        anchors.push((incoming_index, existing_index));
+        next_existing = existing_index + 1;
+    }
+
+    if anchors.is_empty() {
+        return matches;
+    }
+
+    // Turn-history message ids differ from live-notification message ids. Use
+    // exact semantic equality only inside the bounded regions established by
+    // durable id anchors. Requiring a unique candidate prevents repeated
+    // generic rows (for example, empty reasoning or compaction landmarks)
+    // from becoming accidental identities.
+    let mut incoming_start = 0;
+    let mut existing_start = 0;
+    for (incoming_end, existing_end) in anchors
+        .iter()
+        .copied()
+        .chain(std::iter::once((incoming.len(), existing.len())))
+    {
+        match_semantic_history_segment(
+            existing,
+            incoming,
+            incoming_start..incoming_end,
+            existing_start..existing_end,
+            &mut matches,
+            &mut claimed,
+        );
+        if incoming_end < incoming.len() {
+            incoming_start = incoming_end + 1;
+            existing_start = existing_end + 1;
+        }
+    }
+
+    matches
 }
 
-fn history_items_share_identity(left: &TranscriptItem, right: &TranscriptItem) -> bool {
-    match (&left.protocol_id, &right.protocol_id) {
-        (Some(left), Some(right)) if left == right => true,
+fn match_semantic_history_segment(
+    existing: &[TranscriptItem],
+    incoming: &[TranscriptItem],
+    incoming_range: Range<usize>,
+    existing_range: Range<usize>,
+    matches: &mut [Option<usize>],
+    claimed: &mut HashSet<usize>,
+) {
+    let mut next_existing = existing_range.start;
+    for incoming_index in incoming_range {
+        let incoming_item = &incoming[incoming_index];
+        let mut candidates = existing[next_existing..existing_range.end]
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, existing_item)| {
+                let index = next_existing + offset;
+                (!claimed.contains(&index)
+                    && (items_are_semantically_equal(existing_item, incoming_item)
+                        || one_sided_user_identity_matches(existing_item, incoming_item)))
+                .then_some(index)
+            });
+        let Some(candidate) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_some() {
+            continue;
+        }
+        matches[incoming_index] = Some(candidate);
+        claimed.insert(candidate);
+        next_existing = candidate + 1;
+    }
+}
+
+fn history_items_share_stable_identity(left: &TranscriptItem, right: &TranscriptItem) -> bool {
+    let ids_match = match (&left.protocol_id, &right.protocol_id) {
+        (Some(left), Some(right)) => left == right,
         _ => left.key == right.key,
+    };
+    if !ids_match {
+        return false;
+    }
+    !history_item_id_is_projection_local(&left.key)
+        && left
+            .protocol_id
+            .as_deref()
+            .is_none_or(|id| !history_item_id_is_projection_local(id))
+}
+
+fn history_item_id_is_projection_local(id: &str) -> bool {
+    id.strip_prefix("item-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn preserve_durable_history_identity(existing: &TranscriptItem, incoming: &mut TranscriptItem) {
+    let Some(incoming_id) = incoming.protocol_id.as_deref() else {
+        return;
+    };
+    let Some(existing_id) = existing.protocol_id.as_deref() else {
+        return;
+    };
+    if !history_item_id_is_projection_local(incoming_id)
+        || history_item_id_is_projection_local(existing_id)
+    {
+        return;
+    }
+    incoming.protocol_id = Some(existing_id.to_owned());
+    if let Some(raw) = incoming.raw.as_object_mut() {
+        raw.insert("id".into(), existing_id.into());
     }
 }
 
@@ -6144,6 +6254,133 @@ mod tests {
         assert_eq!(outcome.new_len, 1);
         assert_eq!(model.items.len(), 1);
         assert_eq!(model.items[0].key, original);
+    }
+
+    #[test]
+    fn durable_history_anchor_reconciles_projection_local_message_ids() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let item = |id: &str, kind: &str, body: Value| CodexThreadItem {
+            id: id.into(),
+            kind: kind.into(),
+            body: body.as_object().cloned().unwrap(),
+        };
+        let entry = |item| ThreadItemEntry {
+            turn_id: "turn-1".into(),
+            item,
+        };
+        let mut model = TranscriptModel::default();
+        model.load_thread(&CodexThread {
+            id: "thread-1".into(),
+            turns: vec![CodexTurn {
+                id: "turn-1".into(),
+                status: json!("completed"),
+                items: vec![
+                    item(
+                        "msg_canonical_user",
+                        "userMessage",
+                        json!({"content": [{"type": "text", "text": "cached intro"}]}),
+                    ),
+                    item(
+                        "exec-stable-anchor",
+                        "commandExecution",
+                        json!({"command": "cargo check", "status": "completed"}),
+                    ),
+                    item(
+                        "msg_canonical_agent",
+                        "agentMessage",
+                        json!({"text": "cached tail", "status": "completed"}),
+                    ),
+                ],
+            }],
+            ..CodexThread::default()
+        });
+
+        let entries = vec![
+            entry(item(
+                "item-20",
+                "userMessage",
+                json!({"content": [{"type": "text", "text": "cached intro"}]}),
+            )),
+            entry(item(
+                "exec-stable-anchor",
+                "commandExecution",
+                json!({"command": "cargo check", "status": "completed"}),
+            )),
+            entry(item(
+                "item-22",
+                "agentMessage",
+                json!({"text": "cached tail", "status": "completed"}),
+            )),
+            entry(item(
+                "item-23",
+                "userMessage",
+                json!({"content": [{"type": "text", "text": "new prompt"}]}),
+            )),
+            entry(item(
+                "item-24",
+                "agentMessage",
+                json!({"text": "new answer", "status": "completed"}),
+            )),
+        ];
+
+        let outcome = model.merge_thread_item_entries(&entries);
+        assert!(outcome.applied);
+        assert_eq!(outcome.overlap, 3);
+        assert_eq!(outcome.inserted, 2);
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "cached intro",
+                "$ cargo check",
+                "cached tail",
+                "new prompt",
+                "new answer",
+            ]
+        );
+        assert_eq!(
+            model.items[0].protocol_id.as_deref(),
+            Some("msg_canonical_user")
+        );
+        assert_eq!(
+            model.items[2].protocol_id.as_deref(),
+            Some("msg_canonical_agent")
+        );
+    }
+
+    #[test]
+    fn projection_local_item_id_alone_cannot_anchor_history() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let item = |text: &str| CodexThreadItem {
+            id: "item-1".into(),
+            kind: "agentMessage".into(),
+            body: json!({"text": text, "status": "completed"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        };
+        let mut model = TranscriptModel::default();
+        model.load_thread(&CodexThread {
+            id: "thread-1".into(),
+            turns: vec![CodexTurn {
+                id: "old-turn".into(),
+                status: json!("completed"),
+                items: vec![item("old message")],
+            }],
+            ..CodexThread::default()
+        });
+
+        let outcome = model.merge_thread_item_entries(&[ThreadItemEntry {
+            turn_id: "new-turn".into(),
+            item: item("new message"),
+        }]);
+        assert!(!outcome.applied);
+        assert_eq!(model.items[0].content, "old message");
     }
 
     #[test]

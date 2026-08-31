@@ -11,9 +11,9 @@ use std::{
 use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{
-    Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus,
-    Event as AppServerEvent, SortDirection, ThreadItemsListParams, ThreadOpenResponse,
-    ThreadResumeInitialTurnsPageParams,
+    Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus, CodexTurn,
+    Event as AppServerEvent, SortDirection, ThreadItemEntry, ThreadOpenResponse,
+    ThreadResumeInitialTurnsPageParams, ThreadTurnsListParams, TurnItemsView,
 };
 use file_icons::FileIcons;
 use gpui::{
@@ -135,7 +135,7 @@ const CHILD_HIERARCHY_REFRESH_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const THIN_ATTACH_TRANSCRIPT_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 const ACTIVE_TRANSCRIPT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
-const HISTORY_CATCHUP_PAGE_ITEMS: u32 = 128;
+const HISTORY_CATCHUP_PAGE_TURNS: u32 = 4;
 const MAX_HISTORY_CATCHUP_PAGES: usize = 10_000;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
@@ -7460,6 +7460,7 @@ impl HarnessApp {
             .items
             .iter()
             .filter_map(|item| item.protocol_id.clone())
+            .filter(|id| history_item_id_is_durable(id))
             .collect::<HashSet<_>>();
         if attach_cache_bytes.is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES) {
             // A thin attach is the only safe automatic path for an oversized
@@ -7536,7 +7537,11 @@ impl HarnessApp {
             let active_turn_id = active_open_turn_id(&attached).map(ToOwned::to_owned);
             let authoritative_turn_state_loaded = active_turn_id.is_some()
                 || !matches!(&attached.thread.status, CodexThreadStatus::Active { .. });
-            let mut cursor = attached.items_backwards_cursor.clone();
+            // `thread/items/list` is present in the generated 0.151 schema but
+            // the running daemon returns "not supported yet". Start at the
+            // newest complete turn page instead. This also recovers items
+            // emitted earlier in an active turn while Harness was offline.
+            let mut cursor: Option<String> = None;
             let still_current = this
                 .update(cx, |this, cx| {
                     if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
@@ -7579,8 +7584,8 @@ impl HarnessApp {
                 return;
             }
 
-            let mut entries_desc = Vec::new();
-            let mut seen_item_ids = HashSet::new();
+            let mut turns_desc = Vec::new();
+            let mut seen_turn_ids = HashSet::new();
             let mut seen_cursors = HashSet::new();
             let mut found_overlap = false;
             let mut reached_history_start = false;
@@ -7593,24 +7598,30 @@ impl HarnessApp {
                     catchup_error = Some("App Server repeated a history cursor".to_owned());
                     break;
                 }
-                let mut params = ThreadItemsListParams::new(thread_id.clone());
+                let mut params = ThreadTurnsListParams::new(thread_id.clone());
                 params.cursor = cursor;
-                params.limit = Some(HISTORY_CATCHUP_PAGE_ITEMS);
+                params.limit = Some(HISTORY_CATCHUP_PAGE_TURNS);
                 params.sort_direction = Some(SortDirection::Desc);
-                let page = match client.list_thread_items(params).await {
+                params.items_view = Some(TurnItemsView::Full);
+                let page = match client.list_thread_turns(params).await {
                     Ok(page) => page,
                     Err(error) => {
                         catchup_error = Some(error.to_string());
                         break;
                     }
                 };
-                for entry in page.data {
-                    if cached_protocol_ids.contains(&entry.item.id) {
-                        found_overlap = true;
+                for turn in page.data {
+                    if !seen_turn_ids.insert(turn.id.clone()) {
+                        continue;
                     }
-                    if seen_item_ids.insert(entry.item.id.clone()) {
-                        entries_desc.push(entry);
+                    for item in &turn.items {
+                        if history_item_id_is_durable(&item.id)
+                            && cached_protocol_ids.contains(&item.id)
+                        {
+                            found_overlap = true;
+                        }
                     }
+                    turns_desc.push(turn);
                 }
                 if found_overlap {
                     break;
@@ -7624,7 +7635,15 @@ impl HarnessApp {
             if !found_overlap && !reached_history_start && catchup_error.is_none() {
                 catchup_error = Some("History catch-up exceeded its safety page limit".into());
             }
-            entries_desc.reverse();
+            let fetched_entries = chronological_thread_item_entries(turns_desc);
+            let entries = if found_overlap {
+                history_entries_from_last_durable_overlap(
+                    fetched_entries,
+                    &cached_protocol_ids,
+                )
+            } else {
+                fetched_entries
+            };
 
             _ = this.update(cx, |this, cx| {
                 if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
@@ -7650,10 +7669,10 @@ impl HarnessApp {
                     .map(|item| item.key.clone());
                 let outcome = if found_overlap {
                     this.model
-                        .merge_thread_item_entries_protecting(&entries_desc, &protected_keys)
+                        .merge_thread_item_entries_protecting(&entries, &protected_keys)
                 } else if reached_history_start {
                     this.model
-                        .replace_thread_item_entries_protecting(&entries_desc, &protected_keys)
+                        .replace_thread_item_entries_protecting(&entries, &protected_keys)
                 } else {
                     model::ThreadHistoryMergeOutcome::default()
                 };
@@ -7703,16 +7722,22 @@ impl HarnessApp {
                     this.set_transcript_history_complete(true);
                     this.persist_transcript_in_background(&thread_id, cx);
                     this.error = None;
+                    log::info!(
+                        "task history catch-up complete thread={thread_id} turns={} entries={} overlap={} inserted={}",
+                        seen_turn_ids.len(),
+                        entries.len(),
+                        outcome.overlap,
+                        outcome.inserted,
+                    );
                 } else {
-                    this.error = Some(
-                        catchup_error
+                    let error = catchup_error
                             .map(|error| format!("Live task connected, but history catch-up failed: {error}"))
                             .unwrap_or_else(|| {
                                 "Live task connected, but paginated history did not overlap the local cache."
                                     .to_owned()
-                            })
-                            .into(),
-                    );
+                            });
+                    log::warn!("task history catch-up failed thread={thread_id}: {error}");
+                    this.error = Some(error.into());
                 }
                 this.history_hydrating = false;
                 this.attaching_thread = false;
@@ -15554,6 +15579,11 @@ impl Render for HarnessApp {
                     },
                     Color::Muted,
                 ))
+            } else if self.selected_thread_id.is_some() && !self.transcript_history_complete {
+                Some((
+                    "Task history incomplete · refresh to retry".into(),
+                    Color::Warning,
+                ))
             } else if self.settings_update_pending {
                 Some(("Updating task settings…".into(), Color::Muted))
             } else if self.thread_read_only_reason.is_some() {
@@ -17274,6 +17304,40 @@ fn active_open_turn_id(response: &ThreadOpenResponse) -> Option<&str> {
     })
 }
 
+fn chronological_thread_item_entries(mut turns_desc: Vec<CodexTurn>) -> Vec<ThreadItemEntry> {
+    turns_desc.reverse();
+    turns_desc
+        .into_iter()
+        .flat_map(|turn| {
+            let turn_id = turn.id;
+            turn.items.into_iter().map(move |item| ThreadItemEntry {
+                turn_id: turn_id.clone(),
+                item,
+            })
+        })
+        .collect()
+}
+
+fn history_item_id_is_durable(id: &str) -> bool {
+    !id.strip_prefix("item-").is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn history_entries_from_last_durable_overlap(
+    entries: Vec<ThreadItemEntry>,
+    cached_protocol_ids: &HashSet<String>,
+) -> Vec<ThreadItemEntry> {
+    let start = entries
+        .iter()
+        .rposition(|entry| {
+            history_item_id_is_durable(&entry.item.id)
+                && cached_protocol_ids.contains(&entry.item.id)
+        })
+        .unwrap_or_default();
+    entries.into_iter().skip(start).collect()
+}
+
 fn thread_has_active_turn(thread: &CodexThread) -> bool {
     active_thread_turn_id(thread).is_some()
 }
@@ -18032,6 +18096,59 @@ mod tests {
         .expect("thin resume fixture should decode");
 
         assert_eq!(active_open_turn_id(&response), Some("turn-live"));
+    }
+
+    #[test]
+    fn descending_turn_pages_become_chronological_without_reversing_items() {
+        let turns: Vec<CodexTurn> = serde_json::from_value(json!([
+            {
+                "id": "turn-new",
+                "status": "completed",
+                "items": [
+                    {"id": "new-a", "type": "userMessage"},
+                    {"id": "new-b", "type": "agentMessage"}
+                ]
+            },
+            {
+                "id": "turn-old",
+                "status": "completed",
+                "items": [
+                    {"id": "old-a", "type": "userMessage"},
+                    {"id": "old-b", "type": "agentMessage"}
+                ]
+            }
+        ]))
+        .unwrap();
+
+        let entries = chronological_thread_item_entries(turns);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (entry.turn_id.as_str(), entry.item.id.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("turn-old", "old-a"),
+                ("turn-old", "old-b"),
+                ("turn-new", "new-a"),
+                ("turn-new", "new-b"),
+            ]
+        );
+        assert!(!history_item_id_is_durable("item-1"));
+        assert!(!history_item_id_is_durable("item-2992"));
+        assert!(history_item_id_is_durable("msg_abc"));
+        assert!(history_item_id_is_durable("exec-abc"));
+
+        let trimmed = history_entries_from_last_durable_overlap(
+            entries,
+            &HashSet::from(["old-a".to_owned(), "old-b".to_owned()]),
+        );
+        assert_eq!(
+            trimmed
+                .iter()
+                .map(|entry| entry.item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["old-b", "new-a", "new-b"]
+        );
     }
 
     #[test]
