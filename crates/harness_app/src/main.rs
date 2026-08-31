@@ -1341,6 +1341,33 @@ fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
     )
 }
 
+fn transcript_item_is_compact_activity(item: &TranscriptItem) -> bool {
+    !item.expanded
+        && !matches!(
+            item.kind,
+            model::TranscriptKind::User
+                | model::TranscriptKind::Agent
+                | model::TranscriptKind::Reasoning
+                | model::TranscriptKind::Plan
+        )
+}
+
+fn plan_progress(raw: &Value) -> Option<(usize, usize)> {
+    let steps = raw.get("plan")?.as_array()?;
+    (!steps.is_empty()).then(|| {
+        let completed = steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.get("status").and_then(Value::as_str),
+                    Some("completed" | "complete")
+                )
+            })
+            .count();
+        (completed, steps.len())
+    })
+}
+
 fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
     item.expanded
         && item.pending_request.is_none()
@@ -1390,7 +1417,11 @@ fn toggle_model_item_expansion_at(
     index: usize,
 ) -> Option<(String, bool)> {
     let item = model.items.get_mut(index)?;
-    if (!item.kind.is_structured() && item.kind != model::TranscriptKind::Reasoning)
+    if (!item.kind.is_structured()
+        && !matches!(
+            item.kind,
+            model::TranscriptKind::Reasoning | model::TranscriptKind::Plan
+        ))
         || item.content.trim().is_empty()
     {
         return None;
@@ -12504,6 +12535,16 @@ impl HarnessApp {
             });
         let raw_visible = self.raw_visible.contains(&item.key);
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
+        let compact_activity = transcript_item_is_compact_activity(&item);
+        let compact_activity_above = index
+            .checked_sub(1)
+            .and_then(|index| self.model.items.get(index))
+            .is_some_and(transcript_item_is_compact_activity);
+        let compact_activity_below = self
+            .model
+            .items
+            .get(index + 1)
+            .is_some_and(transcript_item_is_compact_activity);
         let request_method = item
             .pending_request
             .as_ref()
@@ -12616,8 +12657,8 @@ impl HarnessApp {
                 Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
             );
         let visible_status = item.display_status().map(ToOwned::to_owned);
-        let header_activity_summary: Option<SharedString> =
-            (item.kind == model::TranscriptKind::Web).then(|| {
+        let header_activity_summary: Option<SharedString> = match item.kind {
+            model::TranscriptKind::Web => Some({
                 let presentation = web_search_presentation(&item.raw);
                 match presentation.queries.len() {
                     0 | 1 => format!("{} results", presentation.results.len()).into(),
@@ -12627,7 +12668,11 @@ impl HarnessApp {
                     )
                     .into(),
                 }
-            });
+            }),
+            model::TranscriptKind::Plan => plan_progress(&item.raw)
+                .map(|(completed, total)| format!("{completed}/{total}").into()),
+            _ => None,
+        };
         let header_title = transcript_item_header_title(&item);
         let header_uses_command_font = command_uses_raw_identity(&item);
         let has_collapsible_content = !item.content.trim().is_empty();
@@ -12641,7 +12686,11 @@ impl HarnessApp {
         let disclosure_weak = cx.weak_entity();
         let disclosure_item_key = item.key.clone();
         let is_disclosure = has_collapsible_content
-            && (item.kind.is_structured() || item.kind == model::TranscriptKind::Reasoning);
+            && (item.kind.is_structured()
+                || matches!(
+                    item.kind,
+                    model::TranscriptKind::Reasoning | model::TranscriptKind::Plan
+                ));
         let raw_search_visible = raw_visible
             && self.search_highlights_visible
             && search_contains(&item.raw.to_string(), &self.search_query);
@@ -13113,16 +13162,26 @@ impl HarnessApp {
                 .into_any_element()
         };
 
+        let normal_vertical_padding = if compact_trace {
+            px(3.)
+        } else if !narrative {
+            if narrow { px(4.) } else { px(5.) }
+        } else {
+            px(8.)
+        };
         let element = div()
             .id(("transcript-item", index))
             .w_full()
             .px(if narrow { px(10.) } else { px(18.) })
-            .py(if compact_trace {
-                px(3.)
-            } else if !narrative {
-                if narrow { px(4.) } else { px(5.) }
+            .pt(if compact_activity && compact_activity_above {
+                px(0.)
             } else {
-                px(8.)
+                normal_vertical_padding
+            })
+            .pb(if compact_activity && compact_activity_below {
+                px(1.)
+            } else {
+                normal_vertical_padding
             })
             .when(visual, |this| {
                 this.bg(visuals.selection_surface.opacity(0.45))
@@ -16271,6 +16330,37 @@ mod tests {
             transcript_item_header_title(&item),
             "App Server — thread/read"
         );
+    }
+
+    #[test]
+    fn plans_report_structural_progress_and_can_collapse() {
+        assert_eq!(
+            plan_progress(&json!({
+                "plan": [
+                    {"step": "Done", "status": "completed"},
+                    {"step": "Working", "status": "inProgress"},
+                    {"step": "Later", "status": "pending"}
+                ]
+            })),
+            Some((1, 3))
+        );
+        assert_eq!(plan_progress(&json!({"plan": []})), None);
+
+        let mut replay = TranscriptModel::replay(3);
+        assert!(replay.items[2].expanded);
+        let plan_key = replay.items[2].key.clone();
+        assert_eq!(
+            toggle_model_item_expansion_at(&mut replay, 2),
+            Some((plan_key, true))
+        );
+        assert!(!replay.items[2].expanded);
+    }
+
+    #[test]
+    fn only_collapsed_activity_rows_form_compact_stacks() {
+        let replay = TranscriptModel::replay(6);
+        assert!(!transcript_item_is_compact_activity(&replay.items[0]));
+        assert!(transcript_item_is_compact_activity(&replay.items[5]));
     }
 
     #[test]

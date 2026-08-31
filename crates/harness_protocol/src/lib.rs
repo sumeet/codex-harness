@@ -2116,10 +2116,11 @@ impl TranscriptModel {
                     "turn/plan/updated" => {
                         let turn_id = string_at(&params, "/turnId").unwrap_or("unknown");
                         let content = render_plan(&params);
+                        let title = plan_title(&params);
                         let index = self.upsert_generated(
                             format!("turn-plan:{turn_id}"),
                             TranscriptKind::Plan,
-                            "Plan",
+                            title,
                             content,
                             params,
                         );
@@ -4547,10 +4548,7 @@ fn humanize_identifier(value: &str) -> String {
 }
 
 fn render_plan(params: &Value) -> String {
-    let mut output = string_at(params, "/explanation")
-        .filter(|text| !text.is_empty())
-        .map(|text| format!("{text}\n\n"))
-        .unwrap_or_default();
+    let mut output = String::new();
     if let Some(steps) = params.get("plan").and_then(Value::as_array) {
         for step in steps {
             let status = string_at(step, "/status").unwrap_or("pending");
@@ -4567,6 +4565,14 @@ fn render_plan(params: &Value) -> String {
         }
     }
     output
+}
+
+fn plan_title(params: &Value) -> String {
+    string_at(params, "/explanation")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("Plan")
+        .to_string()
 }
 
 fn render_turn_completion(turn: &Value, status: &str) -> String {
@@ -5594,6 +5600,7 @@ mod tests {
     #[test]
     fn plan_status_is_encoded_by_the_task_marker_not_appended_as_prose() {
         let rendered = render_plan(&json!({
+            "explanation": "This belongs in the compact plan header.",
             "plan": [
                 {"step": "Done", "status": "completed"},
                 {"step": "Working", "status": "inProgress"},
@@ -5604,6 +5611,11 @@ mod tests {
         assert_eq!(rendered, "- [x] Done\n- [~] Working\n- [ ] Later\n");
         assert!(!rendered.contains("(pending)"));
         assert!(!rendered.contains("(inProgress)"));
+        assert!(!rendered.contains("compact plan header"));
+        assert_eq!(
+            plan_title(&json!({"explanation": "  Coordinate the work.  "})),
+            "Coordinate the work."
+        );
     }
 
     #[test]
