@@ -1347,6 +1347,14 @@ fn thread_resume_params(
     initial_turns_page: Option<&ThreadResumeInitialTurnsPageParams>,
 ) -> Result<Value, Error> {
     let mut params = json!({
+        // Dynamic tools are implemented by the connected client, not by
+        // app-server. They are persisted in rollout metadata, so omitting
+        // this field can accidentally restore tools advertised by the client
+        // that originally created the thread (for example Codex Desktop's
+        // `read_thread_terminal`). Harness currently implements no dynamic
+        // tools; replace the inherited set explicitly rather than promising
+        // capabilities this connection cannot service.
+        "dynamicTools": [],
         "excludeTurns": exclude_turns,
         "threadId": thread_id,
     });
@@ -1790,6 +1798,7 @@ mod tests {
         assert_eq!(
             thread_resume_params("thread-1", false, None).unwrap(),
             json!({
+                "dynamicTools": [],
                 "excludeTurns": false,
                 "threadId": "thread-1",
             })
@@ -1797,6 +1806,7 @@ mod tests {
         assert_eq!(
             thread_resume_params("thread-1", true, None).unwrap(),
             json!({
+                "dynamicTools": [],
                 "excludeTurns": true,
                 "threadId": "thread-1",
             })
@@ -1806,6 +1816,7 @@ mod tests {
         assert_eq!(
             thread_resume_params("thread-1", true, Some(&initial_turns_page)).unwrap(),
             json!({
+                "dynamicTools": [],
                 "excludeTurns": true,
                 "initialTurnsPage": {
                     "itemsView": "notLoaded",

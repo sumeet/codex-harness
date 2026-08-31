@@ -28,7 +28,7 @@ use gpui::{
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
     TranscriptSemanticSpan, TranscriptSemanticStyle, markdown_block_quote_source_ranges,
-    markdown_monospace_source_ranges, minimal_text_edit,
+    markdown_monospace_source_ranges, markdown_source_style_ranges, minimal_text_edit,
 };
 use language::{Buffer, InlayId, Language, LanguageRegistry, Point};
 use multi_buffer::{
@@ -266,6 +266,10 @@ impl EventEmitter<LocalEditorSteered> for LocalEditor {}
 impl EventEmitter<LocalEditorImageClicked> for LocalEditor {}
 
 struct ComposerMarkdownMonospaceGeometryHighlight;
+struct ComposerMarkdownHeadingHighlight;
+struct ComposerMarkdownStrongHighlight;
+struct ComposerMarkdownEmphasisHighlight;
+struct ComposerMarkdownStrikethroughHighlight;
 struct ComposerMarkdownBlockQuoteRows;
 
 impl LocalEditor {
@@ -390,7 +394,7 @@ impl LocalEditor {
     /// and submission ordering therefore all share one source of truth.
     pub fn set_inline_image_tokens(
         &mut self,
-        tokens: Vec<(String, Arc<Image>)>,
+        tokens: Vec<(String, Arc<Image>, (f32, f32))>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -401,7 +405,7 @@ impl LocalEditor {
             let text = editor.text(cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let mut creases = Vec::new();
-            for (token, image) in tokens {
+            for (token, image, (width, height)) in tokens {
                 for (start, _) in text.match_indices(&token) {
                     let range = clipped_anchor_range(&snapshot, start..start + token.len());
                     let image = image.clone();
@@ -415,13 +419,16 @@ impl LocalEditor {
                             let click_owner = owner.clone();
                             div()
                                 .id(("inline-composer-image", start))
-                                .size(px(24.))
+                                .w(px(width))
+                                .h(px(height))
                                 .flex()
                                 .items_center()
+                                .justify_center()
                                 .rounded_xs()
                                 .border_1()
-                                .border_color(colors.border_variant)
-                                .bg(colors.element_background)
+                                .border_color(colors.border)
+                                .bg(colors.editor_background)
+                                .p(px(1.))
                                 .cursor_pointer()
                                 .on_click(move |_, _, cx| {
                                     click_owner
@@ -436,7 +443,7 @@ impl LocalEditor {
                                     img(image.clone())
                                         .size_full()
                                         .rounded_xs()
-                                        .object_fit(ObjectFit::Cover),
+                                        .object_fit(ObjectFit::ScaleDown),
                                 )
                                 .into_any_element()
                         }),
@@ -520,6 +527,14 @@ impl LocalEditor {
         } else {
             Vec::new()
         };
+        let source_styles = if source
+            .bytes()
+            .any(|byte| matches!(byte, b'#' | b'*' | b'_' | b'~'))
+        {
+            markdown_source_style_ranges(&source)
+        } else {
+            Default::default()
+        };
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let anchors = ranges
@@ -533,6 +548,62 @@ impl LocalEditor {
                 anchors,
                 HighlightStyle {
                     font_family: Some(FontFamilyVariant::Monospace),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            let anchors = |ranges: Vec<Range<usize>>| {
+                ranges
+                    .into_iter()
+                    .map(|range| clipped_anchor_range(&snapshot, range))
+                    .collect::<Vec<_>>()
+            };
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownHeadingHighlight,
+                >()),
+                anchors(source_styles.headings),
+                HighlightStyle {
+                    color: Some(cx.theme().colors().text_accent),
+                    font_weight: Some(FontWeight::BOLD),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownStrongHighlight,
+                >()),
+                anchors(source_styles.strong),
+                HighlightStyle {
+                    font_weight: Some(FontWeight::BOLD),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownEmphasisHighlight,
+                >()),
+                anchors(source_styles.emphasis),
+                HighlightStyle {
+                    font_style: Some(gpui::FontStyle::Italic),
+                    ..HighlightStyle::default()
+                },
+                cx,
+            );
+            let strikethrough_color = cx.theme().colors().text_muted;
+            editor.highlight_text(
+                HighlightKey::NavigationOverlay(NavigationOverlayKey::unique::<
+                    ComposerMarkdownStrikethroughHighlight,
+                >()),
+                anchors(source_styles.strikethrough),
+                HighlightStyle {
+                    color: Some(strikethrough_color),
+                    strikethrough: Some(gpui::StrikethroughStyle {
+                        thickness: px(1.),
+                        color: Some(strikethrough_color),
+                    }),
                     ..HighlightStyle::default()
                 },
                 cx,

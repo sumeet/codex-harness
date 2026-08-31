@@ -1074,6 +1074,38 @@ pub fn markdown_block_quote_source_ranges(source: &str) -> Vec<Range<usize>> {
     merged
 }
 
+/// Semantic byte ranges in raw Markdown for a plaintext composer.
+///
+/// Unlike transcript semantic spans, these retain source geometry (including
+/// delimiters) so a real Editor can style a draft without replacing bytes or
+/// disturbing Vim selections and undo history.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MarkdownSourceStyleRanges {
+    pub headings: Vec<Range<usize>>,
+    pub strong: Vec<Range<usize>>,
+    pub emphasis: Vec<Range<usize>>,
+    pub strikethrough: Vec<Range<usize>>,
+}
+
+pub fn markdown_source_style_ranges(source: &str) -> MarkdownSourceStyleRanges {
+    let mut styles = MarkdownSourceStyleRanges::default();
+    for (event, range) in
+        MarkdownParser::new_ext(source, HARNESS_MARKDOWN_OPTIONS).into_offset_iter()
+    {
+        if range.start >= range.end || range.end > source.len() {
+            continue;
+        }
+        match event {
+            MarkdownEvent::Start(Tag::Heading { .. }) => styles.headings.push(range),
+            MarkdownEvent::Start(Tag::Strong) => styles.strong.push(range),
+            MarkdownEvent::Start(Tag::Emphasis) => styles.emphasis.push(range),
+            MarkdownEvent::Start(Tag::Strikethrough) => styles.strikethrough.push(range),
+            _ => {}
+        }
+    }
+    styles
+}
+
 fn selectable_markdown_text(source: &str) -> SelectableBodyProjection {
     selectable_markdown_text_with_link_destinations(source, true, false)
 }
@@ -6014,6 +6046,17 @@ mod tests {
 
         assert_eq!(ranges.len(), 1);
         assert_eq!(&source[ranges[0].clone()], "> quoted");
+    }
+
+    #[test]
+    fn markdown_source_styles_keep_composer_source_geometry() {
+        let source = "# Heading\n\n**strong** and *emphasis* and ~~gone~~";
+        let styles = markdown_source_style_ranges(source);
+
+        assert_eq!(source[styles.headings[0].clone()].trim_end(), "# Heading");
+        assert_eq!(&source[styles.strong[0].clone()], "**strong**");
+        assert_eq!(&source[styles.emphasis[0].clone()], "*emphasis*");
+        assert_eq!(&source[styles.strikethrough[0].clone()], "~~gone~~");
     }
 
     #[test]

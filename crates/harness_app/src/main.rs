@@ -3150,6 +3150,7 @@ struct LiveRequestSurface {
 struct ComposerImageAttachment {
     id: u64,
     image: Arc<Image>,
+    dimensions: Option<(u32, u32)>,
 }
 
 struct ComposerSubmission {
@@ -3447,20 +3448,25 @@ fn transcript_user_image_source(source: &model::UserImageSource) -> Option<UserI
     }
 }
 
-fn user_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
-    const MAX_WIDTH: f32 = 384.;
-    const MAX_HEIGHT: f32 = 220.;
-    const FALLBACK_WIDTH: f32 = 320.;
-    const FALLBACK_HEIGHT: f32 = 180.;
-
+fn aspect_fit_preview_size(
+    dimensions: Option<(u32, u32)>,
+    max_width: f32,
+    max_height: f32,
+) -> (f32, f32) {
     let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
     else {
-        return (FALLBACK_WIDTH, FALLBACK_HEIGHT);
+        return (max_width, max_height);
     };
-    let scale = (MAX_WIDTH / width as f32)
-        .min(MAX_HEIGHT / height as f32)
-        .min(1.);
+    let scale = (max_width / width as f32).min(max_height / height as f32);
     (width as f32 * scale, height as f32 * scale)
+}
+
+fn composer_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    aspect_fit_preview_size(dimensions, 120., 30.)
+}
+
+fn transcript_user_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    aspect_fit_preview_size(dimensions, 220., 96.)
 }
 
 fn legacy_request_controls_active(
@@ -4085,7 +4091,6 @@ struct PermissionProfileChoice {
 enum ComposerActionState {
     Send,
     Queue,
-    Stop,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -4103,11 +4108,11 @@ enum AppearanceFontRole {
     Code,
 }
 
-fn composer_action_state(turn_active: bool, composer_empty: bool) -> ComposerActionState {
-    match (turn_active, composer_empty) {
-        (true, true) => ComposerActionState::Stop,
-        (true, false) => ComposerActionState::Queue,
-        (false, _) => ComposerActionState::Send,
+fn composer_action_state(turn_active: bool) -> ComposerActionState {
+    if turn_active {
+        ComposerActionState::Queue
+    } else {
+        ComposerActionState::Send
     }
 }
 
@@ -6143,39 +6148,18 @@ impl HarnessApp {
         )
     }
 
-    /// Match Zed's composer terminal action: one stable, normally sized control
-    /// changes meaning with the turn and draft state instead of growing into a
-    /// row of textual Queue/Stop buttons. Stopping remains the primary action
-    /// while the draft is empty; as soon as there is a draft, the same location
-    /// queues it.
-    fn render_composer_action(
+    /// Keep control of the active turn independent from control of the draft.
+    /// Zed swaps Stop for Queue as soon as the user types, but that makes the
+    /// running response uninterruptible from the composer at exactly the point
+    /// when the user is most likely to be preparing a correction.
+    fn render_composer_actions(
         &self,
         turn_active: bool,
         composer_empty: bool,
         send_blocked: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let state = composer_action_state(turn_active, composer_empty);
-        if state == ComposerActionState::Stop {
-            let stop_ready = self.model.current_turn_id.is_some();
-            return IconButton::new("stop-turn", IconName::Stop)
-                .style(ButtonStyle::Subtle)
-                .disabled(!stop_ready)
-                .icon_color(if stop_ready {
-                    Color::Error
-                } else {
-                    Color::Muted
-                })
-                .aria_label("Stop the current response")
-                .tooltip(Tooltip::text(if stop_ready {
-                    "Stop response"
-                } else {
-                    "Restoring active-turn controls…"
-                }))
-                .on_click(cx.listener(|this, _, _, cx| this.stop(cx)))
-                .into_any_element();
-        }
-
+        let state = composer_action_state(turn_active);
         let (id, icon, label): (&'static str, IconName, SharedString) = if state
             == ComposerActionState::Queue
         {
@@ -6207,10 +6191,10 @@ impl HarnessApp {
         };
         let tooltip = label.clone();
 
-        IconButton::new(id, icon)
+        let draft_action = IconButton::new(id, icon)
             .style(ButtonStyle::Subtle)
-            .disabled(send_blocked)
-            .icon_color(if send_blocked {
+            .disabled(send_blocked || composer_empty)
+            .icon_color(if send_blocked || composer_empty {
                 Color::Muted
             } else {
                 Color::Accent
@@ -6218,6 +6202,35 @@ impl HarnessApp {
             .aria_label(label)
             .tooltip(Tooltip::text(tooltip))
             .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
+            .into_any_element();
+
+        if !turn_active {
+            return draft_action;
+        }
+
+        let stop_ready = self.model.current_turn_id.is_some();
+        let stop_action = IconButton::new("stop-turn", IconName::Stop)
+            .style(ButtonStyle::Subtle)
+            .disabled(!stop_ready)
+            .icon_color(if stop_ready {
+                Color::Error
+            } else {
+                Color::Muted
+            })
+            .aria_label("Stop the current response")
+            .tooltip(Tooltip::text(if stop_ready {
+                "Stop response"
+            } else {
+                "Restoring active-turn controls…"
+            }))
+            .on_click(cx.listener(|this, _, _, cx| this.stop(cx)));
+
+        div()
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .child(stop_action)
+            .when(!composer_empty, |this| this.child(draft_action))
             .into_any_element()
     }
 
@@ -7038,6 +7051,7 @@ impl HarnessApp {
                         (
                             composer_image_token(attachment.id),
                             attachment.image.clone(),
+                            composer_image_preview_size(attachment.dimensions),
                         )
                     })
                     .collect();
@@ -9976,9 +9990,11 @@ impl HarnessApp {
             }
 
             self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
+            let dimensions = image_dimensions(image.bytes(), image.format());
             self.composer_images.push(ComposerImageAttachment {
                 id: self.next_composer_image_id,
                 image: Arc::new(image.clone()),
+                dimensions,
             });
             inserted_tokens.push(composer_image_token(self.next_composer_image_id));
             added += 1;
@@ -10585,8 +10601,12 @@ impl HarnessApp {
                     };
                     self.next_composer_image_id = self.next_composer_image_id.wrapping_add(1);
                     let id = self.next_composer_image_id;
-                    self.composer_images
-                        .push(ComposerImageAttachment { id, image });
+                    let dimensions = image_dimensions(image.bytes(), image.format());
+                    self.composer_images.push(ComposerImageAttachment {
+                        id,
+                        image,
+                        dimensions,
+                    });
                     text.push_str(&composer_image_token(id));
                 }
                 _ => {}
@@ -14830,7 +14850,7 @@ impl HarnessApp {
                         continue;
                     };
                     let expanded_source = preview.source.clone();
-                    let (width, height) = user_image_preview_size(preview.dimensions);
+                    let (width, height) = transcript_user_image_preview_size(preview.dimensions);
                     children.push(
                         div()
                             .id(format!("user-image-preview:{item_key}:{part_index}"))
@@ -14840,8 +14860,9 @@ impl HarnessApp {
                             .overflow_hidden()
                             .rounded_xs()
                             .border_1()
-                            .border_color(colors.border_variant)
+                            .border_color(colors.border)
                             .bg(colors.editor_background)
+                            .p(px(1.))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.expanded_user_image = Some(expanded_source.clone());
@@ -14862,7 +14883,7 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
             .children(children)
             .into_any_element()
     }
@@ -16460,8 +16481,8 @@ impl Render for HarnessApp {
         let fast_mode_control = self.render_fast_mode_control(cx);
         let model_selector = self.render_model_effort_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
-        let composer_action =
-            self.render_composer_action(turn_active, composer_empty, send_blocked, cx);
+        let composer_actions =
+            self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
         let following_tail = if self.buffer_view {
             self.transcript_editor.read(cx).is_following_tail()
         } else {
@@ -16908,7 +16929,7 @@ impl Render for HarnessApp {
                                                     )
                                                     .child(permission_selector)
                                                     .child(model_selector)
-                                                    .child(composer_action),
+                                                    .child(composer_actions),
                                             )
                                     }),
                             ),
@@ -22031,20 +22052,18 @@ mod tests {
     }
 
     #[test]
-    fn composer_action_uses_one_context_sensitive_control() {
-        assert_eq!(
-            composer_action_state(false, true),
-            ComposerActionState::Send
-        );
-        assert_eq!(
-            composer_action_state(false, false),
-            ComposerActionState::Send
-        );
-        assert_eq!(
-            composer_action_state(true, false),
-            ComposerActionState::Queue
-        );
-        assert_eq!(composer_action_state(true, true), ComposerActionState::Stop);
+    fn composer_draft_action_is_independent_from_the_active_turn_stop() {
+        assert_eq!(composer_action_state(false), ComposerActionState::Send);
+        assert_eq!(composer_action_state(true), ComposerActionState::Queue);
+
+        let source = include_str!("main.rs");
+        let renderer = source
+            .split_once("fn render_composer_actions(")
+            .and_then(|(_, after)| after.split_once("fn render_queued_turns("))
+            .map(|(body, _)| body)
+            .expect("composer actions must remain auditable");
+        assert!(renderer.contains("let stop_action = IconButton::new"));
+        assert!(renderer.contains("when(!composer_empty"));
     }
 
     #[test]
@@ -22059,6 +22078,7 @@ mod tests {
         let images = vec![ComposerImageAttachment {
             id: 7,
             image: Arc::new(Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3])),
+            dimensions: None,
         }];
 
         let input = composer_app_server_input("what is this?", &images);
@@ -22075,6 +22095,7 @@ mod tests {
         let images = vec![ComposerImageAttachment {
             id: 7,
             image: Arc::new(Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3])),
+            dimensions: None,
         }];
         let input = composer_app_server_input("before [Image #7] after", &images);
         assert_eq!(
@@ -22112,12 +22133,16 @@ mod tests {
     }
 
     #[test]
-    fn user_image_preview_hugs_the_bitmap_aspect_ratio() {
-        let wide = user_image_preview_size(Some((1522, 667)));
-        assert_eq!(wide.0, 384.);
-        assert!((wide.1 - 168.284).abs() < 0.001);
-        assert_eq!(user_image_preview_size(Some((100, 80))), (100., 80.));
-        assert_eq!(user_image_preview_size(None), (320., 180.));
+    fn inline_image_previews_preserve_aspect_ratio_at_both_scales() {
+        let composer = composer_image_preview_size(Some((1522, 667)));
+        assert!((composer.0 / composer.1 - 1522. / 667.).abs() < 0.001);
+        assert_eq!(composer.1, 30.);
+
+        let transcript = transcript_user_image_preview_size(Some((1522, 667)));
+        assert!((transcript.0 / transcript.1 - 1522. / 667.).abs() < 0.001);
+        assert_eq!(transcript.1, 96.);
+        assert_eq!(composer_image_preview_size(None), (120., 30.));
+        assert_eq!(transcript_user_image_preview_size(None), (220., 96.));
     }
 
     #[test]
