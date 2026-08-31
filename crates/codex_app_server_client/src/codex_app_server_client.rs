@@ -504,8 +504,6 @@ pub enum Error {
 #[serde(rename_all = "camelCase")]
 struct DaemonLifecycleOutput {
     status: DaemonLifecycleStatus,
-    backend: DaemonBackend,
-    pid: u32,
     managed_codex_path: PathBuf,
     managed_codex_version: String,
     socket_path: PathBuf,
@@ -518,12 +516,6 @@ struct DaemonLifecycleOutput {
 enum DaemonLifecycleStatus {
     Started,
     AlreadyRunning,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum DaemonBackend {
-    Pid,
 }
 
 struct SplitDuplex<R, W> {
@@ -1220,14 +1212,11 @@ fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<PathBuf, Error> {
     let lifecycle: DaemonLifecycleOutput = serde_json::from_slice(stdout)
         .map_err(|error| Error::InvalidDaemonLifecycle(error.to_string()))?;
 
-    // Deserializing the closed enums above verifies the accepted status and
-    // managed PID backend. Validate the remaining cross-field invariants here.
-    let _ = (&lifecycle.status, &lifecycle.backend);
-    if lifecycle.pid == 0 {
-        return Err(Error::InvalidDaemonLifecycle(
-            "managed daemon pid must be non-zero".into(),
-        ));
-    }
+    // The lifecycle command itself establishes that this is the managed
+    // daemon path. Newer Codex releases no longer include the older
+    // informational `backend` and `pid` fields, so only validate fields that
+    // are part of the usable connection contract.
+    let _ = &lifecycle.status;
     if lifecycle.managed_codex_path.as_os_str().is_empty() {
         return Err(Error::InvalidDaemonLifecycle(
             "managedCodexPath must not be empty".into(),
@@ -1577,8 +1566,6 @@ mod tests {
     fn daemon_lifecycle_json(status: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "status": status,
-            "backend": "pid",
-            "pid": 4242,
             "managedCodexPath": "/opt/codex/bin/codex",
             "managedCodexVersion": "0.151.0",
             "socketPath": "/tmp/codex/app-server-control.sock",
@@ -1605,15 +1592,19 @@ mod tests {
             parse_daemon_lifecycle(&serde_json::to_vec(&newer_lifecycle).unwrap()).is_ok(),
             "new informational fields must not break a compatible daemon"
         );
+
+        let mut older_lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("alreadyRunning")).unwrap();
+        older_lifecycle["backend"] = json!("pid");
+        older_lifecycle["pid"] = json!(4242);
+        assert!(
+            parse_daemon_lifecycle(&serde_json::to_vec(&older_lifecycle).unwrap()).is_ok(),
+            "older informational backend and pid fields must remain accepted"
+        );
     }
 
     #[test]
     fn rejects_unmanaged_or_incompatible_daemon_lifecycles() {
-        let mut lifecycle: Value =
-            serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
-        lifecycle["backend"] = Value::Null;
-        assert!(parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle).unwrap()).is_err());
-
         let mut lifecycle: Value =
             serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();
         lifecycle["status"] = json!("stopped");
