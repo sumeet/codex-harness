@@ -1782,7 +1782,7 @@ impl TranscriptModel {
             // of potentially corrupt in-memory identity state. Older builds
             // could append a second copy of a restored history; never write
             // that ambiguity back out again.
-            items: deduplicate_transcript_items_keep_last(
+            items: normalize_transcript_items(
                 self.items
                     .iter()
                     .filter(|item| !is_transient_transport_item(item))
@@ -1821,7 +1821,7 @@ impl TranscriptModel {
 
     fn restore_persisted_snapshot(&mut self, snapshot: PersistedTranscript) -> usize {
         self.clear();
-        self.items = deduplicate_transcript_items_keep_last(
+        self.items = normalize_transcript_items(
             snapshot
                 .items
                 .into_iter()
@@ -2574,6 +2574,23 @@ impl TranscriptModel {
                         .insert(stable_key, incoming_user_content_blocks);
                 }
             }
+            return Some(index);
+        }
+
+        // A pathological or repeatedly retried compaction can emit many
+        // distinct `contextCompaction` items without any semantic activity
+        // between them. Each id is real protocol history, but painting every
+        // one as a transcript row lets internal context maintenance replace
+        // the useful activity timeline. Coalesce only an adjacent run: any
+        // user, agent, tool, or subagent item between two landmarks keeps them
+        // separate and visible.
+        if string_at(&value, "/type") == Some("contextCompaction")
+            && let Some(index) = self.items.len().checked_sub(1)
+            && is_context_compaction_item(&self.items[index])
+        {
+            let incoming = item_from_protocol(value, completed);
+            merge_context_compaction_item(&mut self.items[index], incoming);
+            self.item_indices.insert(protocol_id, index);
             return Some(index);
         }
 
@@ -3445,12 +3462,12 @@ fn merge_snapshot_items(
     fresh: Vec<TranscriptItem>,
     persisted: Vec<TranscriptItem>,
 ) -> (Vec<TranscriptItem>, usize) {
-    let fresh = deduplicate_transcript_items_keep_last(fresh);
+    let fresh = normalize_transcript_items(fresh);
     // Version-1 snapshots may contain provider-level tool wrappers that older
     // Harness builds promoted into transcript cards. They have no semantic
     // identity in `thread/read` and must not be resurrected beside their typed
     // command/file/tool counterparts.
-    let persisted = deduplicate_transcript_items_keep_last(
+    let persisted = normalize_transcript_items(
         persisted
             .into_iter()
             .filter(|item| {
@@ -3497,13 +3514,15 @@ fn merge_snapshot_items(
     (merged, restored)
 }
 
-/// Repair snapshots written by older Harness builds that appended a second
-/// copy of an already-loaded history. Transcript item keys are semantic
-/// identities: retaining more than one makes lookup ambiguous and causes the
-/// native editor to reject the entire navigation document. Keep the last
-/// occurrence because it contains the newest streamed status/content while
-/// preserving the relative order of every surviving item.
-fn deduplicate_transcript_items_keep_last(items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
+/// Repair older snapshots at the transcript's identity/presentation boundary.
+///
+/// Transcript item keys are semantic identities: retaining more than one
+/// makes lookup ambiguous and causes the native editor to reject the entire
+/// navigation document. Keep the last occurrence because it contains the
+/// newest streamed status/content. Consecutive compaction records are a second
+/// form of protocol-level duplication: their ids are distinct, but with no
+/// semantic activity between them they represent one visible landmark.
+fn normalize_transcript_items(items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
     let mut seen = HashSet::with_capacity(items.len());
     let mut unique = items
         .into_iter()
@@ -3511,7 +3530,36 @@ fn deduplicate_transcript_items_keep_last(items: Vec<TranscriptItem>) -> Vec<Tra
         .filter(|item| seen.insert(item.key.clone()))
         .collect::<Vec<_>>();
     unique.reverse();
-    unique
+
+    let mut normalized: Vec<TranscriptItem> = Vec::with_capacity(unique.len());
+    for item in unique {
+        if is_context_compaction_item(&item)
+            && let Some(previous) = normalized.last_mut()
+            && is_context_compaction_item(previous)
+        {
+            merge_context_compaction_item(previous, item);
+        } else {
+            normalized.push(item);
+        }
+    }
+    normalized
+}
+
+fn is_context_compaction_item(item: &TranscriptItem) -> bool {
+    item.kind == TranscriptKind::Trace && string_at(&item.raw, "/type") == Some("contextCompaction")
+}
+
+fn merge_context_compaction_item(existing: &mut TranscriptItem, incoming: TranscriptItem) {
+    existing.event_count = existing.event_count.saturating_add(incoming.event_count);
+    if !incoming.content.trim().is_empty() {
+        existing.content = merge_unique_reasoning(&existing.content, &incoming.content);
+    }
+    existing.title = incoming.title;
+    existing.status = incoming.status;
+    existing.raw = incoming.raw;
+    // Preserve the first row's stable key so the Rich card does not remount,
+    // while retaining the newest authoritative id for future snapshot lookup.
+    existing.protocol_id = incoming.protocol_id;
 }
 
 fn transient_transport_status(method: &str, params: &Value) -> Option<String> {
@@ -5146,6 +5194,92 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_compaction_items_coalesce_without_swallowing_subagent_activity() {
+        let mut model = TranscriptModel::default();
+        let protocol_item = |id: &str, kind: &str| Event::Notification {
+            method: "item/completed".into(),
+            params: json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": id,
+                    "type": kind,
+                    "status": "completed",
+                    "tool": "spawnAgent",
+                    "receiverThreadIds": ["child-1"]
+                }
+            }),
+        };
+
+        let outcome = model.apply_batch(
+            vec![
+                protocol_item("compaction-1", "contextCompaction"),
+                protocol_item("compaction-2", "contextCompaction"),
+                protocol_item("subagent-1", "collabAgentToolCall"),
+                protocol_item("compaction-3", "contextCompaction"),
+                protocol_item("compaction-4", "contextCompaction"),
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(outcome.dirty, HashSet::from([0, 1, 2]));
+        assert_eq!(model.items.len(), 3);
+        assert!(is_context_compaction_item(&model.items[0]));
+        assert_eq!(model.items[0].event_count, 2);
+        assert_eq!(model.items[0].key, "compaction-1");
+        assert_eq!(model.items[0].protocol_id.as_deref(), Some("compaction-2"));
+        assert_eq!(model.items[1].kind, TranscriptKind::Subagent);
+        assert!(model.items[1].is_presentationally_visible());
+        assert!(is_context_compaction_item(&model.items[2]));
+        assert_eq!(model.items[2].event_count, 2);
+        assert_eq!(model.items[2].key, "compaction-3");
+        assert_eq!(model.items[2].protocol_id.as_deref(), Some("compaction-4"));
+        assert_eq!(
+            model.raw_events.len(),
+            5,
+            "exact history remains inspectable"
+        );
+    }
+
+    #[test]
+    fn restored_snapshots_normalize_only_consecutive_compaction_runs() {
+        let compaction = |index| {
+            replay_item(
+                index,
+                TranscriptKind::Trace,
+                "Context compacted",
+                "",
+                json!({
+                    "id": format!("compaction-{index}"),
+                    "type": "contextCompaction"
+                }),
+            )
+        };
+        let activity = replay_item(
+            2,
+            TranscriptKind::Subagent,
+            "Subagent · protocol audit",
+            "Inspecting app-server events",
+            json!({"id": "activity-1", "type": "subAgentActivity"}),
+        );
+
+        let normalized = normalize_transcript_items(vec![
+            compaction(0),
+            compaction(1),
+            activity,
+            compaction(3),
+            compaction(4),
+        ]);
+
+        assert_eq!(normalized.len(), 3);
+        assert!(is_context_compaction_item(&normalized[0]));
+        assert_eq!(normalized[0].event_count, 2);
+        assert_eq!(normalized[1].kind, TranscriptKind::Subagent);
+        assert!(is_context_compaction_item(&normalized[2]));
+        assert_eq!(normalized[2].event_count, 2);
+    }
+
+    #[test]
     fn markdown_monospace_ranges_retain_plaintext_source_geometry() {
         let source = "before `running` after\n\n```rust\nprintln!(\"ok\");\n```";
         let ranges = markdown_monospace_source_ranges(source);
@@ -5236,6 +5370,7 @@ mod tests {
                 status: json!("inProgress"),
                 items: vec![item],
             }],
+            ..CodexThread::default()
         };
 
         let mut model = TranscriptModel::default();

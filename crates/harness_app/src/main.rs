@@ -134,6 +134,7 @@ const COMMAND_PREVIEW_LINES: usize = 4;
 const COMMAND_PREVIEW_BYTES: usize = 800;
 const MAX_COMPOSER_IMAGES: usize = 8;
 const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const QUEUED_PREVIEW_IMAGE_LIMIT: usize = 2;
 #[cfg(test)]
 const WEB_RESULT_PREVIEW_COUNT: usize = 3;
 const PROGRESSIVE_OUTPUT_MEDIUM_LINES: usize = 100;
@@ -2808,11 +2809,12 @@ struct ComposerSubmission {
     input: Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct QueuedTurnSubmission {
     id: Option<String>,
     client_user_message_id: String,
     input: Value,
+    preview_images: Vec<Arc<Image>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2864,6 +2866,7 @@ fn show_submission_optimistically_in_transcript(turn_active: bool) -> bool {
 }
 
 fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
+    let input = value.get("input").cloned().unwrap_or_else(|| json!([]));
     Some(QueuedTurnSubmission {
         id: Some(value.get("id")?.as_str()?.to_owned()),
         client_user_message_id: value
@@ -2871,7 +2874,8 @@ fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        input: value.get("input").cloned().unwrap_or_else(|| json!([])),
+        preview_images: queued_submission_preview_images(&input),
+        input,
     })
 }
 
@@ -2936,11 +2940,28 @@ fn queued_submission_image(block: &Value) -> Option<Arc<Image>> {
     if encoding != "base64" {
         return None;
     }
+    let max_encoded_len = MAX_COMPOSER_IMAGE_BYTES.div_ceil(3) * 4;
+    if encoded.len() > max_encoded_len {
+        return None;
+    }
     let format = ImageFormat::from_mime_type(mime_type)?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded)
         .ok()?;
+    if bytes.len() > MAX_COMPOSER_IMAGE_BYTES {
+        return None;
+    }
     Some(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+fn queued_submission_preview_images(input: &Value) -> Vec<Arc<Image>> {
+    input
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(queued_submission_image)
+        .take(QUEUED_PREVIEW_IMAGE_LIMIT)
+        .collect()
 }
 
 fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
@@ -5128,11 +5149,6 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors);
         let queue_count = self.queued_turns.len();
-        let title: SharedString = if queue_count == 1 {
-            "1 queued prompt".into()
-        } else {
-            format!("{queue_count} queued prompts").into()
-        };
         let active_turn = self.model.current_turn_id.is_some();
         let operations = self.queue_operations.clone();
         let weak = cx.weak_entity();
@@ -5141,29 +5157,12 @@ impl HarnessApp {
             div()
                 .id("queued-prompts")
                 .flex_none()
-                .max_h(px(190.))
+                .max_h(px(160.))
                 .border_t_1()
                 .border_color(visuals.divider)
                 .bg(visuals.pending_surface)
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .h(px(28.))
-                        .flex_none()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(colors.text_muted)
-                        .child(
-                            Icon::new(IconName::QueueMessage)
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(title),
-                )
                 .child(
                     div()
                         .id("queued-prompt-list")
@@ -5176,6 +5175,13 @@ impl HarnessApp {
                             let operation_pending = operation.is_some();
                             let preview = queued_submission_preview(&entry.input);
                             let image_count = queued_submission_image_count(&entry.input);
+                            let preview_image_count = entry.preview_images.len();
+                            let remaining_image_count =
+                                image_count.saturating_sub(preview_image_count);
+                            let position_tooltip = format!(
+                                "Queued prompt {} of {queue_count}",
+                                index + 1
+                            );
                             let weak_edit = weak.clone();
                             let weak_steer = weak.clone();
                             let weak_send = weak.clone();
@@ -5183,14 +5189,56 @@ impl HarnessApp {
                             div()
                                 .id(("queued-prompt", index))
                                 .group("queued-prompt")
-                                .mx_2()
-                                .h(px(38.))
-                                .px_2()
-                                .border_t_1()
-                                .border_color(colors.border_variant)
+                                .h(px(32.))
+                                .flex_none()
+                                .px_2p5()
                                 .flex()
                                 .items_center()
                                 .gap_1()
+                                .when(index + 1 < queue_count, |this| {
+                                    this.border_b_1().border_color(colors.border_variant)
+                                })
+                                .child(
+                                    div()
+                                        .id(("queued-prompt-position", index))
+                                        .flex_none()
+                                        .tooltip(Tooltip::text(position_tooltip))
+                                        .child(
+                                            Icon::new(IconName::QueueMessage)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        ),
+                                )
+                                .children(entry.preview_images.iter().map(|image| {
+                                    div()
+                                        .size(px(22.))
+                                        .flex_none()
+                                        .overflow_hidden()
+                                        .rounded_xs()
+                                        .border_1()
+                                        .border_color(colors.border_variant)
+                                        .bg(colors.editor_background)
+                                        .child(
+                                            gpui::img(image.clone())
+                                                .size_full()
+                                                .object_fit(ObjectFit::Cover),
+                                        )
+                                }))
+                                .when(remaining_image_count > 0, |this| {
+                                    this.child(
+                                        Label::new(if preview_image_count == 0 {
+                                            if remaining_image_count == 1 {
+                                                "1 image".into()
+                                            } else {
+                                                format!("{remaining_image_count} images")
+                                            }
+                                        } else {
+                                            format!("+{remaining_image_count}")
+                                        })
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                    )
+                                })
                                 .child(
                                     div()
                                         .flex_1()
@@ -5204,23 +5252,12 @@ impl HarnessApp {
                                             preview
                                         }),
                                 )
-                                .when(image_count > 0, |this| {
-                                    this.child(
-                                        Label::new(if image_count == 1 {
-                                            "1 image".into()
-                                        } else {
-                                            format!("{image_count} images")
-                                        })
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                                })
                                 .child(
                                     div()
                                         .flex_none()
                                         .flex()
                                         .items_center()
-                                        .gap_1()
+                                        .gap_0p5()
                                         .when(!queue_ready && operation.is_none(), |this| {
                                             this.child(SpinnerLabel::new().size(LabelSize::Small))
                                                 .child(
@@ -5238,36 +5275,18 @@ impl HarnessApp {
                                                 )
                                         })
                                         .when(queue_ready && !operation_pending, |this| {
-                                            this.child(
-                                                IconButton::new(
-                                                    ("edit-queued-prompt", index),
-                                                    IconName::Pencil,
-                                                )
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Compact)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("Edit queued prompt")
-                                                .on_click(move |_, window, cx| {
-                                                    let client_id = client_id.clone();
-                                                    weak_edit
-                                                        .update(cx, |this, cx| {
-                                                            this.edit_queued_turn(
-                                                                client_id, window, cx,
-                                                            )
-                                                        })
-                                                        .ok();
-                                                }),
-                                            )
-                                            .when(active_turn, |this| {
+                                            this.when(active_turn, |this| {
                                                 let client_id =
                                                     entry.client_user_message_id.clone();
                                                 this.child(
-                                                    Button::new(
+                                                    IconButton::new(
                                                         ("steer-queued-prompt", index),
-                                                        "Add to response",
+                                                        IconName::ForwardArrowUp,
                                                     )
+                                                    .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
+                                                    .aria_label("Add queued prompt to response")
                                                     .tooltip(Tooltip::text(
                                                         "Add to the active response at its next input boundary · Ctrl-Shift-Enter for a draft",
                                                     ))
@@ -5284,19 +5303,21 @@ impl HarnessApp {
                                                 )
                                             })
                                             .child(
-                                                Button::new(
+                                                IconButton::new(
                                                     ("send-queued-prompt", index),
-                                                    if active_turn {
-                                                        "Interrupt & run"
-                                                    } else {
-                                                        "Start now"
-                                                    },
+                                                    IconName::PlayFilled,
                                                 )
+                                                .shape(IconButtonShape::Square)
                                                 .size(ButtonSize::Compact)
                                                 .style(if index == 0 {
                                                     ButtonStyle::Outlined
                                                 } else {
                                                     ButtonStyle::Subtle
+                                                })
+                                                .aria_label(if active_turn {
+                                                    "Interrupt response and run queued prompt"
+                                                } else {
+                                                    "Run queued prompt now"
                                                 })
                                                 .tooltip(Tooltip::text(if active_turn {
                                                     "Stop the active response and start this prompt as a new turn"
@@ -5320,6 +5341,27 @@ impl HarnessApp {
                                             )
                                             .child(
                                                 IconButton::new(
+                                                    ("edit-queued-prompt", index),
+                                                    IconName::Pencil,
+                                                )
+                                                .shape(IconButtonShape::Square)
+                                                .size(ButtonSize::Compact)
+                                                .style(ButtonStyle::Subtle)
+                                                .aria_label("Edit queued prompt")
+                                                .tooltip(Tooltip::text("Edit queued prompt"))
+                                                .on_click(move |_, window, cx| {
+                                                    let client_id = client_id.clone();
+                                                    weak_edit
+                                                        .update(cx, |this, cx| {
+                                                            this.edit_queued_turn(
+                                                                client_id, window, cx,
+                                                            )
+                                                        })
+                                                        .ok();
+                                                }),
+                                            )
+                                            .child(
+                                                IconButton::new(
                                                     ("remove-queued-prompt", index),
                                                     IconName::Trash,
                                                 )
@@ -5327,6 +5369,7 @@ impl HarnessApp {
                                                 .size(ButtonSize::Compact)
                                                 .style(ButtonStyle::Subtle)
                                                 .aria_label("Remove queued prompt")
+                                                .tooltip(Tooltip::text("Remove queued prompt"))
                                                 .on_click({
                                                     let client_id =
                                                         entry.client_user_message_id.clone();
@@ -7968,6 +8011,7 @@ impl HarnessApp {
         self.queued_turns.push_back(QueuedTurnSubmission {
             id: None,
             client_user_message_id: client_user_message_id.clone(),
+            preview_images: queued_submission_preview_images(&input),
             input: input.clone(),
         });
         cx.spawn(async move |this, cx| {
@@ -15191,6 +15235,7 @@ mod tests {
             cwd: String::new(),
             updated_at,
             turns: Vec::new(),
+            ..CodexThread::default()
         }
     }
 
@@ -15370,6 +15415,7 @@ mod tests {
             "first line second line"
         );
         assert_eq!(queued_submission_image_count(&queued[0].input), 1);
+        assert_eq!(queued[0].preview_images.len(), 1);
     }
 
     #[test]
@@ -16256,6 +16302,7 @@ mod tests {
                 status,
                 items: Vec::new(),
             }],
+            ..CodexThread::default()
         };
         assert!(thread_has_active_turn(&thread(json!("inProgress"))));
         assert!(thread_has_active_turn(&thread(

@@ -23,7 +23,7 @@ use futures_lite::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -57,7 +57,7 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexThread {
     pub id: String,
@@ -70,7 +70,180 @@ pub struct CodexThread {
     #[serde(default)]
     pub updated_at: i64,
     #[serde(default)]
+    pub parent_thread_id: Option<String>,
+    #[serde(default)]
+    pub forked_from_id: Option<String>,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub source: CodexSessionSource,
+    #[serde(default)]
+    pub thread_source: Option<String>,
+    #[serde(default)]
+    pub status: CodexThreadStatus,
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub can_accept_direct_input: Option<bool>,
+    #[serde(default)]
     pub turns: Vec<CodexTurn>,
+}
+
+impl CodexThread {
+    /// Returns the direct parent reported by app-server, with a fallback to
+    /// the source metadata written by older sub-agent rollouts.
+    pub fn effective_parent_thread_id(&self) -> Option<&str> {
+        self.parent_thread_id.as_deref().or_else(|| {
+            let CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(spawn)) =
+                &self.source
+            else {
+                return None;
+            };
+            Some(spawn.parent_thread_id.as_str())
+        })
+    }
+}
+
+/// The runtime status app-server reports for a thread.
+///
+/// Unknown variants retain their raw payload so a newer app-server does not
+/// make an older client unable to list threads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexThreadStatus {
+    NotLoaded,
+    Idle,
+    SystemError,
+    Active { active_flags: Vec<String> },
+    Unknown(Value),
+}
+
+impl Default for CodexThreadStatus {
+    fn default() -> Self {
+        Self::Unknown(Value::Null)
+    }
+}
+
+impl<'de> Deserialize<'de> for CodexThreadStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let status = value.get("type").and_then(Value::as_str);
+        Ok(match status {
+            Some("notLoaded") => Self::NotLoaded,
+            Some("idle") => Self::Idle,
+            Some("systemError") => Self::SystemError,
+            Some("active") => Self::Active {
+                active_flags: value
+                    .get("activeFlags")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+            },
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+/// Origin of a Codex session. Sub-agent sessions carry the spawn metadata
+/// needed to reconstruct a hierarchy even when older records omit the newer
+/// top-level convenience fields.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexSessionSource {
+    Cli,
+    VsCode,
+    Exec,
+    AppServer,
+    Custom(String),
+    SubAgent(CodexSubagentSource),
+    Unknown(Value),
+}
+
+impl Default for CodexSessionSource {
+    fn default() -> Self {
+        Self::Unknown(Value::Null)
+    }
+}
+
+impl<'de> Deserialize<'de> for CodexSessionSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Ok(match &value {
+            Value::String(source) => match source.as_str() {
+                "cli" => Self::Cli,
+                "vscode" => Self::VsCode,
+                "exec" => Self::Exec,
+                "appServer" => Self::AppServer,
+                _ => Self::Unknown(value),
+            },
+            Value::Object(source) => {
+                if let Some(custom) = source.get("custom").and_then(Value::as_str) {
+                    Self::Custom(custom.to_owned())
+                } else if let Some(subagent) = source.get("subAgent") {
+                    Self::SubAgent(CodexSubagentSource::from_value(subagent.clone()))
+                } else {
+                    Self::Unknown(value)
+                }
+            }
+            _ => Self::Unknown(value),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexSubagentSource {
+    Review,
+    Compact,
+    MemoryConsolidation,
+    ThreadSpawn(CodexThreadSpawnSource),
+    Other(String),
+    Unknown(Value),
+}
+
+impl CodexSubagentSource {
+    fn from_value(value: Value) -> Self {
+        match &value {
+            Value::String(source) => match source.as_str() {
+                "review" => Self::Review,
+                "compact" => Self::Compact,
+                "memory_consolidation" => Self::MemoryConsolidation,
+                _ => Self::Unknown(value),
+            },
+            Value::Object(source) => {
+                if let Some(other) = source.get("other").and_then(Value::as_str) {
+                    Self::Other(other.to_owned())
+                } else if let Some(spawn) = source.get("thread_spawn") {
+                    serde_json::from_value(spawn.clone())
+                        .map(Self::ThreadSpawn)
+                        .unwrap_or(Self::Unknown(value))
+                } else {
+                    Self::Unknown(value)
+                }
+            }
+            _ => Self::Unknown(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CodexThreadSpawnSource {
+    pub parent_thread_id: String,
+    pub depth: i32,
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+    #[serde(default)]
+    pub agent_role: Option<String>,
+    #[serde(default)]
+    pub agent_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -387,16 +560,51 @@ impl Client {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ThreadListResponse, Error> {
+        self.list_threads_with_relationship(limit, cursor, None)
+            .await
+    }
+
+    /// List threads spawned directly by `parent_thread_id`.
+    pub async fn list_child_threads(
+        &self,
+        parent_thread_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ThreadListResponse, Error> {
+        self.list_threads_with_relationship(
+            limit,
+            cursor,
+            Some(ThreadListRelationship::DirectChildren(parent_thread_id)),
+        )
+        .await
+    }
+
+    /// List every spawned descendant of `ancestor_thread_id`, at any depth.
+    /// The ancestor itself is not included in the response.
+    pub async fn list_descendant_threads(
+        &self,
+        ancestor_thread_id: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ThreadListResponse, Error> {
+        self.list_threads_with_relationship(
+            limit,
+            cursor,
+            Some(ThreadListRelationship::Descendants(ancestor_thread_id)),
+        )
+        .await
+    }
+
+    async fn list_threads_with_relationship(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+        relationship: Option<ThreadListRelationship<'_>>,
+    ) -> Result<ThreadListResponse, Error> {
         let response = self
             .request(
                 "thread/list",
-                json!({
-                    "archived": false,
-                    "cursor": cursor,
-                    "limit": limit,
-                    "sortDirection": "desc",
-                    "sortKey": "recency_at",
-                }),
+                thread_list_params(limit, cursor, relationship),
             )
             .await?;
         Ok(serde_json::from_value(response)?)
@@ -630,6 +838,36 @@ impl Client {
             .await
             .map_err(|_| Error::TransportClosed)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadListRelationship<'a> {
+    DirectChildren(&'a str),
+    Descendants(&'a str),
+}
+
+fn thread_list_params(
+    limit: usize,
+    cursor: Option<&str>,
+    relationship: Option<ThreadListRelationship<'_>>,
+) -> Value {
+    let mut params = json!({
+        "archived": false,
+        "cursor": cursor,
+        "limit": limit,
+        "sortDirection": "desc",
+        "sortKey": "recency_at",
+    });
+    match relationship {
+        Some(ThreadListRelationship::DirectChildren(parent_thread_id)) => {
+            params["parentThreadId"] = parent_thread_id.into();
+        }
+        Some(ThreadListRelationship::Descendants(ancestor_thread_id)) => {
+            params["ancestorThreadId"] = ancestor_thread_id.into();
+        }
+        None => {}
+    }
+    params
 }
 
 fn turn_start_params(thread_id: &str, input: Value, client_user_message_id: Option<&str>) -> Value {
@@ -905,6 +1143,40 @@ mod tests {
     }
 
     #[test]
+    fn thread_relationship_filters_are_mutually_exclusive_on_the_wire() {
+        assert_eq!(
+            thread_list_params(
+                50,
+                Some("next-page"),
+                Some(ThreadListRelationship::DirectChildren("parent-1")),
+            ),
+            json!({
+                "archived": false,
+                "cursor": "next-page",
+                "limit": 50,
+                "parentThreadId": "parent-1",
+                "sortDirection": "desc",
+                "sortKey": "recency_at",
+            })
+        );
+        assert_eq!(
+            thread_list_params(
+                100,
+                None,
+                Some(ThreadListRelationship::Descendants("ancestor-1")),
+            ),
+            json!({
+                "ancestorThreadId": "ancestor-1",
+                "archived": false,
+                "cursor": null,
+                "limit": 100,
+                "sortDirection": "desc",
+                "sortKey": "recency_at",
+            })
+        );
+    }
+
+    #[test]
     fn steering_and_queueing_carry_stable_user_message_ids() {
         let input = json!([{"type": "text", "text": "keep going"}]);
         assert_eq!(
@@ -1091,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_thread_list_response_without_unneeded_protocol_fields() {
+    fn decodes_thread_list_response_with_subagent_hierarchy_metadata() {
         let response = serde_json::from_value::<ThreadListResponse>(json!({
             "data": [{
                 "id": "thread_1",
@@ -1104,8 +1376,23 @@ mod tests {
                 "ephemeral": false,
                 "modelProvider": "openai",
                 "sessionId": "session_1",
-                "source": "cli",
-                "status": {"type": "idle"},
+                "parentThreadId": "parent_1",
+                "forkedFromId": "template_1",
+                "source": {"subAgent": {"thread_spawn": {
+                    "parent_thread_id": "parent_1",
+                    "depth": 2,
+                    "agent_nickname": "Scout",
+                    "agent_role": "explorer",
+                    "agent_path": "/root/scout"
+                }}},
+                "threadSource": "harness",
+                "status": {
+                    "type": "active",
+                    "activeFlags": ["waitingOnApproval"]
+                },
+                "agentNickname": "Scout",
+                "agentRole": "explorer",
+                "canAcceptDirectInput": true,
                 "turns": []
             }],
             "nextCursor": "next"
@@ -1114,7 +1401,65 @@ mod tests {
 
         assert_eq!(response.data[0].name.as_deref(), Some("Fast UI"));
         assert_eq!(response.data[0].updated_at, 42);
+        assert_eq!(response.data[0].session_id, "session_1");
+        assert_eq!(
+            response.data[0].effective_parent_thread_id(),
+            Some("parent_1")
+        );
+        assert_eq!(
+            response.data[0].forked_from_id.as_deref(),
+            Some("template_1")
+        );
+        assert_eq!(
+            response.data[0].status,
+            CodexThreadStatus::Active {
+                active_flags: vec!["waitingOnApproval".into()]
+            }
+        );
+        assert_eq!(response.data[0].agent_nickname.as_deref(), Some("Scout"));
+        assert_eq!(response.data[0].agent_role.as_deref(), Some("explorer"));
+        assert_eq!(response.data[0].can_accept_direct_input, Some(true));
+        assert_eq!(response.data[0].thread_source.as_deref(), Some("harness"));
+        assert!(matches!(
+            &response.data[0].source,
+            CodexSessionSource::SubAgent(CodexSubagentSource::ThreadSpawn(spawn))
+                if spawn.parent_thread_id == "parent_1"
+                    && spawn.depth == 2
+                    && spawn.agent_path.as_deref() == Some("/root/scout")
+        ));
         assert_eq!(response.next_cursor.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn hierarchy_parsing_is_forward_compatible_and_supports_legacy_parent_metadata() {
+        let legacy = serde_json::from_value::<CodexThread>(json!({
+            "id": "child_1",
+            "source": {"subAgent": {"thread_spawn": {
+                "parent_thread_id": "parent_1",
+                "depth": 1
+            }}},
+            "status": {"type": "futureStatus", "detail": "new"}
+        }))
+        .expect("future metadata should not prevent thread parsing");
+
+        assert_eq!(legacy.effective_parent_thread_id(), Some("parent_1"));
+        assert_eq!(
+            legacy.status,
+            CodexThreadStatus::Unknown(json!({
+                "type": "futureStatus",
+                "detail": "new"
+            }))
+        );
+
+        let future_source = serde_json::from_value::<CodexThread>(json!({
+            "id": "child_2",
+            "source": {"futureSource": {"version": 2}}
+        }))
+        .expect("future source should not prevent thread parsing");
+        assert_eq!(
+            future_source.source,
+            CodexSessionSource::Unknown(json!({"futureSource": {"version": 2}}))
+        );
     }
 
     #[test]
