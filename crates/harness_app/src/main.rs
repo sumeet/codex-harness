@@ -16367,6 +16367,12 @@ impl Render for HarnessApp {
                 )
                 .into_any_element()
         };
+        let following_tail = if self.buffer_view {
+            self.transcript_editor.read(cx).is_following_tail()
+        } else {
+            list_state.is_following_tail()
+        };
+        let transcript_narrow = window.viewport_size().width < px(720.);
         let transcript_body = if self.buffer_view {
             div()
                 .flex_1()
@@ -16405,7 +16411,6 @@ impl Render for HarnessApp {
                     window,
                     cx,
                 );
-            let show_latest = !list_state.is_following_tail();
             div()
                 .relative()
                 .flex_1()
@@ -16426,43 +16431,6 @@ impl Render for HarnessApp {
                     }),
                 )
                 .child(rich_list)
-                .when(show_latest, |this| {
-                    this.child(
-                        div().absolute().right(px(10.)).bottom(px(10.)).child(
-                            div()
-                                .relative()
-                                .child(
-                                    IconButton::new("transcript-latest", IconName::ArrowDown)
-                                        .shape(IconButtonShape::Square)
-                                        .size(ButtonSize::Compact)
-                                        .style(ButtonStyle::Subtle)
-                                        .icon_color(if turn_active {
-                                            Color::Accent
-                                        } else {
-                                            Color::Muted
-                                        })
-                                        .aria_label("Return to the live transcript")
-                                        .tooltip(Tooltip::text(
-                                            "Return to the live transcript · G or Ctrl-End",
-                                        ))
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.go_to_transcript_tail(window, cx)
-                                        })),
-                                )
-                                .when(turn_active, |this| {
-                                    this.child(
-                                        div()
-                                            .absolute()
-                                            .top(px(1.))
-                                            .right(px(1.))
-                                            .size(px(5.))
-                                            .rounded_full()
-                                            .bg(colors.text_accent),
-                                    )
-                                }),
-                        ),
-                    )
-                })
                 .when(rich_vim_experiment(), |this| {
                     // Keep the native Editor fully laid out so its Vim action
                     // handlers and motion state remain real, but position it
@@ -16488,6 +16456,63 @@ impl Render for HarnessApp {
                 })
                 .into_any_element()
         };
+        let transcript_tail_control = (!following_tail).then(|| {
+            let activity_color = if self.transient_turn_status.is_some() {
+                Color::Warning
+            } else {
+                Color::Accent
+            };
+            div()
+                .absolute()
+                .left(if transcript_narrow { px(10.) } else { px(18.) })
+                .bottom(px(10.))
+                .h(px(28.))
+                .px_1()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .rounded_md()
+                .border_1()
+                .border_color(colors.border_variant)
+                .bg(visuals.raised_surface.opacity(0.94))
+                .shadow_sm()
+                .when(turn_active, |this| {
+                    this.child(
+                        div()
+                            .id("offscreen-turn-activity")
+                            .w(px(20.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .tooltip(Tooltip::text("Codex is still working"))
+                            .child(
+                                SpinnerLabel::dots()
+                                    .size(LabelSize::Large)
+                                    .color(activity_color),
+                            ),
+                    )
+                })
+                .child(
+                    IconButton::new("transcript-latest", IconName::ArrowDown)
+                        .shape(IconButtonShape::Square)
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Subtle)
+                        .icon_color(if turn_active {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        })
+                        .aria_label("Return to the live transcript")
+                        .tooltip(Tooltip::text(
+                            "Return to the live transcript · G or Ctrl-End",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.go_to_transcript_tail(window, cx)
+                        })),
+                )
+                .into_any_element()
+        });
         let command_line_input = self
             .search_visible
             .then(|| self.search_editor.read(cx).text(cx));
@@ -16525,11 +16550,6 @@ impl Render for HarnessApp {
         let permission_selector = self.render_permission_selector(cx);
         let composer_actions =
             self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
-        let following_tail = if self.buffer_view {
-            self.transcript_editor.read(cx).is_following_tail()
-        } else {
-            list_state.is_following_tail()
-        };
         let pending_outbound_proxy = self.render_pending_outbound_proxy(following_tail, cx);
         let queued_turns = self.render_queued_turns(cx);
 
@@ -16834,7 +16854,17 @@ impl Render for HarnessApp {
                                 .child(error),
                         )
                     })
-                    .child(div().flex_1().min_h_0().flex().child(transcript_body))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .child(transcript_body)
+                            .when_some(transcript_tail_control, |this, control| {
+                                this.child(control)
+                            }),
+                    )
                     .when(self.model.items.is_empty(), |this| {
                         this.child(
                             div()
@@ -20360,6 +20390,30 @@ mod tests {
         model.items[0].content = "complete".into();
         model.items[0].status = Some("completed".into());
         assert!(!transcript_has_inline_activity(&model));
+    }
+
+    #[test]
+    fn offscreen_active_tail_pairs_live_spinner_with_nearby_navigation() {
+        let source = include_str!("main.rs");
+        let control = source
+            .split_once("let transcript_tail_control =")
+            .and_then(|(_, after)| after.split_once("let command_line_input ="))
+            .map(|(body, _)| body)
+            .expect("offscreen transcript tail control must remain auditable");
+
+        assert!(control.contains("(!following_tail)"));
+        assert!(control.contains("SpinnerLabel::dots()"));
+        assert!(control.contains("IconName::ArrowDown"));
+        assert!(control.contains("Codex is still working"));
+        assert!(control.contains(".left("));
+        assert!(
+            !control.contains(".right("),
+            "tail status belongs beside the transcript's activity gutter, not at the far edge"
+        );
+        assert!(
+            !control.contains("rounded_full"),
+            "a live spinner must not regress into an ambiguous status dot"
+        );
     }
 
     #[test]
