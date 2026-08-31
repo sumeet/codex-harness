@@ -12,7 +12,8 @@ use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{
     Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus,
-    Event as AppServerEvent, ThreadOpenResponse,
+    Event as AppServerEvent, SortDirection, ThreadItemsListParams, ThreadOpenResponse,
+    ThreadResumeInitialTurnsPageParams,
 };
 use file_icons::FileIcons;
 use gpui::{
@@ -133,6 +134,9 @@ const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
 const CHILD_HIERARCHY_REFRESH_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const THIN_ATTACH_TRANSCRIPT_CACHE_BYTES: u64 = 8 * 1024 * 1024;
+const ACTIVE_TRANSCRIPT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
+const HISTORY_CATCHUP_PAGE_ITEMS: u32 = 128;
+const MAX_HISTORY_CATCHUP_PAGES: usize = 10_000;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
 const COMMAND_PREVIEW_LINES: usize = 4;
@@ -1259,6 +1263,14 @@ fn rich_transcript_entry_placement(
     target_item: Option<usize>,
 ) -> Option<usize> {
     target_item.filter(|target| !cursor_initialized || current_item != Some(*target))
+}
+
+fn transcript_selection_is_authoritative(
+    buffer_view: bool,
+    cursor_initialized: bool,
+    rich_pointer_gesture_active: bool,
+) -> bool {
+    buffer_view || cursor_initialized || rich_pointer_gesture_active
 }
 
 /// Route one visible structured-text fragment into the canonical transcript
@@ -3711,10 +3723,15 @@ struct HarnessApp {
     loading_thread: bool,
     attaching_thread: bool,
     attach_cache_bytes: Option<u64>,
+    history_hydrating: bool,
+    history_live_item_keys: HashSet<String>,
     thread_read_only_reason: Option<SharedString>,
     error: Option<SharedString>,
     transient_turn_status: Option<SharedString>,
     model: TranscriptModel,
+    transcript_history_complete: bool,
+    transcript_checkpoint_scheduled: bool,
+    transcript_checkpoint_generation: u64,
     composer: Entity<LocalEditor>,
     composer_images: Vec<ComposerImageAttachment>,
     next_composer_image_id: u64,
@@ -5547,7 +5564,56 @@ impl HarnessApp {
         .detach();
     }
 
+    fn set_transcript_history_complete(&mut self, complete: bool) {
+        if self.transcript_history_complete == complete {
+            return;
+        }
+        self.transcript_history_complete = complete;
+        self.transcript_checkpoint_generation =
+            self.transcript_checkpoint_generation.wrapping_add(1);
+        self.transcript_checkpoint_scheduled = false;
+    }
+
+    fn schedule_active_transcript_checkpoint(&mut self, cx: &mut Context<Self>) {
+        if !self.transcript_history_complete
+            || self.transcript_checkpoint_scheduled
+            || self.replay_count.is_some()
+        {
+            return;
+        }
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        self.transcript_checkpoint_generation =
+            self.transcript_checkpoint_generation.wrapping_add(1);
+        let generation = self.transcript_checkpoint_generation;
+        self.transcript_checkpoint_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(ACTIVE_TRANSCRIPT_CHECKPOINT_INTERVAL)
+                .await;
+            _ = this.update(cx, |this, cx| {
+                if this.transcript_checkpoint_generation != generation {
+                    return;
+                }
+                this.transcript_checkpoint_scheduled = false;
+                if this.selected_thread_id.as_deref() == Some(thread_id.as_str())
+                    && this.transcript_history_complete
+                {
+                    this.persist_transcript_in_background(&thread_id, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     fn persist_transcript_in_background(&self, thread_id: &str, cx: &mut Context<Self>) {
+        if !self.transcript_history_complete {
+            log::debug!(
+                "not caching task {thread_id} until paginated history reconciliation is complete"
+            );
+            return;
+        }
         let thread_id = thread_id.to_owned();
         cx.spawn(async move |this, cx| {
             // Let the newly loaded transcript reach the compositor before
@@ -5558,7 +5624,9 @@ impl HarnessApp {
                 .timer(Duration::from_millis(50))
                 .await;
             _ = this.update(cx, |this, cx| {
-                if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
+                    || !this.transcript_history_complete
+                {
                     return;
                 }
                 let snapshot = match this.model.prepare_transcript_snapshot(&thread_id) {
@@ -6684,6 +6752,19 @@ impl HarnessApp {
                 if !rich_pointer_gesture_active {
                     this.rich_pointer_autoscroll_suppression = None;
                 }
+                // Rebuilding the hidden Rich/Vim document during thread
+                // restore can move the Editor's default selection. Until a
+                // user click, pointer gesture, or transcript-focus handoff has
+                // established an intentional cursor, that selection must not
+                // pause Tail mode or reveal an old transcript item.
+                if !transcript_selection_is_authoritative(
+                    this.buffer_view,
+                    this.transcript_cursor_initialized,
+                    rich_pointer_gesture_active,
+                ) {
+                    this.rich_navigation_selection = None;
+                    return;
+                }
                 // Snapshot the native selection once at the event boundary. Rich
                 // rendering can then consume the cached logical ranges without
                 // rebuilding an Editor display snapshot and copying selected
@@ -6844,11 +6925,16 @@ impl HarnessApp {
             loading_thread: false,
             attaching_thread: false,
             attach_cache_bytes: None,
+            history_hydrating: false,
+            history_live_item_keys: HashSet::default(),
             thread_read_only_reason: None,
             error: None,
             transient_turn_status: None,
             selected_item: model.items.len().saturating_sub(1),
             model,
+            transcript_history_complete: true,
+            transcript_checkpoint_scheduled: false,
+            transcript_checkpoint_generation: 0,
             composer,
             composer_images: Vec::new(),
             next_composer_image_id: 0,
@@ -7362,9 +7448,19 @@ impl HarnessApp {
         let Some(client) = self.client.clone() else {
             return;
         };
+        // The local cache can predate live events that were produced after
+        // the last process exited. Do not let a thin attach overwrite that
+        // cache until paginated history has proved a continuous overlap.
+        self.set_transcript_history_complete(false);
         let attach_cache_bytes = model::TranscriptModel::persisted_transcript_size(thread_id)
             .ok()
             .flatten();
+        let cached_protocol_ids = self
+            .model
+            .items
+            .iter()
+            .filter_map(|item| item.protocol_id.clone())
+            .collect::<HashSet<_>>();
         if attach_cache_bytes.is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES) {
             // A thin attach is the only safe automatic path for an oversized
             // local transcript. If even that kills App Server, do not turn one
@@ -7376,11 +7472,18 @@ impl HarnessApp {
         self.loading_thread = false;
         self.attaching_thread = true;
         self.attach_cache_bytes = attach_cache_bytes;
+        self.history_hydrating = true;
+        self.history_live_item_keys.clear();
         self.thread_read_only_reason = None;
         self.error = None;
         self.thread_open_task = cx.spawn(async move |this, cx| {
             let attach_started_at = Instant::now();
-            let attached = client.attach_thread_with_settings(&thread_id).await;
+            let attached = client
+                .attach_thread_with_initial_turns_page(
+                    &thread_id,
+                    ThreadResumeInitialTurnsPageParams::latest_turn_state(),
+                )
+                .await;
             let attach_elapsed = attach_started_at.elapsed();
             if attach_elapsed >= Duration::from_secs(2) {
                 log::warn!(
@@ -7405,6 +7508,124 @@ impl HarnessApp {
                     attached.is_ok(),
                 );
             }
+            let attached = match attached {
+                Ok(attached) => attached,
+                Err(error) => {
+                    _ = this.update(cx, |this, cx| {
+                        if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
+                            return;
+                        }
+                        // Never fall back to an unbounded full read here: for
+                        // a multi-GB rollout that can repeat the very OOM which
+                        // caused the disconnect.
+                        this.attaching_thread = false;
+                        this.attach_cache_bytes = None;
+                        this.history_hydrating = false;
+                        this.history_live_item_keys.clear();
+                        this.thread_read_only_reason = Some(
+                            "Could not restore the live connection. Cached history is read-only."
+                                .into(),
+                        );
+                        this.error = Some(format!("Could not reattach task: {error}").into());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let active_turn_id = active_open_turn_id(&attached).map(ToOwned::to_owned);
+            let authoritative_turn_state_loaded = active_turn_id.is_some()
+                || !matches!(&attached.thread.status, CodexThreadStatus::Active { .. });
+            let mut cursor = attached.items_backwards_cursor.clone();
+            let still_current = this
+                .update(cx, |this, cx| {
+                    if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
+                        || !this
+                            .client
+                            .as_ref()
+                            .is_some_and(|current| Rc::ptr_eq(current, &client))
+                    {
+                        return false;
+                    }
+                    // The bounded initial page restores lifecycle authority
+                    // immediately; older semantic history can catch up in the
+                    // background without hiding Stop or sidebar activity.
+                    this.loaded_thread_updated_at = Some(attached.thread.updated_at);
+                    if let Some(turn_id) = active_turn_id.clone() {
+                        this.model.current_turn_id = Some(turn_id);
+                    }
+                    if let Some(listed) = this
+                        .threads
+                        .iter_mut()
+                        .find(|listed| listed.id == thread_id)
+                    {
+                        listed.status = attached.thread.status.clone();
+                        listed.updated_at = attached.thread.updated_at;
+                    }
+                    this.apply_thread_open_settings(&attached);
+                    this.load_server_options(cx);
+                    this.attach_cache_bytes = None;
+                    this.thread_read_only_reason = None;
+                    this.reconnect_attempts = 0;
+                    this.error = None;
+                    this.refresh_queued_turns(cx);
+                    this.schedule_child_hierarchy_refresh(cx);
+                    this.complete_thread_open_request_routing(authoritative_turn_state_loaded, cx);
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+
+            let mut entries_desc = Vec::new();
+            let mut seen_item_ids = HashSet::new();
+            let mut seen_cursors = HashSet::new();
+            let mut found_overlap = false;
+            let mut reached_history_start = false;
+            let mut catchup_error = None;
+
+            for _ in 0..MAX_HISTORY_CATCHUP_PAGES {
+                if let Some(cursor) = cursor.as_ref()
+                    && !seen_cursors.insert(cursor.clone())
+                {
+                    catchup_error = Some("App Server repeated a history cursor".to_owned());
+                    break;
+                }
+                let mut params = ThreadItemsListParams::new(thread_id.clone());
+                params.cursor = cursor;
+                params.limit = Some(HISTORY_CATCHUP_PAGE_ITEMS);
+                params.sort_direction = Some(SortDirection::Desc);
+                let page = match client.list_thread_items(params).await {
+                    Ok(page) => page,
+                    Err(error) => {
+                        catchup_error = Some(error.to_string());
+                        break;
+                    }
+                };
+                for entry in page.data {
+                    if cached_protocol_ids.contains(&entry.item.id) {
+                        found_overlap = true;
+                    }
+                    if seen_item_ids.insert(entry.item.id.clone()) {
+                        entries_desc.push(entry);
+                    }
+                }
+                if found_overlap {
+                    break;
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    reached_history_start = true;
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            if !found_overlap && !reached_history_start && catchup_error.is_none() {
+                catchup_error = Some("History catch-up exceeded its safety page limit".into());
+            }
+            entries_desc.reverse();
+
             _ = this.update(cx, |this, cx| {
                 if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
                     || !this
@@ -7414,40 +7635,88 @@ impl HarnessApp {
                 {
                     return;
                 }
-                match attached {
-                    Ok(attached) => {
-                        // `excludeTurns: true` deliberately leaves the locally
-                        // rendered transcript untouched. Only live authority and
-                        // resolved settings cross this reconnect boundary.
-                        this.loaded_thread_updated_at = Some(attached.thread.updated_at);
-                        if let Some(turn_id) = active_thread_turn_id(&attached.thread) {
-                            this.model.current_turn_id = Some(turn_id.to_owned());
+                let protected_keys = std::mem::take(&mut this.history_live_item_keys);
+                let was_following_tail = this.list_state.is_following_tail();
+                let preserved_top = (!was_following_tail).then(|| {
+                    let top = this.list_state.logical_scroll_top();
+                    this.model.items.get(top.item_ix).map(|item| {
+                        (item.key.clone(), top.offset_in_item)
+                    })
+                }).flatten();
+                let selected_key = this
+                    .model
+                    .items
+                    .get(this.selected_item)
+                    .map(|item| item.key.clone());
+                let outcome = if found_overlap {
+                    this.model
+                        .merge_thread_item_entries_protecting(&entries_desc, &protected_keys)
+                } else if reached_history_start {
+                    this.model
+                        .replace_thread_item_entries_protecting(&entries_desc, &protected_keys)
+                } else {
+                    model::ThreadHistoryMergeOutcome::default()
+                };
+
+                if outcome.applied {
+                    this.list_state.splice(0..outcome.old_len, outcome.new_len);
+                    this.markdown_cache.clear();
+                    this.rich_nested_scrolls.clear();
+                    this.raw_visible.clear();
+                    this.mark_all_image_surfaces_dirty();
+                    this.retire_all_request_surfaces();
+                    this.selected_item = if was_following_tail {
+                        this.model.items.len().saturating_sub(1)
+                    } else {
+                        selected_key
+                            .as_deref()
+                            .and_then(|key| {
+                                this.model.items.iter().position(|item| item.key == key)
+                            })
+                            .unwrap_or_else(|| {
+                                this.selected_item
+                                    .min(this.model.items.len().saturating_sub(1))
+                            })
+                    };
+                    if !this.search_query.is_empty() && !this.search_returns_to_buffer {
+                        this.rebuild_search_matches();
+                    }
+                    if this.buffer_view || rich_vim_experiment() {
+                        drop(this.sync_transcript_document(cx));
+                    }
+                    if was_following_tail {
+                        this.list_state.set_follow_mode(FollowMode::Tail);
+                        this.list_state.scroll_to_end();
+                    } else if let Some((top_key, offset_in_item)) = preserved_top {
+                        if let Some(item_ix) = this
+                            .model
+                            .items
+                            .iter()
+                            .position(|item| item.key == top_key)
+                        {
+                            this.list_state.scroll_to(gpui::ListOffset {
+                                item_ix,
+                                offset_in_item,
+                            });
                         }
-                        this.apply_thread_open_settings(&attached);
-                        this.load_server_options(cx);
-                        this.attaching_thread = false;
-                        this.attach_cache_bytes = None;
-                        this.thread_read_only_reason = None;
-                        this.reconnect_attempts = 0;
-                        this.error = None;
-                        this.refresh_queued_turns(cx);
-                        this.schedule_child_hierarchy_refresh(cx);
-                        this.complete_thread_open_request_routing(true, cx);
                     }
-                    Err(error) => {
-                        // Never fall back to a full read here: for a multi-GB
-                        // rollout that can repeat the very OOM which caused the
-                        // disconnect. Keep the cached transcript truthful and
-                        // read-only until the user retries or starts a new task.
-                        this.attaching_thread = false;
-                        this.attach_cache_bytes = None;
-                        this.thread_read_only_reason = Some(
-                            "Could not restore the live connection. Cached history is read-only."
-                                .into(),
-                        );
-                        this.error = Some(format!("Could not reattach task: {error}").into());
-                    }
+                    this.set_transcript_history_complete(true);
+                    this.persist_transcript_in_background(&thread_id, cx);
+                    this.error = None;
+                } else {
+                    this.error = Some(
+                        catchup_error
+                            .map(|error| format!("Live task connected, but history catch-up failed: {error}"))
+                            .unwrap_or_else(|| {
+                                "Live task connected, but paginated history did not overlap the local cache."
+                                    .to_owned()
+                            })
+                            .into(),
+                    );
                 }
+                this.history_hydrating = false;
+                this.attaching_thread = false;
+                this.attach_cache_bytes = None;
                 cx.notify();
             });
         });
@@ -7491,6 +7760,8 @@ impl HarnessApp {
         self.loading_thread = false;
         self.attaching_thread = false;
         self.attach_cache_bytes = None;
+        self.history_hydrating = false;
+        self.history_live_item_keys.clear();
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
@@ -7523,6 +7794,33 @@ impl HarnessApp {
     }
 
     fn apply_event_batch(&mut self, events: Vec<AppServerEvent>, cx: &mut Context<Self>) {
+        for event in &events {
+            let AppServerEvent::Notification { method, params } = event else {
+                continue;
+            };
+            if method != "thread/status/changed" {
+                continue;
+            }
+            let (Some(thread_id), Some(status)) = (
+                params.get("threadId").and_then(Value::as_str),
+                params.get("status").cloned(),
+            ) else {
+                continue;
+            };
+            let Ok(status) = serde_json::from_value::<CodexThreadStatus>(status) else {
+                continue;
+            };
+            if let Some(thread) = self
+                .threads
+                .iter_mut()
+                .find(|thread| thread.id == thread_id)
+            {
+                thread.status = status.clone();
+            }
+            if let Some(thread) = self.child_threads.by_id.get_mut(thread_id) {
+                thread.status = status;
+            }
+        }
         let refresh_child_hierarchy = events.iter().any(event_refreshes_child_hierarchy);
         let queue_changed = events.iter().any(|event| {
             matches!(
@@ -7556,7 +7854,18 @@ impl HarnessApp {
         let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
         dirty_items.sort_unstable();
         dirty_items.dedup();
+        if self.history_hydrating {
+            self.history_live_item_keys.extend(
+                (old_len..new_len)
+                    .chain(dirty_items.iter().copied())
+                    .filter_map(|index| self.model.items.get(index))
+                    .map(|item| item.key.clone()),
+            );
+        }
         let document_changed = new_len != old_len || !dirty_items.is_empty();
+        if document_changed && self.model.current_turn_id.is_some() {
+            self.schedule_active_transcript_checkpoint(cx);
+        }
         if new_len > old_len {
             self.list_state.splice(old_len..old_len, new_len - old_len);
             if was_following_tail {
@@ -8485,6 +8794,7 @@ impl HarnessApp {
         if self.selected_thread_id.as_deref() != Some(thread.id.as_str()) {
             return;
         }
+        self.set_transcript_history_complete(true);
 
         let was_following_tail = if self.buffer_view {
             self.transcript_editor.read(cx).is_following_tail()
@@ -8716,10 +9026,13 @@ impl HarnessApp {
             self.queued_turns.clear();
         }
         self.selected_thread_id = Some(thread_id.clone());
+        self.set_transcript_history_complete(false);
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
         self.attaching_thread = can_accept_direct_input;
         self.attach_cache_bytes = None;
+        self.history_hydrating = false;
+        self.history_live_item_keys.clear();
         self.settings_update_pending = false;
         self.thread_read_only_reason = (!can_accept_direct_input)
             .then(|| "This child task does not accept direct input.".into());
@@ -8757,6 +9070,7 @@ impl HarnessApp {
                     self.selected_item = restored.saturating_sub(1);
                     self.list_state.set_follow_mode(FollowMode::Tail);
                     drop(self.sync_transcript_document(cx));
+                    self.list_state.scroll_to_end();
                     had_local_content = true;
                     if thread_load_diagnostics_enabled() {
                         eprintln!(
@@ -8970,6 +9284,7 @@ impl HarnessApp {
         }
         let model_started_at = Instant::now();
         self.model.load_thread(thread);
+        self.set_transcript_history_complete(true);
         self.model.current_turn_id = active_thread_turn_id(thread).map(ToOwned::to_owned);
         let model_elapsed = model_started_at.elapsed();
         let persisted_started_at = Instant::now();
@@ -9016,6 +9331,7 @@ impl HarnessApp {
         self.list_state.set_follow_mode(FollowMode::Tail);
         let document_started_at = Instant::now();
         drop(self.sync_transcript_document(cx));
+        self.list_state.scroll_to_end();
         let document_elapsed = document_started_at.elapsed();
         if self.buffer_view {
             self.transcript_editor
@@ -9078,10 +9394,13 @@ impl HarnessApp {
         self.retire_all_request_surfaces();
         self.list_state.splice(0..old_len, 0);
         self.selected_thread_id = None;
+        self.set_transcript_history_complete(true);
         self.loaded_thread_updated_at = None;
         self.loading_thread = false;
         self.attaching_thread = false;
         self.attach_cache_bytes = None;
+        self.history_hydrating = false;
+        self.history_live_item_keys.clear();
         self.settings_update_pending = false;
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
@@ -12080,10 +12399,8 @@ impl HarnessApp {
             AgentThreadStatus::Running
         } else if selected && self.error.is_some() {
             AgentThreadStatus::Error
-        } else if row.depth > 0 {
-            listed_thread_status(&thread)
         } else {
-            AgentThreadStatus::Completed
+            listed_thread_status(&thread)
         };
         let weak = cx.weak_entity();
         let open_thread_id = thread_id.clone();
@@ -15223,6 +15540,8 @@ impl Render for HarnessApp {
                 Some((status, Color::Muted))
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
+            } else if self.history_hydrating && self.attach_cache_bytes.is_none() {
+                Some(("Catching up task history…".into(), Color::Muted))
             } else if self.attaching_thread {
                 Some((
                     if self
@@ -16924,19 +17243,34 @@ fn status_requires_user_confirmation(status: &str) -> bool {
 }
 
 fn active_thread_turn_id(thread: &CodexThread) -> Option<&str> {
-    thread.turns.iter().rev().find_map(|turn| {
-        let status = turn
-            .status
-            .as_str()
-            .or_else(|| turn.status.get("type").and_then(Value::as_str))
-            .or_else(|| turn.status.get("status").and_then(Value::as_str))
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        matches!(
-            status.as_str(),
-            "active" | "inprogress" | "in_progress" | "running" | "streaming"
-        )
-        .then_some(turn.id.as_str())
+    thread
+        .turns
+        .iter()
+        .rev()
+        .find_map(|turn| turn_status_is_active(&turn.status).then_some(turn.id.as_str()))
+}
+
+fn turn_status_is_active(status: &Value) -> bool {
+    let status = status
+        .as_str()
+        .or_else(|| status.get("type").and_then(Value::as_str))
+        .or_else(|| status.get("status").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "active" | "inprogress" | "in_progress" | "running" | "streaming"
+    )
+}
+
+fn active_open_turn_id(response: &ThreadOpenResponse) -> Option<&str> {
+    active_thread_turn_id(&response.thread).or_else(|| {
+        response
+            .initial_turns_page
+            .as_ref()?
+            .data
+            .iter()
+            .find_map(|turn| turn_status_is_active(&turn.status).then_some(turn.id.as_str()))
     })
 }
 
@@ -17675,6 +18009,32 @@ mod tests {
     }
 
     #[test]
+    fn thin_resume_reconstructs_active_turn_from_the_initial_page() {
+        let response: ThreadOpenResponse = serde_json::from_value(json!({
+            "thread": {
+                "id": "thread-1",
+                "status": {"type": "active", "activeFlags": []},
+                "turns": []
+            },
+            "cwd": "/work",
+            "model": "gpt-5.6-sol",
+            "modelProvider": "openai",
+            "approvalPolicy": "never",
+            "sandbox": {"type": "dangerFullAccess"},
+            "initialTurnsPage": {
+                "data": [{
+                    "id": "turn-live",
+                    "status": "inProgress",
+                    "items": []
+                }]
+            }
+        }))
+        .expect("thin resume fixture should decode");
+
+        assert_eq!(active_open_turn_id(&response), Some("turn-live"));
+    }
+
+    #[test]
     fn queue_drain_requires_the_active_completion_to_be_last_lifecycle_effect() {
         use model::TurnLifecycleEvent::{Completed, Started};
 
@@ -18175,6 +18535,8 @@ mod tests {
             .expect("selection subscription must remain auditable");
         assert!(selection_subscription.contains("rich_pointer_gesture_active"));
         assert!(selection_subscription.contains("if !rich_pointer_gesture_active"));
+        assert!(selection_subscription.contains("transcript_selection_is_authoritative("));
+        assert!(selection_subscription.contains("this.rich_navigation_selection = None"));
 
         let rich_viewport = source
             .split_once("let transcript_body = if self.buffer_view")
@@ -18761,6 +19123,14 @@ mod tests {
             Some(7),
             "a newly selected streaming item should receive spatial focus"
         );
+    }
+
+    #[test]
+    fn restore_generated_hidden_editor_selection_cannot_move_the_rich_viewport() {
+        assert!(!transcript_selection_is_authoritative(false, false, false));
+        assert!(transcript_selection_is_authoritative(false, true, false));
+        assert!(transcript_selection_is_authoritative(false, false, true));
+        assert!(transcript_selection_is_authoritative(true, false, false));
     }
 
     #[test]

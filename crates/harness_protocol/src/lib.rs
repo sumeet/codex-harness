@@ -12,7 +12,7 @@ use std::{
 };
 
 use base64::Engine as _;
-use codex_app_server_client::{CodexThread, Event};
+use codex_app_server_client::{CodexThread, Event, ThreadItemEntry};
 use pulldown_cmark::{
     Event as MarkdownEvent, Options as MarkdownOptions, Parser as MarkdownParser, Tag, TagEnd,
 };
@@ -1551,6 +1551,27 @@ pub struct ThreadRefreshOutcome {
     pub reset: bool,
 }
 
+/// Result of merging a chronological window returned by
+/// `thread/items/list` into the semantic transcript.
+///
+/// Unlike `thread/read`, a paginated window is not complete authority for the
+/// whole thread. The merge therefore retains items on both sides of the
+/// overlapping window. `reset` means stable visible indices changed (or the
+/// supplied window could not be joined safely); callers should rebuild their
+/// list projection instead of applying `dirty` as in-place updates.
+#[derive(Default)]
+pub struct ThreadHistoryMergeOutcome {
+    /// False when a partial window had no safe ordered overlap and the model
+    /// was deliberately left untouched.
+    pub applied: bool,
+    pub dirty: HashSet<usize>,
+    pub old_len: usize,
+    pub new_len: usize,
+    pub reset: bool,
+    pub overlap: usize,
+    pub inserted: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UserImageSource {
     Url(String),
@@ -1781,6 +1802,327 @@ impl TranscriptModel {
         }
     }
 
+    /// Merge a chronological, overlapping App Server history window without
+    /// discarding a persisted prefix or a newer live-appended suffix.
+    ///
+    /// Protocol item ids are the primary join identity. Stable semantic keys
+    /// are used only for aggregate rows such as per-turn reasoning. A
+    /// nonempty model is never mutated when the window has no ordered overlap:
+    /// its position is unknowable until the caller retrieves another page.
+    pub fn merge_thread_item_entries(
+        &mut self,
+        entries: &[ThreadItemEntry],
+    ) -> ThreadHistoryMergeOutcome {
+        self.merge_thread_item_entries_protecting(entries, &HashSet::new())
+    }
+
+    /// Variant of [`Self::merge_thread_item_entries`] used while live events
+    /// continue to paint during a potentially long history fetch. Existing
+    /// semantic rows in `protected_keys` win over their paginated snapshot so
+    /// a stale page cannot roll back newer deltas, status, or image metadata.
+    pub fn merge_thread_item_entries_protecting(
+        &mut self,
+        entries: &[ThreadItemEntry],
+        protected_keys: &HashSet<String>,
+    ) -> ThreadHistoryMergeOutcome {
+        let old_len = self.items.len();
+        if entries.is_empty() {
+            return ThreadHistoryMergeOutcome {
+                old_len,
+                new_len: old_len,
+                applied: true,
+                ..ThreadHistoryMergeOutcome::default()
+            };
+        }
+
+        let mut incoming_model = Self::default();
+        for entry in entries {
+            let mut raw = entry.item.body.clone();
+            raw.insert("id".into(), Value::String(entry.item.id.clone()));
+            raw.insert("type".into(), Value::String(entry.item.kind.clone()));
+            let _ =
+                incoming_model.upsert_protocol_item(Value::Object(raw), true, Some(&entry.turn_id));
+        }
+        let incoming_items = normalize_transcript_items(std::mem::take(&mut incoming_model.items));
+        if incoming_items.is_empty() {
+            return ThreadHistoryMergeOutcome {
+                old_len,
+                new_len: old_len,
+                applied: true,
+                ..ThreadHistoryMergeOutcome::default()
+            };
+        }
+
+        if self.items.is_empty() {
+            self.items = incoming_items;
+            self.user_image_sources = incoming_model.user_image_sources;
+            self.user_content_blocks = incoming_model.user_content_blocks;
+            self.rebuild_item_indices();
+            return ThreadHistoryMergeOutcome {
+                old_len,
+                new_len: self.items.len(),
+                inserted: self.items.len(),
+                applied: true,
+                ..ThreadHistoryMergeOutcome::default()
+            };
+        }
+
+        let matches = ordered_history_matches(&self.items, &incoming_items);
+        let overlap = matches.iter().flatten().count();
+        let ordered = matches
+            .iter()
+            .flatten()
+            .try_fold(None, |previous, current| match previous {
+                Some(previous) if *current <= previous => None,
+                _ => Some(Some(*current)),
+            })
+            .is_some();
+        if overlap == 0 || !ordered {
+            return ThreadHistoryMergeOutcome {
+                old_len,
+                new_len: old_len,
+                overlap,
+                ..ThreadHistoryMergeOutcome::default()
+            };
+        }
+
+        let old_items = std::mem::take(&mut self.items);
+        let mut merged = Vec::with_capacity(old_items.len() + incoming_items.len());
+        let mut dirty_keys = HashSet::new();
+        let mut next_existing = 0;
+        let mut inserted = 0;
+        for (incoming_index, mut incoming) in incoming_items.into_iter().enumerate() {
+            let incoming_key = incoming.key.clone();
+            if let Some(existing_index) = matches[incoming_index] {
+                merged.extend(old_items[next_existing..existing_index].iter().cloned());
+                let existing = &old_items[existing_index];
+                let stable_key = existing.key.clone();
+                if protected_keys.contains(&stable_key) {
+                    merged.push(existing.clone());
+                    next_existing = existing_index + 1;
+                    continue;
+                }
+                let changed = !thread_snapshot_items_equal(existing, &incoming);
+                if incoming.client_user_message_id().is_none()
+                    && let Some(client_user_message_id) = existing.client_user_message_id()
+                {
+                    insert_client_user_message_id(&mut incoming.raw, client_user_message_id);
+                }
+                incoming.key = stable_key.clone();
+                incoming.expanded = existing.expanded
+                    || matches!(
+                        incoming.command_execution_status(),
+                        Some(CommandExecutionStatus::Failed(_))
+                    );
+                incoming.pending_request = existing.pending_request.clone();
+                incoming.event_count = if changed {
+                    existing.event_count.saturating_add(1)
+                } else {
+                    existing.event_count
+                };
+                if changed {
+                    dirty_keys.insert(stable_key.clone());
+                }
+                merge_incoming_user_content_maps(
+                    &mut self.user_image_sources,
+                    &mut self.user_content_blocks,
+                    &incoming_model,
+                    &incoming_key,
+                    &stable_key,
+                    incoming.kind,
+                );
+                merged.push(incoming);
+                next_existing = existing_index + 1;
+            } else {
+                merge_incoming_user_content_maps(
+                    &mut self.user_image_sources,
+                    &mut self.user_content_blocks,
+                    &incoming_model,
+                    &incoming_key,
+                    &incoming_key,
+                    incoming.kind,
+                );
+                merged.push(incoming);
+                inserted += 1;
+            }
+        }
+        merged.extend(old_items[next_existing..].iter().cloned());
+        self.items = normalize_transcript_items(merged);
+        self.rebuild_item_indices();
+
+        let new_len = self.items.len();
+        let prefix_compatible = old_len <= new_len
+            && old_items
+                .iter()
+                .zip(&self.items)
+                .all(|(old, new)| old.key == new.key);
+        let reset = !prefix_compatible;
+        let dirty = if reset {
+            (0..new_len).collect()
+        } else {
+            self.items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| dirty_keys.contains(&item.key).then_some(index))
+                .collect()
+        };
+
+        ThreadHistoryMergeOutcome {
+            applied: true,
+            dirty,
+            old_len,
+            new_len,
+            reset,
+            overlap,
+            inserted,
+        }
+    }
+
+    /// Replace the historical authority after pagination has reached the
+    /// beginning of the thread. This is the safe EOF fallback when a partial
+    /// merge could not find overlap with a nonempty cache.
+    pub fn replace_thread_item_entries(
+        &mut self,
+        entries: &[ThreadItemEntry],
+    ) -> ThreadHistoryMergeOutcome {
+        self.replace_thread_item_entries_protecting(entries, &HashSet::new())
+    }
+
+    /// Authoritative replacement that retains rows changed by live events
+    /// while pagination was in flight. Unmatched protected rows are treated as
+    /// a live suffix and remain after the fully paginated history.
+    pub fn replace_thread_item_entries_protecting(
+        &mut self,
+        entries: &[ThreadItemEntry],
+        protected_keys: &HashSet<String>,
+    ) -> ThreadHistoryMergeOutcome {
+        let old_len = self.items.len();
+        let old_items = std::mem::take(&mut self.items);
+        let old_image_sources = std::mem::take(&mut self.user_image_sources);
+        let old_content_blocks = std::mem::take(&mut self.user_content_blocks);
+
+        let mut incoming_model = Self::default();
+        for entry in entries {
+            let mut raw = entry.item.body.clone();
+            raw.insert("id".into(), Value::String(entry.item.id.clone()));
+            raw.insert("type".into(), Value::String(entry.item.kind.clone()));
+            let _ =
+                incoming_model.upsert_protocol_item(Value::Object(raw), true, Some(&entry.turn_id));
+        }
+        let incoming_items = normalize_transcript_items(std::mem::take(&mut incoming_model.items));
+        let matches = ordered_history_matches(&old_items, &incoming_items);
+        let overlap = matches.iter().flatten().count();
+        let claimed_existing = matches.iter().flatten().copied().collect::<HashSet<_>>();
+        let mut inserted = 0;
+        let mut dirty_keys = HashSet::new();
+        let mut merged = Vec::with_capacity(incoming_items.len() + protected_keys.len());
+        let mut image_sources = HashMap::new();
+        let mut content_blocks = HashMap::new();
+
+        for (incoming_index, mut incoming) in incoming_items.into_iter().enumerate() {
+            let incoming_key = incoming.key.clone();
+            if let Some(existing_index) = matches[incoming_index] {
+                let existing = &old_items[existing_index];
+                let stable_key = existing.key.clone();
+                if protected_keys.contains(&stable_key) {
+                    copy_user_content_maps(
+                        &old_image_sources,
+                        &old_content_blocks,
+                        &mut image_sources,
+                        &mut content_blocks,
+                        &stable_key,
+                    );
+                    merged.push(existing.clone());
+                    continue;
+                }
+                let changed = !thread_snapshot_items_equal(existing, &incoming);
+                if incoming.client_user_message_id().is_none()
+                    && let Some(client_user_message_id) = existing.client_user_message_id()
+                {
+                    insert_client_user_message_id(&mut incoming.raw, client_user_message_id);
+                }
+                incoming.key = stable_key.clone();
+                incoming.expanded = existing.expanded
+                    || matches!(
+                        incoming.command_execution_status(),
+                        Some(CommandExecutionStatus::Failed(_))
+                    );
+                incoming.pending_request = existing.pending_request.clone();
+                incoming.event_count = if changed {
+                    existing.event_count.saturating_add(1)
+                } else {
+                    existing.event_count
+                };
+                if changed {
+                    dirty_keys.insert(stable_key.clone());
+                }
+                merge_incoming_user_content_maps(
+                    &mut image_sources,
+                    &mut content_blocks,
+                    &incoming_model,
+                    &incoming_key,
+                    &stable_key,
+                    incoming.kind,
+                );
+                merged.push(incoming);
+            } else {
+                inserted += 1;
+                merge_incoming_user_content_maps(
+                    &mut image_sources,
+                    &mut content_blocks,
+                    &incoming_model,
+                    &incoming_key,
+                    &incoming_key,
+                    incoming.kind,
+                );
+                merged.push(incoming);
+            }
+        }
+
+        for (index, existing) in old_items.iter().enumerate() {
+            if !claimed_existing.contains(&index) && protected_keys.contains(&existing.key) {
+                copy_user_content_maps(
+                    &old_image_sources,
+                    &old_content_blocks,
+                    &mut image_sources,
+                    &mut content_blocks,
+                    &existing.key,
+                );
+                merged.push(existing.clone());
+            }
+        }
+
+        self.items = normalize_transcript_items(merged);
+        self.user_image_sources = image_sources;
+        self.user_content_blocks = content_blocks;
+        self.rebuild_item_indices();
+        let new_len = self.items.len();
+        let same_keys = old_len == new_len
+            && old_items
+                .iter()
+                .zip(&self.items)
+                .all(|(old, new)| old.key == new.key);
+        let reset = !same_keys;
+        let dirty = if reset {
+            (0..new_len).collect()
+        } else {
+            self.items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| dirty_keys.contains(&item.key).then_some(index))
+                .collect()
+        };
+        ThreadHistoryMergeOutcome {
+            applied: true,
+            dirty,
+            old_len,
+            new_len,
+            reset,
+            overlap,
+            inserted,
+        }
+    }
+
     pub fn persist_transcript(&self, thread_id: &str) -> anyhow::Result<()> {
         self.prepare_transcript_snapshot(thread_id)?.write()
     }
@@ -1966,6 +2308,16 @@ impl TranscriptModel {
             Event::Notification { method, params } => {
                 if !event_matches_thread(selected_thread_id, &params) {
                     return;
+                }
+                // Reattaching to an already-running turn does not replay its
+                // original `turn/started` notification. Any subsequent live
+                // turn activity is enough to recover the missing lifecycle
+                // state, including a completion that should clear it below.
+                if self.current_turn_id.is_none()
+                    && notification_resumes_turn_activity(&method, &params)
+                    && let Some(turn_id) = string_at(&params, "/turnId")
+                {
+                    self.current_turn_id = Some(turn_id.to_string());
                 }
                 self.record_raw(method.clone(), params.clone());
                 if self.telemetry.ingest(&method, &params) {
@@ -2430,6 +2782,11 @@ impl TranscriptModel {
             Event::ServerRequest { id, method, params } => {
                 if !event_matches_thread(selected_thread_id, &params) {
                     return;
+                }
+                if self.current_turn_id.is_none()
+                    && let Some(turn_id) = string_at(&params, "/turnId")
+                {
+                    self.current_turn_id = Some(turn_id.to_string());
                 }
                 self.record_raw(method.clone(), params.clone());
                 let key = format!("request:{}", compact_json(&id));
@@ -3618,6 +3975,83 @@ fn merge_snapshot_items(
     }
     merged.extend(fresh[next_unmerged_fresh..].iter().cloned());
     (merged, restored)
+}
+
+fn ordered_history_matches(
+    existing: &[TranscriptItem],
+    incoming: &[TranscriptItem],
+) -> Vec<Option<usize>> {
+    let mut claimed = HashSet::new();
+    incoming
+        .iter()
+        .map(|incoming| {
+            existing
+                .iter()
+                .enumerate()
+                .find_map(|(index, existing)| {
+                    (!claimed.contains(&index) && history_items_share_identity(existing, incoming))
+                        .then_some(index)
+                })
+                .inspect(|index| {
+                    claimed.insert(*index);
+                })
+        })
+        .collect()
+}
+
+fn history_items_share_identity(left: &TranscriptItem, right: &TranscriptItem) -> bool {
+    match (&left.protocol_id, &right.protocol_id) {
+        (Some(left), Some(right)) if left == right => true,
+        _ => left.key == right.key,
+    }
+}
+
+fn merge_incoming_user_content_maps(
+    image_sources: &mut HashMap<String, Vec<UserImageSource>>,
+    content_blocks: &mut HashMap<String, Vec<UserContentBlock>>,
+    incoming_model: &TranscriptModel,
+    incoming_key: &str,
+    stable_key: &str,
+    kind: TranscriptKind,
+) {
+    if kind != TranscriptKind::User {
+        return;
+    }
+    if incoming_key != stable_key {
+        image_sources.remove(incoming_key);
+        content_blocks.remove(incoming_key);
+    }
+    match incoming_model.user_image_sources.get(incoming_key) {
+        Some(incoming) => {
+            image_sources.insert(stable_key.to_string(), incoming.clone());
+        }
+        None => {
+            image_sources.remove(stable_key);
+        }
+    }
+    match incoming_model.user_content_blocks.get(incoming_key) {
+        Some(incoming) => {
+            content_blocks.insert(stable_key.to_string(), incoming.clone());
+        }
+        None => {
+            content_blocks.remove(stable_key);
+        }
+    }
+}
+
+fn copy_user_content_maps(
+    source_images: &HashMap<String, Vec<UserImageSource>>,
+    source_blocks: &HashMap<String, Vec<UserContentBlock>>,
+    target_images: &mut HashMap<String, Vec<UserImageSource>>,
+    target_blocks: &mut HashMap<String, Vec<UserContentBlock>>,
+    key: &str,
+) {
+    if let Some(images) = source_images.get(key) {
+        target_images.insert(key.to_string(), images.clone());
+    }
+    if let Some(blocks) = source_blocks.get(key) {
+        target_blocks.insert(key.to_string(), blocks.clone());
+    }
 }
 
 /// Repair older snapshots at the transcript's identity/presentation boundary.
@@ -5547,6 +5981,360 @@ mod tests {
         let unchanged = model.refresh_thread(&completed);
         assert!(unchanged.dirty.is_empty());
         assert!(!unchanged.reset);
+    }
+
+    #[test]
+    fn paginated_history_merge_fills_a_missing_middle_and_keeps_cache_and_live_suffix() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let thread_item = |id: &str, kind: &str, body: Value| CodexThreadItem {
+            id: id.into(),
+            kind: kind.into(),
+            body: body.as_object().cloned().unwrap_or_default(),
+        };
+        let user = |id: &str, text: &str, image_url: Option<&str>| {
+            let mut content = vec![json!({"type": "text", "text": text})];
+            if let Some(url) = image_url {
+                content.push(json!({"type": "image", "url": url}));
+            }
+            thread_item(id, "userMessage", json!({"content": content}))
+        };
+        let agent = |id: &str, text: &str| {
+            thread_item(
+                id,
+                "agentMessage",
+                json!({"text": text, "status": "completed"}),
+            )
+        };
+        let entry = |turn_id: &str, item| ThreadItemEntry {
+            turn_id: turn_id.into(),
+            item,
+        };
+
+        // This models a restored semantic cache with one absent item. A live
+        // notification then appends a newer suffix before history hydration.
+        let mut model = TranscriptModel::default();
+        model.load_thread(&CodexThread {
+            id: "thread-1".into(),
+            turns: vec![CodexTurn {
+                id: "turn-1".into(),
+                status: json!("completed"),
+                items: vec![
+                    user("item-a", "cached prefix", Some("https://example.com/a.png")),
+                    agent("item-b", "overlap before gap"),
+                    agent("item-d", "overlap after gap"),
+                ],
+            }],
+            ..CodexThread::default()
+        });
+        model.items[2].expanded = false;
+        let _ = model.apply_batch(
+            vec![Event::Notification {
+                method: "item/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-live",
+                    "item": {
+                        "id": "item-e",
+                        "type": "agentMessage",
+                        "text": "live suffix",
+                        "status": "completed"
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        let entries = vec![
+            entry("turn-1", agent("item-b", "overlap before gap")),
+            entry(
+                "turn-1",
+                user(
+                    "item-c",
+                    "hydrated middle",
+                    Some("https://example.com/c.png"),
+                ),
+            ),
+            entry("turn-1", agent("item-d", "overlap after gap")),
+        ];
+        let outcome = model.merge_thread_item_entries(&entries);
+
+        assert!(outcome.applied);
+        assert_eq!(outcome.overlap, 2);
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(outcome.old_len, 4);
+        assert_eq!(outcome.new_len, 5);
+        assert!(outcome.reset, "middle insertion shifts visible indices");
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.protocol_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["item-a", "item-b", "item-c", "item-d", "item-e"]
+        );
+        assert!(!model.items[3].expanded, "overlap keeps expansion state");
+        assert_eq!(
+            model.user_image_sources(&model.items[0].key),
+            &[UserImageSource::Url("https://example.com/a.png".into())]
+        );
+        assert_eq!(
+            model.user_image_sources(&model.items[2].key),
+            &[UserImageSource::Url("https://example.com/c.png".into())]
+        );
+        assert_eq!(
+            model.user_content_blocks(&model.items[2].key),
+            &[
+                UserContentBlock::Text("hydrated middle".into()),
+                UserContentBlock::Image(UserImageSource::Url("https://example.com/c.png".into())),
+            ]
+        );
+
+        let keys = model
+            .items
+            .iter()
+            .map(|item| item.key.clone())
+            .collect::<Vec<_>>();
+        let unchanged = model.merge_thread_item_entries(&entries);
+        assert!(unchanged.applied);
+        assert_eq!(unchanged.overlap, 3);
+        assert_eq!(unchanged.inserted, 0);
+        assert_eq!(unchanged.old_len, 5);
+        assert_eq!(unchanged.new_len, 5);
+        assert!(!unchanged.reset);
+        assert!(unchanged.dirty.is_empty());
+        assert_eq!(
+            model.items.iter().map(|item| &item.key).collect::<Vec<_>>(),
+            keys.iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn paginated_history_without_overlap_is_not_applied() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let item = |id: &str, text: &str| CodexThreadItem {
+            id: id.into(),
+            kind: "agentMessage".into(),
+            body: json!({"text": text, "status": "completed"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        };
+        let mut model = TranscriptModel::default();
+        model.load_thread(&CodexThread {
+            id: "thread-1".into(),
+            turns: vec![CodexTurn {
+                id: "turn-1".into(),
+                status: json!("completed"),
+                items: vec![item("cached", "cached")],
+            }],
+            ..CodexThread::default()
+        });
+        let original = model.items[0].key.clone();
+
+        let outcome = model.merge_thread_item_entries(&[ThreadItemEntry {
+            turn_id: "turn-2".into(),
+            item: item("unrelated", "unrelated"),
+        }]);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.overlap, 0);
+        assert_eq!(outcome.old_len, 1);
+        assert_eq!(outcome.new_len, 1);
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, original);
+    }
+
+    #[test]
+    fn paginated_history_protects_live_overlap_from_a_stale_page() {
+        use codex_app_server_client::CodexThreadItem;
+
+        let mut model = TranscriptModel::default();
+        let _ = model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "agent-1",
+                            "type": "agentMessage",
+                            "text": "page snapshot",
+                            "status": "inProgress"
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/agentMessage/delta".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "itemId": "agent-1",
+                        "delta": " + live delta"
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+        let protected_key = model.items[0].key.clone();
+        let live_content = model.items[0].content.clone();
+        let live_status = model.items[0].status.clone();
+        let live_events = model.items[0].event_count;
+        let stale = ThreadItemEntry {
+            turn_id: "turn-1".into(),
+            item: CodexThreadItem {
+                id: "agent-1".into(),
+                kind: "agentMessage".into(),
+                body: json!({"text": "page snapshot", "status": "completed"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+            },
+        };
+
+        let outcome =
+            model.merge_thread_item_entries_protecting(&[stale], &HashSet::from([protected_key]));
+
+        assert!(outcome.applied);
+        assert_eq!(outcome.overlap, 1);
+        assert_eq!(outcome.inserted, 0);
+        assert!(!outcome.reset);
+        assert!(outcome.dirty.is_empty());
+        assert_eq!(model.items[0].content, live_content);
+        assert_eq!(model.items[0].status, live_status);
+        assert_eq!(model.items[0].event_count, live_events);
+    }
+
+    #[test]
+    fn authoritative_paginated_replacement_keeps_an_unmatched_protected_live_suffix() {
+        use codex_app_server_client::{CodexThreadItem, CodexTurn};
+
+        let item = |id: &str, text: &str| CodexThreadItem {
+            id: id.into(),
+            kind: "agentMessage".into(),
+            body: json!({"text": text, "status": "completed"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        };
+        let mut model = TranscriptModel::default();
+        model.load_thread(&CodexThread {
+            id: "thread-1".into(),
+            turns: vec![CodexTurn {
+                id: "old-turn".into(),
+                status: json!("completed"),
+                items: vec![item("stale-cache", "stale cache")],
+            }],
+            ..CodexThread::default()
+        });
+        let _ = model.apply_batch(
+            vec![Event::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "live-turn",
+                    "item": {
+                        "id": "live-agent",
+                        "type": "agentMessage",
+                        "text": "live suffix",
+                        "status": "inProgress"
+                    }
+                }),
+            }],
+            Some("thread-1"),
+        );
+        let live_key = model.items[1].key.clone();
+
+        let outcome = model.replace_thread_item_entries_protecting(
+            &[
+                ThreadItemEntry {
+                    turn_id: "history-turn".into(),
+                    item: item("history-a", "history a"),
+                },
+                ThreadItemEntry {
+                    turn_id: "history-turn".into(),
+                    item: item("history-b", "history b"),
+                },
+            ],
+            &HashSet::from([live_key]),
+        );
+
+        assert!(outcome.applied);
+        assert_eq!(outcome.overlap, 0);
+        assert_eq!(outcome.inserted, 2);
+        assert!(outcome.reset);
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.protocol_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["history-a", "history-b", "live-agent"]
+        );
+        assert_eq!(model.items[2].content, "live suffix");
+        assert_eq!(model.items[2].status.as_deref(), Some("in progress"));
+    }
+
+    #[test]
+    fn reattached_live_activity_recovers_and_completes_current_turn_state() {
+        let mut model = TranscriptModel::default();
+        let update = model.apply_batch(
+            vec![Event::Notification {
+                method: "item/agentMessage/delta".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-active",
+                    "itemId": "agent-1",
+                    "delta": "still running"
+                }),
+            }],
+            Some("thread-1"),
+        );
+        assert_eq!(model.current_turn_id.as_deref(), Some("turn-active"));
+        assert_eq!(update.dirty, HashSet::from([0]));
+
+        let completed = model.apply_batch(
+            vec![Event::Notification {
+                method: "turn/completed".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-active",
+                    "turn": {"id": "turn-active", "status": "completed", "items": []}
+                }),
+            }],
+            Some("thread-1"),
+        );
+        assert_eq!(model.current_turn_id, None);
+        assert_eq!(
+            completed.turn_lifecycle,
+            vec![TurnLifecycleEvent::Completed {
+                turn_id: "turn-active".into(),
+                status: "completed".into(),
+                was_active: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn reattached_server_request_recovers_current_turn_state() {
+        let mut model = TranscriptModel::default();
+        model.apply_batch(
+            vec![Event::ServerRequest {
+                id: json!(7),
+                method: "item/commandExecution/requestApproval".into(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-active",
+                    "itemId": "command-1",
+                    "command": "cargo test"
+                }),
+            }],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.current_turn_id.as_deref(), Some("turn-active"));
     }
 
     #[test]

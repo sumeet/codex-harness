@@ -31,7 +31,7 @@ use futures_lite::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
 };
 use parking_lot::Mutex;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -263,6 +263,135 @@ pub struct CodexTurn {
     pub items: Vec<CodexThreadItem>,
 }
 
+/// Pagination direction accepted by app-server history endpoints.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SortDirection {
+    Asc,
+    Desc,
+}
+
+/// Amount of item detail requested for each turn in a turn-history page.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    Full,
+}
+
+/// Optional initial page embedded in a `thread/resume` response.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadResumeInitialTurnsPageParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_view: Option<TurnItemsView>,
+}
+
+impl ThreadResumeInitialTurnsPageParams {
+    /// The cheapest bootstrap that still reports the newest turn id/status.
+    pub fn latest_turn_state() -> Self {
+        Self {
+            limit: Some(1),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::NotLoaded),
+        }
+    }
+
+    /// A compact newest-first page suitable for recovering live turn state
+    /// before older transcript history is hydrated.
+    pub fn recent_summary(limit: u32) -> Self {
+        Self {
+            limit: Some(limit),
+            sort_direction: Some(SortDirection::Desc),
+            items_view: Some(TurnItemsView::Summary),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListParams {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_view: Option<TurnItemsView>,
+}
+
+impl ThreadTurnsListParams {
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+            items_view: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResponse {
+    pub data: Vec<CodexTurn>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListParams {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<SortDirection>,
+}
+
+impl ThreadItemsListParams {
+    pub fn new(thread_id: impl Into<String>) -> Self {
+        Self {
+            thread_id: thread_id.into(),
+            turn_id: None,
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemEntry {
+    pub turn_id: String,
+    pub item: CodexThreadItem,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsListResponse {
+    pub data: Vec<ThreadItemEntry>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct CodexThreadItem {
     pub id: String,
@@ -310,6 +439,12 @@ pub struct ThreadOpenResponse {
     pub active_permission_profile: Option<Value>,
     #[serde(default)]
     pub service_tier: Option<String>,
+    #[serde(default)]
+    pub initial_turns_page: Option<ThreadTurnsListResponse>,
+    #[serde(default)]
+    pub turns_backwards_cursor: Option<String>,
+    #[serde(default)]
+    pub items_backwards_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -791,6 +926,30 @@ impl Client {
         Ok(serde_json::from_value::<ThreadReadResponse>(response)?.thread)
     }
 
+    /// Page turns retained in app-server history. New clients should prefer
+    /// this endpoint over asking `thread/read` to hydrate every turn at once.
+    pub async fn list_thread_turns(
+        &self,
+        params: ThreadTurnsListParams,
+    ) -> Result<ThreadTurnsListResponse, Error> {
+        let response = self
+            .request("thread/turns/list", serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
+    /// Page individual items retained in app-server history, optionally
+    /// restricted to a single turn.
+    pub async fn list_thread_items(
+        &self,
+        params: ThreadItemsListParams,
+    ) -> Result<ThreadItemsListResponse, Error> {
+        let response = self
+            .request("thread/items/list", serde_json::to_value(params)?)
+            .await?;
+        Ok(serde_json::from_value(response)?)
+    }
+
     /// Start a persistent Codex thread rooted in `cwd` and subscribe this
     /// connection to every event it emits.
     pub async fn start_thread(&self, cwd: &str) -> Result<CodexThread, Error> {
@@ -823,7 +982,7 @@ impl Client {
         &self,
         thread_id: &str,
     ) -> Result<ThreadOpenResponse, Error> {
-        self.resume_thread_with_exclude_turns(thread_id, false)
+        self.resume_thread_with_exclude_turns(thread_id, false, None)
             .await
     }
 
@@ -834,18 +993,31 @@ impl Client {
         &self,
         thread_id: &str,
     ) -> Result<ThreadOpenResponse, Error> {
-        self.resume_thread_with_exclude_turns(thread_id, true).await
+        self.resume_thread_with_exclude_turns(thread_id, true, None)
+            .await
+    }
+
+    /// Attach to live events without the deprecated full-history response and
+    /// bootstrap a bounded newest-turn page in the same round trip.
+    pub async fn attach_thread_with_initial_turns_page(
+        &self,
+        thread_id: &str,
+        initial_turns_page: ThreadResumeInitialTurnsPageParams,
+    ) -> Result<ThreadOpenResponse, Error> {
+        self.resume_thread_with_exclude_turns(thread_id, true, Some(initial_turns_page))
+            .await
     }
 
     async fn resume_thread_with_exclude_turns(
         &self,
         thread_id: &str,
         exclude_turns: bool,
+        initial_turns_page: Option<ThreadResumeInitialTurnsPageParams>,
     ) -> Result<ThreadOpenResponse, Error> {
         let response = self
             .request(
                 "thread/resume",
-                thread_resume_params(thread_id, exclude_turns),
+                thread_resume_params(thread_id, exclude_turns, initial_turns_page.as_ref())?,
             )
             .await?;
         decode_thread_open_response(response)
@@ -1180,11 +1352,19 @@ fn thread_list_params(
     params
 }
 
-fn thread_resume_params(thread_id: &str, exclude_turns: bool) -> Value {
-    json!({
+fn thread_resume_params(
+    thread_id: &str,
+    exclude_turns: bool,
+    initial_turns_page: Option<&ThreadResumeInitialTurnsPageParams>,
+) -> Result<Value, Error> {
+    let mut params = json!({
         "excludeTurns": exclude_turns,
         "threadId": thread_id,
-    })
+    });
+    if let Some(initial_turns_page) = initial_turns_page {
+        params["initialTurnsPage"] = serde_json::to_value(initial_turns_page)?;
+    }
+    Ok(params)
 }
 
 fn turn_start_params(thread_id: &str, input: Value, client_user_message_id: Option<&str>) -> Value {
@@ -1617,17 +1797,66 @@ mod tests {
     #[test]
     fn resume_and_attach_use_distinct_turn_history_flags_on_the_wire() {
         assert_eq!(
-            thread_resume_params("thread-1", false),
+            thread_resume_params("thread-1", false, None).unwrap(),
             json!({
                 "excludeTurns": false,
                 "threadId": "thread-1",
             })
         );
         assert_eq!(
-            thread_resume_params("thread-1", true),
+            thread_resume_params("thread-1", true, None).unwrap(),
             json!({
                 "excludeTurns": true,
                 "threadId": "thread-1",
+            })
+        );
+
+        let initial_turns_page = ThreadResumeInitialTurnsPageParams::latest_turn_state();
+        assert_eq!(
+            thread_resume_params("thread-1", true, Some(&initial_turns_page)).unwrap(),
+            json!({
+                "excludeTurns": true,
+                "initialTurnsPage": {
+                    "itemsView": "notLoaded",
+                    "limit": 1,
+                    "sortDirection": "desc",
+                },
+                "threadId": "thread-1",
+            })
+        );
+    }
+
+    #[test]
+    fn paginated_history_params_match_the_app_server_schema() {
+        let mut turns = ThreadTurnsListParams::new("thread-1");
+        turns.cursor = Some("turn-cursor".into());
+        turns.limit = Some(25);
+        turns.sort_direction = Some(SortDirection::Desc);
+        turns.items_view = Some(TurnItemsView::Full);
+        assert_eq!(
+            serde_json::to_value(turns).unwrap(),
+            json!({
+                "threadId": "thread-1",
+                "cursor": "turn-cursor",
+                "limit": 25,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            })
+        );
+
+        let mut items = ThreadItemsListParams::new("thread-1");
+        items.turn_id = Some("turn-1".into());
+        items.cursor = Some("item-cursor".into());
+        items.limit = Some(100);
+        items.sort_direction = Some(SortDirection::Asc);
+        assert_eq!(
+            serde_json::to_value(items).unwrap(),
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "cursor": "item-cursor",
+                "limit": 100,
+                "sortDirection": "asc",
             })
         );
     }
@@ -1945,6 +2174,51 @@ mod tests {
     }
 
     #[test]
+    fn decodes_paginated_turns_and_items_with_cursors_and_future_fields() {
+        let turns = serde_json::from_value::<ThreadTurnsListResponse>(json!({
+            "data": [{
+                "id": "turn_1",
+                "status": "inProgress",
+                "items": [],
+                "itemsView": "notLoaded",
+                "futureTurnField": {"version": 2}
+            }],
+            "nextCursor": "older-turns",
+            "backwardsCursor": "newer-turns",
+            "futurePageField": true
+        }))
+        .expect("turn page should remain forward compatible");
+        assert_eq!(turns.data[0].id, "turn_1");
+        assert_eq!(turns.data[0].status, json!("inProgress"));
+        assert_eq!(turns.next_cursor.as_deref(), Some("older-turns"));
+        assert_eq!(turns.backwards_cursor.as_deref(), Some("newer-turns"));
+
+        let items = serde_json::from_value::<ThreadItemsListResponse>(json!({
+            "data": [{
+                "turnId": "turn_1",
+                "item": {
+                    "id": "item_1",
+                    "type": "futureItemType",
+                    "payload": {"version": 2}
+                },
+                "futureEntryField": "retained by newer servers"
+            }],
+            "nextCursor": null,
+            "backwardsCursor": "newer-items",
+            "futurePageField": true
+        }))
+        .expect("item page should remain forward compatible");
+        assert_eq!(items.data[0].turn_id, "turn_1");
+        assert_eq!(items.data[0].item.kind, "futureItemType");
+        assert_eq!(
+            items.data[0].item.body.get("payload"),
+            Some(&json!({"version": 2}))
+        );
+        assert_eq!(items.next_cursor, None);
+        assert_eq!(items.backwards_cursor.as_deref(), Some("newer-items"));
+    }
+
+    #[test]
     fn decodes_start_and_resume_thread_responses_with_extra_settings() {
         let response = decode_thread_open_response(json!({
             "thread": {
@@ -1960,7 +2234,19 @@ mod tests {
             "reasoningEffort": "xhigh",
             "approvalPolicy": "on-request",
             "sandbox": {"type": "workspaceWrite"},
-            "activePermissionProfile": {"id": ":workspace"}
+            "activePermissionProfile": {"id": ":workspace"},
+            "initialTurnsPage": {
+                "data": [{
+                    "id": "turn_latest",
+                    "status": "inProgress",
+                    "items": []
+                }],
+                "nextCursor": "older-turns",
+                "backwardsCursor": "newer-turns"
+            },
+            "turnsBackwardsCursor": "turn-anchor",
+            "itemsBackwardsCursor": "item-anchor",
+            "futureResumeField": {"version": 2}
         }))
         .expect("thread response should retain effective settings");
 
@@ -1968,6 +2254,22 @@ mod tests {
         assert_eq!(response.thread.cwd, "/work/harness");
         assert_eq!(response.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(response.model_provider, "openai");
+        assert_eq!(
+            response
+                .initial_turns_page
+                .as_ref()
+                .and_then(|page| page.data.first())
+                .map(|turn| turn.id.as_str()),
+            Some("turn_latest")
+        );
+        assert_eq!(
+            response.turns_backwards_cursor.as_deref(),
+            Some("turn-anchor")
+        );
+        assert_eq!(
+            response.items_backwards_cursor.as_deref(),
+            Some("item-anchor")
+        );
         assert_eq!(
             response
                 .active_permission_profile
