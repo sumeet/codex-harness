@@ -19,10 +19,10 @@ use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
     FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
     KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, MouseButton,
-    ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, StyledImage, StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal,
-    WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point,
-    prelude::*, px, relative, size, uniform_list,
+    MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TouchPhase,
+    UniformListScrollHandle, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions,
+    actions, canvas, deferred, div, list, point, prelude::*, px, relative, size, uniform_list,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -550,31 +550,33 @@ struct RichMarkdownNavigationPaint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RichMarkdownPointerAnchor {
+struct RichPointerPosition {
     item_index: usize,
     body_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RichMarkdownPointerUpdate {
-    Begin(RichMarkdownPointerAnchor),
+struct RichPointerGesture {
+    anchor: RichPointerPosition,
+    head: RichPointerPosition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RichPointerUpdate {
+    Begin(RichPointerPosition),
     Extend {
-        anchor: RichMarkdownPointerAnchor,
-        head: RichMarkdownPointerAnchor,
-    },
-    Finish {
-        anchor: RichMarkdownPointerAnchor,
-        head: RichMarkdownPointerAnchor,
+        anchor: RichPointerPosition,
+        head: RichPointerPosition,
     },
 }
 
-fn rich_markdown_pointer_update(
-    active: Option<RichMarkdownPointerAnchor>,
+fn rich_pointer_update(
+    active: Option<RichPointerGesture>,
     item_index: usize,
     body_offset: usize,
     phase: SourcePointerPhase,
-) -> Option<RichMarkdownPointerUpdate> {
-    let head = RichMarkdownPointerAnchor {
+) -> Option<RichPointerUpdate> {
+    let head = RichPointerPosition {
         item_index,
         body_offset,
     };
@@ -582,16 +584,15 @@ fn rich_markdown_pointer_update(
         SourcePointerPhase::Down {
             button: MouseButton::Left,
             ..
-        } => Some(RichMarkdownPointerUpdate::Begin(head)),
+        } => Some(RichPointerUpdate::Begin(head)),
         SourcePointerPhase::Drag {
             button: MouseButton::Left,
-        } => active.map(|anchor| RichMarkdownPointerUpdate::Extend { anchor, head }),
-        SourcePointerPhase::Up {
-            button: MouseButton::Left,
-            ..
-        } => active.map(|anchor| RichMarkdownPointerUpdate::Finish { anchor, head }),
+        }
+        | SourcePointerPhase::Move => active.map(|gesture| RichPointerUpdate::Extend {
+            anchor: gesture.anchor,
+            head,
+        }),
         SourcePointerPhase::Down { .. }
-        | SourcePointerPhase::Move
         | SourcePointerPhase::Drag { .. }
         | SourcePointerPhase::Up { .. } => None,
     }
@@ -1208,6 +1209,7 @@ fn rich_cursor_autoscroll_marker(
     layout: gpui::TextLayout,
     rendered_index: usize,
     color: gpui::Hsla,
+    request_autoscroll: bool,
 ) -> AnyElement {
     canvas(
         move |bounds, window, _| {
@@ -1218,13 +1220,15 @@ fn rich_cursor_autoscroll_marker(
                 .y
                 .max(bounds.top())
                 .min(bounds.bottom() - px(1.));
-            window.request_autoscroll(Bounds::from_corners(
-                point(bounds.left(), cursor_y),
-                point(
-                    bounds.right(),
-                    (cursor_y + layout.line_height()).min(bounds.bottom()),
-                ),
-            ));
+            if request_autoscroll {
+                window.request_autoscroll(Bounds::from_corners(
+                    point(bounds.left(), cursor_y),
+                    point(
+                        bounds.right(),
+                        (cursor_y + layout.line_height()).min(bounds.bottom()),
+                    ),
+                ));
+            }
 
             let text = layout.text();
             let next_index = text
@@ -1257,20 +1261,28 @@ fn rich_transcript_entry_placement(
     target_item.filter(|target| !cursor_initialized || current_item != Some(*target))
 }
 
-/// Make a visible structured-text fragment place the persistent Editor/Vim
-/// cursor at the clicked glyph. Without this adapter, the card-level click
-/// handler can only jump to the first row of the item.
-fn rich_clickable_styled_text(
+/// Route one visible structured-text fragment into the canonical transcript
+/// pointer gesture. Each surface only reports geometry while actually
+/// hovered; the outer transcript owns release and focus transfer.
+fn rich_pointer_styled_text(
     id: String,
     styled: StyledText,
     item_index: usize,
     logical_fragment: Range<usize>,
     owner: Option<WeakEntity<HarnessApp>>,
+    allow_simple_click: bool,
 ) -> AnyElement {
     let Some(owner) = owner.filter(|_| !logical_fragment.is_empty()) else {
         return styled.into_any_element();
     };
     let layout = styled.layout().clone();
+    let down_layout = layout.clone();
+    let down_range = logical_fragment.clone();
+    let down_owner = owner.clone();
+    let move_layout = layout;
+    let move_range = logical_fragment;
+    let move_owner = owner.clone();
+    let click_owner = owner;
     div()
         .id(id)
         // A transcript row is a placement surface, not merely a run of
@@ -1279,44 +1291,69 @@ fn rich_clickable_styled_text(
         .w_full()
         .min_h(px(20.))
         .min_w_0()
-        .on_click(move |event, window, cx| {
-            let rendered_index = match layout.index_for_position(event.position()) {
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            let rendered_index = match down_layout.index_for_position(event.position) {
                 Ok(index) | Err(index) => index,
             };
-            let body_offset = logical_offset_for_rendered_index(&logical_fragment, rendered_index);
-            cx.stop_propagation();
-            window.prevent_default();
-            owner
+            let position = RichPointerPosition {
+                item_index,
+                body_offset: logical_offset_for_rendered_index(&down_range, rendered_index),
+            };
+            if !allow_simple_click {
+                cx.stop_propagation();
+                window.prevent_default();
+            }
+            down_owner
                 .update(cx, |this, cx| {
-                    this.selected_item = item_index;
-                    this.visual_anchor = None;
-                    this.focus_mode = FocusMode::Buffer;
-                    this.transcript_cursor_initialized = true;
-                    this.list_state.pause_following_tail();
-                    // The clicked glyph is already visible. A command row can
-                    // wrap to many viewport heights, so revealing the whole
-                    // virtual row here would immediately scroll the exact
-                    // click target away. Preserve this cursor as the nested
-                    // surface's already-revealed position; keyboard motions
-                    // still take the ordinary row/line reveal path.
-                    if let Some(item_key) = this
-                        .model
-                        .items
-                        .get(item_index)
-                        .filter(|item| item.kind == model::TranscriptKind::Command)
-                        .map(|item| item.key.clone())
-                        && let Some(state) = this.rich_nested_scrolls.get_mut(&item_key)
-                    {
-                        state.last_cursor = Some(body_offset);
+                    if this.buffer_view {
+                        this.selected_item = position.item_index;
+                        this.place_rich_cursor_in_item(
+                            position.item_index,
+                            position.body_offset,
+                            window,
+                            cx,
+                        );
+                        this.transcript_editor.focus_handle(cx).focus(window, cx);
+                        this.transcript_editor.update(cx, |editor, cx| {
+                            editor.enter_normal_mode(window, cx);
+                        });
+                    } else {
+                        this.begin_rich_pointer_selection(position, window, cx);
                     }
-                    this.place_rich_cursor_in_item(item_index, body_offset, window, cx);
-                    this.transcript_editor.focus_handle(cx).focus(window, cx);
-                    this.transcript_editor.update(cx, |editor, cx| {
-                        editor.enter_normal_mode(window, cx);
-                    });
-                    cx.notify();
                 })
                 .ok();
+        })
+        .on_mouse_move(move |event, window, cx| {
+            if !event.dragging() {
+                return;
+            }
+            let rendered_index = match move_layout.index_for_position(event.position) {
+                Ok(index) | Err(index) => index,
+            };
+            let head = RichPointerPosition {
+                item_index,
+                body_offset: logical_offset_for_rendered_index(&move_range, rendered_index),
+            };
+            cx.stop_propagation();
+            window.prevent_default();
+            move_owner
+                .update(cx, |this, cx| {
+                    if !this.buffer_view {
+                        this.extend_rich_pointer_selection(head, window, cx);
+                    }
+                })
+                .ok();
+        })
+        .on_click(move |_, _, cx| {
+            let nonempty_drag = click_owner
+                .update(cx, |this, _| {
+                    this.rich_pointer_gesture
+                        .is_some_and(|gesture| gesture.anchor != gesture.head)
+                })
+                .unwrap_or(true);
+            if !allow_simple_click || nonempty_drag {
+                cx.stop_propagation();
+            }
         })
         .child(styled)
         .into_any_element()
@@ -3685,7 +3722,8 @@ struct HarnessApp {
     search_editor: Entity<LocalEditor>,
     transcript_editor: Entity<TranscriptEditor>,
     rich_navigation_selection: Option<TranscriptSelectionSnapshot>,
-    rich_markdown_pointer_anchor: Option<RichMarkdownPointerAnchor>,
+    rich_pointer_gesture: Option<RichPointerGesture>,
+    rich_pointer_autoscroll_suppression: Option<RichPointerPosition>,
     mode_indicator: Entity<ModeIndicator>,
     buffer_view: bool,
     transcript_focus: FocusHandle,
@@ -6383,6 +6421,21 @@ impl HarnessApp {
         })
     }
 
+    fn rich_cursor_autoscroll_allowed(
+        &self,
+        item_index: usize,
+        navigation: Option<&RichNavigationPaint>,
+    ) -> bool {
+        let Some(head) = navigation.and_then(|navigation| navigation.head) else {
+            return false;
+        };
+        self.rich_pointer_autoscroll_suppression
+            != Some(RichPointerPosition {
+                item_index,
+                body_offset: head,
+            })
+    }
+
     fn reveal_rich_navigation_item(&mut self, item_index: usize, body_offset: usize) {
         let Some(item) = self.model.items.get(item_index) else {
             return;
@@ -6467,7 +6520,7 @@ impl HarnessApp {
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let next_navigation = Some(navigation.markdown_source_navigation(&source));
-        let pointer_gesture_active = self.rich_markdown_pointer_anchor.is_some();
+        let pointer_gesture_active = self.rich_pointer_gesture.is_some();
         let Some(cached) = self.markdown_cache.get_mut(&key) else {
             return false;
         };
@@ -6627,7 +6680,10 @@ impl HarnessApp {
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
-                let rich_pointer_gesture_active = this.rich_markdown_pointer_anchor.is_some();
+                let rich_pointer_gesture_active = this.rich_pointer_gesture.is_some();
+                if !rich_pointer_gesture_active {
+                    this.rich_pointer_autoscroll_suppression = None;
+                }
                 // Snapshot the native selection once at the event boundary. Rich
                 // rendering can then consume the cached logical ranges without
                 // rebuilding an Editor display snapshot and copying selected
@@ -6800,7 +6856,8 @@ impl HarnessApp {
             search_editor,
             transcript_editor,
             rich_navigation_selection: None,
-            rich_markdown_pointer_anchor: None,
+            rich_pointer_gesture: None,
+            rich_pointer_autoscroll_suppression: None,
             mode_indicator,
             buffer_view: start_in_text_view,
             transcript_focus,
@@ -10562,8 +10619,119 @@ impl HarnessApp {
         cx.notify();
     }
 
-    /// Route visible Rich Markdown pointer geometry into the canonical native
-    /// selection without asking either the Editor or list to reveal it.
+    fn note_rich_pointer_position(&mut self, position: RichPointerPosition) {
+        self.rich_pointer_autoscroll_suppression = Some(position);
+        let Some(item_key) = self
+            .model
+            .items
+            .get(position.item_index)
+            .map(|item| item.key.clone())
+        else {
+            return;
+        };
+        if let Some(state) = self.rich_nested_scrolls.get_mut(&item_key) {
+            // The pointer-owned glyph is already visible. Consume this cursor
+            // in every nested surface so its ordinary keyboard reveal path
+            // cannot realign the row after the gesture guard is released.
+            state.last_cursor = Some(position.body_offset);
+        }
+    }
+
+    fn begin_rich_pointer_selection(
+        &mut self,
+        position: RichPointerPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Install the guard before changing the native selection:
+        // TranscriptSelectionChanged is emitted synchronously by the Editor.
+        self.rich_pointer_gesture = Some(RichPointerGesture {
+            anchor: position,
+            head: position,
+        });
+        self.note_rich_pointer_position(position);
+        self.selected_item = position.item_index;
+        self.visual_anchor = None;
+        self.focus_mode = FocusMode::Buffer;
+        self.transcript_cursor_initialized = true;
+        self.list_state.pause_following_tail();
+        let placed = self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_pointer_cursor_in_item(position.item_index, position.body_offset, window, cx)
+        });
+        if !placed {
+            self.rich_pointer_gesture = None;
+            self.rich_pointer_autoscroll_suppression = None;
+        }
+        cx.notify();
+    }
+
+    fn extend_rich_pointer_selection(
+        &mut self,
+        head: RichPointerPosition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut gesture) = self.rich_pointer_gesture else {
+            return;
+        };
+        if gesture.head == head {
+            return;
+        }
+        gesture.head = head;
+        self.rich_pointer_gesture = Some(gesture);
+        self.note_rich_pointer_position(head);
+        let placed = self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_pointer_selection(
+                gesture.anchor.item_index,
+                gesture.anchor.body_offset,
+                head.item_index,
+                head.body_offset,
+                window,
+                cx,
+            )
+        });
+        if placed {
+            self.selected_item = head.item_index;
+        }
+        cx.notify();
+    }
+
+    /// Finish at the last coordinate reported by an actually hovered surface.
+    /// The outer Rich transcript calls this during mouse-up capture, so a drag
+    /// crossing items never remaps release through its originating layout.
+    fn finish_rich_pointer_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(gesture) = self.rich_pointer_gesture else {
+            return;
+        };
+        let placed = self.transcript_editor.update(cx, |editor, cx| {
+            editor.set_pointer_selection(
+                gesture.anchor.item_index,
+                gesture.anchor.body_offset,
+                gesture.head.item_index,
+                gesture.head.body_offset,
+                window,
+                cx,
+            )
+        });
+        if placed {
+            self.selected_item = gesture.head.item_index;
+        }
+        self.transcript_editor.focus_handle(cx).focus(window, cx);
+        if gesture.anchor == gesture.head {
+            self.transcript_editor.update(cx, |editor, cx| {
+                editor.enter_normal_mode(window, cx);
+            });
+        }
+        cx.defer_in(window, move |this, _, _| {
+            if this.rich_pointer_gesture == Some(gesture) {
+                this.rich_pointer_gesture = None;
+            }
+        });
+        cx.notify();
+    }
+
+    /// Route visible Rich Markdown pointer geometry through the renderer-
+    /// neutral transcript gesture. Mouse-up is owned by the outer viewport.
     fn handle_rich_markdown_pointer(
         &mut self,
         markdown_key: &str,
@@ -10573,12 +10741,9 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(update) = rich_markdown_pointer_update(
-            self.rich_markdown_pointer_anchor,
-            item_index,
-            body_offset,
-            phase,
-        ) else {
+        let Some(update) =
+            rich_pointer_update(self.rich_pointer_gesture, item_index, body_offset, phase)
+        else {
             return;
         };
         if let Some(cached) = self.markdown_cache.get_mut(markdown_key) {
@@ -10589,64 +10754,11 @@ impl HarnessApp {
         }
 
         match update {
-            RichMarkdownPointerUpdate::Begin(anchor) => {
-                // Install the gesture guard before changing the native
-                // selection. TranscriptSelectionChanged is emitted from that
-                // update, and must repaint the visible Markdown without
-                // revealing a row that the pointer is already inside.
-                self.rich_markdown_pointer_anchor = Some(anchor);
-                self.selected_item = anchor.item_index;
-                self.visual_anchor = None;
-                self.focus_mode = FocusMode::Buffer;
-                self.transcript_cursor_initialized = true;
-                self.list_state.pause_following_tail();
-                let placed = self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_pointer_cursor_in_item(
-                        anchor.item_index,
-                        anchor.body_offset,
-                        window,
-                        cx,
-                    )
-                });
-                if !placed {
-                    self.rich_markdown_pointer_anchor = None;
-                }
-                cx.notify();
+            RichPointerUpdate::Begin(anchor) => {
+                self.begin_rich_pointer_selection(anchor, window, cx)
             }
-            RichMarkdownPointerUpdate::Extend { anchor, head }
-            | RichMarkdownPointerUpdate::Finish { anchor, head } => {
-                let finishing = matches!(update, RichMarkdownPointerUpdate::Finish { .. });
-                let placed = self.transcript_editor.update(cx, |editor, cx| {
-                    editor.set_pointer_selection(
-                        anchor.item_index,
-                        anchor.body_offset,
-                        head.item_index,
-                        head.body_offset,
-                        window,
-                        cx,
-                    )
-                });
-                if placed {
-                    self.selected_item = head.item_index;
-                }
-                if finishing {
-                    // Focusing only after mouse-up lets Markdown retain the
-                    // gesture while handing subsequent Vim input back to the
-                    // canonical Editor. Preserve the legacy click behavior,
-                    // but do not collapse a non-empty drag selection.
-                    self.transcript_editor.focus_handle(cx).focus(window, cx);
-                    if anchor == head {
-                        self.transcript_editor.update(cx, |editor, cx| {
-                            editor.enter_normal_mode(window, cx);
-                        });
-                    }
-                    cx.defer_in(window, move |this, _, _| {
-                        if this.rich_markdown_pointer_anchor == Some(anchor) {
-                            this.rich_markdown_pointer_anchor = None;
-                        }
-                    });
-                }
-                cx.notify();
+            RichPointerUpdate::Extend { head, .. } => {
+                self.extend_rich_pointer_selection(head, window, cx)
             }
         }
     }
@@ -12051,7 +12163,7 @@ impl HarnessApp {
         autoscroll_generation: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
-        let pointer_gesture_active = self.rich_markdown_pointer_anchor.is_some();
+        let pointer_gesture_active = self.rich_pointer_gesture.is_some();
         let cached = self
             .markdown_cache
             .entry(key.to_string())
@@ -12192,12 +12304,13 @@ impl HarnessApp {
                     logical_line_range.clone(),
                     cx,
                 );
-                let clickable_line = rich_clickable_styled_text(
+                let clickable_line = rich_pointer_styled_text(
                     format!("rich-diff-line:{item_index}:{logical_line_offset}"),
                     highlighted_line,
                     item_index,
                     logical_line_range,
                     owner.clone(),
+                    false,
                 );
                 div()
                     .w_full()
@@ -12273,12 +12386,13 @@ impl HarnessApp {
                 path_range.clone(),
                 cx,
             );
-            let clickable_path = rich_clickable_styled_text(
+            let clickable_path = rich_pointer_styled_text(
                 format!("rich-diff-path:{index}:{section_index}"),
                 highlighted_path,
                 index,
                 path_range,
                 owner.clone(),
+                false,
             );
             sections.push(
                 div()
@@ -12372,6 +12486,7 @@ impl HarnessApp {
         index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        request_cursor_autoscroll: bool,
         owner: &WeakEntity<HarnessApp>,
         cx: &mut App,
     ) -> AnyElement {
@@ -12393,12 +12508,13 @@ impl HarnessApp {
                     logical_range.clone(),
                     cx,
                 );
-                let clickable_path = rich_clickable_styled_text(
+                let clickable_path = rich_pointer_styled_text(
                     format!("rich-file-change-path:{index}:{section_index}"),
                     highlighted_path,
                     index,
                     logical_range.clone(),
                     Some(owner.clone()),
+                    false,
                 );
                 let operation_color = match presentation.operation.as_str() {
                     "Added" => Color::Success,
@@ -12491,15 +12607,17 @@ impl HarnessApp {
                             highlighted_line.layout().clone(),
                             rendered_index,
                             cx.theme().players().local().cursor.opacity(0.55),
+                            request_cursor_autoscroll,
                         )
                     },
                 );
-                let clickable_line = rich_clickable_styled_text(
+                let clickable_line = rich_pointer_styled_text(
                     format!("rich-file-change-line:{index}:{section_index}:{line_index}"),
                     highlighted_line,
                     index,
                     logical_range.clone(),
                     Some(owner.clone()),
+                    false,
                 );
                 div()
                     .w_full()
@@ -12536,6 +12654,7 @@ impl HarnessApp {
         let (data, list_state, horizontal_handle) =
             self.rich_file_change_surface(item, navigation, cx);
         let colors = cx.theme().colors().clone();
+        let request_cursor_autoscroll = self.rich_cursor_autoscroll_allowed(index, navigation);
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
@@ -12548,6 +12667,7 @@ impl HarnessApp {
                 index,
                 search.as_ref(),
                 navigation.as_ref(),
+                request_cursor_autoscroll,
                 &row_owner,
                 cx,
             )
@@ -12591,8 +12711,10 @@ impl HarnessApp {
 
     fn render_reasoning(
         content: &str,
+        item_index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        owner: Option<WeakEntity<HarnessApp>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
@@ -12630,12 +12752,20 @@ impl HarnessApp {
                     start..end,
                     cx,
                 );
+                let pointer_step = rich_pointer_styled_text(
+                    format!("rich-reasoning:{item_index}:{start}"),
+                    highlighted_step,
+                    item_index,
+                    start..end,
+                    owner.clone(),
+                    false,
+                );
                 div()
                     .w_full()
                     .min_w_0()
                     .font_harness_reading(cx)
                     .text_color(colors.text)
-                    .child(highlighted_step)
+                    .child(pointer_step)
             }))
             .into_any_element()
     }
@@ -12673,12 +12803,13 @@ impl HarnessApp {
                     range.clone(),
                     cx,
                 );
-                let clickable = rich_clickable_styled_text(
+                let clickable = rich_pointer_styled_text(
                     format!("rich-terminal:{index}:{line_index}"),
                     highlighted,
                     index,
                     range,
                     Some(owner.clone()),
+                    false,
                 );
                 div()
                     .w_full()
@@ -12766,12 +12897,13 @@ impl HarnessApp {
                     range.clone(),
                     cx,
                 );
-                let clickable = rich_clickable_styled_text(
+                let clickable = rich_pointer_styled_text(
                     format!("rich-activity-heading:{index}:{section_index}"),
                     highlighted,
                     index,
                     range.clone(),
                     Some(owner.clone()),
+                    false,
                 );
                 row_ranges.push(Some(range));
                 rows.push(
@@ -12812,12 +12944,13 @@ impl HarnessApp {
                         range.clone(),
                         cx,
                     );
-                    let clickable = rich_clickable_styled_text(
+                    let clickable = rich_pointer_styled_text(
                         format!("rich-activity-body:{index}:{section_index}:{line_index}"),
                         highlighted,
                         index,
                         range.clone(),
                         Some(owner.clone()),
+                        false,
                     );
                     row_ranges.push(Some(range));
                     rows.push(
@@ -12892,6 +13025,7 @@ impl HarnessApp {
         let (data, command_scroll_handle, output_list_state, output_horizontal_handle) =
             self.rich_command_surface(item, navigation, cx)?;
         let colors = cx.theme().colors().clone();
+        let request_cursor_autoscroll = self.rich_cursor_autoscroll_allowed(index, navigation);
         let owner = cx.weak_entity();
         let search = search.cloned();
         let navigation = navigation.cloned();
@@ -12926,14 +13060,16 @@ impl HarnessApp {
                                 highlighted.layout().clone(),
                                 rendered_index,
                                 cx.theme().players().local().cursor.opacity(0.55),
+                                request_cursor_autoscroll,
                             )
                         });
-                let clickable = rich_clickable_styled_text(
+                let clickable = rich_pointer_styled_text(
                     format!("rich-command-text:{index}:{}", row.line_index),
                     highlighted,
                     index,
                     logical_range,
                     Some(command_owner.clone()),
+                    false,
                 );
                 let visual_status = (first_command_row && show_status_in_command_body)
                     .then_some(command_status)
@@ -13007,15 +13143,17 @@ impl HarnessApp {
                             highlighted.layout().clone(),
                             rendered_index,
                             cx.theme().players().local().cursor.opacity(0.55),
+                            request_cursor_autoscroll,
                         )
                     },
                 );
-            let clickable = rich_clickable_styled_text(
+            let clickable = rich_pointer_styled_text(
                 format!("rich-command-output:{index}:{}", row.line_index),
                 highlighted,
                 index,
                 logical_range,
                 Some(output_owner.clone()),
+                false,
             );
             div()
                 .w_full()
@@ -13183,19 +13321,21 @@ impl HarnessApp {
             output_start..output_start + displayed_output.len(),
             cx,
         );
-        let clickable_command = rich_clickable_styled_text(
+        let clickable_command = rich_pointer_styled_text(
             format!("rich-command-text:{index}"),
             highlighted_command,
             index,
             command_start..command_end,
             owner.clone(),
+            false,
         );
-        let clickable_output = rich_clickable_styled_text(
+        let clickable_output = rich_pointer_styled_text(
             format!("rich-command-output:{index}"),
             highlighted_output,
             index,
             output_start..output_start + displayed_output.len(),
             owner,
+            false,
         );
 
         Some(
@@ -13269,6 +13409,7 @@ impl HarnessApp {
         let presentation = web_search_presentation(&item.raw);
         let total_results = presentation.results.len();
         let item_key = item.key.clone();
+        let pointer_owner = cx.weak_entity();
         // The first exact query is painted in the shared card identity row.
         // Begin body mapping after it so additional queries and result rows
         // retain stable Vim/search coordinates without repeating that query.
@@ -13290,8 +13431,16 @@ impl HarnessApp {
                     Vec::new(),
                     search,
                     navigation,
-                    range,
+                    range.clone(),
                     cx,
+                );
+                let pointer_query = rich_pointer_styled_text(
+                    format!("rich-web-query:{index}:{query_index}"),
+                    highlighted,
+                    index,
+                    range,
+                    Some(pointer_owner.clone()),
+                    false,
                 );
                 div()
                     .id(format!("web-query:{item_key}:{query_index}"))
@@ -13300,7 +13449,7 @@ impl HarnessApp {
                     .py_0p5()
                     .font_harness_code(cx)
                     .text_color(colors.text_muted)
-                    .child(highlighted)
+                    .child(pointer_query)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -13309,6 +13458,7 @@ impl HarnessApp {
             .into_iter()
             .enumerate()
             .map(|(result_index, result)| {
+                let has_url = result.url.is_some();
                 let title_range =
                     rich_navigation_fragment_range(navigation, &result.title, &mut logical_cursor);
                 let result_start = title_range.start;
@@ -13319,6 +13469,14 @@ impl HarnessApp {
                     navigation,
                     title_range.clone(),
                     cx,
+                );
+                let pointer_title = rich_pointer_styled_text(
+                    format!("rich-web-title:{index}:{result_index}"),
+                    highlighted_title,
+                    index,
+                    title_range.clone(),
+                    Some(pointer_owner.clone()),
+                    has_url,
                 );
                 let domain = result.domain.clone().map(|domain| {
                     let range =
@@ -13331,7 +13489,15 @@ impl HarnessApp {
                         range.clone(),
                         cx,
                     );
-                    (highlighted, range)
+                    let pointer_domain = rich_pointer_styled_text(
+                        format!("rich-web-domain:{index}:{result_index}"),
+                        highlighted,
+                        index,
+                        range.clone(),
+                        Some(pointer_owner.clone()),
+                        has_url,
+                    );
+                    (pointer_domain, range)
                 });
                 let result_end = domain
                     .as_ref()
@@ -13354,7 +13520,7 @@ impl HarnessApp {
                             .flex_1()
                             .truncate()
                             .font_harness_reading(cx)
-                            .child(highlighted_title),
+                            .child(pointer_title),
                     )
                     .when_some(domain, |this, (highlighted_domain, _)| {
                         this.child(div().flex_none().text_color(colors.text_muted).child("—"))
@@ -13368,12 +13534,25 @@ impl HarnessApp {
                     });
                 if let Some(url) = result.url {
                     let open_url = url.clone();
+                    let link_owner = pointer_owner.clone();
                     result_row
                         .id(format!("web-result:{item_key}:{result_index}"))
                         .cursor_pointer()
                         .hover(|this| this.bg(colors.element_hover))
                         .tooltip(Tooltip::text(url))
-                        .on_click(move |_, _, cx| cx.open_url(&open_url))
+                        .on_click(move |_, _, cx| {
+                            let nonempty_drag = link_owner
+                                .update(cx, |this, _| {
+                                    this.rich_pointer_gesture
+                                        .is_some_and(|gesture| gesture.anchor != gesture.head)
+                                })
+                                .unwrap_or(false);
+                            if nonempty_drag {
+                                cx.stop_propagation();
+                            } else {
+                                cx.open_url(&open_url);
+                            }
+                        })
                         .into_any_element()
                 } else {
                     result_row.into_any_element()
@@ -13425,8 +13604,10 @@ impl HarnessApp {
 
     fn render_plain_prose(
         content: &str,
+        item_index: usize,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
+        owner: Option<WeakEntity<HarnessApp>>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut paragraph_offset = 0;
@@ -13470,10 +13651,15 @@ impl HarnessApp {
                             start..end,
                             cx,
                         );
-                        div()
-                            .min_h(px(20.))
-                            .whitespace_normal()
-                            .child(highlighted_line)
+                        let pointer_line = rich_pointer_styled_text(
+                            format!("rich-plain-prose:{item_index}:{start}"),
+                            highlighted_line,
+                            item_index,
+                            start..end,
+                            owner.clone(),
+                            false,
+                        );
+                        div().min_h(px(20.)).whitespace_normal().child(pointer_line)
                     }))
             }))
             .into_any_element()
@@ -13482,6 +13668,7 @@ impl HarnessApp {
     fn render_image(
         &mut self,
         item: &TranscriptItem,
+        item_index: usize,
         surface: Option<Entity<ImageSurface>>,
         search: Option<&RichSearchPaint>,
         navigation: Option<&RichNavigationPaint>,
@@ -13489,17 +13676,19 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let caption = image_caption_for_display(item).map(ToOwned::to_owned);
+        let pointer_owner = cx.weak_entity();
         let mut logical_cursor = 0;
         let highlighted_caption = caption.as_ref().map(|caption| {
             let range = rich_navigation_fragment_range(navigation, caption, &mut logical_cursor);
-            navigation_searchable_styled_text(
+            let highlighted = navigation_searchable_styled_text(
                 caption.clone(),
                 Vec::new(),
                 search,
                 navigation,
-                range,
+                range.clone(),
                 cx,
-            )
+            );
+            (highlighted, range)
         });
         let surface_size = surface
             .as_ref()
@@ -13535,13 +13724,21 @@ impl HarnessApp {
                     )
                 },
             )
-            .when_some(highlighted_caption, |this, highlighted_caption| {
+            .when_some(highlighted_caption, |this, (highlighted_caption, range)| {
+                let pointer_caption = rich_pointer_styled_text(
+                    format!("rich-image-caption:{item_index}"),
+                    highlighted_caption,
+                    item_index,
+                    range,
+                    Some(pointer_owner),
+                    false,
+                );
                 this.child(
                     div()
                         .text_ui(cx)
                         .line_height(relative(1.45))
                         .text_color(colors.text_muted)
-                        .child(highlighted_caption),
+                        .child(pointer_caption),
                 )
             })
             .into_any_element()
@@ -14416,6 +14613,7 @@ impl HarnessApp {
             )
         });
         let inline_turn_status = self.transient_turn_status.clone();
+        let rich_pointer_owner = cx.weak_entity();
 
         let body = if request_method.is_some() || !item.expanded {
             None
@@ -14502,14 +14700,18 @@ impl HarnessApp {
                 | model::TranscriptKind::Agent
                 | model::TranscriptKind::Plan => Self::render_plain_prose(
                     &item.content,
+                    index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    Some(rich_pointer_owner.clone()),
                     cx,
                 ),
                 model::TranscriptKind::Reasoning => Self::render_reasoning(
                     &item.content,
+                    index,
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
+                    Some(rich_pointer_owner.clone()),
                     cx,
                 ),
                 model::TranscriptKind::Command => self.render_command(
@@ -14546,6 +14748,7 @@ impl HarnessApp {
                 ),
                 model::TranscriptKind::Image => self.render_image(
                     &item,
+                    index,
                     self.image_surfaces.get(&item.key).cloned(),
                     rich_search.as_ref(),
                     rich_navigation.as_ref(),
@@ -15147,6 +15350,17 @@ impl Render for HarnessApp {
                 .flex_col()
                 .overflow_hidden()
                 .bg(visuals.transcript)
+                .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    if event.button == MouseButton::Left {
+                        this.finish_rich_pointer_selection(window, cx);
+                    }
+                }))
+                .on_mouse_up_out(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.finish_rich_pointer_selection(window, cx)
+                    }),
+                )
                 .child(rich_list)
                 .when(show_latest, |this| {
                     this.child(
@@ -17798,8 +18012,8 @@ mod tests {
     }
 
     #[test]
-    fn rich_markdown_pointer_updates_keep_the_original_drag_anchor() {
-        let begin = rich_markdown_pointer_update(
+    fn rich_pointer_updates_keep_the_original_anchor_across_surfaces() {
+        let begin = rich_pointer_update(
             None,
             3,
             7,
@@ -17809,58 +18023,66 @@ mod tests {
             },
         )
         .unwrap();
-        let RichMarkdownPointerUpdate::Begin(anchor) = begin else {
+        let RichPointerUpdate::Begin(anchor) = begin else {
             panic!("left down must begin a pointer selection")
         };
         assert_eq!(
             anchor,
-            RichMarkdownPointerAnchor {
+            RichPointerPosition {
                 item_index: 3,
                 body_offset: 7
             }
         );
 
         assert_eq!(
-            rich_markdown_pointer_update(
-                Some(anchor),
-                3,
+            rich_pointer_update(
+                Some(RichPointerGesture {
+                    anchor,
+                    head: anchor,
+                }),
+                8,
                 19,
                 SourcePointerPhase::Drag {
                     button: MouseButton::Left,
                 },
             ),
-            Some(RichMarkdownPointerUpdate::Extend {
+            Some(RichPointerUpdate::Extend {
                 anchor,
-                head: RichMarkdownPointerAnchor {
-                    item_index: 3,
+                head: RichPointerPosition {
+                    item_index: 8,
                     body_offset: 19,
                 },
-            })
+            }),
+            "a hovered structured or Markdown target owns the cross-item head"
         );
         assert_eq!(
-            rich_markdown_pointer_update(
-                Some(anchor),
-                3,
+            rich_pointer_update(
+                Some(RichPointerGesture {
+                    anchor,
+                    head: RichPointerPosition {
+                        item_index: 8,
+                        body_offset: 19,
+                    },
+                }),
+                9,
                 23,
-                SourcePointerPhase::Up {
-                    button: MouseButton::Left,
-                    click_count: 1,
-                },
+                SourcePointerPhase::Move,
             ),
-            Some(RichMarkdownPointerUpdate::Finish {
+            Some(RichPointerUpdate::Extend {
                 anchor,
-                head: RichMarkdownPointerAnchor {
-                    item_index: 3,
+                head: RichPointerPosition {
+                    item_index: 9,
                     body_offset: 23,
                 },
-            })
+            }),
+            "a passive Move becomes a drag update while another surface owns the gesture"
         );
         assert_eq!(
-            rich_markdown_pointer_update(None, 3, 9, SourcePointerPhase::Move),
+            rich_pointer_update(None, 3, 9, SourcePointerPhase::Move),
             None
         );
         assert_eq!(
-            rich_markdown_pointer_update(
+            rich_pointer_update(
                 None,
                 3,
                 9,
@@ -17869,16 +18091,14 @@ mod tests {
                     click_count: 3,
                 },
             ),
-            Some(RichMarkdownPointerUpdate::Begin(
-                RichMarkdownPointerAnchor {
-                    item_index: 3,
-                    body_offset: 9,
-                }
-            )),
+            Some(RichPointerUpdate::Begin(RichPointerPosition {
+                item_index: 3,
+                body_offset: 9,
+            })),
             "double/triple click expansion is outside the character-drag bridge"
         );
         assert_eq!(
-            rich_markdown_pointer_update(
+            rich_pointer_update(
                 None,
                 3,
                 9,
@@ -17919,16 +18139,16 @@ mod tests {
         }
 
         let handler = source
-            .split_once("fn handle_rich_markdown_pointer(")
+            .split_once("fn note_rich_pointer_position(")
             .and_then(|(_, after)| after.split_once("fn place_rich_cursor_in_item("))
             .map(|(method, _)| method)
-            .expect("Markdown pointer host must remain auditable");
+            .expect("renderer-neutral pointer host must remain auditable");
         for required in [
             "set_pointer_cursor_in_item(",
             "set_pointer_selection(",
             "pause_following_tail()",
             "focus_handle(cx).focus(window, cx)",
-            "if anchor == head",
+            "if gesture.anchor == gesture.head",
             "enter_normal_mode(window, cx)",
         ] {
             assert!(
@@ -17955,6 +18175,71 @@ mod tests {
             .expect("selection subscription must remain auditable");
         assert!(selection_subscription.contains("rich_pointer_gesture_active"));
         assert!(selection_subscription.contains("if !rich_pointer_gesture_active"));
+
+        let rich_viewport = source
+            .split_once("let transcript_body = if self.buffer_view")
+            .and_then(|(_, after)| after.split_once("let command_line_input ="))
+            .map(|(viewport, _)| viewport)
+            .expect("Rich transcript viewport must remain auditable");
+        assert!(rich_viewport.contains(".capture_any_mouse_up("));
+        assert!(rich_viewport.contains(".on_mouse_up_out("));
+        assert!(rich_viewport.contains("finish_rich_pointer_selection("));
+        assert!(!rich_viewport.contains("capture_pointer("));
+    }
+
+    #[test]
+    fn canonical_structured_text_uses_the_shared_pointer_surface() {
+        let source = include_str!("main.rs");
+        for (start, end) in [
+            ("fn render_reasoning(", "fn render_terminal("),
+            ("fn render_terminal(", "fn render_activity_sections("),
+            ("fn render_activity_sections(", "fn render_command("),
+            (
+                "fn render_rich_command_content(",
+                "fn render_command_content(",
+            ),
+            ("fn render_command_content(", "fn render_web_search("),
+            ("fn render_web_search(", "fn render_plain_prose("),
+            ("fn render_plain_prose(", "fn render_image("),
+            ("fn render_image(", "fn render_ordered_user_content("),
+        ] {
+            let renderer = source
+                .split_once(start)
+                .and_then(|(_, after)| after.split_once(end))
+                .map(|(renderer, _)| renderer)
+                .unwrap_or_else(|| panic!("missing renderer boundary {start}..{end}"));
+            assert!(
+                renderer.contains("rich_pointer_styled_text("),
+                "{start} must expose canonical StyledText to the shared pointer host"
+            );
+        }
+
+        let helper = source
+            .split_once("fn rich_pointer_styled_text(")
+            .and_then(|(_, after)| after.split_once("fn search_context_snippet("))
+            .map(|(helper, _)| helper)
+            .expect("structured pointer helper must remain auditable");
+        for required in [
+            ".on_mouse_down(MouseButton::Left",
+            ".on_mouse_move(",
+            "begin_rich_pointer_selection(",
+            "extend_rich_pointer_selection(",
+        ] {
+            assert!(
+                helper.contains(required),
+                "pointer helper must call {required}"
+            );
+        }
+        for forbidden in [
+            "set_cursor_in_item(",
+            "scroll_to_reveal_item(",
+            "capture_pointer(",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "Rich structured pointer path must not call {forbidden}"
+            );
+        }
     }
 
     #[test]

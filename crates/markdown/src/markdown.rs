@@ -2457,20 +2457,27 @@ impl MarkdownElement {
                 if let Some(button) = markdown.source_pointer_button
                     && event.pressed_button == Some(button)
                 {
-                    let source_index = match rendered_text.source_index_for_position(event.position)
-                    {
-                        Ok(ix) | Err(ix) => ix,
-                    };
-                    if let Some(handler) = on_source_pointer.as_ref() {
-                        handler(
-                            SourcePointerEvent {
-                                source_index,
-                                phase: SourcePointerPhase::Drag { button },
-                                modifiers: event.modifiers,
-                            },
-                            window,
-                            cx,
-                        );
+                    // Only the actually hovered surface may contribute drag
+                    // geometry. Continuing to map through the origin after
+                    // leaving it clamps cross-surface selection to that
+                    // Markdown view's first/last source byte. The origin still
+                    // retains gesture ownership for mouse-up cleanup below.
+                    if hitbox.is_hovered(window) {
+                        let source_index =
+                            match rendered_text.source_index_for_position(event.position) {
+                                Ok(ix) | Err(ix) => ix,
+                            };
+                        if let Some(handler) = on_source_pointer.as_ref() {
+                            handler(
+                                SourcePointerEvent {
+                                    source_index,
+                                    phase: SourcePointerPhase::Drag { button },
+                                    modifiers: event.modifiers,
+                                },
+                                window,
+                                cx,
+                            );
+                        }
                     }
                     window.prevent_default();
                     return;
@@ -6733,6 +6740,99 @@ mod tests {
             assert!(!markdown.has_selection());
             assert!(!markdown.selection.pending);
             assert_eq!(markdown.source_pointer_button, None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_source_pointer_drag_geometry_moves_to_the_hovered_markdown(cx: &mut TestAppContext) {
+        struct CrossSurfacePointerView {
+            first: Entity<Markdown>,
+            second: Entity<Markdown>,
+            events: Rc<RefCell<Vec<(usize, SourcePointerEvent)>>>,
+        }
+
+        impl Render for CrossSurfacePointerView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let first_events = self.events.clone();
+                let second_events = self.events.clone();
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div().h(px(32.)).child(
+                            MarkdownElement::new(self.first.clone(), MarkdownStyle::default())
+                                .on_source_pointer(move |event, _, _| {
+                                    first_events.borrow_mut().push((0, event));
+                                }),
+                        ),
+                    )
+                    .child(
+                        div().h(px(32.)).child(
+                            MarkdownElement::new(self.second.clone(), MarkdownStyle::default())
+                                .on_source_pointer(move |event, _, _| {
+                                    second_events.borrow_mut().push((1, event));
+                                }),
+                        ),
+                    )
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let first = cx.new(|cx| Markdown::new("first surface".into(), None, None, cx));
+        let second = cx.new(|cx| Markdown::new("second surface".into(), None, None, cx));
+        let (_, cx) = cx.add_window_view({
+            let first = first.clone();
+            let second = second.clone();
+            let events = events.clone();
+            move |_, _| CrossSurfacePointerView {
+                first,
+                second,
+                events,
+            }
+        });
+        cx.run_until_parked();
+
+        let start = point(px(8.), px(8.));
+        let second_surface = point(px(8.), px(40.));
+        cx.simulate_mouse_move(start, None, Modifiers::default());
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(second_surface, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(second_surface, MouseButton::Left, Modifiers::default());
+
+        let events = events.borrow();
+        assert!(events.iter().any(|(surface, event)| {
+            *surface == 0
+                && matches!(
+                    event.phase,
+                    SourcePointerPhase::Down {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                )
+        }));
+        assert!(
+            events.iter().any(|(surface, event)| {
+                *surface == 1 && event.phase == SourcePointerPhase::Move
+            })
+        );
+        assert!(
+            !events.iter().any(|(surface, event)| {
+                *surface == 0
+                    && matches!(
+                        event.phase,
+                        SourcePointerPhase::Drag {
+                            button: MouseButton::Left
+                        }
+                    )
+            }),
+            "the origin must not clamp cross-surface drag geometry to itself"
+        );
+        drop(events);
+
+        cx.update(|_, cx| {
+            assert_eq!(first.read(cx).source_pointer_button, None);
         });
     }
 
