@@ -18,8 +18,8 @@ use file_icons::FileIcons;
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
     FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
-    KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, ObjectFit,
-    PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, MouseButton,
+    ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
     SharedString, StyledImage, StyledText, Task, TouchPhase, UniformListScrollHandle, UpdateGlobal,
     WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point,
     prelude::*, px, relative, size, uniform_list,
@@ -33,7 +33,7 @@ use harness_editor::{
     VimWordPrevious, shell_capture_priority, shell_capture_ranges, syntax_highlights_for_path,
 };
 use harness_protocol as model;
-use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle, SourcePointerPhase};
 use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
 use serde_json::{Value, json};
 use settings::{Settings as _, SettingsStore};
@@ -541,6 +541,54 @@ struct RichFileChangeSurface {
 struct RichMarkdownNavigationPaint {
     selections: Vec<Range<usize>>,
     cursor: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RichMarkdownPointerAnchor {
+    item_index: usize,
+    body_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RichMarkdownPointerUpdate {
+    Begin(RichMarkdownPointerAnchor),
+    Extend {
+        anchor: RichMarkdownPointerAnchor,
+        head: RichMarkdownPointerAnchor,
+    },
+    Finish {
+        anchor: RichMarkdownPointerAnchor,
+        head: RichMarkdownPointerAnchor,
+    },
+}
+
+fn rich_markdown_pointer_update(
+    active: Option<RichMarkdownPointerAnchor>,
+    item_index: usize,
+    body_offset: usize,
+    phase: SourcePointerPhase,
+) -> Option<RichMarkdownPointerUpdate> {
+    let head = RichMarkdownPointerAnchor {
+        item_index,
+        body_offset,
+    };
+    match phase {
+        SourcePointerPhase::Down {
+            button: MouseButton::Left,
+            ..
+        } => Some(RichMarkdownPointerUpdate::Begin(head)),
+        SourcePointerPhase::Drag {
+            button: MouseButton::Left,
+        } => active.map(|anchor| RichMarkdownPointerUpdate::Extend { anchor, head }),
+        SourcePointerPhase::Up {
+            button: MouseButton::Left,
+            ..
+        } => active.map(|anchor| RichMarkdownPointerUpdate::Finish { anchor, head }),
+        SourcePointerPhase::Down { .. }
+        | SourcePointerPhase::Move
+        | SourcePointerPhase::Drag { .. }
+        | SourcePointerPhase::Up { .. } => None,
+    }
 }
 
 fn changed_markdown_cursor(
@@ -2804,6 +2852,7 @@ struct CachedMarkdown {
     search_ranges: Vec<Range<usize>>,
     navigation: Option<RichMarkdownNavigationPaint>,
     last_autoscroll_generation: Option<u64>,
+    suppress_next_navigation_autoscroll: bool,
 }
 
 struct LiveRequestSurface {
@@ -3513,6 +3562,7 @@ struct HarnessApp {
     search_editor: Entity<LocalEditor>,
     transcript_editor: Entity<TranscriptEditor>,
     rich_navigation_selection: Option<TranscriptSelectionSnapshot>,
+    rich_markdown_pointer_anchor: Option<RichMarkdownPointerAnchor>,
     mode_indicator: Entity<ModeIndicator>,
     buffer_view: bool,
     transcript_focus: FocusHandle,
@@ -6294,15 +6344,21 @@ impl HarnessApp {
             cursor_claimed: Rc::new(Cell::new(false)),
         };
         let next_navigation = Some(navigation.markdown_source_navigation(&source));
+        let pointer_gesture_active = self.rich_markdown_pointer_anchor.is_some();
         let Some(cached) = self.markdown_cache.get_mut(&key) else {
             return false;
         };
         if cached.source != source {
             return false;
         }
+        let navigation_can_autoscroll = !pointer_gesture_active
+            && !std::mem::take(&mut cached.suppress_next_navigation_autoscroll);
         if cached.navigation != next_navigation {
-            let autoscroll_cursor =
-                changed_markdown_cursor(cached.navigation.as_ref(), next_navigation.as_ref());
+            let autoscroll_cursor = navigation_can_autoscroll
+                .then(|| {
+                    changed_markdown_cursor(cached.navigation.as_ref(), next_navigation.as_ref())
+                })
+                .flatten();
             cached.navigation = next_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
                 let navigation = next_navigation.as_ref();
@@ -6448,6 +6504,7 @@ impl HarnessApp {
         cx.subscribe(
             &transcript_editor,
             |this, editor, _: &TranscriptSelectionChanged, cx| {
+                let rich_pointer_gesture_active = this.rich_markdown_pointer_anchor.is_some();
                 // Snapshot the native selection once at the event boundary. Rich
                 // rendering can then consume the cached logical ranges without
                 // rebuilding an Editor display snapshot and copying selected
@@ -6484,10 +6541,12 @@ impl HarnessApp {
                     this.selected_item = item_index;
                     if !this.buffer_view && rich_vim_experiment() {
                         this.list_state.pause_following_tail();
-                        this.reveal_rich_navigation_item(
-                            item_index,
-                            body_offset.unwrap_or_default(),
-                        );
+                        if !rich_pointer_gesture_active {
+                            this.reveal_rich_navigation_item(
+                                item_index,
+                                body_offset.unwrap_or_default(),
+                            );
+                        }
                     }
                     if changed || (rich_selection_changed && !local_markdown_repaint) {
                         cx.notify();
@@ -6618,6 +6677,7 @@ impl HarnessApp {
             search_editor,
             transcript_editor,
             rich_navigation_selection: None,
+            rich_markdown_pointer_anchor: None,
             mode_indicator,
             buffer_view: start_in_text_view,
             transcript_focus,
@@ -10379,6 +10439,95 @@ impl HarnessApp {
         cx.notify();
     }
 
+    /// Route visible Rich Markdown pointer geometry into the canonical native
+    /// selection without asking either the Editor or list to reveal it.
+    fn handle_rich_markdown_pointer(
+        &mut self,
+        markdown_key: &str,
+        item_index: usize,
+        body_offset: usize,
+        phase: SourcePointerPhase,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(update) = rich_markdown_pointer_update(
+            self.rich_markdown_pointer_anchor,
+            item_index,
+            body_offset,
+            phase,
+        ) else {
+            return;
+        };
+        if let Some(cached) = self.markdown_cache.get_mut(markdown_key) {
+            // The release guard is cleared before list processors necessarily
+            // rebuild ordered or streaming Markdown. Carry one no-scroll
+            // navigation update on the actual surface as well.
+            cached.suppress_next_navigation_autoscroll = true;
+        }
+
+        match update {
+            RichMarkdownPointerUpdate::Begin(anchor) => {
+                // Install the gesture guard before changing the native
+                // selection. TranscriptSelectionChanged is emitted from that
+                // update, and must repaint the visible Markdown without
+                // revealing a row that the pointer is already inside.
+                self.rich_markdown_pointer_anchor = Some(anchor);
+                self.selected_item = anchor.item_index;
+                self.visual_anchor = None;
+                self.focus_mode = FocusMode::Buffer;
+                self.transcript_cursor_initialized = true;
+                self.list_state.pause_following_tail();
+                let placed = self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_pointer_cursor_in_item(
+                        anchor.item_index,
+                        anchor.body_offset,
+                        window,
+                        cx,
+                    )
+                });
+                if !placed {
+                    self.rich_markdown_pointer_anchor = None;
+                }
+                cx.notify();
+            }
+            RichMarkdownPointerUpdate::Extend { anchor, head }
+            | RichMarkdownPointerUpdate::Finish { anchor, head } => {
+                let finishing = matches!(update, RichMarkdownPointerUpdate::Finish { .. });
+                let placed = self.transcript_editor.update(cx, |editor, cx| {
+                    editor.set_pointer_selection(
+                        anchor.item_index,
+                        anchor.body_offset,
+                        head.item_index,
+                        head.body_offset,
+                        window,
+                        cx,
+                    )
+                });
+                if placed {
+                    self.selected_item = head.item_index;
+                }
+                if finishing {
+                    // Focusing only after mouse-up lets Markdown retain the
+                    // gesture while handing subsequent Vim input back to the
+                    // canonical Editor. Preserve the legacy click behavior,
+                    // but do not collapse a non-empty drag selection.
+                    self.transcript_editor.focus_handle(cx).focus(window, cx);
+                    if anchor == head {
+                        self.transcript_editor.update(cx, |editor, cx| {
+                            editor.enter_normal_mode(window, cx);
+                        });
+                    }
+                    cx.defer_in(window, move |this, _, _| {
+                        if this.rich_markdown_pointer_anchor == Some(anchor) {
+                            this.rich_markdown_pointer_anchor = None;
+                        }
+                    });
+                }
+                cx.notify();
+            }
+        }
+    }
+
     /// Host-driven Rich cursor placement does not produce a local native
     /// Editor selection event. Snapshot it immediately so the painted Rich
     /// transcript and its hidden Vim input surface agree in the same frame.
@@ -11779,6 +11928,7 @@ impl HarnessApp {
         autoscroll_generation: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
+        let pointer_gesture_active = self.rich_markdown_pointer_anchor.is_some();
         let cached = self
             .markdown_cache
             .entry(key.to_string())
@@ -11799,6 +11949,7 @@ impl HarnessApp {
                     search_ranges: Vec::new(),
                     navigation: None,
                     last_autoscroll_generation: None,
+                    suppress_next_navigation_autoscroll: false,
                 }
             });
         if cached.source != source {
@@ -11819,12 +11970,20 @@ impl HarnessApp {
                 }
             });
         }
+        let navigation_can_autoscroll = !pointer_gesture_active
+            && !std::mem::take(&mut cached.suppress_next_navigation_autoscroll);
 
         let markdown_navigation =
             navigation.map(|navigation| navigation.markdown_source_navigation(source));
         if cached.navigation != markdown_navigation {
-            let autoscroll_cursor =
-                changed_markdown_cursor(cached.navigation.as_ref(), markdown_navigation.as_ref());
+            let autoscroll_cursor = navigation_can_autoscroll
+                .then(|| {
+                    changed_markdown_cursor(
+                        cached.navigation.as_ref(),
+                        markdown_navigation.as_ref(),
+                    )
+                })
+                .flatten();
             cached.navigation = markdown_navigation.clone();
             cached.entity.update(cx, |markdown, cx| {
                 let navigation = markdown_navigation.as_ref();
@@ -13301,20 +13460,22 @@ impl HarnessApp {
                         style.selection_background_color =
                             rich_navigation_markdown_highlight_background(navigation, cx);
                     }
-                    let owner = cx.weak_entity();
-                    let logical = text.clone();
-                    let source = text.clone();
-                    let base = source_range.start;
                     let click_boundary_id =
                         format!("rich-user-markdown-click:{item_key}:{part_index}");
-                    let item_key = item_key.to_owned();
-                    let element = MarkdownElement::new(markdown, style).on_source_click(
-                        move |source_offset, _, window, cx| {
+                    let mut element = MarkdownElement::new(markdown, style);
+                    if rich_vim_experiment() {
+                        let owner = cx.weak_entity();
+                        let logical = text.clone();
+                        let source = text.clone();
+                        let base = source_range.start;
+                        let item_key = item_key.to_owned();
+                        let markdown_key = cache_key.clone();
+                        element = element.on_source_pointer(move |event, window, cx| {
                             let body_offset = base
                                 + markdown_logical_offset_for_source(
                                     &logical,
                                     &source,
-                                    source_offset,
+                                    event.source_index,
                                 );
                             owner
                                 .update(cx, |this, cx| {
@@ -13324,28 +13485,19 @@ impl HarnessApp {
                                         .iter()
                                         .position(|item| item.key == item_key)
                                     {
-                                        this.selected_item = index;
-                                        this.visual_anchor = None;
-                                        this.focus_mode = FocusMode::Buffer;
-                                        this.transcript_cursor_initialized = true;
-                                        this.list_state.pause_following_tail();
-                                        this.place_rich_cursor_in_item(
+                                        this.handle_rich_markdown_pointer(
+                                            &markdown_key,
                                             index,
                                             body_offset,
+                                            event.phase,
                                             window,
                                             cx,
                                         );
-                                        this.transcript_editor.focus_handle(cx).focus(window, cx);
-                                        this.transcript_editor.update(cx, |editor, cx| {
-                                            editor.enter_normal_mode(window, cx)
-                                        });
-                                        cx.notify();
                                     }
                                 })
                                 .ok();
-                            true
-                        },
-                    );
+                        });
+                    }
                     children.push(
                         div()
                             .id(click_boundary_id)
@@ -14174,25 +14326,22 @@ impl HarnessApp {
                     .map(|projection| projection.body_text().to_owned())
                     .unwrap_or_else(|| source.clone());
                 let owner = cx.weak_entity();
-                element = element.on_source_click(move |source_offset, _, window, cx| {
+                let markdown_key = item.key.clone();
+                element = element.on_source_pointer(move |event, window, cx| {
                     let body_offset =
-                        markdown_logical_offset_for_source(&logical, &source, source_offset);
+                        markdown_logical_offset_for_source(&logical, &source, event.source_index);
                     owner
                         .update(cx, |this, cx| {
-                            this.selected_item = index;
-                            this.visual_anchor = None;
-                            this.focus_mode = FocusMode::Buffer;
-                            this.transcript_cursor_initialized = true;
-                            this.list_state.pause_following_tail();
-                            this.place_rich_cursor_in_item(index, body_offset, window, cx);
-                            this.transcript_editor.focus_handle(cx).focus(window, cx);
-                            this.transcript_editor.update(cx, |editor, cx| {
-                                editor.enter_normal_mode(window, cx);
-                            });
-                            cx.notify();
+                            this.handle_rich_markdown_pointer(
+                                &markdown_key,
+                                index,
+                                body_offset,
+                                event.phase,
+                                window,
+                                cx,
+                            );
                         })
                         .ok();
-                    true
                 });
             }
             let element = if streaming && item.kind == model::TranscriptKind::Agent {
@@ -17499,6 +17648,166 @@ mod tests {
                 "every navigable glyph must be a source-owned token: {character:?} at {logical_offset}"
             );
         }
+    }
+
+    #[test]
+    fn rich_markdown_pointer_updates_keep_the_original_drag_anchor() {
+        let begin = rich_markdown_pointer_update(
+            None,
+            3,
+            7,
+            SourcePointerPhase::Down {
+                button: MouseButton::Left,
+                click_count: 1,
+            },
+        )
+        .unwrap();
+        let RichMarkdownPointerUpdate::Begin(anchor) = begin else {
+            panic!("left down must begin a pointer selection")
+        };
+        assert_eq!(
+            anchor,
+            RichMarkdownPointerAnchor {
+                item_index: 3,
+                body_offset: 7
+            }
+        );
+
+        assert_eq!(
+            rich_markdown_pointer_update(
+                Some(anchor),
+                3,
+                19,
+                SourcePointerPhase::Drag {
+                    button: MouseButton::Left,
+                },
+            ),
+            Some(RichMarkdownPointerUpdate::Extend {
+                anchor,
+                head: RichMarkdownPointerAnchor {
+                    item_index: 3,
+                    body_offset: 19,
+                },
+            })
+        );
+        assert_eq!(
+            rich_markdown_pointer_update(
+                Some(anchor),
+                3,
+                23,
+                SourcePointerPhase::Up {
+                    button: MouseButton::Left,
+                    click_count: 1,
+                },
+            ),
+            Some(RichMarkdownPointerUpdate::Finish {
+                anchor,
+                head: RichMarkdownPointerAnchor {
+                    item_index: 3,
+                    body_offset: 23,
+                },
+            })
+        );
+        assert_eq!(
+            rich_markdown_pointer_update(None, 3, 9, SourcePointerPhase::Move),
+            None
+        );
+        assert_eq!(
+            rich_markdown_pointer_update(
+                None,
+                3,
+                9,
+                SourcePointerPhase::Down {
+                    button: MouseButton::Left,
+                    click_count: 3,
+                },
+            ),
+            Some(RichMarkdownPointerUpdate::Begin(
+                RichMarkdownPointerAnchor {
+                    item_index: 3,
+                    body_offset: 9,
+                }
+            )),
+            "double/triple click expansion is outside the character-drag bridge"
+        );
+        assert_eq!(
+            rich_markdown_pointer_update(
+                None,
+                3,
+                9,
+                SourcePointerPhase::Down {
+                    button: MouseButton::Right,
+                    click_count: 1,
+                },
+            ),
+            None,
+            "non-left buttons remain available to Markdown and its context menu"
+        );
+    }
+
+    #[test]
+    fn visible_markdown_pointer_paths_use_the_no_scroll_transcript_bridge() {
+        let source = include_str!("main.rs");
+        let ordered = source
+            .split_once("fn render_ordered_user_content(")
+            .and_then(|(_, after)| after.split_once("fn render_pending_request_summary("))
+            .map(|(method, _)| method)
+            .expect("ordered user Markdown renderer must remain auditable");
+        let item = source
+            .split_once("fn render_item(")
+            .and_then(|(_, after)| after.split_once("fn render_transcript_list_item("))
+            .map(|(method, _)| method)
+            .expect("item Markdown renderer must remain auditable");
+        for renderer in [ordered, item] {
+            assert!(renderer.contains(".on_source_pointer("));
+            assert!(renderer.contains("handle_rich_markdown_pointer("));
+            assert!(
+                !renderer.contains(".on_source_click("),
+                "the legacy click bridge prevents Markdown pointer drag delegation"
+            );
+            assert!(
+                !renderer.contains("event.modifiers"),
+                "Shift extension remains outside this character-drag integration"
+            );
+        }
+
+        let handler = source
+            .split_once("fn handle_rich_markdown_pointer(")
+            .and_then(|(_, after)| after.split_once("fn place_rich_cursor_in_item("))
+            .map(|(method, _)| method)
+            .expect("Markdown pointer host must remain auditable");
+        for required in [
+            "set_pointer_cursor_in_item(",
+            "set_pointer_selection(",
+            "pause_following_tail()",
+            "focus_handle(cx).focus(window, cx)",
+            "if anchor == head",
+            "enter_normal_mode(window, cx)",
+        ] {
+            assert!(
+                handler.contains(required),
+                "pointer host must call {required}"
+            );
+        }
+        for forbidden in [
+            "place_rich_cursor_in_item(",
+            "reveal_rich_navigation_item(",
+            "scroll_to_reveal_item(",
+            "StyledText",
+        ] {
+            assert!(
+                !handler.contains(forbidden),
+                "pointer host must not call {forbidden}"
+            );
+        }
+
+        let selection_subscription = source
+            .split_once("|this, editor, _: &TranscriptSelectionChanged, cx|")
+            .and_then(|(_, after)| after.split_once("let mut model ="))
+            .map(|(subscription, _)| subscription)
+            .expect("selection subscription must remain auditable");
+        assert!(selection_subscription.contains("rich_pointer_gesture_active"));
+        assert!(selection_subscription.contains("if !rich_pointer_gesture_active"));
     }
 
     #[test]
