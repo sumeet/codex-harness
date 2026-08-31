@@ -1938,6 +1938,38 @@ fn segment_position_at_offset(
     })
 }
 
+/// Resolve a Rich renderer's item-relative byte offset into the canonical
+/// transcript Buffer. Pointer geometry can occasionally land between the
+/// bytes of a multi-byte scalar, so clip backward within the item's body
+/// before adding the segment's document offset.
+fn pointer_document_offset(
+    text: &str,
+    segments: &[TranscriptDocumentSegment],
+    item_index: usize,
+    body_offset: usize,
+) -> Option<usize> {
+    let segment_position = segments
+        .binary_search_by_key(&item_index, |segment| segment.item_index)
+        .ok()?;
+    let segment = &segments[segment_position];
+    let body = text.get(segment.body_range.clone())?;
+    let body_offset = previous_char_boundary(body, body_offset.min(body.len()));
+    Some(segment.body_range.start + body_offset)
+}
+
+fn pointer_selection_document_range(
+    text: &str,
+    segments: &[TranscriptDocumentSegment],
+    anchor_item_index: usize,
+    anchor_body_offset: usize,
+    head_item_index: usize,
+    head_body_offset: usize,
+) -> Option<Range<usize>> {
+    let anchor = pointer_document_offset(text, segments, anchor_item_index, anchor_body_offset)?;
+    let head = pointer_document_offset(text, segments, head_item_index, head_body_offset)?;
+    Some(anchor..head)
+}
+
 fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -> bool {
     projection.has_valid_ranges()
 }
@@ -2717,6 +2749,58 @@ impl TranscriptEditor {
         self.editor.update(cx, |editor, cx| {
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
                 selections.select_ranges([point..point]);
+            });
+        });
+        true
+    }
+
+    /// Place a pointer cursor in one Rich item's selectable body without
+    /// revealing it in the hidden native Editor or changing focus.
+    ///
+    /// Unlike keyboard focus entry through `set_cursor_in_item`, this uses
+    /// no-scroll selection effects. The ordinary local selection event still
+    /// flows through Editor and Vim so a collapsed drag naturally returns to
+    /// Normal mode without dispatching a separate mode action on every move.
+    pub fn set_pointer_cursor_in_item(
+        &mut self,
+        item_index: usize,
+        body_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.set_pointer_selection(item_index, body_offset, item_index, body_offset, window, cx)
+    }
+
+    /// Set an oriented Rich pointer selection in the canonical native Editor.
+    ///
+    /// Both endpoints are logical item/body byte offsets. The anchor-to-head
+    /// order is intentionally retained, including for a backwards cross-item
+    /// drag; `MutableSelectionsCollection` records that order as its reversed
+    /// selection state. No native reveal or autoscroll is requested.
+    pub fn set_pointer_selection(
+        &mut self,
+        anchor_item_index: usize,
+        anchor_body_offset: usize,
+        head_item_index: usize,
+        head_body_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let text = self.buffer.read(cx).text();
+        let Some(range) = pointer_selection_document_range(
+            &text,
+            &self.segments,
+            anchor_item_index,
+            anchor_body_offset,
+            head_item_index,
+            head_body_offset,
+        ) else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections
+                    .select_ranges([MultiBufferOffset(range.start)..MultiBufferOffset(range.end)]);
             });
         });
         true
@@ -5622,6 +5706,78 @@ mod tests {
         assert_eq!(segment_position_at_offset(&segments, 9), Some(1));
         assert_eq!(segment_position_at_offset(&segments, 10), Some(1));
         assert_eq!(segment_position_at_offset(&[], 0), None);
+    }
+
+    #[test]
+    fn pointer_ranges_preserve_cross_item_anchor_head_orientation() {
+        let text = "A\nhé\nB\nworld🙂\n";
+        let first_body = "A\n".len().."A\nhé".len();
+        let second_start = "A\nhé\n".len();
+        let second_body = second_start + "B\n".len()..text.trim_end_matches('\n').len();
+        let segments = vec![
+            segment(3, 0..second_start, 0..1, first_body.clone()),
+            segment(
+                8,
+                second_start..text.len(),
+                second_start..second_start + 1,
+                second_body.clone(),
+            ),
+        ];
+
+        let forward = pointer_selection_document_range(text, &segments, 3, 1, 8, 5).unwrap();
+        let reversed = pointer_selection_document_range(text, &segments, 8, 5, 3, 1).unwrap();
+
+        assert_eq!(forward, first_body.start + 1..second_body.start + 5);
+        assert_eq!(reversed, forward.end..forward.start);
+        assert!(text.is_char_boundary(forward.start));
+        assert!(text.is_char_boundary(forward.end));
+    }
+
+    #[test]
+    fn pointer_offsets_clip_to_utf8_body_boundaries_and_ends() {
+        let text = "H\nhé🙂\n";
+        let body = "H\n".len()..text.trim_end_matches('\n').len();
+        let segments = [segment(4, 0..text.len(), 0..1, body.clone())];
+
+        assert_eq!(
+            pointer_document_offset(text, &segments, 4, 2),
+            Some(body.start + 1),
+            "the second byte of é clips to its leading boundary"
+        );
+        assert_eq!(
+            pointer_document_offset(text, &segments, 4, usize::MAX),
+            Some(body.end)
+        );
+        assert_eq!(pointer_document_offset(text, &segments, 99, 0), None);
+    }
+
+    #[test]
+    fn rich_pointer_selection_uses_native_no_scroll_effects_without_mode_dispatch() {
+        let source = include_str!("lib.rs");
+        let method = source
+            .split_once("pub fn set_pointer_selection(")
+            .and_then(|(_, after)| {
+                after.split_once(
+                    "/// Place the cursor at column zero of an item's last logical line",
+                )
+            })
+            .map(|(method, _)| method)
+            .expect("pointer selection must remain an auditable native Editor bridge");
+
+        assert!(method.contains("editor.change_selections("));
+        assert!(method.contains("SelectionEffects::no_scroll()"));
+        assert!(method.contains(".select_ranges("));
+        for forbidden in [
+            "SelectionEffects::default()",
+            "request_autoscroll",
+            "dispatch_action",
+            "enter_normal_mode",
+        ] {
+            assert!(
+                !method.contains(forbidden),
+                "pointer movement must not invoke {forbidden}"
+            );
+        }
     }
 
     #[test]

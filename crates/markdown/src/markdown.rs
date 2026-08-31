@@ -35,8 +35,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
+    ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
     StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
     TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad,
 };
@@ -69,10 +69,37 @@ type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 pub type CodeSpanLinkCallback = Arc<dyn Fn(&str, &App) -> Option<SharedString> + 'static>;
 type UrlHoverCallback = Rc<dyn Fn(Option<SharedString>, &mut Window, &mut App)>;
 type SourceClickCallback = Box<dyn Fn(usize, usize, &mut Window, &mut App) -> bool>;
+type SourcePointerCallback = Rc<dyn Fn(SourcePointerEvent, &mut Window, &mut App)>;
 type CheckboxToggleCallback = Rc<dyn Fn(Range<usize>, bool, &mut Window, &mut App)>;
 /// Invoked when a mermaid diagram's zoom level changes (via scroll gesture or
 /// the reset button), so a scroll container can keep the diagram anchored.
 pub type MermaidZoomCallback = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// The phase of a pointer event mapped back to Markdown source coordinates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourcePointerPhase {
+    Down {
+        button: MouseButton,
+        click_count: usize,
+    },
+    /// A hover move that is not part of a gesture delegated by this view.
+    Move,
+    Drag {
+        button: MouseButton,
+    },
+    Up {
+        button: MouseButton,
+        click_count: usize,
+    },
+}
+
+/// A pointer event mapped to a byte index in the Markdown source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SourcePointerEvent {
+    pub source_index: usize,
+    pub phase: SourcePointerPhase,
+    pub modifiers: Modifiers,
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct BlockQuoteKindColors {
@@ -462,6 +489,9 @@ pub struct Markdown {
     // separate lets the renderer draw a caret at source positions that do not
     // own a visible glyph (newlines, Markdown delimiters, and replacements).
     external_cursor: Option<usize>,
+    // This is gesture bookkeeping only. When a host owns pointer selection,
+    // Markdown does not retain a parallel selection range.
+    source_pointer_button: Option<MouseButton>,
     pressed_link: Option<RenderedLink>,
     pressed_footnote_ref: Option<RenderedFootnoteRef>,
     autoscroll_request: Option<usize>,
@@ -664,6 +694,7 @@ impl Markdown {
             selection: Selection::default(),
             external_selections: None,
             external_cursor: None,
+            source_pointer_button: None,
             pressed_link: None,
             pressed_footnote_ref: None,
             autoscroll_request: None,
@@ -1035,6 +1066,7 @@ impl Markdown {
         self.selection = Selection::default();
         self.external_selections = None;
         self.external_cursor = None;
+        self.source_pointer_button = None;
         self.autoscroll_request = None;
         self.pending_autoscroll = None;
         self.pending_parse = None;
@@ -1576,6 +1608,7 @@ pub struct MarkdownElement {
     on_url_hover: Option<UrlHoverCallback>,
     code_span_link: Option<CodeSpanLinkCallback>,
     on_source_click: Option<SourceClickCallback>,
+    on_source_pointer: Option<SourcePointerCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
     image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
@@ -1604,6 +1637,7 @@ impl MarkdownElement {
             on_url_hover: None,
             code_span_link: None,
             on_source_click: None,
+            on_source_pointer: None,
             on_checkbox_toggle: None,
             on_mermaid_zoom: None,
             image_resolver: None,
@@ -1707,6 +1741,24 @@ impl MarkdownElement {
         handler: impl Fn(usize, usize, &mut Window, &mut App) -> bool + 'static,
     ) -> Self {
         self.on_source_click = Some(Box::new(handler));
+        self
+    }
+
+    /// Delegates plain-text pointer gestures to a host in Markdown source
+    /// coordinates. Installing this callback makes the host the owner of
+    /// pointer selection: Markdown does not build or retain its native
+    /// selection for reported gestures. The host can paint its canonical
+    /// selection with [`Markdown::set_external_selection`] or
+    /// [`Markdown::set_external_selections`].
+    ///
+    /// Link and footnote activation keep their existing behavior. The legacy
+    /// [`Self::on_source_click`] callback, when also installed, runs first and
+    /// can still consume the mouse down as before.
+    pub fn on_source_pointer(
+        mut self,
+        handler: impl Fn(SourcePointerEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_source_pointer = Some(Rc::new(handler));
         self
     }
 
@@ -2262,6 +2314,7 @@ impl MarkdownElement {
         let on_open_url = self.on_url_click.take();
         let on_url_hover = self.on_url_hover.take();
         let on_source_click = self.on_source_click.take();
+        let on_source_pointer = self.on_source_pointer.take();
 
         self.on_mouse_event(window, cx, {
             let hitbox = hitbox.clone();
@@ -2284,9 +2337,11 @@ impl MarkdownElement {
         self.on_mouse_event(window, cx, {
             let rendered_text = rendered_text.clone();
             let hitbox = hitbox.clone();
+            let on_source_pointer = on_source_pointer.clone();
             move |markdown, event: &MouseDownEvent, phase, window, cx| {
                 if hitbox.is_hovered(window) {
                     if phase.bubble() && event.button != MouseButton::Right {
+                        markdown.source_pointer_button = None;
                         let position_result =
                             rendered_text.source_index_for_position(event.position);
 
@@ -2317,6 +2372,25 @@ impl MarkdownElement {
                                     cx.notify();
                                     return;
                                 }
+                            }
+                            if let Some(handler) = on_source_pointer.as_ref() {
+                                markdown.selection = Selection::default();
+                                markdown.source_pointer_button = Some(event.button);
+                                handler(
+                                    SourcePointerEvent {
+                                        source_index,
+                                        phase: SourcePointerPhase::Down {
+                                            button: event.button,
+                                            click_count: event.click_count,
+                                        },
+                                        modifiers: event.modifiers,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                                window.prevent_default();
+                                cx.notify();
+                                return;
                             }
                             let (range, mode, reversed) = match event.click_count {
                                 1 if event.modifiers.shift => {
@@ -2374,8 +2448,31 @@ impl MarkdownElement {
             let rendered_text = rendered_text.clone();
             let hitbox = hitbox.clone();
             let was_hovering_clickable = is_hovering_clickable;
+            let on_source_pointer = on_source_pointer.clone();
             move |markdown, event: &MouseMoveEvent, phase, window, cx| {
                 if phase.capture() {
+                    return;
+                }
+
+                if let Some(button) = markdown.source_pointer_button
+                    && event.pressed_button == Some(button)
+                {
+                    let source_index = match rendered_text.source_index_for_position(event.position)
+                    {
+                        Ok(ix) | Err(ix) => ix,
+                    };
+                    if let Some(handler) = on_source_pointer.as_ref() {
+                        handler(
+                            SourcePointerEvent {
+                                source_index,
+                                phase: SourcePointerPhase::Drag { button },
+                                modifiers: event.modifiers,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    window.prevent_default();
                     return;
                 }
 
@@ -2390,6 +2487,21 @@ impl MarkdownElement {
                     cx.notify();
                 } else {
                     let is_hitbox_hovered = hitbox.is_hovered(window);
+                    if is_hitbox_hovered && let Some(handler) = on_source_pointer.as_ref() {
+                        let source_index =
+                            match rendered_text.source_index_for_position(event.position) {
+                                Ok(ix) | Err(ix) => ix,
+                            };
+                        handler(
+                            SourcePointerEvent {
+                                source_index,
+                                phase: SourcePointerPhase::Move,
+                                modifiers: event.modifiers,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
                     let source_index = is_hitbox_hovered
                         .then(|| rendered_text.source_index_for_position(event.position).ok())
                         .flatten();
@@ -2421,8 +2533,30 @@ impl MarkdownElement {
         });
         self.on_mouse_event(window, cx, {
             let rendered_text = rendered_text.clone();
+            let on_source_pointer = on_source_pointer.clone();
             move |markdown, event: &MouseUpEvent, phase, window, cx| {
-                if phase.bubble() {
+                if phase.capture() && markdown.source_pointer_button == Some(event.button) {
+                    markdown.source_pointer_button = None;
+                    let source_index = match rendered_text.source_index_for_position(event.position)
+                    {
+                        Ok(ix) | Err(ix) => ix,
+                    };
+                    if let Some(handler) = on_source_pointer.as_ref() {
+                        handler(
+                            SourcePointerEvent {
+                                source_index,
+                                phase: SourcePointerPhase::Up {
+                                    button: event.button,
+                                    click_count: event.click_count,
+                                },
+                                modifiers: event.modifiers,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    window.prevent_default();
+                } else if phase.bubble() {
                     let source_index = rendered_text.source_index_for_position(event.position).ok();
                     if let Some(pressed_footnote_ref) = markdown.pressed_footnote_ref.take()
                         && source_index
@@ -6529,6 +6663,121 @@ mod tests {
 
         cx.simulate_mouse_move(point(px(500.), px(500.)), None, gpui::Modifiers::default());
         assert_eq!(hovered_urls.borrow().last(), Some(&None));
+    }
+
+    #[gpui::test]
+    fn test_source_pointer_delegates_selection_gesture(cx: &mut TestAppContext) {
+        struct SourcePointerTestView {
+            markdown: Entity<Markdown>,
+            events: Rc<RefCell<Vec<SourcePointerEvent>>>,
+        }
+
+        impl Render for SourcePointerTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let events = self.events.clone();
+                div().size_full().child(
+                    MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                        .on_source_pointer(move |event, _, _| {
+                            events.borrow_mut().push(event);
+                        }),
+                )
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let markdown = cx.new(|cx| Markdown::new("Hello world".into(), None, None, cx));
+        let (_, cx) = cx.add_window_view({
+            let markdown = markdown.clone();
+            let events = events.clone();
+            move |_, _| SourcePointerTestView { markdown, events }
+        });
+        cx.run_until_parked();
+
+        let start = point(px(8.), px(8.));
+        let end = point(px(80.), px(8.));
+        cx.simulate_mouse_move(start, None, Modifiers::default());
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+
+        let events = events.borrow();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].phase, SourcePointerPhase::Move);
+        assert_eq!(
+            events[1].phase,
+            SourcePointerPhase::Down {
+                button: MouseButton::Left,
+                click_count: 1,
+            }
+        );
+        assert_eq!(
+            events[2].phase,
+            SourcePointerPhase::Drag {
+                button: MouseButton::Left,
+            }
+        );
+        assert_eq!(
+            events[3].phase,
+            SourcePointerPhase::Up {
+                button: MouseButton::Left,
+                click_count: 1,
+            }
+        );
+        assert!(events[1].source_index <= events[2].source_index);
+        assert_eq!(events[2].source_index, events[3].source_index);
+        drop(events);
+
+        cx.update(|_, cx| {
+            let markdown = markdown.read(cx);
+            assert!(!markdown.has_selection());
+            assert!(!markdown.selection.pending);
+            assert_eq!(markdown.source_pointer_button, None);
+        });
+    }
+
+    #[gpui::test]
+    fn test_native_selection_without_source_pointer_callback(cx: &mut TestAppContext) {
+        struct NativeSelectionTestView(Entity<Markdown>);
+
+        impl Render for NativeSelectionTestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(MarkdownElement::new(
+                    self.0.clone(),
+                    MarkdownStyle::default(),
+                ))
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let markdown = cx.new(|cx| Markdown::new("Hello world".into(), None, None, cx));
+        let (_, cx) = cx.add_window_view({
+            let markdown = markdown.clone();
+            move |_, _| NativeSelectionTestView(markdown)
+        });
+        cx.run_until_parked();
+
+        cx.simulate_mouse_down(
+            point(px(8.), px(8.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            point(px(80.), px(8.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            point(px(80.), px(8.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+
+        cx.update(|_, cx| {
+            let markdown = markdown.read(cx);
+            assert!(markdown.has_selection());
+            assert!(!markdown.selection.pending);
+        });
     }
 
     #[gpui::test]
