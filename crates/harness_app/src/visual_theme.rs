@@ -4,7 +4,7 @@ use anyhow::Context as _;
 use gpui::Hsla;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use theme::ThemeColors;
+use theme::{StatusColors, ThemeColors};
 
 pub(crate) const DEFAULT_HARNESS_THEME: &str = "One Dark";
 pub(crate) const MIN_HARNESS_FONT_SIZE: f32 = 10.;
@@ -180,7 +180,7 @@ pub(crate) struct HarnessVisualTheme {
 }
 
 impl HarnessVisualTheme {
-    pub(crate) fn from_zed(colors: &ThemeColors) -> Self {
+    pub(crate) fn from_zed(colors: &ThemeColors, status: &StatusColors) -> Self {
         Self {
             canvas: colors.background,
             transcript: colors.editor_background,
@@ -197,8 +197,8 @@ impl HarnessVisualTheme {
                 .blend(colors.surface_background.opacity(0.86)),
             error_surface: colors
                 .editor_background
-                .blend(colors.version_control_deleted.opacity(0.12)),
-            error_border: colors.version_control_deleted.opacity(0.58),
+                .blend(status.error_background.opacity(0.12)),
+            error_border: status.error_border.opacity(0.58),
             selection_surface: colors.element_selection_background,
             // Use the same surfaces painted by Zed's native Editor for
             // expanded BufferDiff hunks. Version-control tints are intended
@@ -274,10 +274,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_theme_is_derived_only_from_zed_theme_colors() {
+    fn semantic_theme_is_derived_only_from_zed_theme_roles() {
         // Keep this module intentionally data-only. A compile-time construction
         // test is more useful here than hard-coding values from one dark theme.
-        let derive: fn(&ThemeColors) -> HarnessVisualTheme = HarnessVisualTheme::from_zed;
+        let derive: fn(&ThemeColors, &StatusColors) -> HarnessVisualTheme =
+            HarnessVisualTheme::from_zed;
         let _ = derive;
     }
 }

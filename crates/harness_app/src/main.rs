@@ -1072,7 +1072,7 @@ fn rich_navigation_overlay_selection_background(cx: &App) -> gpui::Hsla {
     // theme's element-selection color is already tuned for that compositing
     // order; the read-only player color is opaque and grayscale, so merely
     // lowering its alpha makes selected Rich text look disabled.
-    HarnessVisualTheme::from_zed(cx.theme().colors())
+    HarnessVisualTheme::from_zed(cx.theme().colors(), cx.theme().status())
         .selection_surface
         .alpha(0.42)
 }
@@ -3319,7 +3319,7 @@ impl HybridStructuredSurface {
 impl Render for HybridStructuredSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let command_fallback_title = command_uses_raw_identity(&self.item);
         let command_status = self
             .item
@@ -3501,6 +3501,7 @@ struct HarnessApp {
     connecting: bool,
     loading_thread: bool,
     attaching_thread: bool,
+    attach_cache_bytes: Option<u64>,
     thread_read_only_reason: Option<SharedString>,
     error: Option<SharedString>,
     transient_turn_status: Option<SharedString>,
@@ -3635,6 +3636,7 @@ struct ModelChoice {
     display_name: SharedString,
     default_effort: String,
     efforts: Vec<String>,
+    service_tiers: Vec<String>,
     is_default: bool,
 }
 
@@ -3718,12 +3720,32 @@ fn model_choices_from_response(response: &Value) -> Vec<ModelChoice> {
                 .map(ToOwned::to_owned)
                 .or_else(|| efforts.first().cloned())
                 .unwrap_or_default();
+            let mut service_tiers = entry
+                .get("serviceTiers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|tier| {
+                    tier.get("id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>();
+            if entry
+                .get("additionalSpeedTiers")
+                .and_then(Value::as_array)
+                .is_some_and(|tiers| tiers.iter().any(|tier| tier.as_str() == Some("fast")))
+                && !service_tiers.iter().any(|tier| tier == "priority")
+            {
+                service_tiers.push("priority".into());
+            }
             Some(ModelChoice {
                 id,
                 model,
                 display_name,
                 default_effort,
                 efforts,
+                service_tiers,
                 is_default: entry
                     .get("isDefault")
                     .and_then(Value::as_bool)
@@ -3767,6 +3789,26 @@ fn reasoning_effort_label(effort: &str) -> SharedString {
         "ultra" => "Ultra".into(),
         other => other.to_owned().into(),
     }
+}
+
+fn service_tier_is_fast(service_tier: Option<&str>) -> bool {
+    service_tier == Some("priority")
+}
+
+fn toggled_service_tier(service_tier: Option<&str>) -> &'static str {
+    if service_tier_is_fast(service_tier) {
+        "default"
+    } else {
+        "priority"
+    }
+}
+
+fn model_supports_fast_mode(choice: Option<&ModelChoice>) -> bool {
+    choice.is_some_and(|choice| choice.service_tiers.iter().any(|tier| tier == "priority"))
+}
+
+fn turn_settings_update_applied(response: &Value) -> bool {
+    response.get("status").and_then(Value::as_str) == Some("applied")
 }
 
 fn apply_harness_preferences(preferences: &HarnessPreferences, cx: &mut App) -> bool {
@@ -4321,7 +4363,7 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let owner = cx.entity().downgrade();
         let typography = ThemeSettings::get_global(cx);
         let reading_font = typography.agent_ui_font_family().clone();
@@ -5223,6 +5265,11 @@ impl HarnessApp {
             return;
         };
         let requested_thread_id = thread_id.clone();
+        let running_service_tier = fields
+            .get("serviceTier")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let running_turn_id = self.model.current_turn_id.clone();
         let mut params = fields.as_object().cloned().unwrap_or_default();
         params.insert("threadId".into(), thread_id.into());
         self.settings_update_pending = true;
@@ -5232,6 +5279,26 @@ impl HarnessApp {
             let result = client
                 .request("thread/settings/update", Value::Object(params))
                 .await;
+            let running_result = if result.is_ok() {
+                match (running_turn_id, running_service_tier) {
+                    (Some(turn_id), Some(service_tier)) => Some(
+                        client
+                            .request(
+                                "turn/settings/update",
+                                json!({
+                                    "threadId": requested_thread_id.clone(),
+                                    "turnId": turn_id,
+                                    "serviceTier": service_tier,
+                                }),
+                            )
+                            .await
+                            .map(|response| turn_settings_update_applied(&response)),
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             _ = this.update(cx, |this, cx| {
                 if this.selected_thread_id.as_deref() != Some(requested_thread_id.as_str()) {
                     return;
@@ -5239,6 +5306,29 @@ impl HarnessApp {
                 this.settings_update_pending = false;
                 if let Err(error) = result {
                     this.error = Some(format!("Could not update task settings: {error}").into());
+                } else if let Some(running_result) = running_result {
+                    match running_result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            // The durable task setting succeeded, but App
+                            // Server reports `targetUnavailable` when the turn
+                            // ends between the two publications.
+                            this.error = Some(
+                                "Task speed was updated for future turns, but the running turn was no longer available."
+                                    .into(),
+                            );
+                        }
+                        Err(error) => {
+                            // Retain the future setting even if the narrower
+                            // live publication fails.
+                            this.error = Some(
+                                format!(
+                                    "Task speed was updated for future turns, but the running turn did not change: {error}"
+                                )
+                                .into(),
+                            );
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -5532,6 +5622,42 @@ impl HarnessApp {
         )
     }
 
+    fn render_fast_mode_control(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let settings = self.model.telemetry.thread_settings.as_ref();
+        let service_tier = settings.and_then(|settings| settings.service_tier.as_deref());
+        let is_fast = service_tier_is_fast(service_tier);
+        let selected_model = settings.and_then(|settings| settings.model.as_deref());
+        let selected_choice = effective_model_choice(&self.available_models, selected_model);
+        if !is_fast && !model_supports_fast_mode(selected_choice) {
+            return None;
+        }
+
+        let (icon, color, label) = if is_fast {
+            (IconName::FastForward, Color::Accent, "Disable Fast Mode")
+        } else {
+            (IconName::FastForwardOff, Color::Muted, "Enable Fast Mode")
+        };
+        let next_tier = toggled_service_tier(service_tier);
+        Some(
+            IconButton::new("fast-mode", icon)
+                .icon_size(IconSize::Small)
+                .icon_color(color)
+                .style(ButtonStyle::Subtle)
+                .disabled(
+                    self.selected_thread_id.is_none()
+                        || self.client.is_none()
+                        || self.settings_update_pending
+                        || self.thread_read_only_reason.is_some(),
+                )
+                .aria_label(label)
+                .tooltip(Tooltip::text(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_thread_settings(json!({ "serviceTier": next_tier }), cx)
+                }))
+                .into_any_element(),
+        )
+    }
+
     /// Match Zed's composer terminal action: one stable, normally sized control
     /// changes meaning with the turn and draft state instead of growing into a
     /// row of textual Queue/Stop buttons. Stopping remains the primary action
@@ -5610,7 +5736,7 @@ impl HarnessApp {
             return None;
         }
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let queue_count = self.queued_turns.len();
         let active_turn = self.model.current_turn_id.is_some();
         let operations = self.queue_operations.clone();
@@ -6411,6 +6537,7 @@ impl HarnessApp {
                     display_name: "GPT-5.6-Sol".into(),
                     default_effort: "xhigh".into(),
                     efforts: vec!["medium".into(), "high".into(), "xhigh".into()],
+                    service_tiers: vec!["priority".into()],
                     is_default: true,
                 }],
                 vec![PermissionProfileChoice {
@@ -6478,6 +6605,7 @@ impl HarnessApp {
             connecting: false,
             loading_thread: false,
             attaching_thread: false,
+            attach_cache_bytes: None,
             thread_read_only_reason: None,
             error: None,
             transient_turn_status: None,
@@ -6994,11 +7122,10 @@ impl HarnessApp {
         let Some(client) = self.client.clone() else {
             return;
         };
-        if model::TranscriptModel::persisted_transcript_size(thread_id)
+        let attach_cache_bytes = model::TranscriptModel::persisted_transcript_size(thread_id)
             .ok()
-            .flatten()
-            .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
-        {
+            .flatten();
+        if attach_cache_bytes.is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES) {
             // A thin attach is the only safe automatic path for an oversized
             // local transcript. If even that kills App Server, do not turn one
             // failure into a repeated OOM loop; Refresh remains an explicit
@@ -7008,10 +7135,36 @@ impl HarnessApp {
         let thread_id = thread_id.to_owned();
         self.loading_thread = false;
         self.attaching_thread = true;
+        self.attach_cache_bytes = attach_cache_bytes;
         self.thread_read_only_reason = None;
         self.error = None;
         self.thread_open_task = cx.spawn(async move |this, cx| {
+            let attach_started_at = Instant::now();
             let attached = client.attach_thread_with_settings(&thread_id).await;
+            let attach_elapsed = attach_started_at.elapsed();
+            if attach_elapsed >= Duration::from_secs(2) {
+                log::warn!(
+                    "slow live task restore thread={thread_id} cache_bytes={} elapsed_ms={:.1} success={}",
+                    attach_cache_bytes.unwrap_or_default(),
+                    attach_elapsed.as_secs_f64() * 1_000.,
+                    attached.is_ok(),
+                );
+            } else {
+                log::info!(
+                    "live task attach thread={thread_id} cache_bytes={} elapsed_ms={:.1} success={}",
+                    attach_cache_bytes.unwrap_or_default(),
+                    attach_elapsed.as_secs_f64() * 1_000.,
+                    attached.is_ok(),
+                );
+            }
+            if thread_load_diagnostics_enabled() {
+                eprintln!(
+                    "thread-load attach thread={thread_id} cache_bytes={} elapsed_ms={:.1} success={}",
+                    attach_cache_bytes.unwrap_or_default(),
+                    attach_elapsed.as_secs_f64() * 1_000.,
+                    attached.is_ok(),
+                );
+            }
             _ = this.update(cx, |this, cx| {
                 if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
                     || !this
@@ -7033,6 +7186,7 @@ impl HarnessApp {
                         this.apply_thread_open_settings(&attached);
                         this.load_server_options(cx);
                         this.attaching_thread = false;
+                        this.attach_cache_bytes = None;
                         this.thread_read_only_reason = None;
                         this.reconnect_attempts = 0;
                         this.error = None;
@@ -7046,6 +7200,7 @@ impl HarnessApp {
                         // disconnect. Keep the cached transcript truthful and
                         // read-only until the user retries or starts a new task.
                         this.attaching_thread = false;
+                        this.attach_cache_bytes = None;
                         this.thread_read_only_reason = Some(
                             "Could not restore the live connection. Cached history is read-only."
                                 .into(),
@@ -7095,6 +7250,7 @@ impl HarnessApp {
         self.turn_task = Task::ready(());
         self.loading_thread = false;
         self.attaching_thread = false;
+        self.attach_cache_bytes = None;
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
@@ -7169,7 +7325,7 @@ impl HarnessApp {
         }
         for index in &dirty_items {
             if *index < old_len {
-                self.list_state.splice(*index..*index + 1, 1);
+                self.list_state.remeasure_items(*index..*index + 1);
             }
         }
         if let Some(error) = outcome.transport_error {
@@ -8125,7 +8281,7 @@ impl HarnessApp {
             }
             for index in &dirty_items {
                 if *index < outcome.old_len {
-                    self.list_state.splice(*index..*index + 1, 1);
+                    self.list_state.remeasure_items(*index..*index + 1);
                 }
             }
         }
@@ -8323,6 +8479,7 @@ impl HarnessApp {
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
         self.attaching_thread = can_accept_direct_input;
+        self.attach_cache_bytes = None;
         self.settings_update_pending = false;
         self.thread_read_only_reason = (!can_accept_direct_input)
             .then(|| "This child task does not accept direct input.".into());
@@ -8684,6 +8841,7 @@ impl HarnessApp {
         self.loaded_thread_updated_at = None;
         self.loading_thread = false;
         self.attaching_thread = false;
+        self.attach_cache_bytes = None;
         self.settings_update_pending = false;
         self.selected_item = 0;
         self.transcript_cursor_initialized = false;
@@ -11735,7 +11893,7 @@ impl HarnessApp {
         cx: &App,
     ) -> Vec<AnyElement> {
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let mut logical_line_offset = logical_body_start;
         zed_diff_lines(content, operation)
             .into_iter()
@@ -11803,7 +11961,7 @@ impl HarnessApp {
         cx: &App,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let presentations = diff_file_presentations(&item.content);
         let allocations = progressive_file_line_allocations(
             &presentations
@@ -11943,7 +12101,7 @@ impl HarnessApp {
             } => {
                 let presentation = &row_data.presentations[*section_index];
                 let colors = cx.theme().colors();
-                let visuals = HarnessVisualTheme::from_zed(colors);
+                let visuals = HarnessVisualTheme::from_zed(colors, cx.theme().status());
                 let (additions, deletions) = file_change_counts(presentation);
                 let highlighted_path = navigation_searchable_styled_text(
                     presentation.path.clone(),
@@ -12033,7 +12191,7 @@ impl HarnessApp {
                 tone,
             } => {
                 let colors = cx.theme().colors();
-                let visuals = HarnessVisualTheme::from_zed(colors);
+                let visuals = HarnessVisualTheme::from_zed(colors, cx.theme().status());
                 let presentation = &row_data.presentations[*section_index];
                 let syntax =
                     diff_line_syntax_highlights(&presentation.path, text, *tone, false, cx);
@@ -12124,7 +12282,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
                     .id(("file-change-vertical-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .with_thumb_color(colors.scrollbar_thumb_background)
                     .tracked_scroll_handle(&list_state),
                 window,
                 cx,
@@ -12141,7 +12299,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Horizontal)
                     .id(("file-change-horizontal-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .with_thumb_color(colors.scrollbar_thumb_background)
                     .tracked_scroll_handle(&horizontal_handle),
                 window,
                 cx,
@@ -12262,7 +12420,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
                     .id(("terminal-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .with_thumb_color(colors.scrollbar_thumb_background)
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -12409,7 +12567,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
                     .id(("activity-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .with_thumb_color(colors.scrollbar_thumb_background)
                     .tracked_scroll_handle(&binding.handle),
                 window,
                 cx,
@@ -12519,7 +12677,7 @@ impl HarnessApp {
                         this.child(rich_card_identity_icon(
                             IconName::ToolTerminal,
                             IconSize::Small,
-                            Color::Accent,
+                            Color::Muted,
                         ))
                     })
                     .child(div().min_w_0().flex_1().child(clickable))
@@ -12599,7 +12757,7 @@ impl HarnessApp {
             .custom_scrollbars(
                 Scrollbars::new(ScrollAxes::Vertical)
                     .id(("command-input-scrollbar", index))
-                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                    .with_thumb_color(colors.scrollbar_thumb_background)
                     .tracked_scroll_handle(&command_scroll_handle),
                 window,
                 cx,
@@ -12624,7 +12782,7 @@ impl HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
                         .id(("command-output-scrollbar", index))
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .with_thumb_color(colors.scrollbar_thumb_background)
                         .tracked_scroll_handle(&output_list_state),
                     window,
                     cx,
@@ -12644,7 +12802,7 @@ impl HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Horizontal)
                         .id(("command-output-horizontal-scrollbar", index))
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .with_thumb_color(colors.scrollbar_thumb_background)
                         .tracked_scroll_handle(&output_horizontal_handle),
                     window,
                     cx,
@@ -12664,7 +12822,8 @@ impl HarnessApp {
                         .w_full()
                         .min_w_0()
                         .p_1p5()
-                        .bg(HarnessVisualTheme::from_zed(&colors).tool_header_surface)
+                        .bg(HarnessVisualTheme::from_zed(&colors, cx.theme().status())
+                            .tool_header_surface)
                         .child(command_region),
                 )
                 .when_some(output_region, |this, output| this.child(output))
@@ -12774,7 +12933,7 @@ impl HarnessApp {
                         .child(rich_card_identity_icon(
                             IconName::ToolTerminal,
                             IconSize::Small,
-                            Color::Accent,
+                            Color::Muted,
                         ))
                         .child(div().min_w_0().flex_1().child(clickable_command)),
                 )
@@ -12843,7 +13002,7 @@ impl HarnessApp {
                 row_ranges.push(Some(range.clone()));
                 let highlighted = navigation_searchable_styled_text(
                     query.clone(),
-                    shell_highlights(query, cx),
+                    Vec::new(),
                     search,
                     navigation,
                     range,
@@ -12952,7 +13111,7 @@ impl HarnessApp {
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
                         .id(("web-results-scrollbar", index))
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
+                        .with_thumb_color(colors.scrollbar_thumb_background)
                         .tracked_scroll_handle(&binding.handle),
                     window,
                     cx,
@@ -13815,7 +13974,7 @@ impl HarnessApp {
             self.focus_mode == FocusMode::Approval && index == self.selected_item;
         let approval_cursor = self.approval_cursor;
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let narrow = window.viewport_size().width < px(720.);
         let narrative = matches!(
             item.kind,
@@ -14545,7 +14704,7 @@ impl Render for HarnessApp {
         self.sync_image_surfaces(window, cx);
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors);
+        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
@@ -14566,7 +14725,17 @@ impl Render for HarnessApp {
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
             } else if self.attaching_thread {
-                Some(("Connecting live…".into(), Color::Muted))
+                Some((
+                    if self
+                        .attach_cache_bytes
+                        .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
+                    {
+                        "Restoring live session…".into()
+                    } else {
+                        "Connecting live…".into()
+                    },
+                    Color::Muted,
+                ))
             } else if self.settings_update_pending {
                 Some(("Updating task settings…".into(), Color::Muted))
             } else if self.thread_read_only_reason.is_some() {
@@ -14777,6 +14946,7 @@ impl Render for HarnessApp {
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
         let context_usage = self.render_context_usage(cx);
+        let fast_mode_control = self.render_fast_mode_control(cx);
         let model_selector = self.render_model_effort_selector(cx);
         let permission_selector = self.render_permission_selector(cx);
         let composer_action =
@@ -15214,6 +15384,10 @@ impl Render for HarnessApp {
                                                     .when_some(context_usage, |this, usage| {
                                                         this.child(usage)
                                                     })
+                                                    .when_some(
+                                                        fast_mode_control,
+                                                        |this, control| this.child(control),
+                                                    )
                                                     .child(permission_selector)
                                                     .child(model_selector)
                                                     .child(composer_action),
@@ -17108,6 +17282,9 @@ mod tests {
                     "hidden": false,
                     "isDefault": true,
                     "defaultReasoningEffort": "high",
+                    "serviceTiers": [
+                        {"id": "priority", "name": "Fast", "description": "Priority processing"}
+                    ],
                     "supportedReasoningEfforts": [
                         {"reasoningEffort": "high", "description": "Deep"},
                         {"reasoningEffort": "xhigh", "description": "Deeper"}
@@ -17127,6 +17304,8 @@ mod tests {
         assert_eq!(models[0].model, "gpt-5.6-codex");
         assert_eq!(models[0].default_effort, "high");
         assert_eq!(models[0].efforts, ["high", "xhigh"]);
+        assert_eq!(models[0].service_tiers, ["priority"]);
+        assert!(model_supports_fast_mode(models.first()));
         assert!(models[0].is_default);
         assert_eq!(
             effective_model_choice(&models, None).map(|choice| choice.model.as_str()),
@@ -17137,6 +17316,25 @@ mod tests {
             Some("high")
         );
         assert_eq!(reasoning_effort_label("xhigh").as_ref(), "X high");
+        assert!(!service_tier_is_fast(Some("default")));
+        assert!(service_tier_is_fast(Some("priority")));
+        assert_eq!(toggled_service_tier(Some("priority")), "default");
+        assert_eq!(toggled_service_tier(Some("default")), "priority");
+        assert_eq!(toggled_service_tier(None), "priority");
+        assert!(turn_settings_update_applied(&json!({"status": "applied"})));
+        assert!(!turn_settings_update_applied(
+            &json!({"status": "targetUnavailable"})
+        ));
+        assert!(!turn_settings_update_applied(&json!({})));
+
+        let deprecated_fast_model = model_choices_from_response(&json!({
+            "data": [{
+                "model": "gpt-legacy",
+                "additionalSpeedTiers": ["fast"],
+                "supportedReasoningEfforts": []
+            }]
+        }));
+        assert!(model_supports_fast_mode(deprecated_fast_model.first()));
 
         let profiles = permission_profile_choices_from_response(&json!({
             "data": [

@@ -23,8 +23,8 @@ must survive conversation compaction and hand-offs.
 
 - Reconcile the verified protocol, compaction, and compact-queue slices and
   push a private checkpoint.
-- Build a live child-thread registry and nested sidebar on the typed hierarchy
-  foundation.
+- Verify the live child-thread registry and collapsed completed-task history in
+  a restarted Harness without allowing inherited prompt previews to reappear.
 - Define and apply one systematic lightness/density hierarchy across narrative,
   routine activity stacks, and semantic artifacts instead of tuning each card
   independently.
@@ -35,10 +35,10 @@ must survive conversation compaction and hand-offs.
 
 - [x] Extend the typed App Server model with parent thread, ancestor/source,
   role/nickname, lifecycle status, fork origin, and direct-input capability.
-- [ ] Maintain a child-thread registry keyed by thread ID; reconcile it from
+- [x] Maintain a child-thread registry keyed by thread ID; reconcile it from
   descendant lists and lifecycle notifications rather than inferring the tree
   solely from transcript activity rows.
-- [ ] Render child sessions as nested, Zed-styled sidebar rows with live status,
+- [x] Render child sessions as nested, Zed-styled sidebar rows with live status,
   parent breadcrumbs, and independently openable transcripts.
 - [ ] Expose safe delegate, follow-up, wait, interrupt, and fork workflows while
   keeping supervised child agents distinct from independent thread forks.
@@ -258,6 +258,14 @@ must survive conversation compaction and hand-offs.
 
 - [ ] Make task history feel immediate through snapshot caching, staged loading,
   incremental projection, and measurement of App Server versus client cost.
+- [ ] Instrument cached restore and live attach as separate phases. Avoid making
+  `thread/resume` rescan a multi-GB rollout merely to establish live authority;
+  if the installed App Server cannot attach by cursor/checkpoint, continue in a
+  new live thread with an explicit semantic handoff instead of hiding minutes of
+  work behind `Connecting live…`.
+- [ ] Expose Codex Fast mode as an explicit selectable and deselectable task/turn
+  setting, display the App Server's resolved `serviceTier`, and send `default`
+  when Fast is off rather than inferring it from model or reasoning effort.
 - [ ] Show at most one context-compaction landmark for each actual compaction;
   it must never replace, suppress, or multiply the activity and transcript
   content that follows it.
