@@ -22,10 +22,10 @@ use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
     FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
     KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, MouseButton,
-    MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TouchPhase,
-    UniformListScrollHandle, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions,
-    actions, canvas, deferred, div, list, point, prelude::*, px, relative, size, uniform_list,
+    MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, StyledImage, StyledText, Task, TouchPhase, UpdateGlobal, WeakEntity, Window,
+    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
+    relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -3961,7 +3961,7 @@ struct HarnessApp {
     hybrid_surfaces: HashMap<String, Entity<HybridStructuredSurface>>,
     rich_nested_scrolls: HashMap<String, RichNestedScrollState>,
     list_state: ListState,
-    task_list_state: UniformListScrollHandle,
+    task_list_state: ListState,
     sidebar_open: bool,
     sidebar_user_override: bool,
     turn_start_pending: bool,
@@ -4022,6 +4022,39 @@ impl SidebarThreadRow {
             SidebarThreadRowKind::CompletedHistory { .. } => None,
         }
     }
+
+    fn has_same_identity(&self, other: &Self) -> bool {
+        match (&self.kind, &other.kind) {
+            (
+                SidebarThreadRowKind::Thread {
+                    thread_id: left, ..
+                },
+                SidebarThreadRowKind::Thread {
+                    thread_id: right, ..
+                },
+            ) => left == right,
+            (
+                SidebarThreadRowKind::CompletedHistory {
+                    root_thread_id: left,
+                    ..
+                },
+                SidebarThreadRowKind::CompletedHistory {
+                    root_thread_id: right,
+                    ..
+                },
+            ) => left == right,
+            _ => false,
+        }
+    }
+}
+
+fn sort_root_threads(threads: &mut [CodexThread]) {
+    threads.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -7187,13 +7220,16 @@ impl HarnessApp {
             })
             .map(|item| item.key.clone())
             .collect();
-        // The list measures one boundary sentinel just outside the viewport,
-        // so variable-height rows remain discoverable when leaving a followed
-        // tail without laying out an additional partial viewport every frame.
-        let list_state = ListState::new(model.items.len(), ListAlignment::Top, px(0.));
+        // Keep enough rich transcript content prepainted above and below the
+        // viewport that ordinary scrolling never exposes unmaterialized rows.
+        // This remains bounded regardless of transcript length.
+        let list_state = ListState::new(model.items.len(), ListAlignment::Top, px(2048.));
         list_state.set_diagnostics_name("transcript");
         list_state.set_follow_mode(FollowMode::Tail);
-        let task_list_state = UniformListScrollHandle::new();
+        // Root threads and compact completed-child disclosures intentionally
+        // have different heights, so the sidebar cannot use `uniform_list`.
+        // It is small enough to measure eagerly and avoid scroll-time pop-in.
+        let task_list_state = ListState::new(0, ListAlignment::Top, px(512.)).measure_all();
         let transcript_focus = cx.focus_handle();
         if start_in_text_view {
             transcript_editor.focus_handle(cx).focus(window, cx);
@@ -7583,12 +7619,29 @@ impl HarnessApp {
     }
 
     fn rebuild_sidebar_threads(&mut self, preferred_thread_id: Option<&str>) {
-        self.sidebar_threads = sidebar_thread_rows(
+        let prior_offset = self.task_list_state.logical_scroll_top();
+        let prior_top_row = self.sidebar_threads.get(prior_offset.item_ix).cloned();
+        let next = sidebar_thread_rows(
             &self.threads,
             &self.child_threads,
             preferred_thread_id.or(self.selected_thread_id.as_deref()),
             &self.expanded_child_history_roots,
         );
+        if self.sidebar_threads != next {
+            self.sidebar_threads = next;
+            self.task_list_state.reset(self.sidebar_threads.len());
+            if let Some(prior_top_row) = prior_top_row
+                && let Some(item_ix) = self
+                    .sidebar_threads
+                    .iter()
+                    .position(|row| row.has_same_identity(&prior_top_row))
+            {
+                self.task_list_state.scroll_to(gpui::ListOffset {
+                    item_ix,
+                    offset_in_item: prior_offset.offset_in_item,
+                });
+            }
+        }
         self.selected_task = sidebar_selection_index(
             &self.sidebar_threads,
             preferred_thread_id.or(self.selected_thread_id.as_deref()),
@@ -7619,7 +7672,8 @@ impl HarnessApp {
                 client
                     .initialize("harness", "Harness", env!("CARGO_PKG_VERSION"))
                     .await?;
-                let threads = client.list_threads(THREAD_LIMIT, None).await?.data;
+                let mut threads = client.list_threads(THREAD_LIMIT, None).await?.data;
+                sort_root_threads(&mut threads);
                 let child_threads = match client
                     .list_spawned_subagent_threads(THREAD_LIMIT, None)
                     .await
@@ -7869,7 +7923,14 @@ impl HarnessApp {
                     // not have exposed its exact id yet, so Stop remains
                     // unavailable until a live event or history page supplies
                     // that identity.
-                    this.loaded_thread_updated_at = Some(attached.thread.updated_at);
+                    let newest_updated_at = this
+                        .threads
+                        .iter()
+                        .find(|listed| listed.id == thread_id)
+                        .map_or(attached.thread.updated_at, |listed| {
+                            listed.updated_at.max(attached.thread.updated_at)
+                        });
+                    this.loaded_thread_updated_at = Some(newest_updated_at);
                     if let Some(turn_id) = active_turn_id.clone() {
                         this.model.current_turn_id = Some(turn_id);
                     }
@@ -7879,8 +7940,14 @@ impl HarnessApp {
                         .find(|listed| listed.id == thread_id)
                     {
                         listed.status = attached.thread.status.clone();
-                        listed.updated_at = attached.thread.updated_at;
+                        // `thread/resume` can return the rollout's original
+                        // metadata while `thread/list` has the current
+                        // activity timestamp. Never make the task look older
+                        // as a side effect of establishing its live stream.
+                        listed.updated_at = newest_updated_at;
                     }
+                    sort_root_threads(&mut this.threads);
+                    this.rebuild_sidebar_threads(Some(&thread_id));
                     this.apply_thread_open_settings(&attached);
                     this.load_server_options(cx);
                     this.attach_cache_bytes = None;
@@ -7907,7 +7974,7 @@ impl HarnessApp {
             let mut reached_history_start = false;
             let mut catchup_error = None;
 
-            for _ in 0..MAX_HISTORY_CATCHUP_PAGES {
+            for page_index in 0..MAX_HISTORY_CATCHUP_PAGES {
                 if let Some(cursor) = cursor.as_ref()
                     && !seen_cursors.insert(cursor.clone())
                 {
@@ -7919,6 +7986,7 @@ impl HarnessApp {
                 params.limit = Some(HISTORY_CATCHUP_PAGE_TURNS);
                 params.sort_direction = Some(SortDirection::Desc);
                 params.items_view = Some(TurnItemsView::Full);
+                let page_started_at = Instant::now();
                 let page = match client.list_thread_turns(params).await {
                     Ok(page) => page,
                     Err(error) => {
@@ -7926,6 +7994,14 @@ impl HarnessApp {
                         break;
                     }
                 };
+                let page_elapsed = page_started_at.elapsed();
+                if page_elapsed >= Duration::from_secs(2) {
+                    log::warn!(
+                        "slow background history page thread={thread_id} page={} elapsed_ms={:.1}",
+                        page_index + 1,
+                        page_elapsed.as_secs_f64() * 1_000.,
+                    );
+                }
                 for turn in page.data {
                     if !seen_turn_ids.insert(turn.id.clone()) {
                         continue;
@@ -7994,12 +8070,44 @@ impl HarnessApp {
                 };
 
                 if outcome.applied {
-                    this.list_state.splice(0..outcome.old_len, outcome.new_len);
-                    this.markdown_cache.clear();
-                    this.rich_nested_scrolls.clear();
-                    this.raw_visible.clear();
-                    this.mark_all_image_surfaces_dirty();
-                    this.retire_all_request_surfaces();
+                    if let Some((range, replacement_count)) =
+                        thread_history_list_splice(&outcome)
+                    {
+                        this.list_state.splice(range, replacement_count);
+                    }
+                    if outcome.reset {
+                        // A true reordering invalidates every index-owned
+                        // presentation cache. This is the exceptional path.
+                        this.markdown_cache.clear();
+                        this.rich_nested_scrolls.clear();
+                        this.raw_visible.clear();
+                        this.mark_all_image_surfaces_dirty();
+                        this.retire_all_request_surfaces();
+                    } else {
+                        // The common warm-reopen case is an unchanged cached
+                        // prefix plus an appended suffix. Preserve all measured
+                        // rows and cached surfaces in that prefix; invalidating
+                        // the entire list here caused the completion flicker
+                        // and scroll-time row pop-in.
+                        let mut dirty_items = outcome.dirty.iter().copied().collect::<Vec<_>>();
+                        dirty_items.sort_unstable();
+                        for index in &dirty_items {
+                            if let Some(item) = this.model.items.get(*index) {
+                                this.markdown_cache.remove(&item.key);
+                                this.rich_nested_scrolls.remove(&item.key);
+                                this.raw_visible.remove(&item.key);
+                                if this.request_surfaces.contains_key(&item.key) {
+                                    this.dirty_request_surfaces.insert(item.key.clone());
+                                }
+                            }
+                            this.list_state.remeasure_items(*index..*index + 1);
+                        }
+                        this.track_image_surface_updates(
+                            outcome.old_len,
+                            outcome.new_len,
+                            &dirty_items,
+                        );
+                    }
                     this.selected_item = if was_following_tail {
                         this.model.items.len().saturating_sub(1)
                     } else {
@@ -8058,11 +8166,22 @@ impl HarnessApp {
                 this.history_hydrating = false;
                 this.attaching_thread = false;
                 this.attach_cache_bytes = None;
-                log::info!(
-                    "task history hydration finished thread={thread_id} elapsed_ms={:.1} complete={}",
-                    history_started_at.elapsed().as_secs_f64() * 1_000.,
-                    this.transcript_history_complete,
-                );
+                let history_elapsed = history_started_at.elapsed();
+                if history_elapsed >= Duration::from_secs(2) {
+                    log::warn!(
+                        "slow background history hydration thread={thread_id} turns={} elapsed_ms={:.1} complete={}",
+                        seen_turn_ids.len(),
+                        history_elapsed.as_secs_f64() * 1_000.,
+                        this.transcript_history_complete,
+                    );
+                } else {
+                    log::info!(
+                        "background history hydration finished thread={thread_id} turns={} elapsed_ms={:.1} complete={}",
+                        seen_turn_ids.len(),
+                        history_elapsed.as_secs_f64() * 1_000.,
+                        this.transcript_history_complete,
+                    );
+                }
                 cx.notify();
             });
         });
@@ -8959,7 +9078,9 @@ impl HarnessApp {
                     let preferred_thread_id = this.selected_sidebar_thread_id();
                     match roots {
                         Ok(response) => {
-                            this.threads = response.data;
+                            let mut threads = response.data;
+                            sort_root_threads(&mut threads);
+                            this.threads = threads;
                             this.error = None;
                             this.rebuild_sidebar_threads(preferred_thread_id.as_deref());
                         }
@@ -9064,13 +9185,14 @@ impl HarnessApp {
                 }
 
                 if !active && !selected_is_child {
-                    let root_response = match client.list_threads(THREAD_LIMIT, None).await {
+                    let mut root_response = match client.list_threads(THREAD_LIMIT, None).await {
                         Ok(response) => response,
                         Err(error) => {
                             log::debug!("could not check read-only task freshness: {error}");
                             continue;
                         }
                     };
+                    sort_root_threads(&mut root_response.data);
                     let selected_updated_at = root_response
                         .data
                         .iter()
@@ -9259,7 +9381,7 @@ impl HarnessApp {
                             .min(self.sidebar_threads.len().saturating_sub(1))
                     });
                 self.task_list_state
-                    .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
+                    .scroll_to_reveal_item(self.selected_task);
                 cx.notify();
             }
         }
@@ -12255,7 +12377,7 @@ impl HarnessApp {
         if !self.sidebar_threads.is_empty() {
             self.selected_task = self.selected_task.min(self.sidebar_threads.len() - 1);
             self.task_list_state
-                .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
+                .scroll_to_reveal_item(self.selected_task);
         }
         cx.notify();
     }
@@ -12335,7 +12457,7 @@ impl HarnessApp {
             .saturating_add_signed(delta)
             .min(self.sidebar_threads.len() - 1);
         self.task_list_state
-            .scroll_to_item(self.selected_task, ScrollStrategy::Nearest);
+            .scroll_to_reveal_item(self.selected_task);
         cx.notify();
     }
 
@@ -16097,7 +16219,10 @@ impl Render for HarnessApp {
             } else if self.loading_thread {
                 Some(("Loading task history…".into(), Color::Muted))
             } else if self.history_hydrating && self.attach_cache_bytes.is_none() {
-                Some(("Catching up task history…".into(), Color::Muted))
+                Some((
+                    "Live · syncing missed history in background…".into(),
+                    Color::Muted,
+                ))
             } else if self.attaching_thread {
                 Some((
                     if self
@@ -16162,14 +16287,10 @@ impl Render for HarnessApp {
                 .flex()
                 .flex_col()
                 .child(
-                    uniform_list(
-                        "tasks",
-                        self.sidebar_threads.len(),
-                        cx.processor(|this, range: Range<usize>, _, cx| {
-                            range.map(|index| this.render_task(index, cx)).collect()
-                        }),
+                    list(
+                        task_list_state.clone(),
+                        cx.processor(|this, index, _, cx| this.render_task(index, cx)),
                     )
-                    .track_scroll(&task_list_state)
                     .flex_1()
                     .min_h_0(),
                 )
@@ -16454,7 +16575,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &GoTop, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = 0;
-                    this.task_list_state.scroll_to_item(0, ScrollStrategy::Top);
+                    this.task_list_state.scroll_to(gpui::ListOffset::default());
                 } else {
                     this.selected_item = 0;
                     this.list_state.scroll_to(gpui::ListOffset::default());
@@ -16464,7 +16585,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &GoBottom, window, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = this.sidebar_threads.len().saturating_sub(1);
-                    this.task_list_state.scroll_to_bottom();
+                    this.task_list_state.scroll_to_end();
                 } else {
                     this.go_to_transcript_tail(window, cx);
                 }
@@ -17876,6 +17997,23 @@ fn history_entries_from_last_durable_overlap(
     entries.into_iter().skip(start).collect()
 }
 
+fn thread_history_list_splice(
+    outcome: &model::ThreadHistoryMergeOutcome,
+) -> Option<(Range<usize>, usize)> {
+    if !outcome.applied {
+        None
+    } else if outcome.reset {
+        Some((0..outcome.old_len, outcome.new_len))
+    } else if outcome.new_len > outcome.old_len {
+        Some((
+            outcome.old_len..outcome.old_len,
+            outcome.new_len - outcome.old_len,
+        ))
+    } else {
+        None
+    }
+}
+
 fn thread_has_active_turn(thread: &CodexThread) -> bool {
     active_thread_turn_id(thread).is_some()
 }
@@ -18279,6 +18417,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn root_threads_are_sorted_by_freshest_activity() {
+        let mut roots = vec![
+            cached_thread("older", 10),
+            cached_thread("newest", 30),
+            cached_thread("middle", 20),
+        ];
+        sort_root_threads(&mut roots);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newest", "middle", "older"]
+        );
+    }
+
+    #[test]
+    fn sidebar_uses_a_variable_height_list_for_compact_disclosures() {
+        let source = include_str!("main.rs");
+        let render = source
+            .split_once("let task_body = if self.replay_count.is_some()")
+            .and_then(|(_, after)| after.split_once("let transcript_body = if self.buffer_view"))
+            .map(|(body, _)| body)
+            .expect("sidebar task list must remain auditable");
+
+        assert!(source.contains("task_list_state: ListState"));
+        assert!(render.contains("list(\n                        task_list_state.clone()"));
+        assert!(!render.contains("uniform_list("));
     }
 
     #[test]
@@ -18686,6 +18855,37 @@ mod tests {
                 .map(|entry| entry.item.id.as_str())
                 .collect::<Vec<_>>(),
             ["old-b", "new-a", "new-b"]
+        );
+    }
+
+    #[test]
+    fn append_only_history_hydration_preserves_existing_list_rows() {
+        let append = model::ThreadHistoryMergeOutcome {
+            applied: true,
+            old_len: 5_400,
+            new_len: 5_412,
+            reset: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            thread_history_list_splice(&append),
+            Some((5_400..5_400, 12))
+        );
+
+        let reorder = model::ThreadHistoryMergeOutcome {
+            applied: true,
+            old_len: 5_400,
+            new_len: 5_412,
+            reset: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            thread_history_list_splice(&reorder),
+            Some((0..5_400, 5_412))
+        );
+        assert_eq!(
+            thread_history_list_splice(&model::ThreadHistoryMergeOutcome::default()),
+            None
         );
     }
 
@@ -21797,6 +21997,7 @@ mod tests {
 
         assert!(live_ready.contains("attach_thread_with_settings(&thread_id)"));
         assert!(!live_ready.contains("attach_thread_with_initial_turns_page"));
+        assert!(live_ready.contains("listed.updated_at.max(attached.thread.updated_at)"));
         assert!(live_ready.contains("this.attaching_thread = false"));
         assert!(live_ready.contains("this.refresh_queued_turns(cx)"));
     }
