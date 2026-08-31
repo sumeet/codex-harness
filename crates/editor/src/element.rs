@@ -8433,13 +8433,23 @@ impl Element for EditorElement {
                         )
                     };
 
-                    let (mut highlighted_rows, row_overlays) =
-                        self.editor.update(cx, |editor, cx| {
-                            (
-                                editor.highlighted_display_rows(window, cx),
-                                editor.highlighted_display_row_overlays(window, cx),
-                            )
-                        });
+                    let (mut highlighted_rows, row_overlays) = {
+                        let editor = self.editor.read(cx);
+                        (
+                            editor.highlighted_display_rows_in_range(
+                                start_anchor..end_anchor,
+                                start_row..end_row,
+                                &snapshot.display_snapshot,
+                                cx,
+                            ),
+                            editor.highlighted_display_row_overlays_in_range(
+                                start_anchor..end_anchor,
+                                start_row..end_row,
+                                &snapshot.display_snapshot,
+                                cx,
+                            ),
+                        )
+                    };
 
                     let mut highlighted_ranges = self
                         .editor_with_selections(cx)
