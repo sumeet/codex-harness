@@ -1351,6 +1351,9 @@ fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
 }
 
 fn transcript_item_header_title(item: &TranscriptItem) -> String {
+    if item.kind == model::TranscriptKind::Reasoning {
+        return "Thinking".into();
+    }
     let title = item
         .pending_request
         .as_ref()
@@ -2463,7 +2466,7 @@ fn web_result_domain(url: &str) -> Option<String> {
         .map(|domain| domain.trim_start_matches("www.").to_owned())
 }
 
-fn reasoning_steps(content: &str) -> Vec<String> {
+fn reasoning_summary_lines(content: &str) -> Vec<String> {
     content
         .lines()
         .map(str::trim)
@@ -2473,7 +2476,7 @@ fn reasoning_steps(content: &str) -> Vec<String> {
                 .trim_start_matches('#')
                 .trim_start_matches("- ")
                 .trim()
-                .to_string()
+                .to_owned()
         })
         .filter(|line| !line.is_empty())
         .collect()
@@ -2510,8 +2513,8 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
             return model::rich_markdown_navigation_text(&item.content);
         }
         model::TranscriptKind::Reasoning => {
-            for step in reasoning_steps(&item.content) {
-                append_rich_navigation_fragment(&mut output, &step);
+            for summary in reasoning_summary_lines(&item.content) {
+                append_rich_navigation_fragment(&mut output, &summary);
             }
         }
         model::TranscriptKind::Diff => {
@@ -10900,7 +10903,7 @@ impl HarnessApp {
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let mut logical_search_start = 0;
-        let steps = reasoning_steps(content)
+        let steps = reasoning_summary_lines(content)
             .into_iter()
             .map(|line| {
                 let start = navigation
@@ -10918,7 +10921,11 @@ impl HarnessApp {
             .w_full()
             .flex()
             .flex_col()
-            .gap_2()
+            .gap_1()
+            .ml_1p5()
+            .pl_3p5()
+            .border_l_1()
+            .border_color(colors.border_variant)
             .children(steps.into_iter().map(|(start, step)| {
                 let end = start + step.len();
                 let highlighted_step = navigation_searchable_styled_text(
@@ -10931,20 +10938,10 @@ impl HarnessApp {
                 );
                 div()
                     .w_full()
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(colors.text_muted)
-                    .child(
-                        div()
-                            .mt(px(7.))
-                            .size(px(5.))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(colors.text_accent.opacity(0.7)),
-                    )
-                    .child(div().min_w_0().flex_1().child(highlighted_step))
+                    .min_w_0()
+                    .font_harness_reading(cx)
+                    .text_color(colors.text)
+                    .child(highlighted_step)
             }))
             .into_any_element()
     }
@@ -13016,7 +13013,7 @@ impl HarnessApp {
                 })
                 .when(pending_user_delivery, |this| this.opacity(0.58))
                 .when(item.kind == model::TranscriptKind::Reasoning, |this| {
-                    this.py_1()
+                    this.gap_1().py_1()
                 })
                 .when(item.kind == model::TranscriptKind::Plan, |this| {
                     this.gap_1().py_0p5()
@@ -14748,7 +14745,7 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
     match kind {
         model::TranscriptKind::User => IconName::Person,
         model::TranscriptKind::Agent => IconName::AiOpenAi,
-        model::TranscriptKind::Reasoning => IconName::ThinkingMode,
+        model::TranscriptKind::Reasoning => IconName::ToolThink,
         model::TranscriptKind::Plan => IconName::ListTodo,
         model::TranscriptKind::Command => IconName::ToolTerminal,
         model::TranscriptKind::FileChange => IconName::FileDiff,
