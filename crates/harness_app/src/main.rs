@@ -132,6 +132,7 @@ const READ_ONLY_ACTIVE_REFRESH: Duration = Duration::from_millis(900);
 const READ_ONLY_IDLE_REFRESH: Duration = Duration::from_secs(5);
 const CHILD_HIERARCHY_REFRESH_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
+const THIN_ATTACH_TRANSCRIPT_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 const STRUCTURED_OUTPUT_PREVIEW_LINES: usize = 10;
 const STRUCTURED_OUTPUT_PREVIEW_BYTES: usize = 1_200;
 const COMMAND_PREVIEW_LINES: usize = 4;
@@ -3120,6 +3121,15 @@ fn should_reattach_cached_thread(
     cached_item_count: usize,
 ) -> bool {
     cached_item_count > 0 && selected_thread_id == Some(requested_thread_id)
+}
+
+fn oversized_cached_thread_should_attach(
+    had_local_content: bool,
+    persisted_transcript_bytes: Option<u64>,
+) -> bool {
+    had_local_content
+        && persisted_transcript_bytes
+            .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
 }
 
 fn child_inspection_blocked(read_only_child: bool, has_unresolved_live_request: bool) -> bool {
@@ -6892,6 +6902,7 @@ impl HarnessApp {
                                         this.reattach_cached_thread(&thread_id, cx);
                                     } else {
                                         this.open_thread_by_id(&thread_id, cx);
+                                        reattaching_cached_thread = this.attaching_thread;
                                     }
                                 }
                             }
@@ -6983,6 +6994,17 @@ impl HarnessApp {
         let Some(client) = self.client.clone() else {
             return;
         };
+        if model::TranscriptModel::persisted_transcript_size(thread_id)
+            .ok()
+            .flatten()
+            .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
+        {
+            // A thin attach is the only safe automatic path for an oversized
+            // local transcript. If even that kills App Server, do not turn one
+            // failure into a repeated OOM loop; Refresh remains an explicit
+            // retry and a successful attach clears this sentinel below.
+            self.reconnect_attempts = MAX_RECONNECT_ATTEMPTS;
+        }
         let thread_id = thread_id.to_owned();
         self.loading_thread = false;
         self.attaching_thread = true;
@@ -8266,6 +8288,14 @@ impl HarnessApp {
         }
         let preserve_background_work = observational_child || returning_to_preserved_work;
         let cached_thread = self.thread_snapshots.take(&thread_id);
+        let persisted_transcript_bytes =
+            match model::TranscriptModel::persisted_transcript_size(&thread_id) {
+                Ok(size) => size,
+                Err(error) => {
+                    log::warn!("could not inspect cached task size for {thread_id}: {error}");
+                    None
+                }
+            };
         let load_started_at = thread_load_diagnostics_enabled().then(Instant::now);
         let Some(client) = self.client.clone() else {
             return;
@@ -8347,6 +8377,17 @@ impl HarnessApp {
         cx.notify();
         if !observational_child {
             self.refresh_queued_turns(cx);
+        }
+
+        if can_accept_direct_input
+            && oversized_cached_thread_should_attach(had_local_content, persisted_transcript_bytes)
+        {
+            log::info!(
+                "attaching cached task without replaying turns thread={thread_id} cache_bytes={}",
+                persisted_transcript_bytes.unwrap_or_default(),
+            );
+            self.reattach_cached_thread(&thread_id, cx);
+            return;
         }
 
         self.thread_open_task = cx.spawn(async move |this, cx| {
@@ -19577,6 +19618,23 @@ mod tests {
             0
         ));
         assert!(!should_reattach_cached_thread(None, "thread-a", 8));
+    }
+
+    #[test]
+    fn oversized_persisted_transcript_uses_thin_attach_after_cold_restore() {
+        assert!(oversized_cached_thread_should_attach(
+            true,
+            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
+        ));
+        assert!(!oversized_cached_thread_should_attach(
+            true,
+            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES - 1)
+        ));
+        assert!(!oversized_cached_thread_should_attach(
+            false,
+            Some(THIN_ATTACH_TRANSCRIPT_CACHE_BYTES * 2)
+        ));
+        assert!(!oversized_cached_thread_should_attach(true, None));
     }
 
     #[test]

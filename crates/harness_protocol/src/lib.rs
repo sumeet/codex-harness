@@ -1829,14 +1829,24 @@ impl TranscriptModel {
         Ok(restored)
     }
 
-    /// Restores a previously rendered transcript before the authoritative
-    /// app-server snapshot arrives. Callers must still refresh from the server;
-    /// this cache exists only to make revisiting large threads immediate.
+    /// Restores a previously rendered transcript before live App Server
+    /// authority is attached. Small histories may still be refreshed in full;
+    /// oversized histories can retain this semantic cache and attach without
+    /// replaying every historical turn.
     pub fn restore_persisted_transcript(&mut self, thread_id: &str) -> anyhow::Result<usize> {
         let Some(snapshot) = read_persisted_transcript(thread_id)? else {
             return Ok(0);
         };
         Ok(self.restore_persisted_snapshot(snapshot))
+    }
+
+    pub fn persisted_transcript_size(thread_id: &str) -> anyhow::Result<Option<u64>> {
+        let path = transcript_snapshot_path(thread_id)?;
+        match fs::metadata(path) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn restore_persisted_snapshot(&mut self, snapshot: PersistedTranscript) -> usize {
