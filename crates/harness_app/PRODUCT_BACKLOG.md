@@ -175,6 +175,9 @@ must survive conversation compaction and hand-offs.
   blank output, syntax-highlight the command, wrap long commands, and render a
   literal selectable `$ ` without `/usr/bin/bash -lc` ceremony when the
   protocol structure proves that wrapper is synthetic.
+- [ ] Preserve the same shell syntax-highlight spans in compact one-line
+  command activity rows; compactness may clip/wrap evidence but must not reduce
+  a command to unstructured label text.
 - [ ] Use consistent compact headers (or no redundant header) across tool
   cards, file changes, reasoning, plans, web results, and images.
 - [ ] Flatten single-file and multi-file edits into the same file-panel format.

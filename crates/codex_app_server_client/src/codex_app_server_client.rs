@@ -560,7 +560,22 @@ impl Client {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ThreadListResponse, Error> {
-        self.list_threads_with_relationship(limit, cursor, None)
+        self.list_threads_with_filters(limit, cursor, None, None)
+            .await
+    }
+
+    /// List sessions created by the collaboration `spawnAgent` tool.
+    ///
+    /// App-server deliberately defaults an unfiltered `thread/list` request to
+    /// interactive sources. Keeping this as a separate request preserves that
+    /// root-thread behavior while allowing clients to build a hierarchy without
+    /// also exposing review/compaction maintenance sessions.
+    pub async fn list_spawned_subagent_threads(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<ThreadListResponse, Error> {
+        self.list_threads_with_filters(limit, cursor, None, Some(&["subAgentThreadSpawn"]))
             .await
     }
 
@@ -571,10 +586,11 @@ impl Client {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ThreadListResponse, Error> {
-        self.list_threads_with_relationship(
+        self.list_threads_with_filters(
             limit,
             cursor,
             Some(ThreadListRelationship::DirectChildren(parent_thread_id)),
+            Some(&["subAgentThreadSpawn"]),
         )
         .await
     }
@@ -587,24 +603,26 @@ impl Client {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<ThreadListResponse, Error> {
-        self.list_threads_with_relationship(
+        self.list_threads_with_filters(
             limit,
             cursor,
             Some(ThreadListRelationship::Descendants(ancestor_thread_id)),
+            Some(&["subAgentThreadSpawn"]),
         )
         .await
     }
 
-    async fn list_threads_with_relationship(
+    async fn list_threads_with_filters(
         &self,
         limit: usize,
         cursor: Option<&str>,
         relationship: Option<ThreadListRelationship<'_>>,
+        source_kinds: Option<&[&str]>,
     ) -> Result<ThreadListResponse, Error> {
         let response = self
             .request(
                 "thread/list",
-                thread_list_params(limit, cursor, relationship),
+                thread_list_params(limit, cursor, relationship, source_kinds),
             )
             .await?;
         Ok(serde_json::from_value(response)?)
@@ -850,6 +868,7 @@ fn thread_list_params(
     limit: usize,
     cursor: Option<&str>,
     relationship: Option<ThreadListRelationship<'_>>,
+    source_kinds: Option<&[&str]>,
 ) -> Value {
     let mut params = json!({
         "archived": false,
@@ -866,6 +885,9 @@ fn thread_list_params(
             params["ancestorThreadId"] = ancestor_thread_id.into();
         }
         None => {}
+    }
+    if let Some(source_kinds) = source_kinds {
+        params["sourceKinds"] = source_kinds.into();
     }
     params
 }
@@ -1149,12 +1171,14 @@ mod tests {
                 50,
                 Some("next-page"),
                 Some(ThreadListRelationship::DirectChildren("parent-1")),
+                Some(&["subAgentThreadSpawn"]),
             ),
             json!({
                 "archived": false,
                 "cursor": "next-page",
                 "limit": 50,
                 "parentThreadId": "parent-1",
+                "sourceKinds": ["subAgentThreadSpawn"],
                 "sortDirection": "desc",
                 "sortKey": "recency_at",
             })
@@ -1164,14 +1188,41 @@ mod tests {
                 100,
                 None,
                 Some(ThreadListRelationship::Descendants("ancestor-1")),
+                Some(&["subAgentThreadSpawn"]),
             ),
             json!({
                 "ancestorThreadId": "ancestor-1",
                 "archived": false,
                 "cursor": null,
                 "limit": 100,
+                "sourceKinds": ["subAgentThreadSpawn"],
                 "sortDirection": "desc",
                 "sortKey": "recency_at",
+            })
+        );
+    }
+
+    #[test]
+    fn spawned_subagent_filter_does_not_change_the_root_thread_query() {
+        assert_eq!(
+            thread_list_params(300, None, None, None),
+            json!({
+                "archived": false,
+                "cursor": null,
+                "limit": 300,
+                "sortDirection": "desc",
+                "sortKey": "recency_at",
+            })
+        );
+        assert_eq!(
+            thread_list_params(300, None, None, Some(&["subAgentThreadSpawn"])),
+            json!({
+                "archived": false,
+                "cursor": null,
+                "limit": 300,
+                "sortDirection": "desc",
+                "sortKey": "recency_at",
+                "sourceKinds": ["subAgentThreadSpawn"],
             })
         );
     }
