@@ -21,13 +21,13 @@ must survive conversation compaction and hand-offs.
 
 ## In flight
 
-- Replace the window-owned embedded App Server with Codex's managed daemon and
-  reconnectable proxy transport; preserve the embedded path only as an explicit
-  compatibility API rather than a silent fallback.
-- Apply the first systematic lightness/density slice to routine activity:
-  syntax-aware compact commands, truthful identities, and consecutive stacks.
-- Extend the no-scroll Markdown pointer bridge across structured transcript
-  surfaces, multi-click/Shift selection, and adjacent mounted items.
+- Move command lifecycle onto the terminal glyph: animated while running,
+  quiet-success, error-colored failure, and a plain exit code only when known.
+- Persist the selected root/child and one text-only workspace draft atomically
+  so a full Harness restart restores local view state without duplicating
+  App Server-owned work.
+- Live-verify cross-surface mouse drag selection and then add native
+  double/triple-click plus Shift-extension semantics to the shared pointer host.
 
 ## Now
 
@@ -222,9 +222,10 @@ must survive conversation compaction and hand-offs.
 ### Tool calls, diffs, and structured content
 
 - [ ] Give Bash command and output distinct selectable regions; trim trailing
-  blank output, syntax-highlight the command, wrap long commands, and render a
-  literal selectable `$ ` without `/usr/bin/bash -lc` ceremony when the
-  protocol structure proves that wrapper is synthetic.
+  blank output, syntax-highlight the command, wrap long commands, and use the
+  terminal glyph rather than a fake selectable `$ ` prompt. Omit
+  `/usr/bin/bash -lc` ceremony only when protocol structure proves that wrapper
+  is synthetic.
 - [ ] Preserve the same shell syntax-highlight spans in compact one-line
   command activity rows; compactness may clip/wrap evidence but must not reduce
   a command to unstructured label text.
