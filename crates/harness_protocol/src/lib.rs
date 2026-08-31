@@ -2542,9 +2542,15 @@ impl TranscriptModel {
         }
         if let Some(index) = self.item_indices.get(&protocol_id).copied() {
             let old_events = self.items[index].event_count;
+            let stable_key = self.items[index].key.clone();
             let expanded = self.items[index].expanded;
             let pending_request = self.items[index].pending_request.clone();
             let mut item = item_from_protocol(value, completed);
+            // Optimistic user rows keep their local presentation identity
+            // after the authoritative server id arrives. Replacing the key
+            // remounted Markdown/images and caused a visible disappear/reappear
+            // flicker even though the semantic row never moved.
+            item.key = stable_key.clone();
             item.event_count = old_events + 1;
             item.expanded = expanded
                 || matches!(
@@ -2555,23 +2561,23 @@ impl TranscriptModel {
             self.items[index] = item;
             if self.items[index].kind == TranscriptKind::User {
                 if incoming_user_image_sources.is_empty() {
-                    self.user_image_sources.remove(&protocol_id);
+                    self.user_image_sources.remove(&stable_key);
                 } else {
                     self.user_image_sources
-                        .insert(protocol_id.clone(), incoming_user_image_sources);
+                        .insert(stable_key.clone(), incoming_user_image_sources);
                 }
                 if incoming_user_content_blocks.is_empty() {
-                    self.user_content_blocks.remove(&protocol_id);
+                    self.user_content_blocks.remove(&stable_key);
                 } else {
                     self.user_content_blocks
-                        .insert(protocol_id.clone(), incoming_user_content_blocks);
+                        .insert(stable_key, incoming_user_content_blocks);
                 }
             }
             return Some(index);
         }
 
         let client_user_message_id = string_at(&value, "/clientId").map(ToOwned::to_owned);
-        let item = item_from_protocol(value, completed);
+        let mut item = item_from_protocol(value, completed);
         if item.kind == TranscriptKind::User
             && let Some(index) = client_user_message_id
                 .as_deref()
@@ -2584,9 +2590,7 @@ impl TranscriptModel {
                 })
         {
             let optimistic_key = self.items[index].key.clone();
-            self.item_indices.remove(&optimistic_key);
-            self.user_image_sources.remove(&optimistic_key);
-            self.user_content_blocks.remove(&optimistic_key);
+            item.key = optimistic_key.clone();
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
             if !incoming_user_image_sources.is_empty() {
@@ -7179,7 +7183,7 @@ mod tests {
         );
 
         assert_eq!(model.items.len(), 1);
-        assert_eq!(model.items[0].key, "server-message-1");
+        assert_eq!(model.items[0].key, local_key);
         assert_eq!(
             model.items[0].protocol_id.as_deref(),
             Some("server-message-1")
@@ -7187,11 +7191,10 @@ mod tests {
         assert_eq!(model.items[0].content, "canonical rendering");
         assert_eq!(model.items[0].status.as_deref(), Some("in progress"));
         assert_eq!(
-            model.user_image_sources("server-message-1"),
+            model.user_image_sources(&local_key),
             &[UserImageSource::Url("data:image/png;base64,AQID".into())]
         );
-        assert!(model.user_image_sources(&local_key).is_empty());
-        assert!(!model.item_indices.contains_key(&local_key));
+        assert_eq!(model.item_indices.get(&local_key), Some(&0));
         assert_eq!(model.item_indices.get("server-message-1"), Some(&0));
     }
 
@@ -7235,8 +7238,9 @@ mod tests {
         );
 
         assert_eq!(model.items.len(), 1);
-        assert_eq!(model.items[0].key, "queued-server-message-1");
-        assert!(!model.item_indices.contains_key(&local_key));
+        assert_eq!(model.items[0].key, local_key);
+        assert_eq!(model.item_indices.get(&local_key), Some(&0));
+        assert_eq!(model.item_indices.get("queued-server-message-1"), Some(&0));
         assert!(
             model
                 .ensure_local_user(
@@ -7303,7 +7307,7 @@ mod tests {
             {"type": "text", "text": "describe this"},
             {"type": "image", "url": "data:image/png;base64,AQID"}
         ]);
-        model.push_local_user(
+        let (_, local_key) = model.push_local_user(
             "client-message-without-echo",
             "describe this\n\n[Attached image]".into(),
             optimistic_blocks.as_array().unwrap(),
@@ -7330,7 +7334,9 @@ mod tests {
         );
 
         assert_eq!(model.items.len(), 1);
-        assert_eq!(model.items[0].key, "legacy-server-message");
+        assert_eq!(model.items[0].key, local_key);
+        assert_eq!(model.item_indices.get(&local_key), Some(&0));
+        assert_eq!(model.item_indices.get("legacy-server-message"), Some(&0));
     }
 
     #[test]

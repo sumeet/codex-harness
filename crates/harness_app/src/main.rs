@@ -23,11 +23,11 @@ use gpui::{
 };
 use gpui_platform::application;
 use harness_editor::{
-    LocalEditor, LocalEditorChanged, LocalEditorSteered, LocalEditorSubmitted, ModeIndicator,
-    TranscriptEditor, TranscriptReplacement, TranscriptSelectionChanged,
-    TranscriptSelectionSnapshot, TranscriptSupplement, TranscriptTypographyProfile, VimNextMatch,
-    VimPreviousMatch, VimSearch, VimWordNext, VimWordPrevious, shell_capture_priority,
-    shell_capture_ranges, syntax_highlights_for_path,
+    LocalEditor, LocalEditorChanged, LocalEditorImageClicked, LocalEditorSteered,
+    LocalEditorSubmitted, ModeIndicator, TranscriptEditor, TranscriptReplacement,
+    TranscriptSelectionChanged, TranscriptSelectionSnapshot, TranscriptSupplement,
+    TranscriptTypographyProfile, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext,
+    VimWordPrevious, shell_capture_priority, shell_capture_ranges, syntax_highlights_for_path,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -168,7 +168,7 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
 
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
     let size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
-    px((size.as_f32() * 1.4).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
+    px((size.as_f32() * 1.25).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
 }
 
 /// Apply Harness's semantic code role as one indivisible family/size choice.
@@ -1316,14 +1316,15 @@ fn item_search_context_snippet(
     max_chars: usize,
 ) -> Option<SearchContextSnippet> {
     if item.kind == model::TranscriptKind::Web {
-        let semantic_results = web_search_presentation(&item.raw)
-            .results
+        let presentation = web_search_presentation(&item.raw);
+        let semantic_results = presentation
+            .queries
             .into_iter()
-            .flat_map(|result| {
+            .chain(presentation.results.into_iter().flat_map(|result| {
                 [Some(result.title), result.url, result.snippet]
                     .into_iter()
                     .flatten()
-            })
+            }))
             .collect::<Vec<_>>()
             .join("\n");
         search_context_snippet(&semantic_results, query, max_chars)
@@ -1346,7 +1347,7 @@ fn expanded_item_uses_content_as_header(item: &TranscriptItem) -> bool {
         && (matches!(
             item.kind,
             model::TranscriptKind::Diff | model::TranscriptKind::FileChange
-        ) || (item.kind == model::TranscriptKind::Command && !command_has_semantic_title(item)))
+        ) || command_uses_raw_identity(item))
 }
 
 fn transcript_item_header_title(item: &TranscriptItem) -> String {
@@ -1355,7 +1356,7 @@ fn transcript_item_header_title(item: &TranscriptItem) -> String {
         .as_ref()
         .and_then(|request| request_header_title(&request.method))
         .unwrap_or(&item.title);
-    if item.kind == model::TranscriptKind::Command && !command_has_semantic_title(item) {
+    if command_uses_raw_identity(item) {
         item.command_transcript()
             .and_then(|command| {
                 command
@@ -1366,15 +1367,19 @@ fn transcript_item_header_title(item: &TranscriptItem) -> String {
                     .map(ToOwned::to_owned)
             })
             .unwrap_or_else(|| "Shell command".to_owned())
+    } else if item.kind == model::TranscriptKind::Web {
+        web_search_presentation(&item.raw)
+            .queries
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| title.replace(" · ", " — "))
     } else {
         title.replace(" · ", " — ")
     }
 }
 
-fn command_has_semantic_title(item: &TranscriptItem) -> bool {
+fn command_uses_raw_identity(item: &TranscriptItem) -> bool {
     item.kind == model::TranscriptKind::Command
-        && !item.title.trim().is_empty()
-        && !item.title.trim().eq_ignore_ascii_case("command")
 }
 
 fn toggle_model_item_expansion_at(
@@ -1798,23 +1803,15 @@ fn render_command_visual_status(
 }
 
 fn rich_command_row_logical_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
-    let prompt_len = usize::from(!data.command.is_empty()) * model::COMMAND_PROMPT.len();
     let base = match row.source {
-        RichCommandSource::Command => prompt_len,
-        RichCommandSource::Output => {
-            prompt_len + data.command.len() + usize::from(!data.command.is_empty())
-        }
+        RichCommandSource::Command => 0,
+        RichCommandSource::Output => data.command.len() + usize::from(!data.command.is_empty()),
     };
     base + row.source_range.start..base + row.source_range.end
 }
 
 fn rich_command_row_navigation_range(data: &RichCommandData, row: &RichCommandRow) -> Range<usize> {
-    let range = rich_command_row_logical_range(data, row);
-    if matches!(row.source, RichCommandSource::Command) && row.line_index == 0 {
-        0..range.end
-    } else {
-        range
-    }
+    rich_command_row_logical_range(data, row)
 }
 
 fn progressive_line_limit(expansion: OutputExpansion, preview_limit: usize) -> usize {
@@ -2333,10 +2330,12 @@ fn rich_search_query_is_visible(
                 })
         }
         model::TranscriptKind::Web => {
-            web_search_presentation(&item.raw)
-                .results
+            let presentation = web_search_presentation(&item.raw);
+            presentation
+                .queries
                 .iter()
-                .any(|result| {
+                .any(|candidate| search_contains(candidate, query))
+                || presentation.results.iter().any(|result| {
                     search_contains(&result.title, query)
                         || result
                             .url
@@ -2360,12 +2359,13 @@ fn rich_search_query_is_visible(
 struct WebResultPresentation {
     title: String,
     url: Option<String>,
+    domain: Option<String>,
     snippet: Option<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
 struct WebSearchPresentation {
-    related_queries: usize,
+    queries: Vec<String>,
     results: Vec<WebResultPresentation>,
 }
 
@@ -2391,16 +2391,25 @@ fn web_search_has_hidden_content(presentation: &WebSearchPresentation) -> bool {
 
 fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
     let action = raw.get("action").unwrap_or(&Value::Null);
-    let query_count = action
+    let mut queries = action
         .get("queries")
         .and_then(Value::as_array)
-        .map(|queries| queries.iter().filter(|query| query.is_string()).count())
-        .unwrap_or_else(|| {
-            usize::from(
-                action.get("query").and_then(Value::as_str).is_some()
-                    || raw.get("query").and_then(Value::as_str).is_some(),
-            )
-        });
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(compact_web_text)
+        .filter(|query| !query.is_empty())
+        .collect::<Vec<_>>();
+    if queries.is_empty()
+        && let Some(query) = action
+            .get("query")
+            .or_else(|| raw.get("query"))
+            .and_then(Value::as_str)
+            .map(compact_web_text)
+            .filter(|query| !query.is_empty())
+    {
+        queries.push(query);
+    }
     let results = raw
         .get("results")
         .and_then(Value::as_array)
@@ -2411,6 +2420,7 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
                 return Some(WebResultPresentation {
                     title: compact_web_text(text),
                     url: None,
+                    domain: None,
                     snippet: None,
                 });
             }
@@ -2423,6 +2433,11 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
                 .get("url")
                 .or_else(|| result.get("link"))
                 .and_then(Value::as_str);
+            let domain = result
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(compact_web_text)
+                .or_else(|| url.and_then(web_result_domain));
             let snippet = result
                 .get("snippet")
                 .or_else(|| result.get("description"))
@@ -2431,14 +2446,21 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
             (title.is_some() || url.is_some() || snippet.is_some()).then(|| WebResultPresentation {
                 title: compact_web_text(title.unwrap_or("Result")),
                 url: url.map(compact_web_text),
+                domain,
                 snippet: snippet.map(compact_web_text),
             })
         })
         .collect();
-    WebSearchPresentation {
-        related_queries: query_count.saturating_sub(1),
-        results,
-    }
+    WebSearchPresentation { queries, results }
+}
+
+fn web_result_domain(url: &str) -> Option<String> {
+    let authority = url.split_once("://").map_or(url, |(_, rest)| rest);
+    authority
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|domain| !domain.is_empty())
+        .map(|domain| domain.trim_start_matches("www.").to_owned())
 }
 
 fn reasoning_steps(content: &str) -> Vec<String> {
@@ -2510,18 +2532,28 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
                 );
             }
         }
+        model::TranscriptKind::Command => {
+            let Some(command) = item.command_transcript() else {
+                return fallback.to_owned();
+            };
+            append_rich_navigation_fragment(&mut output, &command.command);
+            append_rich_navigation_fragment(
+                &mut output,
+                command_output_for_display(&command.output),
+            );
+        }
         model::TranscriptKind::Web => {
             let presentation = web_search_presentation(&item.raw);
-            if presentation.results.is_empty() {
+            if presentation.queries.is_empty() && presentation.results.is_empty() {
                 return fallback.to_owned();
+            }
+            for query in presentation.queries {
+                append_rich_navigation_fragment(&mut output, &query);
             }
             for result in presentation.results {
                 append_rich_navigation_fragment(&mut output, &result.title);
-                if let Some(url) = result.url {
-                    append_rich_navigation_fragment(&mut output, &url);
-                }
-                if let Some(snippet) = result.snippet {
-                    append_rich_navigation_fragment(&mut output, &snippet);
+                if let Some(domain) = result.domain {
+                    append_rich_navigation_fragment(&mut output, &domain);
                 }
             }
         }
@@ -3170,8 +3202,7 @@ impl Render for HybridStructuredSurface {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors);
-        let command_fallback_title = self.item.kind == model::TranscriptKind::Command
-            && !command_has_semantic_title(&self.item);
+        let command_fallback_title = command_uses_raw_identity(&self.item);
         let command_status = self
             .item
             .command_execution_status()
@@ -5716,6 +5747,11 @@ impl HarnessApp {
             window,
             |this, _, _: &LocalEditorSteered, window, cx| this.steer(window, cx),
         )
+        .detach();
+        cx.subscribe(&composer, |this, _, event: &LocalEditorImageClicked, cx| {
+            this.expanded_user_image = Some(event.image.clone().into());
+            cx.notify();
+        })
         .detach();
         cx.subscribe_in(
             &search_editor,
@@ -11182,27 +11218,8 @@ impl HarnessApp {
                 let line = &command_data.command[row.source_range.clone()];
                 let first_command_row = row.line_index == 0;
                 let logical_range = rich_command_row_navigation_range(&command_data, row);
-                let (rendered_line, base_highlights) = if first_command_row {
-                    let mut highlights = vec![(
-                        0..1,
-                        gpui::HighlightStyle {
-                            color: Some(cx.theme().colors().text_accent),
-                            ..Default::default()
-                        },
-                    )];
-                    highlights.extend(shell_highlights(line, cx).into_iter().map(
-                        |(range, style)| {
-                            (
-                                range.start + model::COMMAND_PROMPT.len()
-                                    ..range.end + model::COMMAND_PROMPT.len(),
-                                style,
-                            )
-                        },
-                    ));
-                    (format!("{}{line}", model::COMMAND_PROMPT), highlights)
-                } else {
-                    (line.to_owned(), shell_highlights(line, cx))
-                };
+                let rendered_line = line.to_owned();
+                let base_highlights = shell_highlights(line, cx);
                 let highlighted = navigation_searchable_styled_text(
                     rendered_line,
                     base_highlights,
@@ -11240,11 +11257,21 @@ impl HarnessApp {
                     .min_w_0()
                     .min_h(harness_code_row_height(cx))
                     .relative()
+                    .flex()
+                    .items_start()
+                    .gap_1()
                     .whitespace_normal()
                     .when(first_command_row && status_padding > 0., |this| {
                         this.pr(px(status_padding))
                     })
-                    .child(clickable)
+                    .when(first_command_row, |this| {
+                        this.child(rich_card_identity_icon(
+                            IconName::ToolTerminal,
+                            IconSize::Small,
+                            Color::Accent,
+                        ))
+                    })
+                    .child(div().min_w_0().flex_1().child(clickable))
                     .when_some(visual_status, |this, (_, status)| {
                         this.child(
                             div()
@@ -11442,29 +11469,10 @@ impl HarnessApp {
         // The ellipsis is presentation chrome, not a Vim byte. Keep its
         // clickable/highlight range clamped to the actual command prefix so a
         // long preview cannot spill into the output's logical row.
-        let command_end = model::COMMAND_PROMPT.len() + visible_command_source_len;
-        let output_start = model::COMMAND_PROMPT.len()
-            + command_text.len()
+        let command_end = visible_command_source_len;
+        let output_start = command_text.len()
             + usize::from(!command_text.is_empty() && !displayed_output.is_empty());
-        let displayed_command = format!("{}{displayed_command}", model::COMMAND_PROMPT);
-        let mut command_highlights = vec![(
-            0..1,
-            gpui::HighlightStyle {
-                color: Some(colors.text_accent),
-                ..Default::default()
-            },
-        )];
-        command_highlights.extend(
-            shell_highlights(&displayed_command[model::COMMAND_PROMPT.len()..], cx)
-                .into_iter()
-                .map(|(range, style)| {
-                    (
-                        range.start + model::COMMAND_PROMPT.len()
-                            ..range.end + model::COMMAND_PROMPT.len(),
-                        style,
-                    )
-                }),
-        );
+        let command_highlights = shell_highlights(&displayed_command, cx);
         let highlighted_command = navigation_searchable_styled_text(
             displayed_command,
             command_highlights,
@@ -11506,10 +11514,18 @@ impl HarnessApp {
                         .w_full()
                         .min_w_0()
                         .pr_5()
+                        .flex()
+                        .items_start()
+                        .gap_1()
                         .font_harness_code(cx)
                         .line_height(relative(1.35))
                         .whitespace_normal()
-                        .child(clickable_command),
+                        .child(rich_card_identity_icon(
+                            IconName::ToolTerminal,
+                            IconSize::Small,
+                            Color::Accent,
+                        ))
+                        .child(div().min_w_0().flex_1().child(clickable_command)),
                 )
                 .when(!displayed_output.is_empty(), |this| {
                     this.child(
@@ -11558,8 +11574,41 @@ impl HarnessApp {
         let presentation = web_search_presentation(&item.raw);
         let total_results = presentation.results.len();
         let item_key = item.key.clone();
-        let mut logical_cursor = 0;
+        // The first exact query is painted in the shared card identity row.
+        // Begin body mapping after it so additional queries and result rows
+        // retain stable Vim/search coordinates without repeating that query.
+        let mut logical_cursor = presentation
+            .queries
+            .first()
+            .map_or(0, |query| query.len().saturating_add(1));
         let mut row_ranges = Vec::new();
+        let query_rows = presentation
+            .queries
+            .iter()
+            .skip(1)
+            .enumerate()
+            .map(|(query_index, query)| {
+                let range = rich_navigation_fragment_range(navigation, query, &mut logical_cursor);
+                row_ranges.push(Some(range.clone()));
+                let highlighted = navigation_searchable_styled_text(
+                    query.clone(),
+                    shell_highlights(query, cx),
+                    search,
+                    navigation,
+                    range,
+                    cx,
+                );
+                div()
+                    .id(format!("web-query:{item_key}:{query_index}"))
+                    .w_full()
+                    .min_w_0()
+                    .py_0p5()
+                    .font_harness_code(cx)
+                    .text_color(colors.text_muted)
+                    .child(highlighted)
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
         let visible_results = presentation
             .results
             .into_iter()
@@ -11576,24 +11625,11 @@ impl HarnessApp {
                     title_range.clone(),
                     cx,
                 );
-                let url = result.url.map(|url| {
+                let domain = result.domain.clone().map(|domain| {
                     let range =
-                        rich_navigation_fragment_range(navigation, &url, &mut logical_cursor);
+                        rich_navigation_fragment_range(navigation, &domain, &mut logical_cursor);
                     let highlighted = navigation_searchable_styled_text(
-                        url.clone(),
-                        Vec::new(),
-                        search,
-                        navigation,
-                        range.clone(),
-                        cx,
-                    );
-                    (url, highlighted, range)
-                });
-                let snippet = result.snippet.map(|snippet| {
-                    let range =
-                        rich_navigation_fragment_range(navigation, &snippet, &mut logical_cursor);
-                    let highlighted = navigation_searchable_styled_text(
-                        snippet,
+                        domain,
                         Vec::new(),
                         search,
                         navigation,
@@ -11602,67 +11638,55 @@ impl HarnessApp {
                     );
                     (highlighted, range)
                 });
-                let result_end = snippet
+                let result_end = domain
                     .as_ref()
                     .map(|(_, range)| range.end)
-                    .or_else(|| url.as_ref().map(|(_, _, range)| range.end))
                     .unwrap_or(title_range.end);
                 row_ranges.push(Some(result_start..result_end));
-                div()
+                let result_row = div()
                     .w_full()
                     .min_w_0()
                     .flex()
-                    .items_start()
-                    .gap_2()
-                    .py_1()
+                    .items_center()
+                    .gap_1()
+                    .py_0p5()
                     .when(result_index > 0, |this| {
                         this.border_t_1().border_color(colors.border_variant)
                     })
                     .child(
                         div()
-                            .w(px(18.))
-                            .flex_none()
-                            .text_ui_xs(cx)
-                            .text_color(colors.text_muted)
-                            .child(format!("{}.", result_index + 1)),
-                    )
-                    .child(
-                        div()
                             .min_w_0()
                             .flex_1()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .child(div().min_w_0().text_ui_sm(cx).child(highlighted_title))
-                            .when_some(url, |this, (url, highlighted_url, _)| {
-                                let open_url = url.clone();
-                                this.child(
-                                    div()
-                                        .id(format!("web-result-url:{item_key}:{result_index}"))
-                                        .min_w_0()
-                                        .cursor_pointer()
-                                        .text_ui_xs(cx)
-                                        .text_color(colors.text_accent)
-                                        .hover(|this| this.underline())
-                                        .on_click(move |_, _, cx| cx.open_url(&open_url))
-                                        .child(highlighted_url),
-                                )
-                            })
-                            .when_some(snippet, |this, (highlighted_snippet, _)| {
-                                this.child(
-                                    div()
-                                        .min_w_0()
-                                        .text_ui_xs(cx)
-                                        .text_color(colors.text_muted)
-                                        .child(highlighted_snippet),
-                                )
-                            }),
+                            .truncate()
+                            .font_harness_reading(cx)
+                            .child(highlighted_title),
                     )
-                    .into_any_element()
+                    .when_some(domain, |this, (highlighted_domain, _)| {
+                        this.child(div().flex_none().text_color(colors.text_muted).child("—"))
+                            .child(
+                                div()
+                                    .max_w(relative(0.38))
+                                    .truncate()
+                                    .text_color(colors.text_muted)
+                                    .child(highlighted_domain),
+                            )
+                    });
+                if let Some(url) = result.url {
+                    let open_url = url.clone();
+                    result_row
+                        .id(format!("web-result:{item_key}:{result_index}"))
+                        .cursor_pointer()
+                        .hover(|this| this.bg(colors.element_hover))
+                        .tooltip(Tooltip::text(url))
+                        .on_click(move |_, _, cx| cx.open_url(&open_url))
+                        .into_any_element()
+                } else {
+                    result_row.into_any_element()
+                }
             })
             .collect::<Vec<_>>();
 
-        let results_scroll = (total_results > 0).then(|| {
+        let results_scroll = (!query_rows.is_empty() || total_results > 0).then(|| {
             let binding = self.rich_nested_scroll_binding(&item.key, navigation);
             reveal_rich_nested_cursor(Some(&binding), navigation, &row_ranges);
             div()
@@ -11672,6 +11696,7 @@ impl HarnessApp {
                 .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
                 .overflow_y_scroll()
                 .track_scroll(&binding.handle)
+                .children(query_rows)
                 .children(visible_results)
                 .custom_scrollbars(
                     Scrollbars::new(ScrollAxes::Vertical)
@@ -11688,21 +11713,6 @@ impl HarnessApp {
             .min_w_0()
             .flex()
             .flex_col()
-            .when(presentation.related_queries > 0, |this| {
-                this.child(
-                    Label::new(format!(
-                        "+{} related {}",
-                        presentation.related_queries,
-                        if presentation.related_queries == 1 {
-                            "query"
-                        } else {
-                            "queries"
-                        }
-                    ))
-                    .size(LabelSize::XSmall)
-                    .color(Color::Muted),
-                )
-            })
             .when_some(results_scroll, |this, results| this.child(results))
             .when(total_results == 0, |this| {
                 this.child(self.render_terminal(
@@ -11775,6 +11785,7 @@ impl HarnessApp {
     }
 
     fn render_image(
+        &mut self,
         item: &TranscriptItem,
         surface: Option<Entity<ImageSurface>>,
         search: Option<&RichSearchPaint>,
@@ -11798,6 +11809,9 @@ impl HarnessApp {
         let surface_size = surface
             .as_ref()
             .map(|surface| surface.read(cx).preview_size());
+        let expanded_source = surface
+            .as_ref()
+            .and_then(|surface| surface.read(cx).preview_source());
         div()
             .w_full()
             .flex()
@@ -11806,13 +11820,22 @@ impl HarnessApp {
             .when_some(
                 surface.zip(surface_size),
                 |this, (surface, (width, height))| {
+                    let preview_source = expanded_source.clone();
                     this.child(
                         div()
+                            .id(format!("viewed-image-preview:{}", item.key))
                             .w(px(width))
                             .max_w_full()
                             .h(px(height))
                             .overflow_hidden()
                             .rounded_xs()
+                            .when(preview_source.is_some(), |this| this.cursor_pointer())
+                            .when_some(preview_source, |this, source| {
+                                this.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.expanded_user_image = Some(source.clone());
+                                    cx.notify();
+                                }))
+                            })
                             .child(surface),
                     )
                 },
@@ -12590,19 +12613,26 @@ impl HarnessApp {
             && !item.expanded
             && !item.content.is_empty())
         .then(|| compact_reasoning_preview(&item.content));
-        let pending_user_delivery: Option<SharedString> = (item.kind
-            == model::TranscriptKind::User)
-            .then(|| match item.status.as_deref() {
-                Some("sending") => Some("Sending…".into()),
-                Some("adding to response") => Some("Adding to response…".into()),
-                Some("awaiting incorporation") => Some("Waiting to join response…".into()),
-                _ => None,
-            })
-            .flatten();
+        let pending_user_delivery = item.kind == model::TranscriptKind::User
+            && matches!(
+                item.status.as_deref(),
+                Some("sending" | "sent" | "adding to response" | "awaiting incorporation")
+            );
         let visible_status = item.display_status().map(ToOwned::to_owned);
+        let header_activity_summary: Option<SharedString> =
+            (item.kind == model::TranscriptKind::Web).then(|| {
+                let presentation = web_search_presentation(&item.raw);
+                match presentation.queries.len() {
+                    0 | 1 => format!("{} results", presentation.results.len()).into(),
+                    query_count => format!(
+                        "{query_count} queries · {} results",
+                        presentation.results.len()
+                    )
+                    .into(),
+                }
+            });
         let header_title = transcript_item_header_title(&item);
-        let header_uses_command_font =
-            item.kind == model::TranscriptKind::Command && !command_has_semantic_title(&item);
+        let header_uses_command_font = command_uses_raw_identity(&item);
         let has_collapsible_content = !item.content.trim().is_empty();
         let show_header = transcript_item_shows_header(&item);
         let headerless_expanded = show_header && expanded_item_uses_content_as_header(&item);
@@ -12794,7 +12824,7 @@ impl HarnessApp {
                     window,
                     cx,
                 ),
-                model::TranscriptKind::Image => Self::render_image(
+                model::TranscriptKind::Image => self.render_image(
                     &item,
                     self.image_surfaces.get(&item.key).cloned(),
                     rich_search.as_ref(),
@@ -12882,6 +12912,15 @@ impl HarnessApp {
                     .text_color(colors.text_muted)
                     .child(highlighted_header_title),
             )
+            .when_some(header_activity_summary, |this, summary| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .font_harness_reading(cx)
+                        .text_color(colors.text_muted)
+                        .child(summary),
+                )
+            })
             .when_some(
                 visible_status.zip(highlighted_status),
                 |this, (status, highlighted)| {
@@ -12975,13 +13014,13 @@ impl HarnessApp {
                         .px_2()
                         .py_1()
                 })
-                .when(
-                    matches!(
-                        item.kind,
-                        model::TranscriptKind::Reasoning | model::TranscriptKind::Plan
-                    ),
-                    |this| this.py_1(),
-                )
+                .when(pending_user_delivery, |this| this.opacity(0.58))
+                .when(item.kind == model::TranscriptKind::Reasoning, |this| {
+                    this.py_1()
+                })
+                .when(item.kind == model::TranscriptKind::Plan, |this| {
+                    this.gap_1().py_0p5()
+                })
                 .when(show_header, |this| this.child(header))
                 .when_some(reasoning_preview, |this, preview| {
                     let highlighted =
@@ -12996,18 +13035,6 @@ impl HarnessApp {
                 })
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
-                .when_some(pending_user_delivery, |this, label| {
-                    this.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .text_ui_xs(cx)
-                            .text_color(colors.text_muted)
-                            .child(SpinnerLabel::new().size(LabelSize::Small))
-                            .child(label),
-                    )
-                })
                 .when_some(raw, |this, raw| this.child(raw))
                 .into_any_element();
 
@@ -15396,9 +15423,9 @@ mod tests {
     fn rich_command_cursor_marker_uses_the_exact_utf8_glyph_in_each_surface() {
         let command = "/usr/bin/bash -lc 'printf café'";
         let output = "ok\nfinished";
-        let body = format!("{}{command}\n{output}", model::COMMAND_PROMPT);
+        let body = format!("{command}\n{output}");
         let cursor = body.find("é").unwrap();
-        let command_start = model::COMMAND_PROMPT.len();
+        let command_start = 0;
         let output_start = command_start + command.len() + 1;
         let navigation = RichNavigationPaint {
             body_text: body.clone().into(),
@@ -15483,7 +15510,7 @@ mod tests {
         let command = rich_navigation_item_projection(&replay, 5).unwrap();
         assert_eq!(
             command.body_text(),
-            "$ cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
         );
         assert!(
             rich_item_defers_navigation_claim(&replay.items[5]),
@@ -15548,7 +15575,7 @@ mod tests {
                     }]
                 }),
             ),
-            "Zed Docs\nhttps://zed.dev/docs\nFast editor"
+            "zed\nZed Docs\nzed.dev"
         );
     }
 
@@ -15572,8 +15599,12 @@ mod tests {
         assert!(expanded_item_uses_content_as_header(&replay.items[5]));
 
         replay.items[5].title = "Search for identity in crates/harness_app".into();
-        assert!(command_has_semantic_title(&replay.items[5]));
-        assert!(!expanded_item_uses_content_as_header(&replay.items[5]));
+        assert!(command_uses_raw_identity(&replay.items[5]));
+        assert!(expanded_item_uses_content_as_header(&replay.items[5]));
+        assert_eq!(
+            transcript_item_header_title(&replay.items[5]),
+            "cargo check -p harness_app"
+        );
     }
 
     #[test]
@@ -15621,10 +15652,9 @@ mod tests {
         assert_eq!(data.rows.len(), 2);
         assert!(matches!(data.rows[0].source, RichCommandSource::Command));
         assert!(matches!(data.rows[1].source, RichCommandSource::Output));
-        assert_eq!(&body[..model::COMMAND_PROMPT.len()], model::COMMAND_PROMPT);
         assert_eq!(
             rich_command_row_navigation_range(&data, &data.rows[0]),
-            0..model::COMMAND_PROMPT.len() + data.command.len()
+            0..data.command.len()
         );
 
         for row in data.rows.iter() {
@@ -15660,7 +15690,7 @@ mod tests {
         assert_eq!(last.body_range.end, document.text.len());
         assert_eq!(
             &document.text[last.body_range.clone()],
-            "$ cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
+            "cargo check -p harness_app\nFinished replay frame 5 without blocking paint"
         );
 
         let previous = &document.segments[document.segments.len() - 2];
@@ -17042,9 +17072,13 @@ mod tests {
                 "A plain result",
             ],
         }));
-        assert_eq!(presentation.related_queries, 1);
+        assert_eq!(presentation.queries, ["GPUI", "Zed GPUI"]);
         assert_eq!(presentation.results.len(), 2);
         assert_eq!(presentation.results[0].title, "GPUI framework");
+        assert_eq!(
+            presentation.results[0].domain.as_deref(),
+            Some("example.test")
+        );
         assert_eq!(
             presentation.results[0].snippet.as_deref(),
             Some("A native UI framework")

@@ -4,8 +4,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, Context, IntoElement, ObjectFit, Render, SharedString, StyledImage, Window, div,
-    prelude::*,
+    AnyElement, Context, ImageSource, IntoElement, ObjectFit, Render, SharedString, StyledImage,
+    Window, div, prelude::*,
 };
 use serde_json::Value;
 use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize};
@@ -84,6 +84,13 @@ impl ImageSurface {
 
     pub(crate) fn preview_size(&self) -> (f32, f32) {
         preview_size_for_availability(&self.availability)
+    }
+
+    pub(crate) fn preview_source(&self) -> Option<ImageSource> {
+        match &self.availability {
+            ImageAvailability::Present { path, .. } => Some(path.clone().into()),
+            ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => None,
+        }
     }
 }
 

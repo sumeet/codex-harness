@@ -255,9 +255,15 @@ pub struct LocalEditorSubmitted;
 /// instead of persisting it for the next turn.
 pub struct LocalEditorSteered;
 
+#[derive(Clone)]
+pub struct LocalEditorImageClicked {
+    pub image: Arc<Image>,
+}
+
 impl EventEmitter<LocalEditorChanged> for LocalEditor {}
 impl EventEmitter<LocalEditorSubmitted> for LocalEditor {}
 impl EventEmitter<LocalEditorSteered> for LocalEditor {}
+impl EventEmitter<LocalEditorImageClicked> for LocalEditor {}
 
 struct ComposerMarkdownMonospaceGeometryHighlight;
 struct ComposerMarkdownBlockQuoteRows;
@@ -374,6 +380,7 @@ impl LocalEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.weak_entity();
         let previous = std::mem::take(&mut self.inline_attachment_creases);
         self.inline_attachment_creases = self.editor.update(cx, |editor, cx| {
             editor.remove_creases(previous, cx);
@@ -384,28 +391,39 @@ impl LocalEditor {
                 for (start, _) in text.match_indices(&token) {
                     let range = clipped_anchor_range(&snapshot, start..start + token.len());
                     let image = image.clone();
+                    let owner = owner.clone();
                     let placeholder = FoldPlaceholder {
                         constrain_width: false,
                         merge_adjacent: false,
                         render: Arc::new(move |_fold_id, _range, cx| {
                             let colors = cx.theme().colors();
+                            let expanded_image = image.clone();
+                            let click_owner = owner.clone();
                             div()
-                                .h(px(24.))
-                                .px_0p5()
+                                .id(("inline-composer-image", start))
+                                .size(px(24.))
                                 .flex()
                                 .items_center()
-                                .gap_1()
                                 .rounded_xs()
                                 .border_1()
                                 .border_color(colors.border_variant)
                                 .bg(colors.element_background)
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| {
+                                    click_owner
+                                        .update(cx, |_, cx| {
+                                            cx.emit(LocalEditorImageClicked {
+                                                image: expanded_image.clone(),
+                                            })
+                                        })
+                                        .ok();
+                                })
                                 .child(
                                     img(image.clone())
-                                        .size(px(20.))
+                                        .size_full()
                                         .rounded_xs()
                                         .object_fit(ObjectFit::Cover),
                                 )
-                                .child(Label::new("Image").size(LabelSize::Small))
                                 .into_any_element()
                         }),
                         ..Default::default()
