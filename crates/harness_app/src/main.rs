@@ -153,9 +153,6 @@ const RICH_NESTED_COMMAND_OUTPUT_MAX_HEIGHT: f32 = 112.;
 const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_MIN_CODE_ROW_HEIGHT: f32 = 20.;
 const RICH_MIN_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
-// Delta's thread formatter reserves one stable leading document column for
-// actor identity and the trailing draft. Reuse the existing compact tool-icon
-// width so narrative, activity, and composer content share one visual axis.
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
 // Zed's default agent typography arrives at the same ratio indirectly
 // (12px code size * 1.75 / 16px prose size). Delta encodes it directly in
@@ -15731,7 +15728,6 @@ impl HarnessApp {
         let raw_visible = self.raw_visible.contains(&item.key);
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
         let routine_activity = transcript_item_is_routine_activity(&item);
-        let light_document_activity = routine_activity || item.kind == model::TranscriptKind::Image;
         let (routine_activity_above, routine_activity_below) =
             routine_activity_run_neighbors(&self.active_transcript_model().items, index);
         let request_method = item
@@ -16184,7 +16180,7 @@ impl HarnessApp {
                 this.h(harness_routine_activity_row_height(cx))
             })
             .when(!narrative && !compact_trace, |this| {
-                this.px_1().when(!light_document_activity, |this| {
+                this.px_1().when(!routine_activity, |this| {
                     this.bg(visuals.tool_header_surface)
                 })
             })
@@ -16302,21 +16298,19 @@ impl HarnessApp {
         });
 
         let content = if narrative {
-            // Delta's thread surface reads as one document because actor
-            // identity lives in the gutter instead of inside a message card.
-            // Keep Harness's richer Markdown/Vim body and replace only that
-            // outer Zed-style card composition.
-            let narrative_identity = match item.kind {
-                model::TranscriptKind::User => Some(IconName::Person),
-                model::TranscriptKind::Agent => Some(IconName::AiOpenAi),
-                _ => None,
-            };
             let narrative_panel = div()
-                .min_w_0()
-                .flex_1()
+                .w_full()
                 .flex()
                 .flex_col()
                 .gap_2()
+                .when(item.kind == model::TranscriptKind::User, |this| {
+                    this.rounded_sm()
+                        .border_1()
+                        .border_color(visuals.divider)
+                        .bg(visuals.raised_surface)
+                        .px_2()
+                        .py_1()
+                })
                 .when(pending_user_delivery, |this| this.opacity(0.58))
                 .when(item.kind == model::TranscriptKind::Reasoning, |this| {
                     this.gap_1().py_1()
@@ -16338,24 +16332,10 @@ impl HarnessApp {
                 })
                 .when_some(search_context, |this, context| this.child(context))
                 .when_some(body, |this, body| this.child(body))
-                .when_some(raw, |this, raw| this.child(raw));
+                .when_some(raw, |this, raw| this.child(raw))
+                .into_any_element();
 
-            if let Some(icon) = narrative_identity {
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_start()
-                    .gap_1()
-                    .child(
-                        rich_card_identity_icon(icon, IconSize::Small, Color::Muted)
-                            .h(harness_reading_row_height(cx)),
-                    )
-                    .child(narrative_panel)
-                    .into_any_element()
-            } else {
-                narrative_panel.into_any_element()
-            }
+            narrative_panel
         } else {
             let flush_tool_surface = matches!(
                 item.kind,
@@ -16368,27 +16348,22 @@ impl HarnessApp {
                 .relative()
                 .flex()
                 .flex_col()
-                .when(!compact_trace && !light_document_activity, |this| {
+                .when(!compact_trace && !routine_activity, |this| {
                     this.rounded_md()
                         .border_1()
                         .border_color(colors.border.opacity(0.6))
                         .bg(colors.editor_background)
                         .overflow_hidden()
                 })
-                // Delta keeps collapsed activity in the document flow. The
-                // rail belongs to revealed evidence, not every summary row.
-                .when(light_document_activity && item.expanded, |this| {
+                .when(routine_activity, |this| {
                     this.border_l_1()
                         .border_color(visuals.divider)
                         .overflow_hidden()
                 })
-                .when(
-                    light_document_activity && item.expanded && command_succeeded,
-                    |this| {
-                        this.border_color(cx.theme().status().success.opacity(0.42))
-                            .bg(cx.theme().status().success_background.opacity(0.07))
-                    },
-                )
+                .when(routine_activity && command_succeeded, |this| {
+                    this.border_color(cx.theme().status().success.opacity(0.42))
+                        .bg(cx.theme().status().success_background.opacity(0.07))
+                })
                 .when(
                     matches!(
                         item.command_execution_status(),
@@ -16415,7 +16390,15 @@ impl HarnessApp {
                     if flush_tool_surface || compact_trace {
                         this.child(body)
                     } else {
-                        this.child(div().px_2().py_1().child(body))
+                        this.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .when(routine_activity, |this| {
+                                    this.border_t_1().border_color(visuals.divider)
+                                })
+                                .child(body),
+                        )
                     }
                 })
                 .when_some(raw, |this, raw| this.child(div().px_2().pb_1().child(raw)))
@@ -17415,59 +17398,32 @@ impl Render for HarnessApp {
                     .child(
                         div()
                             .flex_none()
-                            // Delta's trailing draft belongs to the document;
-                            // its compact status bar is a separate control
-                            // plane below it. Preserve Harness's independent
-                            // Editor and queue semantics while adopting those
-                            // same visual boundaries.
-                            .bg(visuals.transcript)
-                            .pt_2()
-                            .pb_1()
+                            .border_t_1()
+                            .border_color(colors.border)
+                            .bg(colors.editor_background)
+                            .py_2()
+                            .px_2()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap_2()
                             .when_some(new_thread_project_control, |this, control| {
-                                this.child(
-                                    div()
-                                        .px(if transcript_narrow { px(10.) } else { px(18.) })
-                                        .child(control),
-                                )
+                                this.child(control)
                             })
                             .child(
                                 div()
+                                    .relative()
                                     .w_full()
                                     .min_h_0()
                                     .min_w_0()
-                                    .px(if transcript_narrow { px(10.) } else { px(18.) })
-                                    .flex()
-                                    .items_start()
-                                    .gap_1()
-                                    .child(
-                                        rich_card_identity_icon(
-                                            IconName::Person,
-                                            IconSize::Small,
-                                            Color::Muted,
-                                        )
-                                        .h(harness_reading_row_height(cx)),
-                                    )
-                                    .child(
-                                        div()
-                                            .relative()
-                                            .min_h_0()
-                                            .min_w_0()
-                                            .flex_1()
-                                            .pt_1()
-                                            .pr_2()
-                                            .child(self.composer.clone()),
-                                    ),
+                                    .pt_1()
+                                    .pr_2()
+                                    .child(self.composer.clone()),
                             )
                             .child(
                                 div()
                                     .w_full()
                                     .min_w_0()
                                     .flex_none()
-                                    .px(if transcript_narrow { px(10.) } else { px(18.) })
-                                    .pt_1()
                                     .flex()
                                     .flex_wrap()
                                     .items_center()
@@ -21526,8 +21482,8 @@ mod tests {
         assert!(command_status.contains("CommandExecutionStatus::Running => return None"));
         assert!(command_status.contains("CommandExecutionStatus::Succeeded => return None"));
         assert!(command_status.contains("format!(\"exit {code}\")"));
-        assert!(item_renderer.contains(".when(!compact_trace && !light_document_activity"));
-        assert!(item_renderer.contains(".when(light_document_activity && item.expanded"));
+        assert!(item_renderer.contains(".when(!compact_trace && !routine_activity"));
+        assert!(item_renderer.contains(".when(routine_activity, |this|"));
         assert!(item_renderer.contains("this.border_l_1()"));
         assert!(item_renderer.contains("success_background.opacity(0.07)"));
         assert!(item_renderer.contains("routine_activity && routine_activity_above"));
