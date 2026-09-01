@@ -18,6 +18,7 @@ use codex_app_server_client::{
     ThreadTurnsListParams, TurnItemsView,
 };
 use file_icons::FileIcons;
+use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
     FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
@@ -61,7 +62,10 @@ mod request_surface;
 mod theme_sources;
 mod visual_theme;
 
-use chatgpt_desktop::{ConversationSummary as ChatConversationSummary, Message as ChatMessage};
+use chatgpt_desktop::{
+    ActivityKind as ChatActivityKind, ConversationSummary as ChatConversationSummary,
+    Message as ChatMessage, ModelChoice as ChatModelChoice,
+};
 use image_surface::{
     ImageSurface, SurfaceSyncDecision as ImageSurfaceSyncDecision,
     keys_to_sync as image_surface_keys_to_sync, supplement_key as image_supplement_key,
@@ -4000,12 +4004,21 @@ struct HarnessApp {
     chat_conversations: Vec<ChatConversationSummary>,
     selected_chat_id: Option<String>,
     chat_messages: Vec<ChatMessage>,
+    chat_current_node: Option<String>,
+    chat_models: Vec<ChatModelChoice>,
+    selected_chat_model: Option<String>,
+    expanded_chat_activity: HashSet<String>,
     chat_loading: bool,
+    chat_sending: bool,
+    chat_send_generation: u64,
     chat_error: Option<SharedString>,
     chat_sidebar_list_state: ListState,
     chat_list_state: ListState,
     chat_list_task: Task<()>,
     chat_open_task: Task<()>,
+    chat_model_task: Task<()>,
+    chat_send_task: Task<()>,
+    chat_stream_task: Task<()>,
     client: Option<Rc<Client>>,
     threads: Vec<CodexThread>,
     child_threads: ChildThreadRegistry,
@@ -6111,6 +6124,9 @@ impl HarnessApp {
     }
 
     fn render_model_effort_selector(&self, cx: &Context<Self>) -> AnyElement {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            return self.render_chat_model_selector(cx);
+        }
         let settings = self.model.telemetry.thread_settings.as_ref();
         let selected_model = settings.and_then(|settings| settings.model.as_deref());
         let selected_effort = settings.and_then(|settings| settings.effort.as_deref());
@@ -6234,6 +6250,91 @@ impl HarnessApp {
                                     }),
                             );
                         }
+                    }
+                    menu
+                }))
+            })
+            .with_handle(self.model_menu_handle.clone())
+            .into_any_element()
+    }
+
+    fn render_chat_model_selector(&self, cx: &Context<Self>) -> AnyElement {
+        let selected = self.selected_chat_model.as_deref();
+        let label: SharedString = self
+            .chat_models
+            .iter()
+            .find(|choice| Some(choice.model.as_str()) == selected)
+            .map(|choice| choice.label.clone().into())
+            .or_else(|| selected.map(SharedString::from))
+            .unwrap_or_else(|| "Loading ChatGPT models…".into());
+        let choices = self.chat_models.clone();
+        let current_model = self.selected_chat_model.clone();
+        let menu_deployed = self.model_menu_handle.is_deployed();
+        let trigger_color = if menu_deployed {
+            Color::Accent
+        } else {
+            Color::Muted
+        };
+        let weak = cx.weak_entity();
+        let trigger = Button::new("chat-model-selector-trigger", label)
+            .label_size(LabelSize::Small)
+            .color(trigger_color)
+            .start_icon(
+                Icon::new(IconName::AiOpenAi)
+                    .size(IconSize::XSmall)
+                    .color(trigger_color),
+            )
+            .end_icon(
+                Icon::new(if menu_deployed {
+                    IconName::ChevronUp
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .disabled(choices.is_empty() || self.selected_chat_id.is_none() || self.chat_sending)
+            .aria_label("Change ChatGPT model");
+
+        PopoverMenu::new("chat-model-selector")
+            .trigger(trigger)
+            .anchor(gpui::Anchor::BottomRight)
+            .offset(gpui::Point {
+                x: px(0.),
+                y: px(-2.),
+            })
+            .menu(move |window, cx| {
+                let choices = choices.clone();
+                let current_model = current_model.clone();
+                let weak = weak.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("ChatGPT model");
+                    let mut legacy_header_shown = false;
+                    for choice in choices {
+                        if choice.legacy && !legacy_header_shown {
+                            menu = menu.separator().header("Legacy models");
+                            legacy_header_shown = true;
+                        }
+                        let model = choice.model.clone();
+                        let selected = current_model.as_deref() == Some(choice.model.as_str());
+                        let mut entry = ContextMenuEntry::new(choice.label)
+                            .toggleable(IconPosition::End, selected);
+                        if let Some(tagline) = choice.tagline {
+                            entry = entry
+                                .documentation_aside(DocumentationSide::Right, move |_| {
+                                    Label::new(tagline.clone()).into_any_element()
+                                });
+                        }
+                        menu = menu.item(entry.handler({
+                            let weak = weak.clone();
+                            move |_, cx| {
+                                weak.update(cx, |this, cx| {
+                                    this.selected_chat_model = Some(model.clone());
+                                    cx.notify();
+                                })
+                                .ok();
+                            }
+                        }));
                     }
                     menu
                 }))
@@ -6409,14 +6510,30 @@ impl HarnessApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         if self.workspace_mode == WorkspaceMode::Chat {
+            let label = if self.chat_sending {
+                "Wait for the current ChatGPT response"
+            } else if self.selected_chat_id.is_none() {
+                "Open a ChatGPT conversation before sending"
+            } else if self.chat_current_node.is_none() {
+                "Wait for the ChatGPT conversation to finish loading"
+            } else if self.selected_chat_model.is_none() {
+                "Wait for the ChatGPT model catalog"
+            } else if composer_empty {
+                "Type a message to send"
+            } else {
+                "Send to ChatGPT"
+            };
             return IconButton::new("send-chat", IconName::Send)
                 .style(ButtonStyle::Subtle)
-                .disabled(true)
-                .icon_color(Color::Muted)
-                .aria_label("ChatGPT sending is not connected yet")
-                .tooltip(Tooltip::text(
-                    "ChatGPT history is live; native send and streaming are next",
-                ))
+                .disabled(send_blocked || composer_empty)
+                .icon_color(if send_blocked || composer_empty {
+                    Color::Muted
+                } else {
+                    Color::Accent
+                })
+                .aria_label(label)
+                .tooltip(Tooltip::text(label))
+                .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                 .into_any_element();
         }
         let state = composer_action_state(turn_active);
@@ -7638,12 +7755,21 @@ impl HarnessApp {
             chat_conversations: Vec::new(),
             selected_chat_id: None,
             chat_messages: Vec::new(),
+            chat_current_node: None,
+            chat_models: Vec::new(),
+            selected_chat_model: None,
+            expanded_chat_activity: HashSet::default(),
             chat_loading: false,
+            chat_sending: false,
+            chat_send_generation: 0,
             chat_error: None,
             chat_sidebar_list_state,
             chat_list_state,
             chat_list_task: Task::ready(()),
             chat_open_task: Task::ready(()),
+            chat_model_task: Task::ready(()),
+            chat_send_task: Task::ready(()),
+            chat_stream_task: Task::ready(()),
             client: None,
             threads: Vec::new(),
             child_threads: ChildThreadRegistry::default(),
@@ -9474,7 +9600,38 @@ impl HarnessApp {
         if mode == WorkspaceMode::Chat && self.chat_conversations.is_empty() {
             self.refresh_chat_conversations(cx);
         }
+        if mode == WorkspaceMode::Chat && self.chat_models.is_empty() {
+            self.refresh_chat_models(cx);
+        }
         cx.notify();
+    }
+
+    fn refresh_chat_models(&mut self, cx: &mut Context<Self>) {
+        let client = cx.http_client();
+        self.chat_model_task = cx.spawn(async move |this, cx| {
+            let result = chatgpt_desktop::list_models(client).await;
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(catalog) => {
+                        let selected_exists =
+                            this.selected_chat_model.as_deref().is_some_and(|selected| {
+                                catalog
+                                    .choices
+                                    .iter()
+                                    .any(|choice| choice.model == selected)
+                            });
+                        if !selected_exists {
+                            this.selected_chat_model = Some(catalog.default_model);
+                        }
+                        this.chat_models = catalog.choices;
+                    }
+                    Err(error) => {
+                        log::warn!("could not load ChatGPT model catalog: {error:#}");
+                    }
+                }
+                cx.notify();
+            });
+        });
     }
 
     fn refresh_chat_conversations(&mut self, cx: &mut Context<Self>) {
@@ -9529,6 +9686,7 @@ impl HarnessApp {
         self.chat_error = None;
         let old_len = self.chat_messages.len();
         self.chat_messages.clear();
+        self.chat_current_node = None;
         self.chat_list_state.splice(0..old_len, 0);
         let client = cx.http_client();
         self.chat_open_task = cx.spawn(async move |this, cx| {
@@ -9541,6 +9699,10 @@ impl HarnessApp {
                 match result {
                     Ok(conversation) => {
                         let new_len = conversation.messages.len();
+                        this.chat_current_node = conversation.current_node;
+                        if let Some(model) = conversation.default_model {
+                            this.selected_chat_model = Some(model);
+                        }
                         this.chat_messages = conversation.messages;
                         this.chat_list_state.splice(0..0, new_len);
                         this.chat_list_state.set_follow_mode(FollowMode::Tail);
@@ -9550,6 +9712,158 @@ impl HarnessApp {
                     Err(error) => {
                         this.chat_error =
                             Some(format!("Could not open ChatGPT conversation: {error:#}").into());
+                    }
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
+    fn apply_chat_conversation(
+        &mut self,
+        conversation: chatgpt_desktop::Conversation,
+        update_selected_model: bool,
+    ) {
+        let old_len = self.chat_messages.len();
+        let new_len = conversation.messages.len();
+        self.chat_current_node = conversation.current_node;
+        if update_selected_model && let Some(model) = conversation.default_model {
+            self.selected_chat_model = Some(model);
+        }
+        self.chat_messages = conversation.messages;
+        self.chat_list_state.splice(0..old_len, new_len);
+        self.chat_list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list_state.scroll_to_end();
+    }
+
+    fn apply_chat_stream_message(&mut self, message: ChatMessage) {
+        let was_following_tail = self.chat_list_state.is_following_tail();
+        if let Some(index) = self
+            .chat_messages
+            .iter()
+            .position(|existing| existing.id == message.id)
+        {
+            self.chat_messages[index] = message;
+            self.chat_list_state.splice(index..index + 1, 1);
+        } else {
+            let index = self.chat_messages.len();
+            self.chat_messages.push(message);
+            self.chat_list_state.splice(index..index, 1);
+        }
+        if was_following_tail {
+            self.chat_list_state.set_follow_mode(FollowMode::Tail);
+            self.chat_list_state.scroll_to_end();
+        }
+    }
+
+    fn send_chatgpt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_sending {
+            self.chat_error = Some("Wait for the current ChatGPT response to finish.".into());
+            cx.notify();
+            return;
+        }
+        if !self.composer_images.is_empty() {
+            self.chat_error = Some(
+                "ChatGPT image sending is not wired yet; remove the image before sending.".into(),
+            );
+            cx.notify();
+            return;
+        }
+        let prompt = self.composer.read(cx).text(cx);
+        if prompt.trim().is_empty() {
+            return;
+        }
+        let Some(conversation_id) = self.selected_chat_id.clone() else {
+            self.chat_error = Some("Open a ChatGPT conversation before sending.".into());
+            cx.notify();
+            return;
+        };
+        let Some(parent_message_id) = self.chat_current_node.clone() else {
+            self.chat_error = Some("This ChatGPT conversation has not finished loading.".into());
+            cx.notify();
+            return;
+        };
+        let Some(model) = self.selected_chat_model.clone() else {
+            self.chat_error = Some("The ChatGPT model catalog has not finished loading.".into());
+            cx.notify();
+            return;
+        };
+
+        let optimistic_id = uuid::Uuid::new_v4().to_string();
+        let baseline_len = self.chat_messages.len();
+        self.chat_messages.push(ChatMessage {
+            id: optimistic_id.clone(),
+            role: chatgpt_desktop::MessageRole::User,
+            content: prompt.clone(),
+            activity: None,
+        });
+        self.chat_list_state.splice(baseline_len..baseline_len, 1);
+        self.chat_list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list_state.scroll_to_end();
+        self.composer
+            .update(cx, |editor, cx| editor.set_text("", window, cx));
+        self.chat_error = None;
+        self.chat_sending = true;
+        self.chat_send_generation = self.chat_send_generation.wrapping_add(1);
+        let generation = self.chat_send_generation;
+        let client = cx.http_client();
+        let stream_conversation_id = conversation_id.clone();
+        let (stream_tx, mut stream_rx) = mpsc::unbounded();
+        self.chat_stream_task = cx.spawn(async move |this, cx| {
+            while let Some(message) = stream_rx.next().await {
+                _ = this.update(cx, |this, cx| {
+                    if this.chat_send_generation == generation
+                        && this.selected_chat_id.as_deref() == Some(stream_conversation_id.as_str())
+                    {
+                        this.apply_chat_stream_message(message);
+                        cx.notify();
+                    }
+                });
+            }
+        });
+
+        self.chat_send_task = cx.spawn(async move |this, cx| {
+            let send_result = chatgpt_desktop::send_message(
+                &conversation_id,
+                &parent_message_id,
+                &model,
+                &prompt,
+                &optimistic_id,
+                stream_tx,
+            )
+            .await;
+            let final_conversation = if send_result.is_ok() {
+                chatgpt_desktop::get_conversation(client, &conversation_id)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            _ = this.update(cx, |this, cx| {
+                if this.chat_send_generation != generation {
+                    return;
+                }
+                this.chat_sending = false;
+                match send_result {
+                    Ok(()) => {
+                        if let Some(conversation) = final_conversation {
+                            this.apply_chat_conversation(conversation, false);
+                        }
+                        this.chat_error = None;
+                        this.refresh_chat_conversations(cx);
+                    }
+                    Err(error) => {
+                        let old_len = this.chat_messages.len();
+                        this.chat_messages
+                            .retain(|message| message.id != optimistic_id);
+                        this.chat_list_state
+                            .splice(0..old_len, this.chat_messages.len());
+                        if this.composer.read(cx).text(cx).is_empty() {
+                            this.composer
+                                .update(cx, |editor, cx| editor.restore_text(prompt.clone(), cx));
+                        }
+                        this.chat_error = Some(format!("ChatGPT send failed: {error:#}").into());
                     }
                 }
                 cx.notify();
@@ -9583,6 +9897,177 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_chat_activity_message(
+        &mut self,
+        message: &ChatMessage,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        const RESULT_PREVIEW_LIMIT: usize = 8;
+
+        let Some(activity) = message.activity.clone() else {
+            return div().into_any_element();
+        };
+        let colors = cx.theme().colors().clone();
+        let expanded = self.expanded_chat_activity.contains(&message.id);
+        let expandable = !activity.results.is_empty() || !message.content.trim().is_empty();
+        let icon = match activity.kind {
+            ChatActivityKind::WebSearch => IconName::ToolWeb,
+            ChatActivityKind::Command => IconName::ToolTerminal,
+            ChatActivityKind::Tool => IconName::ToolHammer,
+        };
+        let message_id = message.id.clone();
+        let weak = cx.weak_entity();
+        let header = div()
+            .id(("chat-activity-header", index))
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_1()
+            .py_1()
+            .rounded_sm()
+            .when(expandable, |this| {
+                this.cursor_pointer()
+                    .hover(|this| this.bg(colors.element_hover))
+                    .on_click(move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            if !this.expanded_chat_activity.remove(&message_id) {
+                                this.expanded_chat_activity.insert(message_id.clone());
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+            })
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_baseline()
+                    .gap_1()
+                    .child(
+                        Label::new(activity.title.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .when_some(activity.detail.clone(), |this, detail| {
+                        this.child(
+                            Label::new(detail)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        )
+                    }),
+            )
+            .when(expandable, |this| {
+                this.child(
+                    Icon::new(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+                )
+            });
+
+        let result_count = activity.results.len();
+        let result_rows = activity
+            .results
+            .into_iter()
+            .take(RESULT_PREVIEW_LIMIT)
+            .enumerate()
+            .map(|(result_index, result)| {
+                let url = result.url.clone();
+                div()
+                    .id(format!("chat-search-result:{index}:{result_index}"))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(colors.element_hover))
+                    .tooltip(Tooltip::text(result.url))
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .child(
+                        Label::new(result.title)
+                            .size(LabelSize::Small)
+                            .color(Color::Default)
+                            .truncate(),
+                    )
+                    .when(!result.domain.is_empty(), |this| {
+                        this.child(
+                            Label::new(result.domain)
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let expanded_content = (expanded && !message.content.trim().is_empty()).then(|| {
+            let markdown = self.markdown_for(
+                &format!("chat-activity:{}", message.id),
+                &message.content,
+                None,
+                None,
+                None,
+                cx,
+            );
+            MarkdownElement::new(
+                markdown,
+                refine_harness_markdown_style(MarkdownStyle::themed(
+                    MarkdownFont::Agent,
+                    window,
+                    cx,
+                )),
+            )
+        });
+
+        div()
+            .id(("chat-activity", index))
+            .w_full()
+            .min_w_0()
+            .px(px(18.))
+            .py_0p5()
+            .flex()
+            .flex_col()
+            .child(header)
+            .when(expanded, |this| {
+                this.child(
+                    div()
+                        .ml(px(18.))
+                        .pl_2()
+                        .border_l_1()
+                        .border_color(colors.border_variant)
+                        .children(result_rows)
+                        .when(result_count > RESULT_PREVIEW_LIMIT, |this| {
+                            this.child(
+                                Label::new(format!(
+                                    "{} more sources",
+                                    result_count - RESULT_PREVIEW_LIMIT
+                                ))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                        })
+                        .when_some(expanded_content, |this, content| {
+                            this.child(div().pt_1().child(content))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+
     fn render_chat_message(
         &mut self,
         index: usize,
@@ -9592,6 +10077,9 @@ impl HarnessApp {
         let Some(message) = self.chat_messages.get(index).cloned() else {
             return div().into_any_element();
         };
+        if message.role == chatgpt_desktop::MessageRole::Activity {
+            return self.render_chat_activity_message(&message, index, window, cx);
+        }
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let markdown = self.markdown_for(
@@ -10642,10 +11130,7 @@ impl HarnessApp {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_error = Some(
-                "ChatGPT history is connected; native send and streaming are not wired yet.".into(),
-            );
-            cx.notify();
+            self.send_chatgpt(window, cx);
             return;
         }
         // Starting a brand-new task is the only moment at which no stable
@@ -16863,21 +17348,32 @@ impl Render for HarnessApp {
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
         let composer_empty = composer_is_empty(&composer_text, self.composer_images.len());
-        let send_blocked = self.workspace_mode == WorkspaceMode::Chat
-            || composer_send_blocked(
+        let send_blocked = if self.workspace_mode == WorkspaceMode::Chat {
+            composer_empty
+                || self.chat_sending
+                || self.chat_loading
+                || self.selected_chat_id.is_none()
+                || self.chat_current_node.is_none()
+                || self.selected_chat_model.is_none()
+        } else {
+            composer_send_blocked(
                 composer_empty,
                 self.loading_thread,
                 self.attaching_thread,
                 self.settings_update_pending,
                 self.thread_read_only_reason.is_some(),
                 self.client.is_some() || self.replay_count.is_some(),
-            );
+            )
+        };
         let composer_status: Option<(SharedString, Color)> =
             if self.workspace_mode == WorkspaceMode::Chat {
-                Some((
-                    "ChatGPT history · sending is the next slice".into(),
-                    Color::Muted,
-                ))
+                if self.chat_sending {
+                    Some(("ChatGPT is responding…".into(), Color::Muted))
+                } else if self.chat_loading {
+                    Some(("Loading ChatGPT conversation…".into(), Color::Muted))
+                } else {
+                    None
+                }
             } else if let Some(error) = self.composer_attachment_error.clone() {
                 Some((error, Color::Warning))
             } else if let Some(status) = self.performance_status.clone() {
@@ -17668,31 +18164,16 @@ impl Render for HarnessApp {
                             .flex()
                             .flex_col()
                             .gap_2()
-                            .when(self.workspace_mode == WorkspaceMode::Codex, |this| {
-                                this.child(
-                                    div()
-                                        .relative()
-                                        .w_full()
-                                        .min_h_0()
-                                        .min_w_0()
-                                        .pt_1()
-                                        .pr_2()
-                                        .child(self.composer.clone()),
-                                )
-                            })
-                            .when(self.workspace_mode == WorkspaceMode::Chat, |this| {
-                                this.child(
-                                    div()
-                                        .w_full()
-                                        .px_1()
-                                        .py_1()
-                                        .font_harness_reading(cx)
-                                        .text_color(colors.text_muted)
-                                        .child(
-                                            "Native ChatGPT sending and streaming are the next slice",
-                                        ),
-                                )
-                            })
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .min_h_0()
+                                    .min_w_0()
+                                    .pt_1()
+                                    .pr_2()
+                                    .child(self.composer.clone()),
+                            )
                             .child(
                                 div()
                                     .w_full()
@@ -17754,6 +18235,8 @@ impl Render for HarnessApp {
                                                                             || self.attaching_thread
                                                                             || self.settings_update_pending
                                                                             || self.connecting
+                                                                            || self.chat_sending
+                                                                            || self.chat_loading
                                                                 ),
                                                                 |this| {
                                                                     this.child(
@@ -17791,9 +18274,9 @@ impl Render for HarnessApp {
                                                                 |this, control| this.child(control),
                                                             )
                                                             .child(permission_selector)
-                                                            .child(model_selector)
                                                         },
                                                     )
+                                                    .child(model_selector)
                                                     .child(composer_actions),
                                             )
                                     }),

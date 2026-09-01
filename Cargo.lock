@@ -8330,6 +8330,7 @@ dependencies = [
  "anyhow",
  "assets",
  "async-compression",
+ "async-process",
  "async-tar",
  "base64 0.22.1",
  "codex_app_server_client",
