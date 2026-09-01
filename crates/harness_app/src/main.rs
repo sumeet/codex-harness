@@ -3082,10 +3082,88 @@ enum FocusMode {
     Buffer,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum WorkspaceMode {
     Chat,
+    #[default]
     Codex,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+struct HarnessSessionState {
+    workspace_mode: WorkspaceMode,
+    selected_thread_id: Option<String>,
+    selected_chat_id: Option<String>,
+    pending_thread_cwd: Option<String>,
+    buffer_view: bool,
+    sidebar_open: bool,
+}
+
+impl Default for HarnessSessionState {
+    fn default() -> Self {
+        Self {
+            workspace_mode: WorkspaceMode::Codex,
+            selected_thread_id: None,
+            selected_chat_id: None,
+            pending_thread_cwd: None,
+            buffer_view: false,
+            sidebar_open: true,
+        }
+    }
+}
+
+fn harness_session_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|directory| directory.join("harness").join("session.json"))
+}
+
+fn load_harness_session() -> HarnessSessionState {
+    harness_session_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn persist_harness_session(state: &HarnessSessionState) -> anyhow::Result<()> {
+    let path = harness_session_path().context("no user configuration directory is available")?;
+    let parent = path
+        .parent()
+        .context("Harness session path has no parent directory")?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(state)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ExecutableFingerprint {
+    bytes: u64,
+    modified: Option<SystemTime>,
+}
+
+fn executable_fingerprint(path: &Path) -> Option<ExecutableFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(ExecutableFingerprint {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn observe_executable_update(
+    baseline: ExecutableFingerprint,
+    candidate: Option<ExecutableFingerprint>,
+    dismissed: Option<ExecutableFingerprint>,
+    observed: ExecutableFingerprint,
+) -> (Option<ExecutableFingerprint>, bool) {
+    if observed == baseline {
+        return (None, false);
+    }
+    if candidate == Some(observed) {
+        return (Some(observed), dismissed != Some(observed));
+    }
+    (Some(observed), false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4060,6 +4138,11 @@ struct HarnessApp {
     cwd: String,
     pending_thread_cwd: Option<String>,
     new_task_picker_open: bool,
+    running_executable_path: Option<PathBuf>,
+    running_executable_fingerprint: Option<ExecutableFingerprint>,
+    binary_update_candidate: Option<ExecutableFingerprint>,
+    dismissed_binary_update: Option<ExecutableFingerprint>,
+    binary_update_available: bool,
     replay_count: Option<usize>,
     workspace_mode: WorkspaceMode,
     chat_conversations: Vec<ChatConversationSummary>,
@@ -7537,9 +7620,32 @@ impl HarnessApp {
         replay_count: Option<usize>,
         start_in_text_view: bool,
         initial_thread_id: Option<String>,
+        session: HarnessSessionState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let session = if replay_count.is_some() {
+            HarnessSessionState::default()
+        } else {
+            session
+        };
+        let explicitly_opened_thread = initial_thread_id.is_some();
+        let initial_thread_id = initial_thread_id.or_else(|| session.selected_thread_id.clone());
+        let workspace_mode = if explicitly_opened_thread {
+            WorkspaceMode::Codex
+        } else {
+            session.workspace_mode
+        };
+        let pending_thread_cwd = initial_thread_id
+            .is_none()
+            .then(|| session.pending_thread_cwd.clone())
+            .flatten();
+        let cwd = pending_thread_cwd.clone().unwrap_or(cwd);
+        let start_in_text_view = start_in_text_view || session.buffer_view;
+        let running_executable_path = std::env::current_exe().ok();
+        let running_executable_fingerprint = running_executable_path
+            .as_deref()
+            .and_then(executable_fingerprint);
         let font_family_cache = theme::FontFamilyCache::global(cx);
         cx.spawn(async move |this, cx| {
             font_family_cache.prefetch(cx).await;
@@ -7826,12 +7932,17 @@ impl HarnessApp {
 
         let mut this = Self {
             cwd,
-            pending_thread_cwd: None,
+            pending_thread_cwd,
             new_task_picker_open: false,
+            running_executable_path,
+            running_executable_fingerprint,
+            binary_update_candidate: None,
+            dismissed_binary_update: None,
+            binary_update_available: false,
             replay_count,
-            workspace_mode: WorkspaceMode::Codex,
+            workspace_mode,
             chat_conversations: Vec::new(),
-            selected_chat_id: None,
+            selected_chat_id: session.selected_chat_id,
             chat_messages: Vec::new(),
             chat_current_node: None,
             chat_models: Vec::new(),
@@ -7950,7 +8061,7 @@ impl HarnessApp {
             expanded_user_image: None,
             hybrid_surfaces: HashMap::default(),
             rich_nested_scrolls: HashMap::default(),
-            sidebar_open: true,
+            sidebar_open: session.sidebar_open,
             sidebar_user_override: false,
             turn_start_pending: false,
             queue_start_pending: false,
@@ -8200,10 +8311,104 @@ impl HarnessApp {
             })
             .detach();
         }
+        this.start_binary_update_watcher(cx);
         if replay_count.is_none() {
             this.connect(cx);
+            if this.workspace_mode == WorkspaceMode::Chat {
+                this.refresh_chat_conversations(cx);
+                this.refresh_chat_models(cx);
+            }
         }
         this
+    }
+
+    fn session_state(&self) -> HarnessSessionState {
+        HarnessSessionState {
+            workspace_mode: self.workspace_mode,
+            selected_thread_id: self.selected_thread_id.clone(),
+            selected_chat_id: self.selected_chat_id.clone(),
+            pending_thread_cwd: self.pending_thread_cwd.clone(),
+            buffer_view: self.buffer_view,
+            sidebar_open: self.sidebar_open,
+        }
+    }
+
+    fn persist_session(&self) {
+        if let Err(error) = persist_harness_session(&self.session_state()) {
+            log::warn!("could not persist Harness session: {error:#}");
+        }
+    }
+
+    fn persist_shutdown_state(&mut self, cx: &mut Context<Self>) {
+        let composer_text = self.composer.read(cx).text(cx);
+        self.update_composer_draft(&composer_text, cx);
+        if let Err(error) = persist_composer_drafts(&self.composer_drafts) {
+            log::warn!("could not persist Harness drafts before shutdown: {error:#}");
+        }
+        self.persist_session();
+    }
+
+    fn start_binary_update_watcher(&mut self, cx: &mut Context<Self>) {
+        let (Some(path), Some(baseline)) = (
+            self.running_executable_path.clone(),
+            self.running_executable_fingerprint,
+        ) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+                let Some(observed) = executable_fingerprint(&path) else {
+                    continue;
+                };
+                let keep_watching = this
+                    .update(cx, |this, cx| {
+                        let (candidate, available) = observe_executable_update(
+                            baseline,
+                            this.binary_update_candidate,
+                            this.dismissed_binary_update,
+                            observed,
+                        );
+                        let changed = this.binary_update_candidate != candidate
+                            || this.binary_update_available != available;
+                        this.binary_update_candidate = candidate;
+                        this.binary_update_available = available;
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !keep_watching {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn dismiss_binary_update(&mut self, cx: &mut Context<Self>) {
+        self.dismissed_binary_update = self.binary_update_candidate;
+        self.binary_update_available = false;
+        cx.notify();
+    }
+
+    fn relaunch_for_update(&mut self, cx: &mut Context<Self>) {
+        if self.chat_sending {
+            self.chat_error =
+                Some("Wait for the current ChatGPT response before relaunching Harness.".into());
+            cx.notify();
+            return;
+        }
+        if self.new_task_picker_open {
+            self.error = Some("Finish choosing the project folder before relaunching.".into());
+            cx.notify();
+            return;
+        }
+        self.persist_shutdown_state(cx);
+        if let Some(path) = self.running_executable_path.clone() {
+            cx.set_restart_path(path);
+        }
+        cx.restart();
     }
 
     fn sidebar_thread(&self, row: &SidebarThreadRow) -> Option<&CodexThread> {
@@ -9682,6 +9887,7 @@ impl HarnessApp {
         if mode == WorkspaceMode::Chat && self.chat_models.is_empty() {
             self.refresh_chat_models(cx);
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -9769,6 +9975,10 @@ impl HarnessApp {
                                 let id = first.id.clone();
                                 this.open_chat_conversation(&id, cx);
                             }
+                        } else if this.chat_messages.is_empty()
+                            && let Some(id) = this.selected_chat_id.clone()
+                        {
+                            this.open_chat_conversation(&id, cx);
                         }
                     }
                     Err(error) => {
@@ -9796,6 +10006,7 @@ impl HarnessApp {
         }
         let conversation_id = conversation_id.to_owned();
         self.selected_chat_id = Some(conversation_id.clone());
+        self.persist_session();
         self.chat_loading = true;
         self.chat_error = None;
         let old_len = self.chat_messages.len();
@@ -10737,6 +10948,7 @@ impl HarnessApp {
         }
         self.selected_thread_id = Some(thread_id.clone());
         self.pending_thread_cwd = None;
+        self.persist_session();
         self.set_transcript_history_complete(false);
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
@@ -11216,6 +11428,7 @@ impl HarnessApp {
         self.selected_thread_id = None;
         self.cwd = cwd.clone();
         self.pending_thread_cwd = Some(cwd);
+        self.persist_session();
         self.set_transcript_history_complete(true);
         self.loaded_thread_updated_at = None;
         self.loading_thread = false;
@@ -11481,6 +11694,7 @@ impl HarnessApp {
                         Ok((thread_id, opened_thread, response)) => {
                             this.selected_thread_id = Some(thread_id.clone());
                             this.pending_thread_cwd = None;
+                            this.persist_session();
                             if opened_thread.is_some() {
                                 this.switch_composer_draft_context(Some(thread_id), cx);
                             }
@@ -13228,6 +13442,7 @@ impl HarnessApp {
                 }
             });
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -13308,6 +13523,7 @@ impl HarnessApp {
                 });
             }
         });
+        self.persist_session();
         cx.notify();
     }
 
@@ -13726,6 +13942,7 @@ impl HarnessApp {
                     .scroll_to_reveal_item(self.selected_task);
             }
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -13775,6 +13992,7 @@ impl HarnessApp {
                 self.transcript_focus.focus(window, cx);
             }
         }
+        self.persist_session();
         cx.notify();
     }
 
@@ -14488,6 +14706,7 @@ impl HarnessApp {
                                 None,
                                 false,
                                 Some(thread_id.clone()),
+                                HarnessSessionState::default(),
                                 cx,
                             );
                         }
@@ -18024,6 +18243,60 @@ impl Render for HarnessApp {
                 )
                 .into_any_element()
         });
+        let binary_update_prompt = self.binary_update_available.then(|| {
+            let relaunch_blocked = self.chat_sending || self.new_task_picker_open;
+            let relaunch_tooltip: SharedString = if self.chat_sending {
+                "Wait for the current ChatGPT response before relaunching".into()
+            } else if self.new_task_picker_open {
+                "Finish choosing the project folder before relaunching".into()
+            } else {
+                "Relaunch Harness and restore this session".into()
+            };
+            div()
+                .flex_none()
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .py_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .border_b_1()
+                .border_color(cx.theme().status().info_border)
+                .bg(cx.theme().status().info_background)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .child(
+                            Label::new("A new Harness build is ready")
+                                .size(LabelSize::Small)
+                                .color(Color::Default),
+                        )
+                        .child(
+                            Label::new("Relaunch to update; your current session will reopen.")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .truncate(),
+                        ),
+                )
+                .child(
+                    Button::new("dismiss-binary-update", "Later")
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Subtle)
+                        .on_click(cx.listener(|this, _, _, cx| this.dismiss_binary_update(cx))),
+                )
+                .child(
+                    Button::new("relaunch-binary-update", "Relaunch")
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Tinted(TintColor::Accent))
+                        .start_icon(Icon::new(IconName::RotateCw))
+                        .disabled(relaunch_blocked)
+                        .tooltip(Tooltip::text(relaunch_tooltip))
+                        .on_click(cx.listener(|this, _, _, cx| this.relaunch_for_update(cx))),
+                )
+                .into_any_element()
+        });
 
         let surface_error = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_error.clone()
@@ -18381,6 +18654,7 @@ impl Render for HarnessApp {
                     .flex()
                     .flex_col()
                     .relative()
+                    .when_some(binary_update_prompt, |this, prompt| this.child(prompt))
                     .when_some(surface_error, |this, error| {
                         this.child(
                             div()
@@ -23891,6 +24165,60 @@ mod tests {
     }
 
     #[test]
+    fn durable_session_restores_the_selected_surface_and_new_thread_context() {
+        let state = HarnessSessionState {
+            workspace_mode: WorkspaceMode::Chat,
+            selected_thread_id: Some("codex-thread".into()),
+            selected_chat_id: Some("chat-thread".into()),
+            pending_thread_cwd: Some("/work/project".into()),
+            buffer_view: true,
+            sidebar_open: false,
+        };
+        let encoded = serde_json::to_string(&state).expect("encode session");
+        let restored: HarnessSessionState = serde_json::from_str(&encoded).expect("decode session");
+        assert_eq!(restored, state);
+
+        let legacy = serde_json::from_str::<HarnessSessionState>("{}")
+            .expect("missing fields use forward-compatible defaults");
+        assert_eq!(legacy, HarnessSessionState::default());
+    }
+
+    #[test]
+    fn binary_update_prompt_waits_for_a_stable_completed_replacement() {
+        let baseline = ExecutableFingerprint {
+            bytes: 100,
+            modified: Some(UNIX_EPOCH),
+        };
+        let replacement = ExecutableFingerprint {
+            bytes: 120,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(1)),
+        };
+        let newer_replacement = ExecutableFingerprint {
+            bytes: 130,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(2)),
+        };
+
+        let (candidate, available) = observe_executable_update(baseline, None, None, replacement);
+        assert_eq!(candidate, Some(replacement));
+        assert!(!available, "one observation may still be an active build");
+
+        let (candidate, available) =
+            observe_executable_update(baseline, candidate, None, replacement);
+        assert!(available, "the stable replacement should offer Relaunch");
+
+        let (_, available) =
+            observe_executable_update(baseline, candidate, Some(replacement), replacement);
+        assert!(!available, "Later dismisses only this exact build");
+
+        let (candidate, available) =
+            observe_executable_update(baseline, candidate, Some(replacement), newer_replacement);
+        assert!(!available);
+        let (_, available) =
+            observe_executable_update(baseline, candidate, Some(replacement), newer_replacement);
+        assert!(available, "a later completed build offers Relaunch again");
+    }
+
+    #[test]
     fn cancelling_the_new_thread_picker_cannot_destroy_the_visible_thread() {
         let source = include_str!("main.rs");
         let picker = source
@@ -24284,6 +24612,7 @@ fn open_harness_window(
     replay_count: Option<usize>,
     start_in_text_view: bool,
     initial_thread_id: Option<String>,
+    session: HarnessSessionState,
     cx: &mut App,
 ) {
     let bounds = Bounds::centered(None, size(px(1180.), px(760.)), cx);
@@ -24304,6 +24633,7 @@ fn open_harness_window(
                     replay_count,
                     start_in_text_view,
                     initial_thread_id,
+                    session,
                     window,
                     cx,
                 )
@@ -24358,6 +24688,7 @@ fn main() {
     let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")
         .ok()
         .filter(|thread_id| !thread_id.trim().is_empty());
+    let session = load_harness_session();
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -24416,7 +24747,14 @@ fn main() {
         palette::init(cx);
         load_harness_keymaps(cx);
 
-        open_harness_window(cwd, replay_count, start_in_text_view, initial_thread_id, cx);
+        open_harness_window(
+            cwd,
+            replay_count,
+            start_in_text_view,
+            initial_thread_id,
+            session,
+            cx,
+        );
         cx.activate(true);
     });
 }
