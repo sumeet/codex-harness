@@ -47,9 +47,9 @@ use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
     Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
     Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
-    LabelSize, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle, ScrollAxes, Scrollbars,
-    SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable, Tooltip, WithScrollbar,
-    right_click_menu,
+    LabelSize, LineHeightStyle, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle,
+    ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable,
+    Tooltip, WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -17126,63 +17126,63 @@ impl Render for HarnessApp {
                     .absolute()
                     .left(if transcript_narrow { px(10.) } else { px(18.) })
                     .bottom(px(10.))
+                    .size(px(28.))
+                    .flex_none()
                     .flex()
                     .items_center()
-                    .gap_1()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(visuals.raised_surface.opacity(0.9))
+                    .shadow_sm()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(colors.element_hover))
+                    .aria_label(if turn_active {
+                        "Codex is working; return to the live transcript"
+                    } else {
+                        "Return to the live transcript"
+                    })
+                    .tooltip(Tooltip::text(if turn_active {
+                        "Codex is working · return to the live transcript"
+                    } else {
+                        "Return to the live transcript · G or Ctrl-End"
+                    }))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.go_to_transcript_tail(window, cx)),
+                    )
                     .when(turn_active, |this| {
                         this.child(
                             div()
-                                .id("offscreen-turn-activity")
-                                .size(px(28.))
-                                .flex_none()
+                                .id("offscreen-tail-activity")
+                                .size_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(colors.border_variant)
-                                .bg(visuals.raised_surface.opacity(0.96))
-                                .shadow_sm()
-                                .tooltip(Tooltip::text("Codex is still working"))
                                 .child(
-                                    SpinnerLabel::dots()
-                                        .size(LabelSize::Large)
-                                        .color(activity_color),
+                                    div()
+                                        // Braille glyphs are optically left-heavy in several
+                                        // common fallback fonts; nudge the animated cell, not
+                                        // the floating control's hit target.
+                                        .relative()
+                                        .left(px(1.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            SpinnerLabel::dots()
+                                                .size(LabelSize::Large)
+                                                .line_height_style(LineHeightStyle::UiLabel)
+                                                .color(activity_color),
+                                        ),
                                 ),
                         )
                     })
-                    .child(
-                        div()
-                            .id("transcript-latest-surface")
-                            .size(px(28.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(colors.border_variant)
-                            .bg(visuals.raised_surface.opacity(0.96))
-                            .shadow_sm()
-                            .child(
-                                IconButton::new("transcript-latest", IconName::ArrowDown)
-                                    .shape(IconButtonShape::Square)
-                                    .size(ButtonSize::Compact)
-                                    .style(ButtonStyle::Subtle)
-                                    .icon_color(if turn_active {
-                                        Color::Accent
-                                    } else {
-                                        Color::Muted
-                                    })
-                                    .aria_label("Return to the live transcript")
-                                    .tooltip(Tooltip::text(
-                                        "Return to the live transcript · G or Ctrl-End",
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.go_to_transcript_tail(window, cx)
-                                    })),
-                            ),
-                    )
+                    .when(!turn_active, |this| {
+                        this.child(
+                            Icon::new(IconName::ArrowDown)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                    })
                     .into_any_element()
             });
         let command_line_input = self
@@ -21260,7 +21260,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_tail_status_floats_separate_activity_and_navigation_controls() {
+    fn offscreen_tail_status_uses_one_stateful_navigation_control() {
         let source = include_str!("main.rs");
         let control = source
             .split_once("let transcript_tail_control =")
@@ -21271,20 +21271,21 @@ mod tests {
         assert!(control.contains("WorkspaceMode::Codex && !following_tail"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
-        assert!(control.contains("offscreen-turn-activity"));
-        assert!(control.contains("transcript-latest-surface"));
+        assert!(control.contains("offscreen-tail-activity"));
+        assert!(!control.contains("transcript-latest-surface"));
         assert!(control.contains(".absolute()"));
         assert!(control.contains(".shadow_sm()"));
         assert!(control.contains(".rounded_md()"));
+        assert!(control.contains(".when(turn_active"));
+        assert!(control.contains(".when(!turn_active"));
+        assert!(!control.contains(".border_1()"));
         assert!(
             !control.contains("Label::new(\"Latest\")")
                 && !control.contains("Label::new(\"Codex is working\")"),
             "compact tail controls should not depend on cramped microcopy"
         );
-        assert!(
-            control.matches(".size(px(28.))").count() >= 2,
-            "activity and navigation should remain equally sized but visually distinct"
-        );
+        assert_eq!(control.matches(".size(px(28.))").count(), 1);
+        assert_eq!(control.matches("go_to_transcript_tail").count(), 1);
     }
 
     #[test]
