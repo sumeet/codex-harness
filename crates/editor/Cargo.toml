@@ -14,6 +14,10 @@ doctest = false
 
 [features]
 default = ["project-integration", "workspace-integration"]
+# Harness deliberately embeds the local-buffer portion of Editor without Zed's
+# project/workspace layers. Removing those feature-owned call sites leaves
+# otherwise valid shared Editor code unused in this one build configuration.
+standalone-minimal = []
 project-integration = [
     "dep:client",
     "dep:dap",

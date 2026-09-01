@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},

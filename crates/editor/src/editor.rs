@@ -1,4 +1,14 @@
 #![allow(rustdoc::private_intra_doc_links)]
+#![cfg_attr(
+    feature = "standalone-minimal",
+    allow(
+        dead_code,
+        unused_assignments,
+        unused_imports,
+        unused_mut,
+        unused_variables
+    )
+)]
 //! This is the place where everything editor-related is stored (data-wise) and displayed (ui-wise).
 //! The main point of interest in this crate is [`Editor`] type, which is used in every other Zed part as a user input element.
 //! It comes in different flavors: single line, multiline and a fixed height one.

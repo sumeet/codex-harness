@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 //! The only boundary between Harness and Zed's editor/Vim implementation.
 //!
 //! Keep the public API local-buffer-shaped. Project, workspace, LSP, DAP, Git,

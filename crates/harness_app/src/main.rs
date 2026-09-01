@@ -1,3 +1,5 @@
+#![deny(warnings)]
+
 use std::{
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque},

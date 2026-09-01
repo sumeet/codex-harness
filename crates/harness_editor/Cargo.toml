@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
-editor = { path = "../editor", default-features = false }
+editor = { path = "../editor", default-features = false, features = ["standalone-minimal"] }
 gpui.workspace = true
 grammars.workspace = true
 harness_protocol.workspace = true
