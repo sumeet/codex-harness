@@ -25,7 +25,7 @@ use gpui::{
     App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter, FocusHandle,
     Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, Image,
     IntoElement, KeyBinding, KeyContext, ObjectFit, Pixels, Render, SharedString, TextStyle,
-    TextStyleRefinement, WeakEntity, Window, actions, div, img, prelude::*, px,
+    TextStyleRefinement, WeakEntity, Window, actions, div, img, prelude::*, px, relative,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -744,6 +744,21 @@ pub enum TranscriptTypographyProfile {
     Reading,
 }
 
+/// Delta's `thread_base_style` encodes prose at 0.9375rem with a 1.3125
+/// relative line height. Keep those two recovered values together and apply
+/// them to every Harness surface that represents thread prose: rendered
+/// Markdown, the Vim transcript, and the composer.
+pub const THREAD_READING_FONT_SCALE: f32 = 0.9375;
+pub const THREAD_READING_LINE_HEIGHT: f32 = 1.3125;
+
+fn scaled_thread_reading_font_size(base_size: Pixels) -> Pixels {
+    base_size * THREAD_READING_FONT_SCALE
+}
+
+pub fn thread_reading_font_size(cx: &App) -> Pixels {
+    scaled_thread_reading_font_size(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+}
+
 fn typography_profile_changed(
     current: TranscriptTypographyProfile,
     requested: TranscriptTypographyProfile,
@@ -768,11 +783,15 @@ fn font_size_for_typography_profile(profile: TranscriptTypographyProfile, cx: &A
     let settings = ThemeSettings::get_global(cx);
     match profile {
         TranscriptTypographyProfile::Buffer => settings.agent_buffer_font_size(cx),
-        TranscriptTypographyProfile::Reading => settings.agent_ui_font_size(cx),
+        TranscriptTypographyProfile::Reading => thread_reading_font_size(cx),
     }
 }
 
-fn typography_refinement(font: &Font, font_size: Pixels) -> TextStyleRefinement {
+fn typography_refinement(
+    font: &Font,
+    font_size: Pixels,
+    line_height: Option<f32>,
+) -> TextStyleRefinement {
     TextStyleRefinement {
         font_family: Some(font.family.clone()),
         font_features: Some(font.features.clone()),
@@ -780,17 +799,26 @@ fn typography_refinement(font: &Font, font_size: Pixels) -> TextStyleRefinement 
         font_weight: Some(font.weight),
         font_style: Some(font.style),
         font_size: Some(font_size.into()),
+        line_height: line_height.map(relative),
         ..TextStyleRefinement::default()
     }
 }
 
-fn apply_typography_font(style: &mut TextStyle, font: &Font, font_size: Pixels) {
+fn apply_typography_font(
+    style: &mut TextStyle,
+    font: &Font,
+    font_size: Pixels,
+    line_height: Option<f32>,
+) {
     style.font_family = font.family.clone();
     style.font_features = font.features.clone();
     style.font_fallbacks.clone_from(&font.fallbacks);
     style.font_weight = font.weight;
     style.font_style = font.style;
     style.font_size = font_size.into();
+    if let Some(line_height) = line_height {
+        style.line_height = relative(line_height);
+    }
 }
 
 fn apply_typography_profile_to_editor(
@@ -801,9 +829,11 @@ fn apply_typography_profile_to_editor(
 ) {
     let font = font_for_typography_profile(profile, cx);
     let font_size = font_size_for_typography_profile(profile, cx);
-    editor.set_text_style_refinement(typography_refinement(&font, font_size));
+    let line_height = matches!(profile, TranscriptTypographyProfile::Reading)
+        .then_some(THREAD_READING_LINE_HEIGHT);
+    editor.set_text_style_refinement(typography_refinement(&font, font_size, line_height));
     let mut style = editor.style(cx).clone();
-    apply_typography_font(&mut style.text, &font, font_size);
+    apply_typography_font(&mut style.text, &font, font_size, line_height);
     editor.set_style(style, window, cx);
 }
 
@@ -4801,7 +4831,7 @@ mod tests {
             style: gpui::FontStyle::Italic,
         };
 
-        apply_typography_font(&mut style, &reading_font, gpui::px(19.));
+        apply_typography_font(&mut style, &reading_font, gpui::px(19.), None);
 
         assert_eq!(style.font_size, gpui::px(19.).into());
         assert_eq!(style.line_height, line_height);
@@ -4819,11 +4849,36 @@ mod tests {
     #[test]
     fn typography_refinement_updates_size_without_overriding_line_height() {
         let font = gpui::font("Harness Reading");
-        let refinement = typography_refinement(&font, gpui::px(18.));
+        let refinement = typography_refinement(&font, gpui::px(18.), None);
 
         assert_eq!(refinement.font_family, Some(font.family));
         assert_eq!(refinement.font_size, Some(gpui::px(18.).into()));
         assert_eq!(refinement.line_height, None);
+    }
+
+    #[test]
+    fn delta_thread_role_scales_prose_and_pins_its_line_height() {
+        assert_eq!(
+            scaled_thread_reading_font_size(gpui::px(16.)),
+            gpui::px(15.)
+        );
+
+        let font = gpui::font("Harness Reading");
+        let refinement =
+            typography_refinement(&font, gpui::px(15.), Some(THREAD_READING_LINE_HEIGHT));
+        assert_eq!(refinement.line_height, Some(gpui::relative(1.3125)));
+
+        let mut style = TextStyle {
+            line_height: gpui::relative(1.6),
+            ..TextStyle::default()
+        };
+        apply_typography_font(
+            &mut style,
+            &font,
+            gpui::px(15.),
+            Some(THREAD_READING_LINE_HEIGHT),
+        );
+        assert_eq!(style.line_height, gpui::relative(1.3125));
     }
 
     #[test]

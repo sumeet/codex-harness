@@ -33,9 +33,10 @@ use gpui::{
 use gpui_platform::application;
 use harness_editor::{
     LocalEditor, LocalEditorChanged, LocalEditorImageClicked, LocalEditorSteered,
-    LocalEditorSubmitted, ModeIndicator, TranscriptEditor, TranscriptSelectionChanged,
-    TranscriptSelectionSnapshot, VimNextMatch, VimPreviousMatch, VimSearch, VimWordNext,
-    VimWordPrevious, shell_capture_priority, shell_capture_ranges, syntax_highlights_for_path,
+    LocalEditorSubmitted, ModeIndicator, THREAD_READING_LINE_HEIGHT, TranscriptEditor,
+    TranscriptSelectionChanged, TranscriptSelectionSnapshot, VimNextMatch, VimPreviousMatch,
+    VimSearch, VimWordNext, VimWordPrevious, shell_capture_priority, shell_capture_ranges,
+    syntax_highlights_for_path, thread_reading_font_size,
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle, SourcePointerPhase};
@@ -154,11 +155,6 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_MIN_CODE_ROW_HEIGHT: f32 = 20.;
 const RICH_MIN_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
-// Zed's default agent typography arrives at the same ratio indirectly
-// (12px code size * 1.75 / 16px prose size). Delta encodes it directly in
-// `thread_base_style`. Keep Harness's independently configurable reading and
-// code sizes from accidentally changing prose rhythm.
-const TRANSCRIPT_READING_LINE_HEIGHT: f32 = 1.3125;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -178,10 +174,30 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
     px((harness_code_font_size(cx).as_f32() * 1.35).max(RICH_MIN_CODE_ROW_HEIGHT))
 }
 
-fn refine_harness_markdown_style(mut style: MarkdownStyle) -> MarkdownStyle {
+fn refine_harness_markdown_style(mut style: MarkdownStyle, cx: &App) -> MarkdownStyle {
+    refine_harness_markdown_style_with_font_size(&mut style, thread_reading_font_size(cx));
+    style
+}
+
+fn refine_harness_markdown_style_with_font_size(
+    style: &mut MarkdownStyle,
+    reading_font_size: gpui::Pixels,
+) {
     style.code_block_overflow_x_scroll = true;
-    style.base_text_style.line_height = relative(TRANSCRIPT_READING_LINE_HEIGHT);
-    style.paragraph_line_height = relative(TRANSCRIPT_READING_LINE_HEIGHT);
+    style.base_text_style.font_size = reading_font_size.into();
+    style.base_text_style.line_height = relative(THREAD_READING_LINE_HEIGHT);
+    // Markdown's TextRuns carry family, weight, and paint but intentionally do
+    // not carry font size. The containing Div therefore owns the metrics that
+    // are actually shaped and painted; keep both layers on the same role.
+    style.container_style.text.font_size = Some(reading_font_size.into());
+    style.container_style.text.line_height = Some(relative(THREAD_READING_LINE_HEIGHT));
+    style.paragraph_line_height = relative(THREAD_READING_LINE_HEIGHT);
+    // Zed's generic Markdown renderer gives every non-H1 heading a 24px top
+    // margin. In a continuous thread that stacks with the preceding block's
+    // own 8px boundary (especially visibly after blockquotes). Delta's thread
+    // composition uses a compact semantic spacer instead of that document-
+    // preview gap.
+    style.heading.margin.top = Some(gpui::Length::Definite(px(8.).into()));
     style.strong_font_weight = Some(relative_strong_font_weight(
         style.base_text_style.font_weight,
     ));
@@ -190,7 +206,6 @@ fn refine_harness_markdown_style(mut style: MarkdownStyle) -> MarkdownStyle {
     // becomes a visibly uneven pseudo-chip when the reading and code fonts use
     // different metrics. Keep transcript and composer semantics consistent.
     style.inline_code.background_color = None;
-    style
 }
 
 fn relative_strong_font_weight(base: FontWeight) -> FontWeight {
@@ -202,8 +217,8 @@ fn relative_strong_font_weight(base: FontWeight) -> FontWeight {
 }
 
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
-    let size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
-    px((size.as_f32() * TRANSCRIPT_READING_LINE_HEIGHT).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
+    let size = thread_reading_font_size(cx);
+    px((size.as_f32() * THREAD_READING_LINE_HEIGHT).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
 }
 
 fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
@@ -218,11 +233,19 @@ fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
 /// unrelated roles. Combining them made tool cards adopt the configured code
 /// family and then silently overwrite its size with a fixed UI token.
 trait HarnessStyledTypography: gpui::Styled + Sized {
-    fn font_harness_reading(self, cx: &App) -> Self {
+    fn font_harness_ui(self, cx: &App) -> Self {
         let settings = ThemeSettings::get_global(cx);
         self.font_family(settings.agent_ui_font_family().clone())
             .font_weight(settings.ui_font.weight)
             .text_size(settings.agent_ui_font_size(cx))
+    }
+
+    fn font_harness_reading(self, cx: &App) -> Self {
+        let settings = ThemeSettings::get_global(cx);
+        self.font_family(settings.agent_ui_font_family().clone())
+            .font_weight(settings.ui_font.weight)
+            .text_size(thread_reading_font_size(cx))
+            .line_height(relative(THREAD_READING_LINE_HEIGHT))
     }
 
     fn font_harness_code(self, cx: &App) -> Self {
@@ -15113,8 +15136,10 @@ impl HarnessApp {
             None,
             cx,
         );
-        let mut style =
-            refine_harness_markdown_style(MarkdownStyle::themed(MarkdownFont::Agent, window, cx));
+        let mut style = refine_harness_markdown_style(
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+            cx,
+        );
         style.image_container = gpui::StyleRefinement {
             padding: gpui::EdgesRefinement {
                 top: Some(px(1.).into()),
@@ -15976,11 +16001,10 @@ impl HarnessApp {
         } else if item.content.is_empty() {
             None
         } else if let Some(markdown) = markdown {
-            let mut style = refine_harness_markdown_style(MarkdownStyle::themed(
-                MarkdownFont::Agent,
-                window,
+            let mut style = refine_harness_markdown_style(
+                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
                 cx,
-            ));
+            );
             if let Some(navigation) = rich_navigation.as_ref() {
                 style.selection_background_color =
                     rich_navigation_markdown_highlight_background(navigation, cx);
@@ -17031,7 +17055,7 @@ impl Render for HarnessApp {
             // code surfaces override it with `font_harness_code`, while plain
             // transcript fallbacks and compact activity text now honor the
             // same configured weight as rich Markdown.
-            .font_harness_reading(cx)
+            .font_harness_ui(cx)
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
             .on_action(
@@ -23008,10 +23032,21 @@ mod tests {
         let mut style = MarkdownStyle::default();
         style.inline_code.background_color = Some(gpui::Hsla::default());
 
-        let style = refine_harness_markdown_style(style);
+        refine_harness_markdown_style_with_font_size(&mut style, px(15.));
 
         assert!(style.inline_code.background_color.is_none());
         assert!(style.code_block_overflow_x_scroll);
+        assert_eq!(style.base_text_style.font_size, px(15.).into());
+        assert_eq!(style.base_text_style.line_height, relative(1.3125));
+        assert_eq!(style.container_style.text.font_size, Some(px(15.).into()));
+        assert_eq!(
+            style.container_style.text.line_height,
+            Some(relative(1.3125))
+        );
+        assert_eq!(
+            style.heading.margin.top,
+            Some(gpui::Length::Definite(px(8.).into()))
+        );
     }
 
     #[test]
