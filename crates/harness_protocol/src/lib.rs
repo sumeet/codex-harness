@@ -3028,7 +3028,8 @@ impl TranscriptModel {
                 || matches!(
                     item.command_execution_status(),
                     Some(CommandExecutionStatus::Failed(_))
-                );
+                )
+                || (item.kind == TranscriptKind::Tool && tool_result_failed(&item.raw));
             item.pending_request = pending_request;
             let reconciled_user_content_blocks = reconciled_user_content_blocks(
                 &stable_raw,
@@ -4695,10 +4696,10 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
     let protocol_id = string_at(&raw, "/id").unwrap_or("unknown-item").to_string();
     let protocol_kind = string_at(&raw, "/type").unwrap_or("unknown");
     let kind = kind_from_protocol(protocol_kind);
-    let expanded = if kind == TranscriptKind::Command {
-        command_exit_code(&raw).is_some_and(|exit_code| exit_code != 0)
-    } else {
-        default_expanded(kind, completed)
+    let expanded = match kind {
+        TranscriptKind::Command => command_exit_code(&raw).is_some_and(|exit_code| exit_code != 0),
+        TranscriptKind::Tool => tool_result_failed(&raw),
+        _ => default_expanded(kind, completed),
     };
     TranscriptItem {
         key: protocol_id.clone(),
@@ -4759,13 +4760,30 @@ fn default_expanded(kind: TranscriptKind, _completed: bool) -> bool {
         | TranscriptKind::Image
         | TranscriptKind::Error
         | TranscriptKind::Approval
-        | TranscriptKind::Tool
         | TranscriptKind::Subagent
-        | TranscriptKind::Web
         | TranscriptKind::Review
         | TranscriptKind::Reasoning => true,
-        TranscriptKind::Command | TranscriptKind::Trace => false,
+        TranscriptKind::Command
+        | TranscriptKind::Tool
+        | TranscriptKind::Web
+        | TranscriptKind::Trace => false,
     }
+}
+
+fn tool_result_failed(raw: &Value) -> bool {
+    raw.get("success").and_then(Value::as_bool) == Some(false)
+        || raw.get("error").is_some_and(|error| !error.is_null())
+        || raw.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+        || raw
+            .get("status")
+            .and_then(protocol_status)
+            .is_some_and(|status| {
+                let status = status.to_ascii_lowercase();
+                status.contains("fail")
+                    || status.contains("error")
+                    || status.contains("cancel")
+                    || status.contains("reject")
+            })
 }
 
 fn title_for_kind(kind: TranscriptKind) -> &'static str {
@@ -7975,16 +7993,14 @@ mod tests {
     }
 
     #[test]
-    fn narrative_and_structured_results_start_expanded_but_commands_stay_compact() {
+    fn narrative_and_rich_results_start_expanded_but_routine_traces_stay_compact() {
         for kind in [
             TranscriptKind::Reasoning,
             TranscriptKind::Plan,
             TranscriptKind::FileChange,
-            TranscriptKind::Tool,
             TranscriptKind::Diff,
             TranscriptKind::Image,
             TranscriptKind::Subagent,
-            TranscriptKind::Web,
             TranscriptKind::Review,
             TranscriptKind::Error,
             TranscriptKind::Approval,
@@ -7993,7 +8009,44 @@ mod tests {
         }
         assert!(!default_expanded(TranscriptKind::Command, false));
         assert!(!default_expanded(TranscriptKind::Command, true));
+        assert!(!default_expanded(TranscriptKind::Tool, true));
+        assert!(!default_expanded(TranscriptKind::Web, true));
         assert!(!default_expanded(TranscriptKind::Trace, false));
+    }
+
+    #[test]
+    fn routine_tools_stay_compact_unless_they_fail() {
+        let success = item_from_protocol(
+            json!({
+                "id": "tool-success",
+                "type": "dynamicToolCall",
+                "status": "completed",
+                "success": true,
+                "content": "routine result"
+            }),
+            true,
+        );
+        let failure = item_from_protocol(
+            json!({
+                "id": "tool-failure",
+                "type": "dynamicToolCall",
+                "status": "failed",
+                "success": false,
+                "content": "useful failure detail"
+            }),
+            true,
+        );
+        let mcp_error = item_from_protocol(
+            json!({
+                "id": "mcp-failure",
+                "type": "mcpToolCall",
+                "error": {"message": "server unavailable"}
+            }),
+            true,
+        );
+        assert!(!success.expanded);
+        assert!(failure.expanded);
+        assert!(mcp_error.expanded);
     }
 
     #[test]
