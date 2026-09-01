@@ -1964,6 +1964,7 @@ impl TranscriptModel {
                 if changed {
                     dirty_keys.insert(stable_key.clone());
                 }
+                let existing_blocks = self.user_content_blocks.get(&stable_key).cloned();
                 merge_incoming_user_content_maps(
                     &mut self.user_image_sources,
                     &mut self.user_content_blocks,
@@ -1971,7 +1972,13 @@ impl TranscriptModel {
                     &incoming_key,
                     &stable_key,
                     incoming.kind,
+                    Some(&existing.raw),
+                    Some(&existing.content),
+                    existing_blocks.as_deref(),
                 );
+                if let Some(blocks) = self.user_content_blocks.get(&stable_key) {
+                    insert_user_content_layout(&mut incoming.raw, blocks);
+                }
                 merged.push(incoming);
                 next_existing = existing_index + 1;
             } else {
@@ -1982,6 +1989,9 @@ impl TranscriptModel {
                     &incoming_key,
                     &incoming_key,
                     incoming.kind,
+                    None,
+                    None,
+                    None,
                 );
                 merged.push(incoming);
                 inserted += 1;
@@ -2105,7 +2115,13 @@ impl TranscriptModel {
                     &incoming_key,
                     &stable_key,
                     incoming.kind,
+                    Some(&existing.raw),
+                    Some(&existing.content),
+                    old_content_blocks.get(&stable_key).map(Vec::as_slice),
                 );
+                if let Some(blocks) = content_blocks.get(&stable_key) {
+                    insert_user_content_layout(&mut incoming.raw, blocks);
+                }
                 merged.push(incoming);
             } else {
                 inserted += 1;
@@ -2116,6 +2132,9 @@ impl TranscriptModel {
                     &incoming_key,
                     &incoming_key,
                     incoming.kind,
+                    None,
+                    None,
+                    None,
                 );
                 merged.push(incoming);
             }
@@ -2257,19 +2276,21 @@ impl TranscriptModel {
         let key = local_user_key(client_user_message_id);
         let image_sources = user_image_sources_from_blocks(content_blocks);
         let content_projection = user_content_blocks_from_blocks(content_blocks);
+        let mut raw = json!({
+            "type": "userMessage",
+            "clientId": client_user_message_id,
+            "clientUserMessageId": client_user_message_id,
+            "content": content,
+            "imageCount": image_sources.len(),
+        });
+        insert_user_content_layout(&mut raw, &content_projection);
         let index = self.push_without_splice(TranscriptItem {
             key: key.clone(),
             protocol_id: None,
             kind: TranscriptKind::User,
             title: "You".into(),
             status: Some("sending".into()),
-            raw: json!({
-                "type": "userMessage",
-                "clientId": client_user_message_id,
-                "clientUserMessageId": client_user_message_id,
-                "content": content,
-                "imageCount": image_sources.len(),
-            }),
+            raw,
             content,
             event_count: 1,
             expanded: true,
@@ -2983,6 +3004,9 @@ impl TranscriptModel {
         if let Some(index) = self.item_indices.get(&protocol_id).copied() {
             let old_events = self.items[index].event_count;
             let stable_key = self.items[index].key.clone();
+            let stable_raw = self.items[index].raw.clone();
+            let stable_content = self.items[index].content.clone();
+            let stable_user_content_blocks = self.user_content_blocks.get(&stable_key).cloned();
             let expanded = self.items[index].expanded;
             let pending_request = self.items[index].pending_request.clone();
             let stable_client_user_message_id = self.items[index]
@@ -3006,6 +3030,13 @@ impl TranscriptModel {
                     Some(CommandExecutionStatus::Failed(_))
                 );
             item.pending_request = pending_request;
+            let reconciled_user_content_blocks = reconciled_user_content_blocks(
+                &stable_raw,
+                &stable_content,
+                stable_user_content_blocks.as_deref(),
+                incoming_user_content_blocks.clone(),
+            );
+            insert_user_content_layout(&mut item.raw, &reconciled_user_content_blocks);
             self.items[index] = item;
             if self.items[index].kind == TranscriptKind::User {
                 if incoming_user_image_sources.is_empty() {
@@ -3014,11 +3045,11 @@ impl TranscriptModel {
                     self.user_image_sources
                         .insert(stable_key.clone(), incoming_user_image_sources);
                 }
-                if incoming_user_content_blocks.is_empty() {
+                if reconciled_user_content_blocks.is_empty() {
                     self.user_content_blocks.remove(&stable_key);
                 } else {
                     self.user_content_blocks
-                        .insert(stable_key, incoming_user_content_blocks);
+                        .insert(stable_key, reconciled_user_content_blocks);
                 }
             }
             return Some(index);
@@ -3059,6 +3090,10 @@ impl TranscriptModel {
             .flatten();
         if let Some(index) = optimistic_user_index {
             let optimistic_key = self.items[index].key.clone();
+            let optimistic_raw = self.items[index].raw.clone();
+            let optimistic_content = self.items[index].content.clone();
+            let optimistic_user_content_blocks =
+                self.user_content_blocks.get(&optimistic_key).cloned();
             let old_events = self.items[index].event_count;
             let expanded = self.items[index].expanded;
             let pending_request = self.items[index].pending_request.clone();
@@ -3066,6 +3101,13 @@ impl TranscriptModel {
             item.event_count = old_events.saturating_add(1);
             item.expanded = expanded;
             item.pending_request = pending_request;
+            let reconciled_user_content_blocks = reconciled_user_content_blocks(
+                &optimistic_raw,
+                &optimistic_content,
+                optimistic_user_content_blocks.as_deref(),
+                incoming_user_content_blocks,
+            );
+            insert_user_content_layout(&mut item.raw, &reconciled_user_content_blocks);
             self.item_indices.insert(protocol_id, index);
             self.items[index] = item;
             if incoming_user_image_sources.is_empty() {
@@ -3074,11 +3116,11 @@ impl TranscriptModel {
                 self.user_image_sources
                     .insert(optimistic_key.clone(), incoming_user_image_sources);
             }
-            if incoming_user_content_blocks.is_empty() {
+            if reconciled_user_content_blocks.is_empty() {
                 self.user_content_blocks.remove(&optimistic_key);
             } else {
                 self.user_content_blocks
-                    .insert(optimistic_key, incoming_user_content_blocks);
+                    .insert(optimistic_key, reconciled_user_content_blocks);
             }
             return Some(index);
         }
@@ -3185,6 +3227,114 @@ fn insert_client_user_message_id(raw: &mut Value, client_user_message_id: &str) 
             Value::String(client_user_message_id.to_string()),
         );
     }
+}
+
+const HARNESS_USER_CONTENT_LAYOUT: &str = "harnessUserContentLayout";
+
+/// Persist only the compact ordering shape, not a second copy of image data.
+/// App Server may normalize an ordered `text, image, text` submission into an
+/// image plus one flattened text block when it echoes or reloads the message.
+fn insert_user_content_layout(raw: &mut Value, blocks: &[UserContentBlock]) {
+    let Some(raw) = raw.as_object_mut() else {
+        return;
+    };
+    if !blocks
+        .iter()
+        .any(|block| matches!(block, UserContentBlock::Image(_)))
+    {
+        raw.remove(HARNESS_USER_CONTENT_LAYOUT);
+        return;
+    }
+
+    let mut image_index = 0_u64;
+    let layout = blocks
+        .iter()
+        .map(|block| match block {
+            UserContentBlock::Text(text) => json!({"textBytes": text.len()}),
+            UserContentBlock::Image(_) => {
+                let entry = json!({"image": image_index});
+                image_index += 1;
+                entry
+            }
+        })
+        .collect::<Vec<_>>();
+    raw.insert(HARNESS_USER_CONTENT_LAYOUT.into(), Value::Array(layout));
+}
+
+fn user_content_blocks_from_layout(
+    raw: &Value,
+    existing_text: &str,
+    incoming: &[UserContentBlock],
+) -> Option<Vec<UserContentBlock>> {
+    let layout = raw.get(HARNESS_USER_CONTENT_LAYOUT)?.as_array()?;
+    let text = incoming
+        .iter()
+        .filter_map(|block| match block {
+            UserContentBlock::Text(text) => Some(text.as_str()),
+            UserContentBlock::Image(_) => None,
+        })
+        .collect::<String>();
+    if text != existing_text {
+        return None;
+    }
+    let images = incoming
+        .iter()
+        .filter_map(|block| match block {
+            UserContentBlock::Image(source) => Some(source.clone()),
+            UserContentBlock::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let mut text_cursor = 0_usize;
+    let mut projected = Vec::with_capacity(layout.len());
+    for entry in layout {
+        if let Some(byte_len) = entry.get("textBytes").and_then(Value::as_u64) {
+            let byte_len = usize::try_from(byte_len).ok()?;
+            let end = text_cursor.checked_add(byte_len)?;
+            if end > text.len()
+                || !text.is_char_boundary(text_cursor)
+                || !text.is_char_boundary(end)
+            {
+                return None;
+            }
+            projected.push(UserContentBlock::Text(text[text_cursor..end].to_owned()));
+            text_cursor = end;
+        } else if let Some(image_index) = entry.get("image").and_then(Value::as_u64) {
+            projected.push(UserContentBlock::Image(
+                images.get(usize::try_from(image_index).ok()?)?.clone(),
+            ));
+        } else {
+            return None;
+        }
+    }
+    (text_cursor == text.len()
+        && user_content_payload(&projected) == user_content_payload(incoming))
+    .then_some(projected)
+}
+
+fn user_content_payload(blocks: &[UserContentBlock]) -> (String, Vec<UserImageSource>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in blocks {
+        match block {
+            UserContentBlock::Text(part) => text.push_str(part),
+            UserContentBlock::Image(source) => images.push(source.clone()),
+        }
+    }
+    (text, images)
+}
+
+fn reconciled_user_content_blocks(
+    existing_raw: &Value,
+    existing_text: &str,
+    existing: Option<&[UserContentBlock]>,
+    incoming: Vec<UserContentBlock>,
+) -> Vec<UserContentBlock> {
+    if let Some(existing) = existing
+        && user_content_payload(existing) == user_content_payload(&incoming)
+    {
+        return existing.to_vec();
+    }
+    user_content_blocks_from_layout(existing_raw, existing_text, &incoming).unwrap_or(incoming)
 }
 
 fn unique_legacy_user_candidate(items: &[TranscriptItem], content: &str) -> Option<usize> {
@@ -4164,6 +4314,9 @@ fn merge_incoming_user_content_maps(
     incoming_key: &str,
     stable_key: &str,
     kind: TranscriptKind,
+    existing_raw: Option<&Value>,
+    existing_text: Option<&str>,
+    existing_blocks: Option<&[UserContentBlock]>,
 ) {
     if kind != TranscriptKind::User {
         return;
@@ -4182,7 +4335,13 @@ fn merge_incoming_user_content_maps(
     }
     match incoming_model.user_content_blocks.get(incoming_key) {
         Some(incoming) => {
-            content_blocks.insert(stable_key.to_string(), incoming.clone());
+            let reconciled = existing_raw.zip(existing_text).map_or_else(
+                || incoming.clone(),
+                |(raw, text)| {
+                    reconciled_user_content_blocks(raw, text, existing_blocks, incoming.clone())
+                },
+            );
+            content_blocks.insert(stable_key.to_string(), reconciled);
         }
         None => {
             content_blocks.remove(stable_key);
@@ -8960,6 +9119,131 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_user_echo_keeps_exact_local_inline_image_order() {
+        let mut model = TranscriptModel::default();
+        let local_blocks = json!([
+            {"type": "text", "text": "before "},
+            {"type": "image", "url": "data:image/png;base64,AQID"},
+            {"type": "text", "text": " after"}
+        ]);
+        let (_, local_key) = model.push_local_user(
+            "client-inline-image",
+            "before  after".into(),
+            local_blocks.as_array().unwrap(),
+        );
+
+        model.apply_batch(
+            vec![
+                Event::Notification {
+                    method: "item/started".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-inline-image",
+                            "clientId": "client-inline-image",
+                            "type": "userMessage",
+                            "content": [
+                                {"type": "input_image", "image_url": "data:image/png;base64,AQID"},
+                                {"type": "input_text", "text": "before  after"}
+                            ]
+                        }
+                    }),
+                },
+                Event::Notification {
+                    method: "item/completed".into(),
+                    params: json!({
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "server-inline-image",
+                            "type": "userMessage",
+                            "content": [
+                                {"type": "input_image", "image_url": "data:image/png;base64,AQID"},
+                                {"type": "input_text", "text": "before  after"}
+                            ]
+                        }
+                    }),
+                },
+            ],
+            Some("thread-1"),
+        );
+
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.items[0].key, local_key);
+        assert!(matches!(
+            model.user_content_blocks(&local_key),
+            [
+                UserContentBlock::Text(before),
+                UserContentBlock::Image(_),
+                UserContentBlock::Text(after)
+            ] if before == "before " && after == " after"
+        ));
+        assert!(
+            model.items[0]
+                .raw
+                .get(HARNESS_USER_CONTENT_LAYOUT)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn inline_image_layout_rehydrates_after_snapshot_and_history_merge() {
+        use codex_app_server_client::CodexThreadItem;
+
+        let mut local = TranscriptModel::default();
+        let local_blocks = json!([
+            {"type": "text", "text": "before "},
+            {"type": "image", "url": "data:image/png;base64,AQID"},
+            {"type": "text", "text": " after"}
+        ]);
+        let (_, local_key) = local.push_local_user(
+            "client-inline-image",
+            "before  after".into(),
+            local_blocks.as_array().unwrap(),
+        );
+        let mut authoritative = json!({
+            "id": "server-inline-image",
+            "clientId": "client-inline-image",
+            "type": "userMessage",
+            "content": [
+                {"type": "input_image", "image_url": "data:image/png;base64,AQID"},
+                {"type": "input_text", "text": "before  after"}
+            ]
+        });
+        local.upsert_protocol_item(authoritative.clone(), true, Some("turn-1"));
+        let snapshot = PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            items: local.items.iter().map(item_for_snapshot).collect(),
+        };
+        let mut restored = TranscriptModel::default();
+        restored.restore_persisted_snapshot(snapshot);
+
+        let body = authoritative.as_object_mut().unwrap();
+        body.remove("id");
+        body.remove("type");
+        let outcome = restored.merge_thread_item_entries(&[ThreadItemEntry {
+            turn_id: "turn-1".into(),
+            item: CodexThreadItem {
+                id: "server-inline-image".into(),
+                kind: "userMessage".into(),
+                body: body.clone(),
+            },
+        }]);
+
+        assert!(outcome.applied);
+        assert!(matches!(
+            restored.user_content_blocks(&local_key),
+            [
+                UserContentBlock::Text(before),
+                UserContentBlock::Image(_),
+                UserContentBlock::Text(after)
+            ] if before == "before " && after == " after"
+        ));
+    }
+
+    #[test]
     fn queued_user_fallback_is_visible_once_and_reconciles_authoritatively() {
         let mut model = TranscriptModel::default();
         let blocks = json!([{"type": "text", "text": "queued follow-up"}]);
@@ -9059,6 +9343,26 @@ mod tests {
             ] if before == "before " && after == " after"
         ));
         assert_eq!(render_user_content(&content), "before  after");
+    }
+
+    #[test]
+    fn persisted_inline_layout_does_not_override_changed_authoritative_text() {
+        let local = vec![
+            UserContentBlock::Text("before ".into()),
+            UserContentBlock::Image(UserImageSource::Url("image-1".into())),
+            UserContentBlock::Text(" after".into()),
+        ];
+        let incoming = vec![
+            UserContentBlock::Image(UserImageSource::Url("image-1".into())),
+            UserContentBlock::Text("changed text!".into()),
+        ];
+        let mut raw = json!({});
+        insert_user_content_layout(&mut raw, &local);
+
+        assert_eq!(
+            reconciled_user_content_blocks(&raw, "before  after", None, incoming.clone()),
+            incoming
+        );
     }
 
     #[test]
