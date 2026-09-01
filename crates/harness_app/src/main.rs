@@ -3244,6 +3244,19 @@ impl QueueOperation {
     }
 }
 
+fn queue_operation_indicator(id: impl Into<gpui::ElementId>, label: &'static str) -> AnyElement {
+    div()
+        .id(id)
+        .size(ButtonSize::Compact.rems())
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(Tooltip::text(label))
+        .child(SpinnerLabel::new().size(LabelSize::Small))
+        .into_any_element()
+}
+
 #[derive(Clone)]
 struct UserImagePreview {
     semantic_source: model::UserImageSource,
@@ -3549,6 +3562,15 @@ fn aspect_fit_preview_size(
 }
 
 fn composer_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    let (width, height) = aspect_fit_preview_size(dimensions, 120., 30.);
+    if dimensions.is_some() && height < 14. {
+        (width, 14.)
+    } else {
+        (width, height)
+    }
+}
+
+fn transcript_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
     aspect_fit_preview_size(dimensions, 120., 30.)
 }
 
@@ -6445,6 +6467,12 @@ impl HarnessApp {
                             let queue_ready = entry.id.is_some();
                             let operation = operations.get(&client_id).copied();
                             let operation_pending = operation.is_some();
+                            let steer_pending =
+                                operation == Some(QueueOperation::AddingToResponse);
+                            let interrupt_pending =
+                                operation == Some(QueueOperation::Interrupting);
+                            let edit_pending = operation == Some(QueueOperation::Editing);
+                            let remove_pending = operation == Some(QueueOperation::Removing);
                             let preview = queued_submission_preview(&entry.input);
                             let preview_segments = entry.preview_segments.clone();
                             let display_preview: SharedString = if preview.is_empty() {
@@ -6467,7 +6495,7 @@ impl HarnessApp {
                                 };
                                 div()
                                     .id(("queued-prompt-drag-handle", index))
-                                    .size(px(20.))
+                                    .size(ButtonSize::Compact.rems())
                                     .flex_none()
                                     .flex()
                                     .items_center()
@@ -6483,8 +6511,16 @@ impl HarnessApp {
                                         cx.new(|_| dragged.clone())
                                     })
                                     .into_any_element()
+                            } else if operation == Some(QueueOperation::Reordering) {
+                                queue_operation_indicator(
+                                    ("queued-prompt-reordering", index),
+                                    QueueOperation::Reordering.progress_label(),
+                                )
                             } else {
-                                div().size(px(20.)).flex_none().into_any_element()
+                                div()
+                                    .size(ButtonSize::Compact.rems())
+                                    .flex_none()
+                                    .into_any_element()
                             };
                             let drag_style_target = target_client_id.clone();
                             let drop_predicate_target = target_client_id.clone();
@@ -6497,11 +6533,11 @@ impl HarnessApp {
                                 // The handle owns the edge gutter; applying the
                                 // row's normal content inset before it made the
                                 // reorder affordance look doubly indented.
-                                .pl_0p5()
+                                .pl_0()
                                 .pr_2p5()
                                 .flex()
                                 .items_center()
-                                .gap_1()
+                                .gap_0p5()
                                 .when(index + 1 < queue_count, |this| {
                                     this.border_b_1().border_color(colors.border_variant)
                                 })
@@ -6548,11 +6584,15 @@ impl HarnessApp {
                                         .items_center()
                                         .gap_1()
                                         .text_sm()
+                                        .line_height(relative(1.))
                                         .text_color(colors.text)
                                         .children(preview_segments.into_iter().map(
                                             |segment| match segment {
                                                 QueuedPromptPreviewSegment::Text(text) => div()
                                                     .flex_none()
+                                                    .h_full()
+                                                    .flex()
+                                                    .items_center()
                                                     .whitespace_nowrap()
                                                     .child(text)
                                                     .into_any_element(),
@@ -6595,124 +6635,162 @@ impl HarnessApp {
                                                         .color(Color::Muted),
                                                 )
                                         })
-                                        .when_some(operation, |this, operation| {
-                                            this.child(SpinnerLabel::new().size(LabelSize::Small))
-                                                .child(
-                                                    Label::new(operation.progress_label())
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
-                                        })
-                                        .when(queue_ready && !operation_pending, |this| {
-                                            this.when(active_turn_control_ready, |this| {
-                                                let client_id =
-                                                    entry.client_user_message_id.clone();
+                                        .when(queue_ready, |this| {
+                                            this.when(
+                                                active_turn_control_ready || steer_pending,
+                                                |this| {
+                                                    this.when(steer_pending, |this| {
+                                                        this.child(queue_operation_indicator(
+                                                            ("queued-prompt-steering", index),
+                                                            QueueOperation::AddingToResponse
+                                                                .progress_label(),
+                                                        ))
+                                                    })
+                                                    .when(!steer_pending, |this| {
+                                                        let client_id = entry
+                                                            .client_user_message_id
+                                                            .clone();
+                                                        this.child(
+                                                            IconButton::new(
+                                                                ("steer-queued-prompt", index),
+                                                                IconName::SteeringWheel,
+                                                            )
+                                                            .shape(IconButtonShape::Square)
+                                                            .size(ButtonSize::Compact)
+                                                            .style(ButtonStyle::Subtle)
+                                                            .disabled(operation_pending)
+                                                            .aria_label(
+                                                                "Steer queued prompt into the active response",
+                                                            )
+                                                            .tooltip(Tooltip::text(
+                                                                "Steer at the active response's next input boundary · Ctrl-Shift-Enter for a draft",
+                                                            ))
+                                                            .on_click(move |_, _, cx| {
+                                                                weak_steer
+                                                                    .update(cx, |this, cx| {
+                                                                        this.steer_queued_turn(
+                                                                            client_id.clone(),
+                                                                            cx,
+                                                                        )
+                                                                    })
+                                                                    .ok();
+                                                            }),
+                                                        )
+                                                    })
+                                                },
+                                            )
+                                            .when(interrupt_pending, |this| {
+                                                this.child(queue_operation_indicator(
+                                                    ("queued-prompt-interrupting", index),
+                                                    QueueOperation::Interrupting.progress_label(),
+                                                ))
+                                            })
+                                            .when(!interrupt_pending, |this| {
                                                 this.child(
                                                     IconButton::new(
-                                                        ("steer-queued-prompt", index),
-                                                        IconName::SteeringWheel,
+                                                        ("send-queued-prompt", index),
+                                                        IconName::InterruptAndRun,
                                                     )
                                                     .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
-                                                    .aria_label(
-                                                        "Steer queued prompt into the active response",
+                                                    .disabled(
+                                                        operation_pending
+                                                            || (active_turn
+                                                                && !active_turn_control_ready),
                                                     )
-                                                    .tooltip(Tooltip::text(
-                                                        "Steer at the active response's next input boundary · Ctrl-Shift-Enter for a draft",
-                                                    ))
-                                                    .on_click(move |_, _, cx| {
-                                                        weak_steer
+                                                    .aria_label(if active_turn {
+                                                        "Interrupt response and run queued prompt"
+                                                    } else {
+                                                        "Run queued prompt now"
+                                                    })
+                                                    .tooltip(Tooltip::text(if active_turn {
+                                                        "Stop the active response and start this prompt as a new turn"
+                                                    } else {
+                                                        "Start this queued prompt now"
+                                                    }))
+                                                    .on_click({
+                                                        let client_id = entry
+                                                            .client_user_message_id
+                                                            .clone();
+                                                        move |_, _, cx| {
+                                                            weak_send
+                                                                .update(cx, |this, cx| {
+                                                                    this.send_queued_turn_now(
+                                                                        client_id.clone(),
+                                                                        cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        }
+                                                    }),
+                                                )
+                                            })
+                                            .when(edit_pending, |this| {
+                                                this.child(queue_operation_indicator(
+                                                    ("queued-prompt-editing", index),
+                                                    QueueOperation::Editing.progress_label(),
+                                                ))
+                                            })
+                                            .when(!edit_pending, |this| {
+                                                this.child(
+                                                    IconButton::new(
+                                                        ("edit-queued-prompt", index),
+                                                        IconName::Pencil,
+                                                    )
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .disabled(operation_pending)
+                                                    .aria_label("Edit queued prompt")
+                                                    .tooltip(Tooltip::text("Edit queued prompt"))
+                                                    .on_click(move |_, window, cx| {
+                                                        let client_id = client_id.clone();
+                                                        weak_edit
                                                             .update(cx, |this, cx| {
-                                                                this.steer_queued_turn(
-                                                                    client_id.clone(),
-                                                                    cx,
+                                                                this.edit_queued_turn(
+                                                                    client_id, window, cx,
                                                                 )
                                                             })
                                                             .ok();
                                                     }),
                                                 )
                                             })
-                                            .child(
-                                                IconButton::new(
-                                                    ("send-queued-prompt", index),
-                                                    IconName::InterruptAndRun,
+                                            .when(remove_pending, |this| {
+                                                this.child(queue_operation_indicator(
+                                                    ("queued-prompt-removing", index),
+                                                    QueueOperation::Removing.progress_label(),
+                                                ))
+                                            })
+                                            .when(!remove_pending, |this| {
+                                                this.child(
+                                                    IconButton::new(
+                                                        ("remove-queued-prompt", index),
+                                                        IconName::Trash,
+                                                    )
+                                                    .shape(IconButtonShape::Square)
+                                                    .size(ButtonSize::Compact)
+                                                    .style(ButtonStyle::Subtle)
+                                                    .disabled(operation_pending)
+                                                    .aria_label("Remove queued prompt")
+                                                    .tooltip(Tooltip::text("Remove queued prompt"))
+                                                    .on_click({
+                                                        let client_id = entry
+                                                            .client_user_message_id
+                                                            .clone();
+                                                        move |_, _, cx| {
+                                                            weak_remove
+                                                                .update(cx, |this, cx| {
+                                                                    this.cancel_queued_turn(
+                                                                        client_id.clone(),
+                                                                        cx,
+                                                                    )
+                                                                })
+                                                                .ok();
+                                                        }
+                                                    }),
                                                 )
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Compact)
-                                                .style(ButtonStyle::Subtle)
-                                                .disabled(active_turn && !active_turn_control_ready)
-                                                .aria_label(if active_turn {
-                                                    "Interrupt response and run queued prompt"
-                                                } else {
-                                                    "Run queued prompt now"
-                                                })
-                                                .tooltip(Tooltip::text(if active_turn {
-                                                    "Stop the active response and start this prompt as a new turn"
-                                                } else {
-                                                    "Start this queued prompt now"
-                                                }))
-                                                .on_click({
-                                                    let client_id =
-                                                        entry.client_user_message_id.clone();
-                                                    move |_, _, cx| {
-                                                        weak_send
-                                                            .update(cx, |this, cx| {
-                                                                this.send_queued_turn_now(
-                                                                    client_id.clone(),
-                                                                    cx,
-                                                                )
-                                                            })
-                                                            .ok();
-                                                    }
-                                                }),
-                                            )
-                                            .child(
-                                                IconButton::new(
-                                                    ("edit-queued-prompt", index),
-                                                    IconName::Pencil,
-                                                )
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Compact)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("Edit queued prompt")
-                                                .tooltip(Tooltip::text("Edit queued prompt"))
-                                                .on_click(move |_, window, cx| {
-                                                    let client_id = client_id.clone();
-                                                    weak_edit
-                                                        .update(cx, |this, cx| {
-                                                            this.edit_queued_turn(
-                                                                client_id, window, cx,
-                                                            )
-                                                        })
-                                                        .ok();
-                                                }),
-                                            )
-                                            .child(
-                                                IconButton::new(
-                                                    ("remove-queued-prompt", index),
-                                                    IconName::Trash,
-                                                )
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Compact)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("Remove queued prompt")
-                                                .tooltip(Tooltip::text("Remove queued prompt"))
-                                                .on_click({
-                                                    let client_id =
-                                                        entry.client_user_message_id.clone();
-                                                    move |_, _, cx| {
-                                                        weak_remove
-                                                            .update(cx, |this, cx| {
-                                                                this.cancel_queued_turn(
-                                                                    client_id.clone(),
-                                                                    cx,
-                                                                )
-                                                            })
-                                                            .ok();
-                                                    }
-                                                }),
-                                            )
+                                            })
                                         }),
                                 )
                             })),
@@ -6748,8 +6826,14 @@ impl HarnessApp {
             }
             _ => "Submitted prompt · waiting for the live transcript",
         };
+        let steer_pending = matches!(
+            pending.status.as_deref(),
+            Some("adding to response" | "awaiting incorporation")
+        );
+        let stop_ready = self.model.current_turn_id.is_some();
         let weak = cx.weak_entity();
         let weak_jump = weak.clone();
+        let weak_stop = weak.clone();
         Some(
             div()
                 .id("pending-outbound-proxy")
@@ -6762,26 +6846,15 @@ impl HarnessApp {
                 })
                 .h(px(32.))
                 .flex_none()
-                .px_2p5()
+                .pl_0()
+                .pr_2p5()
                 .flex()
                 .items_center()
-                .gap_1()
+                .gap_0p5()
                 .when(!self.queued_turns.is_empty(), |this| {
                     this.border_b_1().border_color(colors.border_variant)
                 })
-                .child(
-                    div()
-                        .w(px(20.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            SpinnerLabel::dots()
-                                .size(LabelSize::Small)
-                                .color(Color::Accent),
-                        ),
-                )
+                .child(div().size(ButtonSize::Compact.rems()).flex_none())
                 .child(
                     div()
                         .min_w_0()
@@ -6790,6 +6863,35 @@ impl HarnessApp {
                         .text_sm()
                         .text_color(colors.text_muted)
                         .child(label),
+                )
+                .child(queue_operation_indicator(
+                    "pending-outbound-operation",
+                    if steer_pending {
+                        "Waiting for the active response to incorporate this prompt"
+                    } else {
+                        "Waiting for the live transcript"
+                    },
+                ))
+                .child(
+                    IconButton::new("stop-pending-outbound", IconName::Stop)
+                        .shape(IconButtonShape::Square)
+                        .size(ButtonSize::Compact)
+                        .style(ButtonStyle::Subtle)
+                        .disabled(!stop_ready)
+                        .icon_color(if stop_ready {
+                            Color::Error
+                        } else {
+                            Color::Muted
+                        })
+                        .aria_label("Stop the active response")
+                        .tooltip(Tooltip::text(if stop_ready {
+                            "Stop response · the submitted prompt cannot be withdrawn separately"
+                        } else {
+                            "Restoring active-turn controls…"
+                        }))
+                        .on_click(move |_, _, cx| {
+                            weak_stop.update(cx, |this, cx| this.stop(cx)).ok();
+                        }),
                 )
                 .when(!following_tail, |this| {
                     this.child(
@@ -15058,7 +15160,7 @@ impl HarnessApp {
         let mut element =
             MarkdownElement::new(markdown, style).image_resolver_with_size(move |url, _| {
                 let preview = image_previews.get(url)?;
-                let (width, height) = composer_image_preview_size(preview.dimensions);
+                let (width, height) = transcript_image_preview_size(preview.dimensions);
                 Some((preview.source.clone(), px(width), px(height)))
             });
         {
@@ -19464,7 +19566,7 @@ mod tests {
         assert!(renderer.contains(".when_some(pending_outbound"));
         assert!(renderer.contains("IconName::SteeringWheel"));
         assert!(renderer.contains("IconName::InterruptAndRun"));
-        assert!(renderer.contains(".pl_0p5()"));
+        assert!(renderer.contains(".pl_0()"));
         assert!(renderer.contains(".pr_2p5()"));
         assert!(!renderer.contains(".px_2p5()"));
         assert!(!renderer.contains("queued-prompt-position"));
@@ -19481,7 +19583,10 @@ mod tests {
             .map(|(body, _)| body)
             .expect("pending outbound renderer must remain auditable");
 
-        assert!(proxy.contains("SpinnerLabel::dots()"));
+        assert!(proxy.contains("queue_operation_indicator"));
+        assert!(proxy.contains("stop-pending-outbound"));
+        assert!(proxy.contains("IconName::Stop"));
+        assert!(proxy.contains("cannot be withdrawn separately"));
         assert!(proxy.contains("pending-outbound-tail"));
         assert!(proxy.contains("item.protocol_id.is_none()"));
         assert!(proxy.contains(".when(!following_tail"));
@@ -22539,6 +22644,11 @@ mod tests {
         assert!((composer.0 / composer.1 - 1522. / 667.).abs() < 0.001);
         assert_eq!(composer.1, 30.);
         assert_eq!(composer_image_preview_size(None), (120., 30.));
+
+        // Extremely wide images keep a legible composer hit target without
+        // changing the exact aspect-fit geometry used in the transcript.
+        assert_eq!(composer_image_preview_size(Some((1200, 40))), (120., 14.));
+        assert_eq!(transcript_image_preview_size(Some((1200, 40))), (120., 4.));
 
         let queued = queued_image_preview_size(Some((1522, 667)));
         assert!((queued.0 / queued.1 - 1522. / 667.).abs() < 0.001);

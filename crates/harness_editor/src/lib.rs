@@ -450,7 +450,12 @@ impl LocalEditor {
                                     img(image.clone())
                                         .size_full()
                                         .rounded_xs()
-                                        .object_fit(ObjectFit::ScaleDown),
+                                        // Very wide screenshots receive a slightly
+                                        // thicker thumbnail frame. Cover preserves
+                                        // their geometry while cropping only the
+                                        // extreme horizontal preview; clicking still
+                                        // opens the complete source image.
+                                        .object_fit(ObjectFit::Cover),
                                 )
                                 .into_any_element()
                         }),
