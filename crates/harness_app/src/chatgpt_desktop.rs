@@ -288,15 +288,15 @@ fn project_message(message: &ApiMessage) -> Option<Message> {
 
 fn message_content(content: &Value) -> Option<String> {
     match content.get("content_type").and_then(Value::as_str) {
-        Some("text") => Some(
-            content
+        Some("text") => Some(sanitize_chatgpt_text(
+            &content
                 .get("parts")?
                 .as_array()?
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join("\n"),
-        ),
+        )),
         Some("code") => {
             let text = content.get("text")?.as_str()?;
             let language = content
@@ -305,19 +305,50 @@ fn message_content(content: &Value) -> Option<String> {
                 .unwrap_or_default();
             Some(format!("```{language}\n{text}\n```"))
         }
-        Some("reasoning_recap") => content.get("content").and_then(|value| match value {
-            Value::String(content) => Some(content.clone()),
-            Value::Array(parts) => Some(
-                parts
+        Some("reasoning_recap") => content.get("content").and_then(|value| {
+            let content = match value {
+                Value::String(content) => content.clone(),
+                Value::Array(parts) => parts
                     .iter()
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join("\n"),
-            ),
-            _ => None,
+                _ => return None,
+            };
+            Some(sanitize_chatgpt_text(&content))
         }),
         _ => None,
     }
+}
+
+fn sanitize_chatgpt_text(text: &str) -> String {
+    const REFERENCE_START: char = '\u{e200}';
+    const REFERENCE_END: char = '\u{e201}';
+
+    let mut sanitized = String::with_capacity(text.len());
+    let mut remainder = text;
+    while let Some(start) = remainder.find(REFERENCE_START) {
+        sanitized.push_str(&remainder[..start]);
+        let payload = &remainder[start + REFERENCE_START.len_utf8()..];
+        let Some(end) = payload.find(REFERENCE_END) else {
+            // Preserve unknown or truncated backend markup instead of silently
+            // deleting user-visible prose.
+            sanitized.push(REFERENCE_START);
+            remainder = payload;
+            continue;
+        };
+        let after_reference = &payload[end + REFERENCE_END.len_utf8()..];
+        if payload[..end].starts_with("cite") {
+            remainder = after_reference;
+        } else {
+            sanitized.push(REFERENCE_START);
+            sanitized.push_str(&payload[..end]);
+            sanitized.push(REFERENCE_END);
+            remainder = after_reference;
+        }
+    }
+    sanitized.push_str(remainder);
+    sanitized
 }
 
 #[cfg(test)]
@@ -393,6 +424,27 @@ mod tests {
             "```rust\nfn main() {}\n```"
         );
         assert!(project_message(&tool).is_none());
+    }
+
+    #[test]
+    fn citation_transport_markers_are_not_painted_as_transcript_text() {
+        let text = ApiMessage {
+            id: "cited-answer".into(),
+            author: ApiAuthor {
+                role: "assistant".into(),
+            },
+            content: json!({
+                "content_type": "text",
+                "parts": [
+                    "First claim. \u{e200}cite\u{e202}turn1search0\u{e202}turn1search2\u{e201}\nSecond claim."
+                ]
+            }),
+        };
+
+        assert_eq!(
+            project_message(&text).unwrap().content,
+            "First claim. \nSecond claim."
+        );
     }
 
     #[test]

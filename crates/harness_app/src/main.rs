@@ -4453,10 +4453,27 @@ fn permission_profile_choices_from_response(response: &Value) -> Vec<PermissionP
 
 fn permission_profile_label(id: &str) -> SharedString {
     match id.trim_start_matches(':') {
-        "danger-full-access" | "full-access" => "Full access".into(),
+        "danger-full-access" | "full-access" | "full" => "Full access".into(),
         "workspace" | "workspace-write" => "Workspace".into(),
         "read-only" => "Read only".into(),
         other => other.replace(['-', '_'], " ").into(),
+    }
+}
+
+fn effective_permission_label(
+    active_profile: Option<&str>,
+    sandbox_policy: Option<&model::SandboxPolicySnapshot>,
+) -> SharedString {
+    if let Some(active_profile) = active_profile.filter(|profile| !profile.trim().is_empty()) {
+        return permission_profile_label(active_profile);
+    }
+
+    match sandbox_policy {
+        Some(model::SandboxPolicySnapshot::DangerFullAccess) => "Full access".into(),
+        Some(model::SandboxPolicySnapshot::WorkspaceWrite { .. }) => "Workspace".into(),
+        Some(model::SandboxPolicySnapshot::ReadOnly { .. }) => "Read only".into(),
+        Some(model::SandboxPolicySnapshot::ExternalSandbox { .. }) => "External sandbox".into(),
+        None => "Permissions".into(),
     }
 }
 
@@ -6226,16 +6243,14 @@ impl HarnessApp {
     }
 
     fn render_permission_selector(&self, cx: &Context<Self>) -> AnyElement {
-        let active_profile = self
-            .model
-            .telemetry
-            .thread_settings
-            .as_ref()
+        let thread_settings = self.model.telemetry.thread_settings.as_ref();
+        let active_profile = thread_settings
             .and_then(|settings| settings.active_permission_profile.as_ref())
             .and_then(|profile| profile.id.as_deref());
-        let label = active_profile
-            .map(permission_profile_label)
-            .unwrap_or_else(|| "Permissions".into());
+        let label = effective_permission_label(
+            active_profile,
+            thread_settings.and_then(|settings| settings.sandbox_policy.as_ref()),
+        );
         let current_profile = active_profile.map(ToOwned::to_owned);
         let profiles = self.permission_profiles.clone();
         let menu_deployed = self.permission_menu_handle.is_deployed();
@@ -19008,15 +19023,15 @@ fn thread_load_diagnostics_enabled() -> bool {
 fn load_harness_keymaps(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("ctrl-shift-p", OpenActionPalette, Some("Harness")),
-        // In the modal composer, Ctrl-V should behave like an ordinary app
-        // paste while typing: image clipboard entries become attachments and
-        // text entries flow through the native Editor paste path. Keep this
-        // insert-specific so Vim's Normal/Visual Ctrl-V semantics remain
-        // available outside the composer typing state.
+        // Ctrl-V is always ordinary paste inside the composer. The composer can
+        // retain Vim Normal mode across focus changes; allowing stock Vim to
+        // consume Ctrl-V there enters Visual Block, and a subsequent change can
+        // overwrite an image clipboard with the selected text. Vim Ctrl-V stays
+        // available everywhere outside the composer.
         KeyBinding::new(
             "ctrl-v",
             PasteComposer,
-            Some("HarnessComposer && Editor && vim_mode == insert"),
+            Some("HarnessComposer && Editor"),
         ),
         KeyBinding::new(
             "ctrl-shift-v",
@@ -19316,6 +19331,53 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["newest", "middle", "older"]
         );
+    }
+
+    #[test]
+    fn restored_sandbox_populates_the_permission_label_without_a_named_profile() {
+        let full = serde_json::from_value::<model::SandboxPolicySnapshot>(json!({
+            "type": "dangerFullAccess"
+        }))
+        .unwrap();
+        let workspace = serde_json::from_value::<model::SandboxPolicySnapshot>(json!({
+            "type": "workspaceWrite"
+        }))
+        .unwrap();
+        let read_only = serde_json::from_value::<model::SandboxPolicySnapshot>(json!({
+            "type": "readOnly"
+        }))
+        .unwrap();
+
+        assert_eq!(effective_permission_label(None, Some(&full)), "Full access");
+        assert_eq!(
+            effective_permission_label(None, Some(&workspace)),
+            "Workspace"
+        );
+        assert_eq!(
+            effective_permission_label(None, Some(&read_only)),
+            "Read only"
+        );
+        assert_eq!(permission_profile_label(":full"), "Full access");
+        assert_eq!(
+            effective_permission_label(Some("workspace-write"), Some(&full)),
+            "Workspace",
+            "an explicit active profile remains authoritative"
+        );
+    }
+
+    #[test]
+    fn composer_ctrl_v_is_paste_in_every_vim_mode() {
+        let source = include_str!("main.rs");
+        let keymaps = source
+            .split_once("fn load_harness_keymaps(cx: &mut App)")
+            .and_then(|(_, source)| source.split_once("#[cfg(test)]\nmod tests"))
+            .map(|(keymaps, _)| keymaps)
+            .expect("Harness keymaps must remain independently auditable");
+
+        assert!(keymaps.contains(
+            "KeyBinding::new(\n            \"ctrl-v\",\n            PasteComposer,\n            Some(\"HarnessComposer && Editor\"),"
+        ));
+        assert!(!keymaps.contains("HarnessComposer && Editor && vim_mode == insert"));
     }
 
     #[test]

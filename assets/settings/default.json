@@ -2656,7 +2656,10 @@
   "vim": {
     "default_mode": "normal",
     "toggle_relative_line_numbers": false,
-    "use_system_clipboard": "always",
+    // Keep ordinary Vim yanks, deletes, and changes in Vim's registers.
+    // Explicit GUI copy, "+, and (on Linux) "* still target their native
+    // system selections.
+    "use_system_clipboard": "never",
     "use_smartcase_find": false,
     "use_regex_search": true,
     "gdefault": false,
