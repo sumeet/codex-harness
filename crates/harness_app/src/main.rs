@@ -17671,10 +17671,12 @@ impl Render for HarnessApp {
                                 .child(
                                     div()
                                         // Braille glyphs are optically left-heavy in several
-                                        // common fallback fonts; nudge the animated cell, not
-                                        // the floating control's hit target.
+                                        // common fallback fonts and sit above the visual center
+                                        // of their line box. Nudge the animated cell, not the
+                                        // floating control's hit target.
                                         .relative()
                                         .left(px(1.))
+                                        .top(px(1.5))
                                         .flex()
                                         .items_center()
                                         .justify_center()
@@ -21823,6 +21825,7 @@ mod tests {
         assert!(control.contains(".rounded_md()"));
         assert!(control.contains(".when(turn_active"));
         assert!(control.contains(".when(!turn_active"));
+        assert!(control.contains(".top(px(1.5))"));
         assert!(!control.contains(".border_1()"));
         assert!(
             !control.contains("Label::new(\"Latest\")")
