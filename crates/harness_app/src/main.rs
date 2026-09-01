@@ -16655,54 +16655,55 @@ impl Render for HarnessApp {
                 Color::Accent
             };
             div()
-                .absolute()
-                .left(if transcript_narrow { px(10.) } else { px(18.) })
-                .bottom(px(10.))
-                .h(px(28.))
-                .px_1()
+                .id("offscreen-tail-status")
+                .w_full()
+                .h(px(26.))
+                .flex_none()
+                .px(if transcript_narrow { px(10.) } else { px(18.) })
                 .flex()
                 .items_center()
-                .gap_0p5()
-                .rounded_md()
-                .border_1()
-                .border_color(colors.border_variant)
-                .bg(visuals.raised_surface.opacity(0.94))
-                .shadow_sm()
+                .gap_1()
+                .border_t_1()
+                .border_color(visuals.divider)
+                .bg(visuals.transcript)
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.element_hover))
+                .tooltip(Tooltip::text(
+                    "Return to the live transcript · G or Ctrl-End",
+                ))
                 .when(turn_active, |this| {
                     this.child(
-                        div()
-                            .id("offscreen-turn-activity")
-                            .w(px(20.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .tooltip(Tooltip::text("Codex is still working"))
-                            .child(
-                                SpinnerLabel::dots()
-                                    .size(LabelSize::Large)
-                                    .color(activity_color),
-                            ),
+                        SpinnerLabel::dots()
+                            .size(LabelSize::Small)
+                            .color(activity_color),
+                    )
+                    .child(
+                        Label::new("Codex is working")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
                     )
                 })
+                .child(div().flex_1())
                 .child(
-                    IconButton::new("transcript-latest", IconName::ArrowDown)
-                        .shape(IconButtonShape::Square)
-                        .size(ButtonSize::Compact)
-                        .style(ButtonStyle::Subtle)
-                        .icon_color(if turn_active {
-                            Color::Accent
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .text_color(if turn_active {
+                            colors.text_accent
                         } else {
-                            Color::Muted
+                            colors.text_muted
                         })
-                        .aria_label("Return to the live transcript")
-                        .tooltip(Tooltip::text(
-                            "Return to the live transcript · G or Ctrl-End",
-                        ))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.go_to_transcript_tail(window, cx)
-                        })),
+                        .child(Label::new("Latest").size(LabelSize::XSmall))
+                        .child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall).color(
+                            if turn_active {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            },
+                        )),
                 )
+                .on_click(cx.listener(|this, _, window, cx| this.go_to_transcript_tail(window, cx)))
                 .into_any_element()
         });
         let command_line_input = self
@@ -17052,6 +17053,7 @@ impl Render for HarnessApp {
                             .flex_1()
                             .min_h_0()
                             .flex()
+                            .flex_col()
                             .child(transcript_body)
                             .when_some(transcript_tail_control, |this, control| {
                                 this.child(control)
@@ -20636,7 +20638,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_active_tail_pairs_live_spinner_with_nearby_navigation() {
+    fn offscreen_tail_status_docks_activity_beside_latest_navigation() {
         let source = include_str!("main.rs");
         let control = source
             .split_once("let transcript_tail_control =")
@@ -20647,15 +20649,29 @@ mod tests {
         assert!(control.contains("(!following_tail)"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
-        assert!(control.contains("Codex is still working"));
-        assert!(control.contains(".left("));
+        assert!(control.contains("Codex is working"));
+        assert!(control.contains("Label::new(\"Latest\")"));
+        assert!(control.contains(".flex_none()"));
+        assert!(control.contains(".border_t_1()"));
         assert!(
-            !control.contains(".right("),
-            "tail status belongs beside the transcript's activity gutter, not at the far edge"
+            !control.contains(".absolute()"),
+            "tail status must reserve space rather than cover transcript content"
         );
         assert!(
-            !control.contains("rounded_full"),
-            "a live spinner must not regress into an ambiguous status dot"
+            !control.contains(".shadow_") && !control.contains(".rounded_"),
+            "tail status should remain a quiet edge strip, not another floating card"
+        );
+    }
+
+    #[test]
+    fn thread_items_use_the_theme_selected_token_for_persistent_selection() {
+        let source = include_str!("../../ui/src/components/ai/thread_item.rs");
+
+        assert!(source.contains(".when(self.selected, |s| s.bg(color.element_selected))"));
+        assert!(source.contains("apparent_bg.blend(color.element_selected)"));
+        assert!(
+            !source.contains(".when(self.selected, |s| s.bg(color.element_active))"),
+            "the transient pressed token can be transparent in otherwise valid themes"
         );
     }
 

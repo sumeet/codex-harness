@@ -264,7 +264,7 @@ impl RenderOnce for ThreadItem {
         let apparent_bg = color.background.blend(raw_bg);
 
         let base_bg = if self.selected {
-            apparent_bg.blend(color.element_active)
+            apparent_bg.blend(color.element_selected)
         } else {
             apparent_bg
         };
@@ -434,7 +434,7 @@ impl RenderOnce for ThreadItem {
             .w_full()
             .py_1()
             .px_1p5()
-            .when(self.selected, |s| s.bg(color.element_active))
+            .when(self.selected, |s| s.bg(color.element_selected))
             .border_1()
             .border_color(gpui::transparent_black())
             .when(self.focused, |s| s.border_color(color.border_focused))
