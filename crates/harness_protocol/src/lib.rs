@@ -1244,11 +1244,8 @@ fn project_transcript_item_with_header(
 
     let mut text = String::new();
     let header_start = text.len();
-    let show_header = include_header
-        && !matches!(
-            (item.kind, item.title.as_str()),
-            (TranscriptKind::Agent, "Codex") | (TranscriptKind::User, "You")
-        );
+    let show_header =
+        include_header && !matches!(item.kind, TranscriptKind::Agent | TranscriptKind::User);
     if show_header {
         text.push_str("━━━━ ");
         text.push_str(&normalize_buffer_line_endings(item.title.clone()));
@@ -1642,6 +1639,19 @@ pub struct TranscriptModel {
 }
 
 impl TranscriptModel {
+    /// Replace a presentation-only transcript projection.
+    ///
+    /// Provider adapters that do not speak the Codex App Server protocol can
+    /// still use Harness's shared transcript, selection, and navigation model
+    /// without manufacturing protocol notifications. These items are already
+    /// ordered and normalized by the adapter, so preserve their identities and
+    /// rebuild only the lookup index.
+    pub fn replace_presentational_items(&mut self, items: Vec<TranscriptItem>) {
+        self.clear();
+        self.items = items;
+        self.rebuild_item_indices();
+    }
+
     pub fn replay(item_count: usize) -> Self {
         let mut this = Self::default();
         let templates = replay_templates()

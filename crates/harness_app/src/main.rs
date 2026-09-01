@@ -465,12 +465,113 @@ fn transcript_has_inline_activity(transcript: &TranscriptModel) -> bool {
     })
 }
 
-fn chat_has_inline_activity(messages: &[ChatMessage], sending: bool) -> bool {
-    sending
-        && messages.last().is_some_and(|message| {
-            message.role == chatgpt_desktop::MessageRole::Assistant
-                && !message.content.trim().is_empty()
+fn chat_transcript_items(
+    messages: &[ChatMessage],
+    sending: bool,
+    expanded_activity: &HashSet<String>,
+) -> Vec<TranscriptItem> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let (kind, title, raw, content, expanded) = match (&message.role, &message.activity) {
+                (chatgpt_desktop::MessageRole::User, _) => (
+                    model::TranscriptKind::User,
+                    "You".to_owned(),
+                    json!({"provider": "chatgpt", "type": "userMessage"}),
+                    message.content.clone(),
+                    true,
+                ),
+                (chatgpt_desktop::MessageRole::Assistant, _) => (
+                    model::TranscriptKind::Agent,
+                    "ChatGPT".to_owned(),
+                    json!({"provider": "chatgpt", "type": "assistantMessage"}),
+                    message.content.clone(),
+                    true,
+                ),
+                (chatgpt_desktop::MessageRole::Reasoning, _) => (
+                    model::TranscriptKind::Reasoning,
+                    "Reasoning".to_owned(),
+                    json!({"provider": "chatgpt", "type": "reasoning"}),
+                    message.content.clone(),
+                    true,
+                ),
+                (chatgpt_desktop::MessageRole::Activity, Some(activity)) => {
+                    let results = activity
+                        .results
+                        .iter()
+                        .map(|result| {
+                            json!({
+                                "title": result.title,
+                                "url": result.url,
+                                "domain": result.domain,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let kind = match activity.kind {
+                        ChatActivityKind::WebSearch => model::TranscriptKind::Web,
+                        ChatActivityKind::Command | ChatActivityKind::Tool => {
+                            model::TranscriptKind::Tool
+                        }
+                    };
+                    let content = if message.content.trim().is_empty() {
+                        activity
+                            .results
+                            .iter()
+                            .map(|result| {
+                                if result.domain.is_empty() {
+                                    result.title.clone()
+                                } else {
+                                    format!("{}\n{}", result.title, result.domain)
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        message.content.clone()
+                    };
+                    (
+                        kind,
+                        activity.title.clone(),
+                        json!({
+                            "provider": "chatgpt",
+                            "type": match activity.kind {
+                                ChatActivityKind::WebSearch => "webSearch",
+                                ChatActivityKind::Command => "command",
+                                ChatActivityKind::Tool => "tool",
+                            },
+                            "detail": activity.detail,
+                            "results": results,
+                        }),
+                        content,
+                        expanded_activity.contains(&message.id),
+                    )
+                }
+                (chatgpt_desktop::MessageRole::Activity, None) => (
+                    model::TranscriptKind::Tool,
+                    "Activity".to_owned(),
+                    json!({"provider": "chatgpt", "type": "tool"}),
+                    message.content.clone(),
+                    expanded_activity.contains(&message.id),
+                ),
+            };
+            let streaming = sending
+                && index + 1 == messages.len()
+                && message.role == chatgpt_desktop::MessageRole::Assistant;
+            TranscriptItem {
+                key: format!("chatgpt:{}", message.id),
+                protocol_id: Some(message.id.clone()),
+                kind,
+                title,
+                status: streaming.then(|| "streaming".to_owned()),
+                content,
+                raw,
+                event_count: 1,
+                expanded,
+                pending_request: None,
+            }
         })
+        .collect()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1597,8 +1698,8 @@ fn item_search_context_snippet(
 
 fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
     !matches!(
-        (item.kind, item.title.as_str()),
-        (model::TranscriptKind::Agent, "Codex") | (model::TranscriptKind::User, "You")
+        item.kind,
+        model::TranscriptKind::Agent | model::TranscriptKind::User
     )
 }
 
@@ -4148,6 +4249,7 @@ struct HarnessApp {
     chat_conversations: Vec<ChatConversationSummary>,
     selected_chat_id: Option<String>,
     chat_messages: Vec<ChatMessage>,
+    chat_transcript: TranscriptModel,
     chat_current_node: Option<String>,
     chat_models: Vec<ChatModelChoice>,
     selected_chat_model: Option<String>,
@@ -7501,17 +7603,23 @@ impl HarnessApp {
     }
 
     fn reveal_rich_navigation_item(&mut self, item_index: usize, body_offset: usize) {
-        let Some(item) = self.model.items.get(item_index) else {
+        let Some(item_kind) = self
+            .active_transcript_model()
+            .items
+            .get(item_index)
+            .map(|item| item.kind)
+        else {
             return;
         };
-        let viewport = self.list_state.viewport_bounds();
+        let viewport = self.active_transcript_list_state().viewport_bounds();
         let item_is_visible = self
-            .list_state
+            .active_transcript_list_state()
             .bounds_for_item(item_index)
             .is_some_and(|bounds| bounds.intersects(&viewport));
-        if item.kind != model::TranscriptKind::Command {
+        if item_kind != model::TranscriptKind::Command {
             if !item_is_visible {
-                self.list_state.scroll_to_reveal_item(item_index);
+                self.active_transcript_list_state()
+                    .scroll_to_reveal_item(item_index);
             }
             return;
         }
@@ -7524,16 +7632,23 @@ impl HarnessApp {
             return;
         }
 
-        let cursor_is_in_command = rich_command_data(item).is_none_or(|data| {
-            body_offset < data.command.len() + usize::from(!data.command.is_empty())
-        });
-        if cursor_is_in_command {
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix: item_index,
-                offset_in_item: px(0.),
+        let cursor_is_in_command = self
+            .active_transcript_model()
+            .items
+            .get(item_index)
+            .and_then(rich_command_data)
+            .is_none_or(|data| {
+                body_offset < data.command.len() + usize::from(!data.command.is_empty())
             });
+        if cursor_is_in_command {
+            self.active_transcript_list_state()
+                .scroll_to(gpui::ListOffset {
+                    item_ix: item_index,
+                    offset_in_item: px(0.),
+                });
         } else {
-            self.list_state.scroll_to_reveal_item(item_index);
+            self.active_transcript_list_state()
+                .scroll_to_reveal_item(item_index);
         }
     }
 
@@ -7550,7 +7665,7 @@ impl HarnessApp {
         snapshot: &TranscriptSelectionSnapshot,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(item) = self.model.items.get(item_index) else {
+        let Some(item) = self.active_transcript_model().items.get(item_index) else {
             return false;
         };
         if !matches!(
@@ -7830,7 +7945,7 @@ impl HarnessApp {
                     let changed = this.selected_item != item_index;
                     this.selected_item = item_index;
                     if !this.buffer_view && rich_vim_experiment() {
-                        this.list_state.pause_following_tail();
+                        this.active_transcript_list_state().pause_following_tail();
                         if !rich_pointer_gesture_active {
                             this.reveal_rich_navigation_item(
                                 item_index,
@@ -7944,6 +8059,7 @@ impl HarnessApp {
             chat_conversations: Vec::new(),
             selected_chat_id: session.selected_chat_id,
             chat_messages: Vec::new(),
+            chat_transcript: TranscriptModel::default(),
             chat_current_node: None,
             chat_models: Vec::new(),
             selected_chat_model: None,
@@ -9853,9 +9969,9 @@ impl HarnessApp {
             return None;
         }
         let document = if self.buffer_view {
-            self.model.full_document()
+            self.active_transcript_model().full_document()
         } else {
-            rich_navigation_document(&self.model)
+            rich_navigation_document(self.active_transcript_model())
         };
         let old_text = self.transcript_editor.read(cx).text(cx);
         if old_text == document.text {
@@ -9874,6 +9990,42 @@ impl HarnessApp {
         Some(document)
     }
 
+    fn active_transcript_model(&self) -> &TranscriptModel {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            &self.chat_transcript
+        } else {
+            &self.model
+        }
+    }
+
+    fn active_transcript_model_mut(&mut self) -> &mut TranscriptModel {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            &mut self.chat_transcript
+        } else {
+            &mut self.model
+        }
+    }
+
+    fn active_transcript_list_state(&self) -> &ListState {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            &self.chat_list_state
+        } else {
+            &self.list_state
+        }
+    }
+
+    fn rebuild_chat_transcript(&mut self, cx: &mut Context<Self>) {
+        let items = chat_transcript_items(
+            &self.chat_messages,
+            self.chat_sending,
+            &self.expanded_chat_activity,
+        );
+        self.chat_transcript.replace_presentational_items(items);
+        if self.workspace_mode == WorkspaceMode::Chat {
+            drop(self.sync_transcript_document(cx));
+        }
+    }
+
     fn set_workspace_mode(&mut self, mode: WorkspaceMode, cx: &mut Context<Self>) {
         if self.workspace_mode == mode {
             return;
@@ -9887,6 +10039,9 @@ impl HarnessApp {
         if mode == WorkspaceMode::Chat && self.chat_models.is_empty() {
             self.refresh_chat_models(cx);
         }
+        drop(self.sync_transcript_document(cx));
+        self.rich_navigation_selection = None;
+        self.transcript_cursor_initialized = false;
         self.persist_session();
         cx.notify();
     }
@@ -10011,6 +10166,7 @@ impl HarnessApp {
         self.chat_error = None;
         let old_len = self.chat_messages.len();
         self.chat_messages.clear();
+        self.rebuild_chat_transcript(cx);
         self.chat_current_node = None;
         self.chat_list_state.splice(0..old_len, 0);
         let client = cx.http_client();
@@ -10032,6 +10188,7 @@ impl HarnessApp {
                             );
                         }
                         this.chat_messages = conversation.messages;
+                        this.rebuild_chat_transcript(cx);
                         this.chat_list_state.splice(0..0, new_len);
                         this.chat_list_state.set_follow_mode(FollowMode::Tail);
                         this.chat_list_state.scroll_to_end();
@@ -10052,6 +10209,7 @@ impl HarnessApp {
         &mut self,
         conversation: chatgpt_desktop::Conversation,
         update_selected_model: bool,
+        cx: &mut Context<Self>,
     ) {
         let old_len = self.chat_messages.len();
         let new_len = conversation.messages.len();
@@ -10060,12 +10218,13 @@ impl HarnessApp {
             self.select_chat_model_from_conversation(model, conversation.default_thinking_effort);
         }
         self.chat_messages = conversation.messages;
+        self.rebuild_chat_transcript(cx);
         self.chat_list_state.splice(0..old_len, new_len);
         self.chat_list_state.set_follow_mode(FollowMode::Tail);
         self.chat_list_state.scroll_to_end();
     }
 
-    fn apply_chat_stream_message(&mut self, message: ChatMessage) {
+    fn apply_chat_stream_message(&mut self, message: ChatMessage, cx: &mut Context<Self>) {
         let was_following_tail = self.chat_list_state.is_following_tail();
         if let Some(index) = self
             .chat_messages
@@ -10079,6 +10238,7 @@ impl HarnessApp {
             self.chat_messages.push(message);
             self.chat_list_state.splice(index..index, 1);
         }
+        self.rebuild_chat_transcript(cx);
         if was_following_tail {
             self.chat_list_state.set_follow_mode(FollowMode::Tail);
             self.chat_list_state.scroll_to_end();
@@ -10127,13 +10287,14 @@ impl HarnessApp {
             content: prompt.clone(),
             activity: None,
         });
+        self.rebuild_chat_transcript(cx);
         self.chat_list_state.splice(baseline_len..baseline_len, 1);
         self.chat_list_state.set_follow_mode(FollowMode::Tail);
         self.chat_list_state.scroll_to_end();
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.chat_error = None;
-        self.set_chat_sending(true);
+        self.set_chat_sending(true, cx);
         self.chat_list_state.set_follow_mode(FollowMode::Tail);
         self.chat_list_state.scroll_to_end();
         self.chat_send_generation = self.chat_send_generation.wrapping_add(1);
@@ -10147,7 +10308,7 @@ impl HarnessApp {
                     if this.chat_send_generation == generation
                         && this.selected_chat_id.as_deref() == Some(stream_conversation_id.as_str())
                     {
-                        this.apply_chat_stream_message(message);
+                        this.apply_chat_stream_message(message, cx);
                         cx.notify();
                     }
                 });
@@ -10176,11 +10337,11 @@ impl HarnessApp {
                 if this.chat_send_generation != generation {
                     return;
                 }
-                this.set_chat_sending(false);
+                this.set_chat_sending(false, cx);
                 match send_result {
                     Ok(()) => {
                         if let Some(conversation) = final_conversation {
-                            this.apply_chat_conversation(conversation, false);
+                            this.apply_chat_conversation(conversation, false, cx);
                         }
                         this.chat_error = None;
                         this.refresh_chat_conversations(cx);
@@ -10189,6 +10350,7 @@ impl HarnessApp {
                         let old_len = this.chat_messages.len();
                         this.chat_messages
                             .retain(|message| message.id != optimistic_id);
+                        this.rebuild_chat_transcript(cx);
                         this.chat_list_state
                             .splice(0..old_len, this.chat_messages.len());
                         if this.composer.read(cx).text(cx).is_empty() {
@@ -10227,290 +10389,6 @@ impl HarnessApp {
                 .ok();
             })
             .into_any_element()
-    }
-
-    fn render_chat_activity_message(
-        &mut self,
-        message: &ChatMessage,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        const RESULT_PREVIEW_LIMIT: usize = 8;
-
-        let Some(activity) = message.activity.clone() else {
-            return div().into_any_element();
-        };
-        let colors = cx.theme().colors().clone();
-        let expanded = self.expanded_chat_activity.contains(&message.id);
-        let expandable = !activity.results.is_empty() || !message.content.trim().is_empty();
-        let icon = match activity.kind {
-            ChatActivityKind::WebSearch => IconName::ToolWeb,
-            ChatActivityKind::Command => IconName::ToolTerminal,
-            ChatActivityKind::Tool => IconName::ToolHammer,
-        };
-        let message_id = message.id.clone();
-        let weak = cx.weak_entity();
-        let header = div()
-            .id(("chat-activity-header", index))
-            .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_1()
-            .py_1()
-            .rounded_sm()
-            .when(expandable, |this| {
-                this.cursor_pointer()
-                    .hover(|this| this.bg(colors.element_hover))
-                    .on_click(move |_, _, cx| {
-                        weak.update(cx, |this, cx| {
-                            if !this.expanded_chat_activity.remove(&message_id) {
-                                this.expanded_chat_activity.insert(message_id.clone());
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    })
-            })
-            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_baseline()
-                    .gap_1()
-                    .child(
-                        Label::new(activity.title.clone())
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
-                    .when_some(activity.detail.clone(), |this, detail| {
-                        this.child(
-                            Label::new(detail)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .truncate(),
-                        )
-                    }),
-            )
-            .when(expandable, |this| {
-                this.child(
-                    Icon::new(if expanded {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(IconSize::XSmall)
-                    .color(Color::Muted),
-                )
-            });
-
-        let result_count = activity.results.len();
-        let result_rows = activity
-            .results
-            .into_iter()
-            .take(RESULT_PREVIEW_LIMIT)
-            .enumerate()
-            .map(|(result_index, result)| {
-                let url = result.url.clone();
-                div()
-                    .id(format!("chat-search-result:{index}:{result_index}"))
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .py_1()
-                    .px_1()
-                    .rounded_sm()
-                    .cursor_pointer()
-                    .hover(|this| this.bg(colors.element_hover))
-                    .tooltip(Tooltip::text(result.url))
-                    .on_click(move |_, _, cx| cx.open_url(&url))
-                    .child(
-                        Label::new(result.title)
-                            .size(LabelSize::Small)
-                            .color(Color::Default)
-                            .truncate(),
-                    )
-                    .when(!result.domain.is_empty(), |this| {
-                        this.child(
-                            Label::new(result.domain)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let expanded_content = (expanded && !message.content.trim().is_empty()).then(|| {
-            let markdown = self.markdown_for(
-                &format!("chat-activity:{}", message.id),
-                &message.content,
-                None,
-                None,
-                None,
-                cx,
-            );
-            MarkdownElement::new(
-                markdown,
-                refine_harness_markdown_style(MarkdownStyle::themed(
-                    MarkdownFont::Agent,
-                    window,
-                    cx,
-                )),
-            )
-        });
-
-        div()
-            .id(("chat-activity", index))
-            .w_full()
-            .min_w_0()
-            .px(px(18.))
-            .py_0p5()
-            .flex()
-            .flex_col()
-            .child(header)
-            .when(expanded, |this| {
-                this.child(
-                    div()
-                        .ml(px(18.))
-                        .pl_2()
-                        .border_l_1()
-                        .border_color(colors.border_variant)
-                        .children(result_rows)
-                        .when(result_count > RESULT_PREVIEW_LIMIT, |this| {
-                            this.child(
-                                Label::new(format!(
-                                    "{} more sources",
-                                    result_count - RESULT_PREVIEW_LIMIT
-                                ))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                            )
-                        })
-                        .when_some(expanded_content, |this, content| {
-                            this.child(div().pt_1().child(content))
-                        }),
-                )
-            })
-            .into_any_element()
-    }
-
-    fn render_chat_message(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(message) = self.chat_messages.get(index).cloned() else {
-            return div().into_any_element();
-        };
-        if message.role == chatgpt_desktop::MessageRole::Activity {
-            return self.render_chat_activity_message(&message, index, window, cx);
-        }
-        let colors = cx.theme().colors().clone();
-        let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
-        let markdown = self.markdown_for(
-            &format!("chat:{}", message.id),
-            &message.content,
-            None,
-            None,
-            None,
-            cx,
-        );
-        let style =
-            refine_harness_markdown_style(MarkdownStyle::themed(MarkdownFont::Agent, window, cx));
-        let body = MarkdownElement::new(markdown, style);
-        let streaming = self.chat_sending
-            && index + 1 == self.chat_messages.len()
-            && message.role == chatgpt_desktop::MessageRole::Assistant
-            && !message.content.trim().is_empty();
-        let body = if streaming {
-            let activity_color = colors.text_accent;
-            body.with_animation(
-                format!("streaming-chat-activity:{}", message.id),
-                gpui::Animation::new(Duration::from_millis(1000)).repeat_synced(),
-                move |element, delta| {
-                    element.trailing_spinner_activity(
-                        SharedString::default(),
-                        activity_color,
-                        delta,
-                    )
-                },
-            )
-            .into_any_element()
-        } else {
-            body.into_any_element()
-        };
-        div()
-            .id(("chat-message", index))
-            .w_full()
-            .px(px(18.))
-            .py_2()
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .when(message.role == chatgpt_desktop::MessageRole::User, |this| {
-                        this.rounded_sm()
-                            .border_1()
-                            .border_color(visuals.divider)
-                            .bg(visuals.raised_surface)
-                            .px_2()
-                            .py_1()
-                    })
-                    .when(
-                        message.role == chatgpt_desktop::MessageRole::Reasoning,
-                        |this| {
-                            this.ml_1p5()
-                                .pl_3p5()
-                                .border_l_1()
-                                .border_color(colors.border_variant)
-                                .text_color(colors.text_muted)
-                        },
-                    )
-                    .child(body),
-            )
-            .into_any_element()
-    }
-
-    fn render_chat_transcript_list_item(
-        &mut self,
-        index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if index < self.chat_messages.len() {
-            return self.render_chat_message(index, window, cx);
-        }
-        if index != self.chat_messages.len() || !self.chat_sending {
-            return div().into_any_element();
-        }
-        if chat_has_inline_activity(&self.chat_messages, self.chat_sending) {
-            // Preserve one real tail row for list following while the final
-            // assistant Markdown owns the visible spinner at its insertion
-            // point, exactly as the Codex transcript does.
-            return div()
-                .id("chat-response-tail")
-                .w_full()
-                .h(px(1.))
-                .into_any_element();
-        }
-        let horizontal_padding = if window.viewport_size().width < px(720.) {
-            px(10.)
-        } else {
-            px(18.)
-        };
-        transcript_response_activity_indicator(
-            "chat-response-tail",
-            horizontal_padding,
-            None,
-            Color::Accent,
-        )
     }
 
     fn refresh_threads(&mut self, cx: &mut Context<Self>) {
@@ -13061,7 +12939,8 @@ impl HarnessApp {
             }
             self.transcript_cursor_initialized = true;
             self.transcript_editor.focus_handle(cx).focus(window, cx);
-            self.list_state.scroll_to_reveal_item(self.selected_item);
+            self.active_transcript_list_state()
+                .scroll_to_reveal_item(self.selected_item);
             cx.defer_in(window, |this, window, cx| {
                 if !this.buffer_view && this.focus_mode == FocusMode::Buffer {
                     this.transcript_editor.update(cx, |editor, cx| {
@@ -13075,10 +12954,12 @@ impl HarnessApp {
         }
         self.focus_mode = FocusMode::Transcript;
         self.transcript_focus.focus(window, cx);
-        self.list_state.scroll_to_reveal_item(self.selected_item);
+        self.active_transcript_list_state()
+            .scroll_to_reveal_item(self.selected_item);
         cx.defer_in(window, |this, _, cx| {
             if !this.buffer_view && this.focus_mode == FocusMode::Transcript {
-                this.list_state.scroll_to_reveal_item(this.selected_item);
+                this.active_transcript_list_state()
+                    .scroll_to_reveal_item(this.selected_item);
                 cx.notify();
             }
         });
@@ -13088,7 +12969,7 @@ impl HarnessApp {
     fn note_rich_pointer_position(&mut self, position: RichPointerPosition) {
         self.rich_pointer_autoscroll_suppression = Some(position);
         let Some(item_key) = self
-            .model
+            .active_transcript_model()
             .items
             .get(position.item_index)
             .map(|item| item.key.clone())
@@ -13119,10 +13000,12 @@ impl HarnessApp {
             .as_ref()
             .and_then(rich_pointer_existing_anchor);
         let click_range = self
-            .model
+            .active_transcript_model()
             .items
             .get(position.item_index)
-            .and_then(|_| rich_navigation_item_projection(&self.model, position.item_index))
+            .and_then(|_| {
+                rich_navigation_item_projection(self.active_transcript_model(), position.item_index)
+            })
             .map(|projection| {
                 rich_pointer_click_range(projection.body_text(), position.body_offset, click_count)
             })
@@ -13147,7 +13030,7 @@ impl HarnessApp {
         self.visual_anchor = None;
         self.focus_mode = FocusMode::Buffer;
         self.transcript_cursor_initialized = true;
-        self.list_state.pause_following_tail();
+        self.active_transcript_list_state().pause_following_tail();
         let placed = self.transcript_editor.update(cx, |editor, cx| {
             editor.set_pointer_selection(
                 anchor.item_index,
@@ -13330,7 +13213,7 @@ impl HarnessApp {
             self.place_rich_cursor_in_item(item_index, body_offset, window, cx);
             self.transcript_cursor_initialized = true;
         } else {
-            self.selected_item = self.model.items.len().saturating_sub(1);
+            self.selected_item = self.active_transcript_model().items.len().saturating_sub(1);
         }
 
         // Keep the native text projection ready for streaming and pin the
@@ -13339,15 +13222,16 @@ impl HarnessApp {
         // re-engage when a manual scroll reaches the bottom again.
         self.transcript_editor
             .update(cx, |editor, cx| editor.reveal_tail(cx));
-        self.list_state.set_follow_mode(FollowMode::Tail);
-        self.list_state.scroll_to_end();
+        self.active_transcript_list_state()
+            .set_follow_mode(FollowMode::Tail);
+        self.active_transcript_list_state().scroll_to_end();
 
         // A streaming row can change height in the same frame. Reassert the
         // item-count anchor after that layout rather than revealing only the
         // last measured line from the preceding frame.
         cx.defer_in(window, |this, _, cx| {
-            if this.list_state.is_following_tail() {
-                this.list_state.scroll_to_end();
+            if this.active_transcript_list_state().is_following_tail() {
+                this.active_transcript_list_state().scroll_to_end();
                 cx.notify();
             }
         });
@@ -13405,29 +13289,33 @@ impl HarnessApp {
             self.transcript_focus.focus(window, cx);
         }
         if was_following_tail {
-            self.list_state.set_follow_mode(FollowMode::Tail);
+            self.active_transcript_list_state()
+                .set_follow_mode(FollowMode::Tail);
         } else {
-            self.list_state.pause_following_tail();
-            self.list_state.scroll_to(gpui::ListOffset {
-                item_ix: top_visible_item.unwrap_or(self.selected_item),
-                offset_in_item: px(0.),
-            });
+            self.active_transcript_list_state().pause_following_tail();
+            self.active_transcript_list_state()
+                .scroll_to(gpui::ListOffset {
+                    item_ix: top_visible_item.unwrap_or(self.selected_item),
+                    offset_in_item: px(0.),
+                });
         }
         cx.defer_in(window, move |this, _, cx| {
             if !this.buffer_view
                 && matches!(this.focus_mode, FocusMode::Transcript | FocusMode::Buffer)
             {
-                if this.list_state.is_following_tail() {
-                    this.list_state.scroll_to_end();
+                if this.active_transcript_list_state().is_following_tail() {
+                    this.active_transcript_list_state().scroll_to_end();
                 } else if !preserved_viewport {
                     let selected_visible = this
-                        .list_state
+                        .active_transcript_list_state()
                         .bounds_for_item(this.selected_item)
                         .is_some_and(|bounds| {
-                            bounds.intersects(&this.list_state.viewport_bounds())
+                            bounds
+                                .intersects(&this.active_transcript_list_state().viewport_bounds())
                         });
                     if !selected_visible {
-                        this.list_state.scroll_to_reveal_item(this.selected_item);
+                        this.active_transcript_list_state()
+                            .scroll_to_reveal_item(this.selected_item);
                     }
                 }
                 cx.notify();
@@ -13464,13 +13352,14 @@ impl HarnessApp {
         self.active_search_body_offset = None;
         self.search_returns_to_buffer = false;
         self.buffer_search_backwards = false;
-        let should_follow_tail = self.list_state.is_following_tail()
-            && (self.model.items.is_empty() || self.selected_item + 1 >= self.model.items.len());
+        let should_follow_tail = self.active_transcript_list_state().is_following_tail()
+            && (self.active_transcript_model().items.is_empty()
+                || self.selected_item + 1 >= self.active_transcript_model().items.len());
         let top_visible_item = (!should_follow_tail).then(|| {
-            self.list_state
+            self.active_transcript_list_state()
                 .logical_scroll_top()
                 .item_ix
-                .min(self.model.items.len().saturating_sub(1))
+                .min(self.active_transcript_model().items.len().saturating_sub(1))
         });
         self.buffer_view = true;
         self.transcript_editor
@@ -13997,18 +13886,21 @@ impl HarnessApp {
     }
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.model.items.is_empty() {
+        let item_count = self.active_transcript_model().items.len();
+        if item_count == 0 {
             return;
         }
         self.selected_item = self
             .selected_item
             .saturating_add_signed(delta)
-            .min(self.model.items.len() - 1);
-        if self.selected_item + 1 >= self.model.items.len() && delta > 0 {
-            self.list_state.set_follow_mode(FollowMode::Tail);
+            .min(item_count - 1);
+        if self.selected_item + 1 >= item_count && delta > 0 {
+            self.active_transcript_list_state()
+                .set_follow_mode(FollowMode::Tail);
         } else {
-            self.list_state.pause_following_tail();
-            self.list_state.scroll_to_reveal_item(self.selected_item);
+            self.active_transcript_list_state().pause_following_tail();
+            self.active_transcript_list_state()
+                .scroll_to_reveal_item(self.selected_item);
         }
         cx.notify();
     }
@@ -14046,6 +13938,10 @@ impl HarnessApp {
     }
 
     fn toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            self.toggle_item_at(self.selected_item, window, cx);
+            return;
+        }
         if self
             .model
             .items
@@ -14105,17 +14001,29 @@ impl HarnessApp {
     }
 
     fn toggle_item_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((item_key, collapsed)) = toggle_model_item_expansion_at(&mut self.model, index)
+        let Some((item_key, collapsed)) =
+            toggle_model_item_expansion_at(self.active_transcript_model_mut(), index)
         else {
             return;
         };
-        self.list_state.splice(index..index + 1, 1);
+        if self.workspace_mode == WorkspaceMode::Chat {
+            let message_id = item_key.strip_prefix("chatgpt:").unwrap_or(&item_key);
+            if collapsed {
+                self.expanded_chat_activity.remove(message_id);
+            } else {
+                self.expanded_chat_activity.insert(message_id.to_owned());
+            }
+        }
+        self.active_transcript_list_state()
+            .splice(index..index + 1, 1);
         if self.buffer_view {
             self.transcript_editor.update(cx, |editor, cx| {
                 editor.set_item_collapsed(&item_key, collapsed, window, cx);
             });
+        } else if self.workspace_mode == WorkspaceMode::Chat {
+            drop(self.sync_transcript_document(cx));
         } else if rich_vim_experiment() {
-            let item_count = self.model.items.len();
+            let item_count = self.active_transcript_model().items.len();
             if !self.sync_transcript_item_updates(item_count, &[index], cx) {
                 drop(self.sync_transcript_document(cx));
             }
@@ -14125,7 +14033,7 @@ impl HarnessApp {
 
     fn toggle_item_by_key(&mut self, item_key: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self
-            .model
+            .active_transcript_model()
             .items
             .iter()
             .position(|item| item.key == item_key)
@@ -14140,13 +14048,18 @@ impl HarnessApp {
     }
 
     fn toggle_raw(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = self.model.items.get(self.selected_item) else {
+        let Some(item_key) = self
+            .active_transcript_model()
+            .items
+            .get(self.selected_item)
+            .map(|item| item.key.clone())
+        else {
             return;
         };
-        if !self.raw_visible.remove(&item.key) {
-            self.raw_visible.insert(item.key.clone());
+        if !self.raw_visible.remove(&item_key) {
+            self.raw_visible.insert(item_key);
         }
-        self.list_state
+        self.active_transcript_list_state()
             .splice(self.selected_item..self.selected_item + 1, 1);
         cx.notify();
     }
@@ -14161,13 +14074,13 @@ impl HarnessApp {
     }
 
     fn yank_selected(&mut self, cx: &mut Context<Self>) {
-        if self.model.items.is_empty() {
+        if self.active_transcript_model().items.is_empty() {
             return;
         }
         let anchor = self.visual_anchor.unwrap_or(self.selected_item);
         let start = anchor.min(self.selected_item);
         let end = anchor.max(self.selected_item);
-        let content = self.model.items[start..=end]
+        let content = self.active_transcript_model().items[start..=end]
             .iter()
             .map(|item| item.content.as_str())
             .collect::<Vec<_>>()
@@ -14189,14 +14102,19 @@ impl HarnessApp {
     }
 
     fn scroll_page(&mut self, direction: f32, cx: &mut Context<Self>) {
-        let height = self.list_state.viewport_bounds().size.height;
-        self.list_state.scroll_by(height * direction * 0.88);
-        if !self.model.items.is_empty() {
+        let height = self
+            .active_transcript_list_state()
+            .viewport_bounds()
+            .size
+            .height;
+        self.active_transcript_list_state()
+            .scroll_by(height * direction * 0.88);
+        if !self.active_transcript_model().items.is_empty() {
             self.selected_item = self
-                .list_state
+                .active_transcript_list_state()
                 .logical_scroll_top()
                 .item_ix
-                .min(self.model.items.len() - 1);
+                .min(self.active_transcript_model().items.len() - 1);
         }
         cx.notify();
     }
@@ -14418,7 +14336,7 @@ impl HarnessApp {
         self.search_matches = if query.is_empty() {
             Vec::new()
         } else {
-            self.model
+            self.active_transcript_model()
                 .items
                 .iter()
                 .enumerate()
@@ -14481,8 +14399,9 @@ impl HarnessApp {
             self.active_search_item = Some(index);
             self.active_search_body_offset = None;
             self.search_navigation_generation = self.search_navigation_generation.wrapping_add(1);
-            self.list_state.pause_following_tail();
-            self.list_state.scroll_to_reveal_item(index);
+            self.active_transcript_list_state().pause_following_tail();
+            self.active_transcript_list_state()
+                .scroll_to_reveal_item(index);
             cx.notify();
         }
     }
@@ -14577,8 +14496,9 @@ impl HarnessApp {
         }
     }
 
-    fn set_chat_sending(&mut self, sending: bool) {
+    fn set_chat_sending(&mut self, sending: bool, cx: &mut Context<Self>) {
         self.chat_sending = sending;
+        self.rebuild_chat_transcript(cx);
         self.sync_chat_tail_indicator(sending);
     }
 
@@ -16969,7 +16889,9 @@ impl HarnessApp {
     ) -> AnyElement {
         let render_started_at = slow_list_diagnostics().then(std::time::Instant::now);
         let clone_started_at = slow_list_diagnostics().then(std::time::Instant::now);
-        let mut item = self.model.items[index].clone();
+        let Some(mut item) = self.active_transcript_model().items.get(index).cloned() else {
+            return div().into_any_element();
+        };
         if let Some(presentation) = subagent_activity_presentation(&item, &self.child_threads) {
             item.title = presentation.title;
             item.content = presentation.content;
@@ -16997,7 +16919,7 @@ impl HarnessApp {
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
         let routine_activity = transcript_item_is_routine_activity(&item);
         let (routine_activity_above, routine_activity_below) =
-            routine_activity_run_neighbors(&self.model.items, index);
+            routine_activity_run_neighbors(&self.active_transcript_model().items, index);
         let request_method = item
             .pending_request
             .as_ref()
@@ -17047,15 +16969,16 @@ impl HarnessApp {
             .then(|| {
                 self.active_search_body_offset
                     .and_then(|active_offset| {
-                        rich_navigation_item_projection(&self.model, index).and_then(|projection| {
-                            search_match_byte_ranges(
-                                projection.body_text(),
-                                &self.search_query,
-                                RICH_SEARCH_HIGHLIGHT_LIMIT,
-                            )
-                            .iter()
-                            .position(|range| range.start == active_offset)
-                        })
+                        rich_navigation_item_projection(self.active_transcript_model(), index)
+                            .and_then(|projection| {
+                                search_match_byte_ranges(
+                                    projection.body_text(),
+                                    &self.search_query,
+                                    RICH_SEARCH_HIGHLIGHT_LIMIT,
+                                )
+                                .iter()
+                                .position(|range| range.start == active_offset)
+                            })
                     })
                     // The legacy non-Editor path only knows the matching card.
                     // Preserve its previous first-occurrence emphasis there.
@@ -17115,24 +17038,31 @@ impl HarnessApp {
         );
         let visible_status = item.display_status().map(ToOwned::to_owned);
         let header_activity_summary: Option<SharedString> = match item.kind {
-            model::TranscriptKind::Web => Some({
-                let presentation = web_search_presentation(&item.raw);
-                let query_count = presentation.queries.len();
-                let source_count = presentation.results.len();
-                match (query_count, source_count) {
-                    (0, sources) => format!(
-                        "{sources} {}",
-                        if sources == 1 { "source" } else { "sources" }
+            model::TranscriptKind::Web => item
+                .raw
+                .get("detail")
+                .and_then(Value::as_str)
+                .filter(|detail| !detail.trim().is_empty())
+                .map(SharedString::from)
+                .or_else(|| {
+                    let presentation = web_search_presentation(&item.raw);
+                    let query_count = presentation.queries.len();
+                    let source_count = presentation.results.len();
+                    Some(
+                        match (query_count, source_count) {
+                            (0, sources) => format!(
+                                "{sources} {}",
+                                if sources == 1 { "source" } else { "sources" }
+                            ),
+                            (queries, sources) => format!(
+                                "{queries} {} · {sources} {}",
+                                if queries == 1 { "query" } else { "queries" },
+                                if sources == 1 { "source" } else { "sources" },
+                            ),
+                        }
+                        .into(),
                     )
-                    .into(),
-                    (queries, sources) => format!(
-                        "{queries} {} · {sources} {}",
-                        if queries == 1 { "query" } else { "queries" },
-                        if sources == 1 { "source" } else { "sources" },
-                    )
-                    .into(),
-                }
-            }),
+                }),
             model::TranscriptKind::Plan => plan_progress(&item.raw)
                 .map(|(completed, total)| format!("{completed}/{total}").into()),
             _ => None,
@@ -17189,7 +17119,11 @@ impl HarnessApp {
                 .into_any_element()
         });
         let ordered_user_content = (item.kind == model::TranscriptKind::User)
-            .then(|| self.model.user_content_blocks(&item.key).to_vec())
+            .then(|| {
+                self.active_transcript_model()
+                    .user_content_blocks(&item.key)
+                    .to_vec()
+            })
             .filter(|blocks| !blocks.is_empty());
         let ordered_user_previews = self
             .user_image_previews
@@ -17212,7 +17146,9 @@ impl HarnessApp {
                 cx,
             )
         });
-        let inline_turn_status = self.transient_turn_status.clone();
+        let inline_turn_status = (self.workspace_mode == WorkspaceMode::Codex)
+            .then(|| self.transient_turn_status.clone())
+            .flatten();
         let rich_pointer_owner = cx.weak_entity();
 
         let body = if request_method.is_some() || !item.expanded {
@@ -17242,9 +17178,10 @@ impl HarnessApp {
             let mut element = MarkdownElement::new(markdown, style);
             if rich_vim_experiment() {
                 let source = item.content.clone();
-                let logical = rich_navigation_item_projection(&self.model, index)
-                    .map(|projection| projection.body_text().to_owned())
-                    .unwrap_or_else(|| source.clone());
+                let logical =
+                    rich_navigation_item_projection(self.active_transcript_model(), index)
+                        .map(|projection| projection.body_text().to_owned())
+                        .unwrap_or_else(|| source.clone());
                 let owner = cx.weak_entity();
                 let markdown_key = item.key.clone();
                 element = element.on_source_pointer(move |event, window, cx| {
@@ -17710,8 +17647,8 @@ impl HarnessApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.selected_item = index;
                 this.visual_anchor = None;
-                if index + 1 < this.model.items.len() {
-                    this.list_state.pause_following_tail();
+                if index + 1 < this.active_transcript_model().items.len() {
+                    this.active_transcript_list_state().pause_following_tail();
                 }
                 this.focus_transcript(window, cx);
             }))
@@ -17737,16 +17674,24 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if index < self.model.items.len() {
+        let transcript_len = self.active_transcript_model().items.len();
+        if index < transcript_len {
             return self.render_item(index, window, cx);
         }
-        if index != self.model.items.len() || !self.turn_active() {
+        let response_active = if self.workspace_mode == WorkspaceMode::Chat {
+            self.chat_sending
+        } else {
+            self.turn_active()
+        };
+        if index != transcript_len || !response_active {
             return div().into_any_element();
         }
 
         let narrow = window.viewport_size().width < px(720.);
-        let transient_status = self.transient_turn_status.clone();
-        let inline_activity = transcript_has_inline_activity(&self.model);
+        let transient_status = (self.workspace_mode == WorkspaceMode::Codex)
+            .then(|| self.transient_turn_status.clone())
+            .flatten();
+        let inline_activity = transcript_has_inline_activity(self.active_transcript_model());
         if inline_activity {
             // Keep the sentinel as a real list item so tail following remains
             // stable, but let the streaming Markdown own the visible activity
@@ -17870,9 +17815,14 @@ impl Render for HarnessApp {
                 None
             };
         let turn_active = self.turn_active();
+        let response_active = if self.workspace_mode == WorkspaceMode::Chat {
+            self.chat_sending
+        } else {
+            turn_active
+        };
         self.sync_turn_tail_indicator(turn_active);
         self.sync_chat_tail_indicator(self.chat_sending);
-        let list_state = self.list_state.clone();
+        let list_state = self.active_transcript_list_state().clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
         let expanded_user_image = self.expanded_user_image.clone();
@@ -17963,45 +17913,13 @@ impl Render for HarnessApp {
                 )
                 .into_any_element()
         };
-        let following_tail = if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_list_state.is_following_tail()
-        } else if self.buffer_view {
+        let following_tail = if self.buffer_view {
             self.transcript_editor.read(cx).is_following_tail()
         } else {
             list_state.is_following_tail()
         };
         let transcript_narrow = window.viewport_size().width < px(720.);
-        let transcript_body = if self.workspace_mode == WorkspaceMode::Chat {
-            let chat_list_state = self.chat_list_state.clone();
-            div()
-                .relative()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .bg(visuals.transcript)
-                .child(
-                    list(
-                        chat_list_state.clone(),
-                        cx.processor(|this, index, window, cx| {
-                            this.render_chat_transcript_list_item(index, window, cx)
-                        }),
-                    )
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden(),
-                )
-                .custom_scrollbars(
-                    Scrollbars::new(ScrollAxes::Vertical)
-                        .id("chat-transcript-scrollbar")
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
-                        .tracked_scroll_handle(&chat_list_state),
-                    window,
-                    cx,
-                )
-                .into_any_element()
-        } else if self.buffer_view {
+        let transcript_body = if self.buffer_view {
             div()
                 .flex_1()
                 .min_h_0()
@@ -18084,79 +18002,83 @@ impl Render for HarnessApp {
                 })
                 .into_any_element()
         };
-        let transcript_tail_control =
-            (self.workspace_mode == WorkspaceMode::Codex && !following_tail).then(|| {
-                let activity_color = if self.transient_turn_status.is_some() {
-                    Color::Warning
+        let transcript_tail_control = (!following_tail).then(|| {
+            let activity_color = if self.workspace_mode == WorkspaceMode::Codex
+                && self.transient_turn_status.is_some()
+            {
+                Color::Warning
+            } else {
+                Color::Accent
+            };
+            let provider = if self.workspace_mode == WorkspaceMode::Chat {
+                "ChatGPT"
+            } else {
+                "Codex"
+            };
+            div()
+                .id("offscreen-tail-status")
+                .absolute()
+                .left(if transcript_narrow { px(10.) } else { px(18.) })
+                .bottom(px(10.))
+                .size(px(28.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(visuals.raised_surface.opacity(0.9))
+                .shadow_sm()
+                .cursor_pointer()
+                .hover(|style| style.bg(colors.element_hover))
+                .aria_label(if response_active {
+                    format!("{provider} is working; return to the live transcript")
                 } else {
-                    Color::Accent
-                };
-                div()
-                    .id("offscreen-tail-status")
-                    .absolute()
-                    .left(if transcript_narrow { px(10.) } else { px(18.) })
-                    .bottom(px(10.))
-                    .size(px(28.))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(visuals.raised_surface.opacity(0.9))
-                    .shadow_sm()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(colors.element_hover))
-                    .aria_label(if turn_active {
-                        "Codex is working; return to the live transcript"
-                    } else {
-                        "Return to the live transcript"
-                    })
-                    .tooltip(Tooltip::text(if turn_active {
-                        "Codex is working · return to the live transcript"
-                    } else {
-                        "Return to the live transcript · G or Ctrl-End"
-                    }))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.go_to_transcript_tail(window, cx)),
+                    "Return to the live transcript".to_owned()
+                })
+                .tooltip(Tooltip::text(if response_active {
+                    format!("{provider} is working · return to the live transcript")
+                } else {
+                    "Return to the live transcript · G or Ctrl-End".to_owned()
+                }))
+                .on_click(cx.listener(|this, _, window, cx| this.go_to_transcript_tail(window, cx)))
+                .when(response_active, |this| {
+                    this.child(
+                        div()
+                            .id("offscreen-tail-activity")
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    // Braille glyphs are optically left-heavy in several
+                                    // common fallback fonts and sit above the visual center
+                                    // of their line box. Nudge the animated cell, not the
+                                    // floating control's hit target.
+                                    .relative()
+                                    .left(px(1.))
+                                    .top(px(1.5))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        SpinnerLabel::dots()
+                                            .size(LabelSize::Large)
+                                            .line_height_style(LineHeightStyle::UiLabel)
+                                            .color(activity_color),
+                                    ),
+                            ),
                     )
-                    .when(turn_active, |this| {
-                        this.child(
-                            div()
-                                .id("offscreen-tail-activity")
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    div()
-                                        // Braille glyphs are optically left-heavy in several
-                                        // common fallback fonts and sit above the visual center
-                                        // of their line box. Nudge the animated cell, not the
-                                        // floating control's hit target.
-                                        .relative()
-                                        .left(px(1.))
-                                        .top(px(1.5))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            SpinnerLabel::dots()
-                                                .size(LabelSize::Large)
-                                                .line_height_style(LineHeightStyle::UiLabel)
-                                                .color(activity_color),
-                                        ),
-                                ),
-                        )
-                    })
-                    .when(!turn_active, |this| {
-                        this.child(
-                            Icon::new(IconName::ArrowDown)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                    })
-                    .into_any_element()
-            });
+                })
+                .when(!response_active, |this| {
+                    this.child(
+                        Icon::new(IconName::ArrowDown)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .into_any_element()
+        });
         let command_line_input = self
             .search_visible
             .then(|| self.search_editor.read(cx).text(cx));
@@ -18415,11 +18337,10 @@ impl Render for HarnessApp {
                     } else {
                         this.task_list_state.scroll_to(gpui::ListOffset::default());
                     }
-                } else if this.workspace_mode == WorkspaceMode::Chat {
-                    this.chat_list_state.scroll_to(gpui::ListOffset::default());
                 } else {
                     this.selected_item = 0;
-                    this.list_state.scroll_to(gpui::ListOffset::default());
+                    this.active_transcript_list_state()
+                        .scroll_to(gpui::ListOffset::default());
                 }
                 cx.notify();
             }))
@@ -18432,8 +18353,6 @@ impl Render for HarnessApp {
                         this.selected_task = this.sidebar_threads.len().saturating_sub(1);
                         this.task_list_state.scroll_to_end();
                     }
-                } else if this.workspace_mode == WorkspaceMode::Chat {
-                    this.chat_list_state.scroll_to_end();
                 } else {
                     this.go_to_transcript_tail(window, cx);
                 }
@@ -21516,7 +21435,7 @@ mod tests {
         assert!(selection_subscription.contains("this.rich_navigation_selection = None"));
 
         let rich_viewport = source
-            .split_once("let transcript_body = if self.workspace_mode == WorkspaceMode::Chat")
+            .split_once("let transcript_body = if self.buffer_view")
             .and_then(|(_, after)| after.split_once("let transcript_tail_control ="))
             .map(|(viewport, _)| viewport)
             .expect("Rich transcript viewport must remain auditable");
@@ -22376,31 +22295,77 @@ mod tests {
     }
 
     #[test]
-    fn streamed_chat_text_owns_the_same_visible_tail_activity() {
-        let mut messages = vec![ChatMessage {
-            id: "assistant-stream".into(),
-            role: chatgpt_desktop::MessageRole::Assistant,
-            content: "The response has started".into(),
-            activity: None,
-        }];
+    fn chat_messages_project_into_the_shared_transcript_model() {
+        let messages = vec![
+            ChatMessage {
+                id: "user".into(),
+                role: chatgpt_desktop::MessageRole::User,
+                content: "question".into(),
+                activity: None,
+            },
+            ChatMessage {
+                id: "assistant-stream".into(),
+                role: chatgpt_desktop::MessageRole::Assistant,
+                content: "The response has started".into(),
+                activity: None,
+            },
+        ];
 
-        assert!(chat_has_inline_activity(&messages, true));
-        assert!(!chat_has_inline_activity(&messages, false));
-        messages[0].content.clear();
+        let items = chat_transcript_items(&messages, true, &HashSet::new());
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "chatgpt:user");
+        assert_eq!(items[0].kind, model::TranscriptKind::User);
+        assert_eq!(items[1].kind, model::TranscriptKind::Agent);
+        assert_eq!(items[1].status.as_deref(), Some("streaming"));
+
+        let mut transcript = TranscriptModel::default();
+        transcript.replace_presentational_items(items);
+        assert!(transcript_has_inline_activity(&transcript));
         assert!(
-            !chat_has_inline_activity(&messages, true),
-            "the shared list-tail spinner remains visible before the first text delta"
+            rich_navigation_document(&transcript)
+                .text
+                .contains("The response has started")
         );
-        messages.push(ChatMessage {
-            id: "tool".into(),
+    }
+
+    #[test]
+    fn chat_web_search_preserves_structured_results_and_expansion() {
+        let message = ChatMessage {
+            id: "search".into(),
             role: chatgpt_desktop::MessageRole::Activity,
             content: String::new(),
-            activity: None,
-        });
-        assert!(
-            !chat_has_inline_activity(&messages, true),
-            "activity after assistant text must retain a real tail-row spinner"
-        );
+            activity: Some(chatgpt_desktop::Activity {
+                kind: ChatActivityKind::WebSearch,
+                title: "Searched the web".into(),
+                detail: Some("1 source · 1 site".into()),
+                results: vec![chatgpt_desktop::SearchResult {
+                    title: "Harness design".into(),
+                    url: "https://example.com/design".into(),
+                    domain: "example.com".into(),
+                }],
+            }),
+        };
+        let expanded = HashSet::from(["search".to_owned()]);
+        let items = chat_transcript_items(&[message], false, &expanded);
+
+        assert_eq!(items[0].kind, model::TranscriptKind::Web);
+        assert!(items[0].expanded);
+        assert_eq!(items[0].raw["results"][0]["domain"], "example.com");
+        assert!(items[0].content.contains("Harness design"));
+    }
+
+    #[test]
+    fn chat_and_codex_use_one_rich_transcript_surface() {
+        let source = include_str!("main.rs");
+        let render = source
+            .split_once("impl Render for HarnessApp")
+            .map(|(_, render)| render)
+            .expect("Harness renderer must remain auditable");
+
+        assert!(render.contains("let list_state = self.active_transcript_list_state().clone()"));
+        assert!(render.contains("this.render_transcript_list_item(index, window, cx)"));
+        assert!(!source.contains(&["fn render_chat_", "message("].concat()));
+        assert!(!source.contains(&["fn render_chat_transcript_", "list_item("].concat()));
     }
 
     #[test]
@@ -22412,7 +22377,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("offscreen transcript tail control must remain auditable");
 
-        assert!(control.contains("WorkspaceMode::Codex && !following_tail"));
+        assert!(control.contains("(!following_tail)"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
         assert!(control.contains("offscreen-tail-activity"));
@@ -22420,8 +22385,8 @@ mod tests {
         assert!(control.contains(".absolute()"));
         assert!(control.contains(".shadow_sm()"));
         assert!(control.contains(".rounded_md()"));
-        assert!(control.contains(".when(turn_active"));
-        assert!(control.contains(".when(!turn_active"));
+        assert!(control.contains(".when(response_active"));
+        assert!(control.contains(".when(!response_active"));
         assert!(control.contains(".top(px(1.5))"));
         assert!(!control.contains(".border_1()"));
         assert!(
