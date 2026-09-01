@@ -6639,16 +6639,13 @@ impl HarnessApp {
                                         .items_center()
                                         .gap_1()
                                         .text_sm()
-                                        .line_height(relative(1.))
                                         .text_color(colors.text)
                                         .children(preview_segments.into_iter().map(
                                             |segment| match segment {
                                                 QueuedPromptPreviewSegment::Text(text) => div()
-                                                    .flex_none()
-                                                    .h_full()
-                                                    .flex()
-                                                    .items_center()
-                                                    .whitespace_nowrap()
+                                                    .min_w_0()
+                                                    .flex_initial()
+                                                    .truncate()
                                                     .child(text)
                                                     .into_any_element(),
                                                 QueuedPromptPreviewSegment::Image {
@@ -20078,6 +20075,9 @@ mod tests {
         assert!(renderer.contains("IconName::DragHandle"));
         assert!(renderer.contains(".on_drag("));
         assert!(renderer.contains(".drag_over::<DraggedQueuedTurn>"));
+        assert!(renderer.contains(".flex_initial()"));
+        assert!(renderer.contains(".truncate()"));
+        assert!(!renderer.contains(".line_height(relative(1.))"));
         assert!(renderer.contains(".on_drop("));
         assert!(renderer.contains(".id(\"outbound-tray\")"));
         assert!(renderer.contains(".when_some(pending_outbound"));
