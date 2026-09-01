@@ -107,10 +107,6 @@ impl RequestSurface {
         cx.notify();
     }
 
-    pub(crate) fn rows(&self) -> u32 {
-        request_surface_rows(&self.method, &self.raw)
-    }
-
     pub(crate) fn is_approval(&self) -> bool {
         self.kind == SurfaceKind::Approval
     }
@@ -1027,105 +1023,6 @@ fn humanize_permission_key(key: &str) -> String {
     }
 }
 
-fn estimated_text_rows(text: &str) -> u32 {
-    let characters = text.chars().count() as u32;
-    characters.div_ceil(72).clamp(1, 6)
-}
-
-pub(crate) fn request_surface_rows(method: &str, raw: &Value) -> u32 {
-    match surface_kind(method, raw) {
-        SurfaceKind::Approval => {
-            let mut rows = 4;
-            for key in ["command", "cwd", "reason", "grantRoot"] {
-                if let Some(text) = raw.get(key).and_then(Value::as_str) {
-                    rows += estimated_text_rows(text);
-                }
-            }
-            rows += semantic_permission_rows(raw).len() as u32;
-            rows += (request_choices(method, raw).len() > 3) as u32;
-            rows.clamp(6, 24)
-        }
-        SurfaceKind::UserInput => {
-            let content_rows = raw
-                .get("questions")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|question| {
-                    let options = question
-                        .get("options")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default();
-                    let text_rows = if options.is_empty()
-                        || question
-                            .get("isOther")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                    {
-                        3
-                    } else {
-                        0
-                    };
-                    let prompt_rows = question
-                        .get("question")
-                        .and_then(Value::as_str)
-                        .map(estimated_text_rows)
-                        .unwrap_or(1);
-                    let option_rows = options
-                        .iter()
-                        .map(|option| {
-                            1 + option
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .filter(|description| !description.is_empty())
-                                .map(estimated_text_rows)
-                                .unwrap_or(0)
-                        })
-                        .sum::<u32>();
-                    2 + prompt_rows + option_rows + text_rows
-                })
-                .sum::<u32>();
-            (5 + content_rows).clamp(8, 96)
-        }
-        SurfaceKind::McpForm => {
-            let content_rows = raw
-                .pointer("/requestedSchema/properties")
-                .and_then(Value::as_object)
-                .map(|properties| {
-                    properties
-                        .values()
-                        .map(|schema| {
-                            4 + schema
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .filter(|description| !description.is_empty())
-                                .map(estimated_text_rows)
-                                .unwrap_or(0)
-                                + u32::from(!mcp_form_field_hint(schema).is_empty())
-                        })
-                        .sum::<u32>()
-                })
-                .unwrap_or(0);
-            let message_rows = raw
-                .get("message")
-                .and_then(Value::as_str)
-                .map(estimated_text_rows)
-                .unwrap_or(1);
-            (6 + message_rows + content_rows).clamp(8, 96)
-        }
-        SurfaceKind::McpUrl => {
-            let text_rows = ["message", "url"]
-                .into_iter()
-                .filter_map(|key| raw.get(key).and_then(Value::as_str))
-                .map(estimated_text_rows)
-                .sum::<u32>();
-            (8 + text_rows).clamp(10, 24)
-        }
-        SurfaceKind::McpUnsupported => 8,
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SurfaceSyncDecision {
     Ignore,
@@ -1189,75 +1086,5 @@ mod tests {
             rows.iter()
                 .all(|row| !row.contains('{') && !row.contains('}'))
         );
-    }
-
-    #[test]
-    fn deterministic_rows_scale_with_content_without_unbounded_blank_space() {
-        let compact_approval = request_surface_rows(
-            "item/fileChange/requestApproval",
-            &json!({"grantRoot": "/workspace"}),
-        );
-        let long_approval = request_surface_rows(
-            "item/commandExecution/requestApproval",
-            &json!({"command": "x".repeat(600), "reason": "needed"}),
-        );
-        assert!((6..=10).contains(&compact_approval));
-        assert!(long_approval > compact_approval);
-        assert!(long_approval <= 32);
-
-        let one_question = request_surface_rows(
-            "item/tool/requestUserInput",
-            &json!({
-                "questions": [{
-                    "id": "pick",
-                    "question": "Choose one",
-                    "options": [{"label": "A"}, {"label": "B"}],
-                }],
-            }),
-        );
-        let dense_questions = request_surface_rows(
-            "item/tool/requestUserInput",
-            &json!({
-                "questions": (0..8).map(|index| json!({
-                    "id": format!("q{index}"),
-                    "question": "Explain the requested value in enough detail",
-                    "isOther": true,
-                    "options": [
-                        {"label": "A", "description": "First option"},
-                        {"label": "B", "description": "Second option"},
-                    ],
-                })).collect::<Vec<_>>(),
-            }),
-        );
-        assert!(dense_questions > one_question);
-        assert!(dense_questions <= 96);
-
-        let one_field = request_surface_rows(
-            "mcpServer/elicitation/request",
-            &json!({
-                "mode": "form",
-                "message": "Configure",
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": {"region": {"type": "string", "description": "Region"}},
-                },
-            }),
-        );
-        let many_fields = request_surface_rows(
-            "mcpServer/elicitation/request",
-            &json!({
-                "mode": "form",
-                "message": "Configure",
-                "requestedSchema": {
-                    "type": "object",
-                    "properties": (0..10).map(|index| (
-                        format!("field{index}"),
-                        json!({"type": "string", "description": "A described field"}),
-                    )).collect::<serde_json::Map<String, Value>>(),
-                },
-            }),
-        );
-        assert!(many_fields > one_field);
-        assert!(many_fields <= 96);
     }
 }

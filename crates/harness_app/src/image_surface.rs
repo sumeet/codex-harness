@@ -45,10 +45,6 @@ pub(crate) fn surface_sync_decision(
     }
 }
 
-pub(crate) fn supplement_key(item_key: &str) -> String {
-    format!("image-preview:{item_key}")
-}
-
 pub(crate) fn keys_to_sync(
     existing_surface_keys: impl IntoIterator<Item = String>,
     projected_image_keys: impl IntoIterator<Item = String>,
@@ -76,10 +72,6 @@ impl ImageSurface {
             self.availability = availability;
             cx.notify();
         }
-    }
-
-    pub(crate) fn rows(&self) -> u32 {
-        rows_for_availability(&self.availability)
     }
 
     pub(crate) fn preview_size(&self) -> (f32, f32) {
@@ -116,18 +108,6 @@ fn classify_path(path: Option<PathBuf>, is_file: impl FnOnce(&Path) -> bool) -> 
     }
 }
 
-fn rows_for_availability(availability: &ImageAvailability) -> u32 {
-    match availability {
-        ImageAvailability::Present { .. } => (preview_size_for_availability(availability).1
-            / IMAGE_ROW_HEIGHT)
-            .ceil()
-            .max(1.) as u32,
-        ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => {
-            IMAGE_PLACEHOLDER_ROWS
-        }
-    }
-}
-
 fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
     let Some((width, height)) = dimensions.filter(|(width, height)| *width > 0 && *height > 0)
     else {
@@ -142,9 +122,10 @@ fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
 fn preview_size_for_availability(availability: &ImageAvailability) -> (f32, f32) {
     match availability {
         ImageAvailability::Present { dimensions, .. } => preview_size(*dimensions),
-        ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => {
-            (IMAGE_PREVIEW_FALLBACK_WIDTH, IMAGE_ROW_HEIGHT * 3.)
-        }
+        ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => (
+            IMAGE_PREVIEW_FALLBACK_WIDTH,
+            IMAGE_ROW_HEIGHT * IMAGE_PLACEHOLDER_ROWS as f32,
+        ),
     }
 }
 
@@ -263,24 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn preview_height_is_bounded_and_placeholders_stay_compact() {
-        let preview = ImageAvailability::Present {
-            path: PathBuf::from("preview.png"),
-            dimensions: Some((1522, 667)),
-        };
-        let missing = ImageAvailability::MissingFile(PathBuf::from("missing.png"));
-
-        assert_eq!(rows_for_availability(&preview), 9);
-        assert_eq!(rows_for_availability(&missing), IMAGE_PLACEHOLDER_ROWS);
-        assert_eq!(
-            rows_for_availability(&ImageAvailability::MissingPath),
-            IMAGE_PLACEHOLDER_ROWS
-        );
-        assert!(IMAGE_PLACEHOLDER_ROWS < rows_for_availability(&preview));
-        assert!(rows_for_availability(&preview) <= 16);
-    }
-
-    #[test]
     fn viewed_image_preview_hugs_the_bitmap_aspect_ratio() {
         let wide = preview_size(Some((1522, 667)));
         assert_eq!(wide.0, IMAGE_PREVIEW_MAX_WIDTH);
@@ -310,8 +273,6 @@ mod tests {
             surface_sync_decision(false, false),
             SurfaceSyncDecision::Ignore
         );
-        assert_eq!(supplement_key("image:7"), "image-preview:image:7");
-
         let dirty = keys_to_sync(
             ["old-only", "stable"].map(str::to_string),
             ["stable", "new-only"].map(str::to_string),

@@ -17,15 +17,15 @@ use editor::{
     RowOverlayOptions, SelectionEffects,
     display_map::{
         BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseId, CustomBlockId,
-        FoldPlaceholder, HighlightKey, NavigationOverlayKey, RenderBlock,
+        FoldPlaceholder, HighlightKey, NavigationOverlayKey,
     },
     scroll::Autoscroll,
 };
 use gpui::{
-    AnyView, App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter,
-    FocusHandle, Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla,
-    Image, IntoElement, KeyBinding, KeyContext, ObjectFit, Pixels, Render, SharedString, TextStyle,
-    TextStyleRefinement, WeakEntity, Window, actions, div, img, point, prelude::*, px,
+    App, AppContext as _, ClipboardItem, Context, Edges, Entity, EventEmitter, FocusHandle,
+    Focusable, Font, FontFamilyVariant, FontWeight, Global, HighlightStyle, Hsla, Image,
+    IntoElement, KeyBinding, KeyContext, ObjectFit, Pixels, Render, SharedString, TextStyle,
+    TextStyleRefinement, WeakEntity, Window, actions, div, img, prelude::*, px,
 };
 use harness_protocol::{
     TranscriptDocument, TranscriptDocumentSegment, TranscriptItemProjection, TranscriptKind,
@@ -716,8 +716,6 @@ pub struct TranscriptEditor {
     collapsed_items: BTreeSet<String>,
     padding_inlays: Vec<InlayId>,
     next_padding_inlay_id: usize,
-    supplements: BTreeMap<String, MountedTranscriptSupplement>,
-    replacements: BTreeMap<String, MountedTranscriptReplacement>,
     viewport_decorations: Option<ViewportDecorationWindow>,
     viewport_refresh_pending: bool,
     refresh_when_rendered: bool,
@@ -850,72 +848,6 @@ impl Addon for ComposerKeyContextAddon {
 /// embedded view owns its domain state and emits its own events to the host.
 /// Its height is expressed in editor rows so layout remains deterministic.
 #[derive(Clone)]
-pub struct TranscriptSupplement {
-    pub key: String,
-    pub item_key: String,
-    pub rows: u32,
-    pub view: AnyView,
-}
-
-impl TranscriptSupplement {
-    pub fn new(
-        key: impl Into<String>,
-        item_key: impl Into<String>,
-        rows: u32,
-        view: AnyView,
-    ) -> Self {
-        Self {
-            key: key.into(),
-            item_key: item_key.into(),
-            rows: rows.max(1),
-            view,
-        }
-    }
-}
-
-struct MountedTranscriptSupplement {
-    item_key: String,
-    rows: u32,
-    view: AnyView,
-    block_id: Option<CustomBlockId>,
-}
-
-/// A host-owned rich view that replaces one semantic transcript item.
-///
-/// The item's bytes remain in the Buffer, so search, yank, and raw inspection
-/// still operate on the canonical transcript. The display map treats the rich
-/// surface as one atomic Vim object while it is mounted.
-#[derive(Clone)]
-pub struct TranscriptReplacement {
-    pub key: String,
-    pub item_key: String,
-    pub rows: u32,
-    pub view: AnyView,
-}
-
-impl TranscriptReplacement {
-    pub fn new(
-        key: impl Into<String>,
-        item_key: impl Into<String>,
-        rows: u32,
-        view: AnyView,
-    ) -> Self {
-        Self {
-            key: key.into(),
-            item_key: item_key.into(),
-            rows: rows.max(1),
-            view,
-        }
-    }
-}
-
-struct MountedTranscriptReplacement {
-    item_key: String,
-    rows: u32,
-    view: AnyView,
-    block_id: Option<CustomBlockId>,
-}
-
 pub struct TranscriptSelectionChanged;
 
 impl EventEmitter<TranscriptSelectionChanged> for TranscriptEditor {}
@@ -2411,116 +2343,10 @@ fn transcript_item_is_foldable(segment: &TranscriptDocumentSegment) -> bool {
         )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SupplementUpdate {
-    Unchanged,
-    Resize,
-    ReplaceRenderer,
-    ResizeAndReplaceRenderer,
-    Reanchor,
-}
-
-fn supplement_update(
-    item_changed: bool,
-    rows_changed: bool,
-    view_changed: bool,
-) -> SupplementUpdate {
-    if item_changed {
-        SupplementUpdate::Reanchor
-    } else {
-        match (rows_changed, view_changed) {
-            (false, false) => SupplementUpdate::Unchanged,
-            (true, false) => SupplementUpdate::Resize,
-            (false, true) => SupplementUpdate::ReplaceRenderer,
-            (true, true) => SupplementUpdate::ResizeAndReplaceRenderer,
-        }
-    }
-}
-
-fn supplement_anchor_offset(
-    item_key: &str,
-    segments: &[TranscriptDocumentSegment],
-) -> Option<usize> {
-    segments
-        .iter()
-        .find(|segment| segment.item_key == item_key)
-        .map(|segment| segment.body_range.end)
-}
-
-fn scroll_top_after_supplement_removal(
-    block_row: f64,
-    block_rows: u32,
-    scroll_top: f64,
-) -> Option<f64> {
-    (block_row + f64::from(block_rows) <= scroll_top)
-        .then(|| (scroll_top - f64::from(block_rows)).max(0.))
-}
-
-fn supplemental_renderer(view: AnyView) -> RenderBlock {
-    Arc::new(move |cx: &mut BlockContext| {
-        div()
-            .id(cx.block_id)
-            .size_full()
-            .min_w_0()
-            .block_mouse_except_scroll()
-            .child(view.clone())
-            .into_any_element()
-    })
-}
-
-fn supplemental_block(placement: Anchor, rows: u32, view: AnyView) -> BlockProperties<Anchor> {
-    BlockProperties {
-        placement: BlockPlacement::Below(placement),
-        height: Some(rows.max(1)),
-        style: BlockStyle::Spacer,
-        render: supplemental_renderer(view),
-        priority: 0,
-    }
-}
-
-fn replacement_anchor_range(
-    item_key: &str,
-    segments: &[TranscriptDocumentSegment],
-) -> Option<Range<usize>> {
-    segments
-        .iter()
-        .find(|segment| segment.item_key == item_key)
-        .map(|segment| segment.whole_range.clone())
-}
-
-/// Translate a half-open document item range into the inclusive byte offsets
-/// expected by an Editor replacement block. Using the exclusive end directly
-/// makes adjacent items share a display row, so BlockMap coalesces their two
-/// replacement renderers and only one remains visible.
-fn replacement_anchor_offsets(range: Range<usize>) -> Option<(usize, usize)> {
+/// Translate a half-open row range into inclusive byte offsets for an Editor
+/// replacement block.
+fn inclusive_anchor_offsets(range: Range<usize>) -> Option<(usize, usize)> {
     (!range.is_empty()).then(|| (range.start, range.end - 1))
-}
-
-fn replacement_renderer(view: AnyView) -> RenderBlock {
-    Arc::new(move |cx: &mut BlockContext| {
-        div()
-            .id(cx.block_id)
-            .size_full()
-            .min_w_0()
-            .overflow_hidden()
-            .block_mouse_except_scroll()
-            .child(view.clone())
-            .into_any_element()
-    })
-}
-
-fn replacement_block(
-    placement: RangeInclusive<Anchor>,
-    rows: u32,
-    view: AnyView,
-) -> BlockProperties<Anchor> {
-    BlockProperties {
-        placement: BlockPlacement::Replace(placement),
-        height: Some(rows.max(1)),
-        style: BlockStyle::Spacer,
-        render: replacement_renderer(view),
-        priority: 1,
-    }
 }
 
 impl TranscriptEditor {
@@ -2591,8 +2417,6 @@ impl TranscriptEditor {
             collapsed_items: BTreeSet::new(),
             padding_inlays: Vec::new(),
             next_padding_inlay_id: 0,
-            supplements: BTreeMap::new(),
-            replacements: BTreeMap::new(),
             viewport_decorations: None,
             viewport_refresh_pending: false,
             refresh_when_rendered: false,
@@ -2623,15 +2447,9 @@ impl TranscriptEditor {
         self.input_only = input_only;
 
         // Rich mode keeps this Editor mounted only for input, selection, Vim,
-        // and text geometry. Native header/diff/supplement replacement blocks
-        // exist solely to paint the Text view. Leaving them mounted in the
-        // hidden mirror makes an ordinary j/k motion expand to the replaced
-        // source range, which Vim correctly interprets as a visual selection.
-        // Drop those paint-only blocks while input-only and remount them from
-        // the retained logical specs when the Text view is restored.
+        // and text geometry. Drop paint-only blocks from the hidden mirror so
+        // native motions operate solely on the canonical projected text.
         if input_only {
-            self.unmount_all_supplements(cx);
-            self.unmount_all_replacements(cx);
             let header_blocks = std::mem::take(&mut self.header_blocks);
             let diff_file_blocks = std::mem::take(&mut self.diff_file_blocks);
             if !header_blocks.is_empty() || !diff_file_blocks.is_empty() {
@@ -2978,398 +2796,6 @@ impl TranscriptEditor {
         }
     }
 
-    /// Insert or update a rich view below the selectable body of an item.
-    ///
-    /// Resizing and replacing the host view retain the existing Editor block
-    /// id. Moving the same logical supplement to a different item deliberately
-    /// re-anchors it. If its item is not projected yet, the spec remains queued
-    /// and mounts as soon as that segment is appended or the document rebuilds.
-    pub fn upsert_supplement(&mut self, supplement: TranscriptSupplement, cx: &mut Context<Self>) {
-        let key = supplement.key;
-        let was_present = self.supplements.contains_key(&key);
-        let rows = supplement.rows.max(1);
-        let mut mounted =
-            self.supplements
-                .remove(&key)
-                .unwrap_or_else(|| MountedTranscriptSupplement {
-                    item_key: supplement.item_key.clone(),
-                    rows,
-                    view: supplement.view.clone(),
-                    block_id: None,
-                });
-        let update = supplement_update(
-            mounted.item_key != supplement.item_key,
-            mounted.rows != rows,
-            mounted.view != supplement.view,
-        );
-        let display_changed = !was_present || update != SupplementUpdate::Unchanged;
-        mounted.item_key = supplement.item_key;
-        mounted.rows = rows;
-        mounted.view = supplement.view;
-
-        if let Some(block_id) = mounted.block_id {
-            match update {
-                SupplementUpdate::Unchanged => {}
-                SupplementUpdate::Resize => {
-                    self.editor.update(cx, |editor, cx| {
-                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx)
-                    });
-                }
-                SupplementUpdate::ReplaceRenderer => {
-                    let renderer = supplemental_renderer(mounted.view.clone());
-                    self.editor.update(cx, |editor, cx| {
-                        editor.replace_blocks(
-                            [(block_id, renderer)].into_iter().collect(),
-                            None,
-                            cx,
-                        )
-                    });
-                }
-                SupplementUpdate::ResizeAndReplaceRenderer => {
-                    let renderer = supplemental_renderer(mounted.view.clone());
-                    self.editor.update(cx, |editor, cx| {
-                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx);
-                        editor.replace_blocks(
-                            [(block_id, renderer)].into_iter().collect(),
-                            None,
-                            cx,
-                        );
-                    });
-                }
-                SupplementUpdate::Reanchor => {
-                    self.editor.update(cx, |editor, cx| {
-                        editor.remove_blocks([block_id].into_iter().collect(), None, cx)
-                    });
-                    mounted.block_id = None;
-                }
-            }
-        }
-        self.supplements.insert(key, mounted);
-        self.mount_unmounted_supplements(cx);
-        if should_request_tail_autoscroll(self.follow_tail, display_changed) {
-            self.request_tail_autoscroll(cx);
-        }
-    }
-
-    /// Remove one logical supplement without disturbing the buffer selection.
-    /// If the block is wholly above a paused viewport, preserve the same
-    /// visible buffer content by compensating for the removed display rows.
-    pub fn remove_supplement(
-        &mut self,
-        key: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(supplement) = self.supplements.remove(key) else {
-            return false;
-        };
-        let Some(block_id) = supplement.block_id else {
-            return true;
-        };
-        let was_following_tail = self.follow_tail;
-        self.editor.update(cx, |editor, cx| {
-            let scroll_position = editor.scroll_position(cx);
-            let adjusted_scroll_top = (!was_following_tail)
-                .then(|| editor.row_for_block(block_id, cx))
-                .flatten()
-                .and_then(|row| {
-                    scroll_top_after_supplement_removal(
-                        row.0 as f64,
-                        supplement.rows,
-                        scroll_position.y,
-                    )
-                });
-            editor.remove_blocks([block_id].into_iter().collect(), None, cx);
-            if let Some(scroll_top) = adjusted_scroll_top {
-                editor.set_scroll_position(point(scroll_position.x, scroll_top), window, cx);
-            }
-        });
-        if was_following_tail {
-            self.request_tail_autoscroll(cx);
-        }
-        true
-    }
-
-    /// Drop all host-owned supplemental views and their mounted blocks.
-    pub fn clear_supplements(&mut self, cx: &mut Context<Self>) {
-        let block_ids = self
-            .supplements
-            .values()
-            .filter_map(|supplement| supplement.block_id)
-            .collect::<Vec<_>>();
-        self.supplements.clear();
-        if !block_ids.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
-            });
-            if self.follow_tail {
-                self.request_tail_autoscroll(cx);
-            }
-        }
-    }
-
-    /// Replace one projected item with a host-rendered semantic component.
-    ///
-    /// This is the hybrid transcript seam: the Buffer remains authoritative,
-    /// while the Editor display map presents a richer atomic view for item
-    /// types whose layout cannot be expressed by row and text highlights.
-    pub fn upsert_replacement(
-        &mut self,
-        replacement: TranscriptReplacement,
-        cx: &mut Context<Self>,
-    ) {
-        let key = replacement.key;
-        let was_present = self.replacements.contains_key(&key);
-        let rows = replacement.rows.max(1);
-        let mut mounted =
-            self.replacements
-                .remove(&key)
-                .unwrap_or_else(|| MountedTranscriptReplacement {
-                    item_key: replacement.item_key.clone(),
-                    rows,
-                    view: replacement.view.clone(),
-                    block_id: None,
-                });
-        let update = supplement_update(
-            mounted.item_key != replacement.item_key,
-            mounted.rows != rows,
-            mounted.view != replacement.view,
-        );
-        let display_changed = !was_present || update != SupplementUpdate::Unchanged;
-        mounted.item_key = replacement.item_key;
-        mounted.rows = rows;
-        mounted.view = replacement.view;
-
-        if let Some(block_id) = mounted.block_id {
-            match update {
-                SupplementUpdate::Unchanged => {}
-                SupplementUpdate::Resize => self.editor.update(cx, |editor, cx| {
-                    editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx)
-                }),
-                SupplementUpdate::ReplaceRenderer => {
-                    let renderer = replacement_renderer(mounted.view.clone());
-                    self.editor.update(cx, |editor, cx| {
-                        editor.replace_blocks(
-                            [(block_id, renderer)].into_iter().collect(),
-                            None,
-                            cx,
-                        )
-                    });
-                }
-                SupplementUpdate::ResizeAndReplaceRenderer => {
-                    let renderer = replacement_renderer(mounted.view.clone());
-                    self.editor.update(cx, |editor, cx| {
-                        editor.resize_blocks([(block_id, rows)].into_iter().collect(), None, cx);
-                        editor.replace_blocks(
-                            [(block_id, renderer)].into_iter().collect(),
-                            None,
-                            cx,
-                        );
-                    });
-                }
-                SupplementUpdate::Reanchor => {
-                    self.editor.update(cx, |editor, cx| {
-                        editor.remove_blocks([block_id].into_iter().collect(), None, cx)
-                    });
-                    mounted.block_id = None;
-                }
-            }
-        }
-        self.replacements.insert(key, mounted);
-        self.mount_unmounted_replacements(cx);
-        if should_request_tail_autoscroll(self.follow_tail, display_changed) {
-            self.request_tail_autoscroll(cx);
-        }
-    }
-
-    pub fn remove_replacement(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
-        let Some(replacement) = self.replacements.remove(key) else {
-            return false;
-        };
-        if let Some(block_id) = replacement.block_id {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks([block_id].into_iter().collect(), None, cx)
-            });
-        }
-        self.viewport_decorations = None;
-        true
-    }
-
-    /// Reveal an already-mounted supplement without changing the transcript
-    /// cursor or selection. Tall blocks align to the top; shorter blocks move
-    /// only enough to fit inside the current Editor viewport.
-    pub fn reveal_supplement(
-        &mut self,
-        key: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(supplement) = self.supplements.get(key) else {
-            return false;
-        };
-        let Some(block_id) = supplement.block_id else {
-            return false;
-        };
-        let rows = f64::from(supplement.rows);
-        self.editor.update(cx, |editor, cx| {
-            let Some(block_row) = editor.row_for_block(block_id, cx).map(|row| row.0 as f64) else {
-                return false;
-            };
-            let visible_rows = editor.visible_line_count().unwrap_or(1.).max(1.);
-            let scroll_position = editor.scroll_position(cx);
-            let scroll_bottom = scroll_position.y + visible_rows;
-            let target = if rows >= visible_rows || block_row < scroll_position.y {
-                Some(block_row)
-            } else if block_row + rows > scroll_bottom {
-                Some(block_row + rows - visible_rows)
-            } else {
-                None
-            };
-            if let Some(scroll_top) = target {
-                editor.set_scroll_position(
-                    point(scroll_position.x, scroll_top.max(0.)),
-                    window,
-                    cx,
-                );
-            }
-            true
-        })
-    }
-
-    fn unmount_all_supplements(&mut self, cx: &mut Context<Self>) {
-        let block_ids = self
-            .supplements
-            .values_mut()
-            .filter_map(|supplement| supplement.block_id.take())
-            .collect::<Vec<_>>();
-        if !block_ids.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
-            });
-        }
-    }
-
-    fn unmount_all_replacements(&mut self, cx: &mut Context<Self>) {
-        let block_ids = self
-            .replacements
-            .values_mut()
-            .filter_map(|replacement| replacement.block_id.take())
-            .collect::<Vec<_>>();
-        if !block_ids.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(block_ids.into_iter().collect(), None, cx)
-            });
-        }
-    }
-
-    fn mount_unmounted_supplements(&mut self, cx: &mut Context<Self>) {
-        if self.input_only {
-            return;
-        }
-        let pending = self
-            .supplements
-            .iter()
-            .filter(|(_, supplement)| supplement.block_id.is_none())
-            .filter_map(|(key, supplement)| {
-                Some((
-                    key.clone(),
-                    supplement_anchor_offset(&supplement.item_key, &self.segments)?,
-                    supplement.rows,
-                    supplement.view.clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return;
-        }
-        let block_ids = self.editor.update(cx, |editor, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let blocks = pending.iter().map(|(_, offset, rows, view)| {
-                supplemental_block(
-                    clipped_anchor_after(&snapshot, *offset),
-                    *rows,
-                    view.clone(),
-                )
-            });
-            editor.insert_blocks(blocks, None, cx)
-        });
-        debug_assert_eq!(pending.len(), block_ids.len());
-        for ((key, _, _, _), block_id) in pending.into_iter().zip(block_ids) {
-            if let Some(supplement) = self.supplements.get_mut(&key) {
-                supplement.block_id = Some(block_id);
-            }
-        }
-    }
-
-    fn mount_unmounted_replacements(&mut self, cx: &mut Context<Self>) {
-        if self.input_only {
-            return;
-        }
-        let pending = self
-            .replacements
-            .iter()
-            .filter(|(_, replacement)| replacement.block_id.is_none())
-            .filter_map(|(key, replacement)| {
-                Some((
-                    key.clone(),
-                    replacement_anchor_range(&replacement.item_key, &self.segments)?,
-                    replacement.rows,
-                    replacement.view.clone(),
-                ))
-            })
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
-            return;
-        }
-
-        let replaced_item_keys = pending
-            .iter()
-            .filter_map(|(key, _, _, _)| {
-                self.replacements
-                    .get(key)
-                    .map(|replacement| replacement.item_key.clone())
-            })
-            .collect::<BTreeSet<_>>();
-        let header_blocks_to_remove = self
-            .segments
-            .iter()
-            .enumerate()
-            .filter(|(_, segment)| replaced_item_keys.contains(&segment.item_key))
-            .filter_map(|(position, _)| self.header_blocks.remove(&position))
-            .collect::<Vec<_>>();
-        let diff_file_blocks_to_remove = std::mem::take(&mut self.diff_file_blocks);
-
-        let block_ids = self.editor.update(cx, |editor, cx| {
-            if !header_blocks_to_remove.is_empty() {
-                editor.remove_blocks(header_blocks_to_remove.into_iter().collect(), None, cx);
-            }
-            if !diff_file_blocks_to_remove.is_empty() {
-                editor.remove_blocks(diff_file_blocks_to_remove.into_iter().collect(), None, cx);
-            }
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let blocks = pending.iter().map(|(_, range, rows, view)| {
-                let (start_offset, end_offset) =
-                    replacement_anchor_offsets(range.clone()).unwrap_or((range.start, range.start));
-                let start = snapshot.clip_offset(MultiBufferOffset(start_offset), Bias::Left);
-                let end = snapshot.clip_offset(MultiBufferOffset(end_offset), Bias::Left);
-                let start = snapshot.anchor_before(start);
-                let end = snapshot.anchor_before(end);
-                replacement_block(start..=end, *rows, view.clone())
-            });
-            editor.insert_blocks(blocks, None, cx)
-        });
-        debug_assert_eq!(pending.len(), block_ids.len());
-        for ((key, _, _, _), block_id) in pending.into_iter().zip(block_ids) {
-            if let Some(replacement) = self.replacements.get_mut(&key) {
-                replacement.block_id = Some(block_id);
-            }
-        }
-        self.viewport_decorations = None;
-    }
-
-    /// Explicitly opt into streaming tail-follow for an initial/full thread
-    /// open. This scrolls by an Editor display-map anchor and leaves Vim's
-    /// cursor, visual selection, and registers untouched.
     pub fn reveal_tail(&mut self, cx: &mut Context<Self>) {
         self.follow_tail = true;
         self.pending_tail_intent = None;
@@ -3506,8 +2932,8 @@ impl TranscriptEditor {
     }
 
     /// Align a Buffer row to the top of the viewport without changing the Vim
-    /// cursor or selection. The request is anchor-based so soft wrapping and
-    /// supplemental display-map blocks are accounted for during layout.
+    /// cursor or selection. The request is anchor-based so soft wrapping is
+    /// accounted for during layout.
     pub fn reveal_row_at_top(&mut self, row: u32, cx: &mut Context<Self>) {
         self.pause_tail_follow();
         let text = self.buffer.read(cx).text();
@@ -3693,18 +3119,6 @@ impl TranscriptEditor {
         } else {
             (Vec::new(), Vec::new())
         };
-        let replacement_item_keys = self
-            .replacements
-            .values()
-            .filter(|replacement| replacement.block_id.is_some())
-            .map(|replacement| replacement.item_key.as_str())
-            .collect::<BTreeSet<_>>();
-        let header_positions_to_insert = header_positions_to_insert
-            .into_iter()
-            .filter(|position| {
-                !replacement_item_keys.contains(self.segments[*position].item_key.as_str())
-            })
-            .collect::<Vec<_>>();
         let header_segments = header_positions_to_insert
             .iter()
             .map(|position| self.segments[*position].clone())
@@ -3728,7 +3142,6 @@ impl TranscriptEditor {
                 self.segments[visible_segments]
                     .iter()
                     .filter(|segment| segment.kind == TranscriptKind::Diff)
-                    .filter(|segment| !replacement_item_keys.contains(segment.item_key.as_str()))
                     .flat_map(|segment| {
                         let (text, complete) = bounded_buffer_text(
                             buffer,
@@ -3939,7 +3352,7 @@ impl TranscriptEditor {
                 };
                 let native_diff_headers = diff_file_headers.into_iter().filter_map(|header| {
                     let (start_offset, end_offset) =
-                        replacement_anchor_offsets(header.line_range.clone())?;
+                        inclusive_anchor_offsets(header.line_range.clone())?;
                     let start = snapshot.clip_offset(MultiBufferOffset(start_offset), Bias::Left);
                     let end = snapshot.clip_offset(MultiBufferOffset(end_offset), Bias::Left);
                     Some(native_diff_file_header_block(
@@ -4430,10 +3843,7 @@ impl TranscriptEditor {
         if !document_has_valid_segment_ranges(document) {
             // Keep the raw Buffer readable/selectable, but discard every
             // decoration whose semantic ownership can no longer be proven.
-            // A later valid full sync remounts the retained logical supplement
-            // specs against fresh ranges.
-            self.unmount_all_supplements(cx);
-            self.unmount_all_replacements(cx);
+            // A later valid full sync rebuilds the semantic ranges.
             self.segments.clear();
             self.segment_header_texts.clear();
             self.segment_body_texts.clear();
@@ -4492,11 +3902,7 @@ impl TranscriptEditor {
             return false;
         }
 
-        // A full document rebuild can replace the anchors under a supplement.
-        // Keep the logical specs and host views, but remount their Editor blocks
-        // against the new per-item body ranges below.
-        self.unmount_all_supplements(cx);
-        self.unmount_all_replacements(cx);
+        // A full document rebuild can replace the semantic anchors.
         self.segments.clone_from(&document.segments);
         self.collapsed_items.retain(|item_key| {
             document
@@ -4557,8 +3963,6 @@ impl TranscriptEditor {
         });
         self.refresh_semantic_font_geometry(cx);
         if !self.input_only {
-            self.mount_unmounted_supplements(cx);
-            self.mount_unmounted_replacements(cx);
             self.refresh_viewport_decorations(cx);
         }
         true
@@ -4755,8 +4159,6 @@ impl TranscriptEditor {
             self.refresh_semantic_font_geometry(cx);
         }
         if !self.input_only {
-            self.mount_unmounted_supplements(cx);
-            self.mount_unmounted_replacements(cx);
             self.refresh_viewport_decorations(cx);
         }
         if should_request_tail_autoscroll(self.follow_tail, search_text_changed) {
@@ -5767,33 +5169,6 @@ mod tests {
         assert!(!request.contains("on_next_frame"));
     }
 
-    #[test]
-    fn body_and_supplement_updates_request_tail_at_most_once() {
-        let source = include_str!("lib.rs");
-        let edit = source
-            .split_once("pub fn edit(")
-            .and_then(|(_, after)| after.split_once("pub fn upsert_supplement"))
-            .map(|(edit, _)| edit)
-            .expect("edit must precede supplement upsert");
-        let upsert = source
-            .split_once("pub fn upsert_supplement")
-            .and_then(|(_, after)| after.split_once("pub fn remove_supplement"))
-            .map(|(upsert, _)| upsert)
-            .expect("upsert must precede supplement removal");
-        let projections = source
-            .split_once("pub fn apply_item_projections")
-            .and_then(|(_, after)| after.split_once("fn decorate_appended_segments"))
-            .map(|(projections, _)| projections)
-            .expect("projection updates must precede appended decoration");
-
-        for update_path in [edit, upsert, projections] {
-            assert_eq!(
-                update_path.matches("request_tail_autoscroll(cx)").count(),
-                1
-            );
-        }
-    }
-
     fn segment(
         item_index: usize,
         whole_range: Range<usize>,
@@ -6053,84 +5428,14 @@ mod tests {
     }
 
     #[test]
-    fn supplemental_updates_keep_block_identity_until_the_item_changes() {
-        assert_eq!(
-            supplement_update(false, false, false),
-            SupplementUpdate::Unchanged
-        );
-        assert_eq!(
-            supplement_update(false, true, false),
-            SupplementUpdate::Resize
-        );
-        assert_eq!(
-            supplement_update(false, false, true),
-            SupplementUpdate::ReplaceRenderer
-        );
-        assert_eq!(
-            supplement_update(false, true, true),
-            SupplementUpdate::ResizeAndReplaceRenderer
-        );
-        assert_eq!(
-            supplement_update(true, false, false),
-            SupplementUpdate::Reanchor
-        );
-        assert_eq!(
-            supplement_update(true, true, true),
-            SupplementUpdate::Reanchor
-        );
-    }
+    fn inclusive_anchor_offsets_do_not_share_the_exclusive_boundary() {
+        assert_eq!(inclusive_anchor_offsets(0..23), Some((0, 22)));
+        assert_eq!(inclusive_anchor_offsets(23..43), Some((23, 42)));
+        assert_eq!(inclusive_anchor_offsets(9..9), None);
 
-    #[test]
-    fn supplemental_anchor_follows_its_item_across_document_rebuilds() {
-        let before = [
-            segment(0, 0..30, 0..8, 10..28),
-            segment(1, 30..60, 30..38, 40..58),
-        ];
-        let after = [
-            segment(0, 0..75, 0..8, 10..73),
-            segment(1, 75..105, 75..83, 85..103),
-        ];
-
-        assert_eq!(supplement_anchor_offset("item-1", &before), Some(58));
-        assert_eq!(supplement_anchor_offset("item-1", &after), Some(103));
-        assert_eq!(supplement_anchor_offset("missing", &after), None);
-    }
-
-    #[test]
-    fn replacement_covers_the_whole_semantic_item_across_rebuilds() {
-        let before = [
-            segment(0, 0..30, 0..8, 10..28),
-            segment(1, 30..60, 30..38, 40..58),
-        ];
-        let after = [
-            segment(0, 0..75, 0..8, 10..73),
-            segment(1, 75..105, 75..83, 85..103),
-        ];
-
-        assert_eq!(replacement_anchor_range("item-1", &before), Some(30..60));
-        assert_eq!(replacement_anchor_range("item-1", &after), Some(75..105));
-        assert_eq!(replacement_anchor_range("missing", &after), None);
-    }
-
-    #[test]
-    fn adjacent_replacement_offsets_do_not_share_the_exclusive_boundary() {
-        assert_eq!(replacement_anchor_offsets(0..23), Some((0, 22)));
-        assert_eq!(replacement_anchor_offsets(23..43), Some((23, 42)));
-        assert_eq!(replacement_anchor_offsets(9..9), None);
-
-        let (_, first_end) = replacement_anchor_offsets(0..23).unwrap();
-        let (second_start, _) = replacement_anchor_offsets(23..43).unwrap();
+        let (_, first_end) = inclusive_anchor_offsets(0..23).unwrap();
+        let (second_start, _) = inclusive_anchor_offsets(23..43).unwrap();
         assert!(first_end < second_start);
-    }
-
-    #[test]
-    fn removing_supplement_above_paused_viewport_preserves_visible_rows() {
-        assert_eq!(scroll_top_after_supplement_removal(10., 4, 30.), Some(26.));
-        assert_eq!(scroll_top_after_supplement_removal(10., 4, 14.), Some(10.));
-        assert_eq!(scroll_top_after_supplement_removal(0., 4, 4.), Some(0.));
-
-        assert_eq!(scroll_top_after_supplement_removal(10., 4, 12.), None);
-        assert_eq!(scroll_top_after_supplement_removal(20., 4, 12.), None);
     }
 
     #[test]
