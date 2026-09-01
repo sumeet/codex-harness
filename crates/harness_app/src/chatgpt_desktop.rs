@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
-use async_process::{Command as AsyncCommand, Stdio};
+use async_process::{ChildStdin, Command as AsyncCommand, Stdio};
 use futures::{
     AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _,
     channel::mpsc::UnboundedSender, io::BufReader,
@@ -374,20 +374,13 @@ pub(crate) async fn send_message(
     let mut child = command
         .spawn()
         .context("starting the ChatGPT conversation worker")?;
-    let mut stdin = child.stdin.take().context("opening ChatGPT worker input")?;
+    let stdin = child.stdin.take().context("opening ChatGPT worker input")?;
     let stdout = child
         .stdout
         .take()
         .context("opening ChatGPT worker output")?;
     let input = serde_json::to_vec(&bridge_input).context("encoding ChatGPT send request")?;
-    stdin
-        .write_all(&input)
-        .await
-        .context("sending request to ChatGPT worker")?;
-    stdin
-        .close()
-        .await
-        .context("closing ChatGPT worker input")?;
+    write_worker_input(stdin, &input).await?;
 
     let mut accepted = false;
     let mut worker_error = None;
@@ -426,6 +419,23 @@ pub(crate) async fn send_message(
     if !accepted {
         bail!("ChatGPT conversation request ended before it was accepted");
     }
+    Ok(())
+}
+
+async fn write_worker_input(mut stdin: ChildStdin, input: &[u8]) -> anyhow::Result<()> {
+    stdin
+        .write_all(input)
+        .await
+        .context("sending request to ChatGPT worker")?;
+    stdin
+        .close()
+        .await
+        .context("closing ChatGPT worker input")?;
+    // `ChildStdin::close` flushes the async writer but can retain the backing
+    // descriptor until the handle is dropped. The Node worker reads stdin to
+    // EOF synchronously, so ownership must end here rather than at the end of
+    // the whole send operation.
+    drop(stdin);
     Ok(())
 }
 
@@ -1001,6 +1011,30 @@ fn escape_markdown_link_label(label: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn worker_input_ownership_delivers_eof_before_waiting_for_output() {
+        futures::executor::block_on(async {
+            let mut child = AsyncCommand::new("timeout")
+                .arg("2s")
+                .arg("sh")
+                .arg("-c")
+                .arg("cat >/dev/null")
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("spawn EOF probe");
+            let stdin = child.stdin.take().expect("open EOF probe input");
+
+            write_worker_input(stdin, br#"{"request":{}}"#)
+                .await
+                .expect("write EOF probe input");
+
+            assert!(
+                child.status().await.expect("wait for EOF probe").success(),
+                "the worker did not observe EOF before the probe timeout"
+            );
+        });
+    }
 
     #[test]
     fn projects_only_the_selected_conversation_branch() {

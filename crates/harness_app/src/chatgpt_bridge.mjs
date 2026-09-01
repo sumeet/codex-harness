@@ -18,6 +18,20 @@ const { chromium } = require(playwrightRoot);
 const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
 const sentinelSource = fs.readFileSync(path.join(sourceDirectory, "chatgpt_sentinel.js"), "utf8");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const BROWSER_STAGE_TIMEOUT_MS = 15_000;
+const NETWORK_STAGE_TIMEOUT_MS = 45_000;
+
+async function fetchWithHeadersTimeout(url, options) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NETWORK_STAGE_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    // Once response headers arrive, preserve the potentially long-lived SSE
+    // body. This timeout guards connection establishment, not generation time.
+    clearTimeout(timeout);
+  }
+}
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -70,7 +84,7 @@ async function runSentinel(page, sentinelInput) {
     (route) => route.fulfill({ contentType: "text/html", body: html }),
     { times: 1 },
   );
-  await page.goto("http://harness.local/sentinel");
+  await page.goto("http://harness.local/sentinel", { timeout: BROWSER_STAGE_TIMEOUT_MS });
   await page.waitForFunction(
     () => document.body.textContent.trim().startsWith("{"),
     null,
@@ -132,6 +146,7 @@ async function main() {
     executablePath: process.env.HARNESS_CHROMIUM ?? "/usr/bin/chromium",
     headless: true,
     args: ["--disable-dev-shm-usage"],
+    timeout: BROWSER_STAGE_TIMEOUT_MS,
   });
   try {
     const page = await browser.newPage();
@@ -139,7 +154,7 @@ async function main() {
       mode: "requirements-key",
     });
     const requirements = await checkedJson(
-      await fetch("https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare", {
+      await fetchWithHeadersTimeout("https://chatgpt.com/backend-api/sentinel/chat-requirements/prepare", {
         method: "POST",
         headers: { ...headers, "Content-Type": "application/json" },
         body: JSON.stringify({ p: requirementsKey }),
@@ -154,7 +169,7 @@ async function main() {
 
     let conduitToken = null;
     try {
-      const prepared = await fetch("https://chatgpt.com/backend-api/f/conversation/prepare", {
+      const prepared = await fetchWithHeadersTimeout("https://chatgpt.com/backend-api/f/conversation/prepare", {
         method: "POST",
         headers: {
           ...headers,
@@ -185,7 +200,7 @@ async function main() {
     if (integrity.turnstile) streamHeaders["OpenAI-Sentinel-Turnstile-Token"] = integrity.turnstile;
     if (conduitToken) streamHeaders["x-conduit-token"] = conduitToken;
 
-    const response = await fetch("https://chatgpt.com/backend-api/f/conversation", {
+    const response = await fetchWithHeadersTimeout("https://chatgpt.com/backend-api/f/conversation", {
       method: "POST",
       headers: streamHeaders,
       body: JSON.stringify(request),

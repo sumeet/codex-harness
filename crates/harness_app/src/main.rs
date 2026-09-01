@@ -465,6 +465,14 @@ fn transcript_has_inline_activity(transcript: &TranscriptModel) -> bool {
     })
 }
 
+fn chat_has_inline_activity(messages: &[ChatMessage], sending: bool) -> bool {
+    sending
+        && messages.last().is_some_and(|message| {
+            message.role == chatgpt_desktop::MessageRole::Assistant
+                && !message.content.trim().is_empty()
+        })
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct StructuredOutputPreview {
     content: String,
@@ -3274,6 +3282,47 @@ fn queue_operation_indicator(id: impl Into<gpui::ElementId>, label: &'static str
         .justify_center()
         .tooltip(Tooltip::text(label))
         .child(SpinnerLabel::new().size(LabelSize::Small))
+        .into_any_element()
+}
+
+fn transcript_response_activity_indicator(
+    id: impl Into<gpui::ElementId>,
+    horizontal_padding: gpui::Pixels,
+    transient_status: Option<SharedString>,
+    activity_color: Color,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w_full()
+        .px(horizontal_padding)
+        .pt_1()
+        .pb_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(20.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            SpinnerLabel::dots()
+                                .size(LabelSize::Large)
+                                .color(activity_color),
+                        ),
+                )
+                .when_some(transient_status, |this, status| {
+                    this.child(
+                        Label::new(status)
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    )
+                }),
+        )
         .into_any_element()
 }
 
@@ -9726,6 +9775,13 @@ impl HarnessApp {
         {
             return;
         }
+        if self.chat_sending && self.selected_chat_id.as_deref() != Some(conversation_id) {
+            self.chat_error = Some(
+                "Wait for the current ChatGPT response before switching conversations.".into(),
+            );
+            cx.notify();
+            return;
+        }
         let conversation_id = conversation_id.to_owned();
         self.selected_chat_id = Some(conversation_id.clone());
         self.chat_loading = true;
@@ -9854,7 +9910,9 @@ impl HarnessApp {
         self.composer
             .update(cx, |editor, cx| editor.set_text("", window, cx));
         self.chat_error = None;
-        self.chat_sending = true;
+        self.set_chat_sending(true);
+        self.chat_list_state.set_follow_mode(FollowMode::Tail);
+        self.chat_list_state.scroll_to_end();
         self.chat_send_generation = self.chat_send_generation.wrapping_add(1);
         let generation = self.chat_send_generation;
         let client = cx.http_client();
@@ -9895,7 +9953,7 @@ impl HarnessApp {
                 if this.chat_send_generation != generation {
                     return;
                 }
-                this.chat_sending = false;
+                this.set_chat_sending(false);
                 match send_result {
                     Ok(()) => {
                         if let Some(conversation) = final_conversation {
@@ -10144,6 +10202,27 @@ impl HarnessApp {
         let style =
             refine_harness_markdown_style(MarkdownStyle::themed(MarkdownFont::Agent, window, cx));
         let body = MarkdownElement::new(markdown, style);
+        let streaming = self.chat_sending
+            && index + 1 == self.chat_messages.len()
+            && message.role == chatgpt_desktop::MessageRole::Assistant
+            && !message.content.trim().is_empty();
+        let body = if streaming {
+            let activity_color = colors.text_accent;
+            body.with_animation(
+                format!("streaming-chat-activity:{}", message.id),
+                gpui::Animation::new(Duration::from_millis(1000)).repeat_synced(),
+                move |element, delta| {
+                    element.trailing_spinner_activity(
+                        SharedString::default(),
+                        activity_color,
+                        delta,
+                    )
+                },
+            )
+            .into_any_element()
+        } else {
+            body.into_any_element()
+        };
         div()
             .id(("chat-message", index))
             .w_full()
@@ -10174,6 +10253,41 @@ impl HarnessApp {
                     .child(body),
             )
             .into_any_element()
+    }
+
+    fn render_chat_transcript_list_item(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if index < self.chat_messages.len() {
+            return self.render_chat_message(index, window, cx);
+        }
+        if index != self.chat_messages.len() || !self.chat_sending {
+            return div().into_any_element();
+        }
+        if chat_has_inline_activity(&self.chat_messages, self.chat_sending) {
+            // Preserve one real tail row for list following while the final
+            // assistant Markdown owns the visible spinner at its insertion
+            // point, exactly as the Codex transcript does.
+            return div()
+                .id("chat-response-tail")
+                .w_full()
+                .h(px(1.))
+                .into_any_element();
+        }
+        let horizontal_padding = if window.viewport_size().width < px(720.) {
+            px(10.)
+        } else {
+            px(18.)
+        };
+        transcript_response_activity_indicator(
+            "chat-response-tail",
+            horizontal_padding,
+            None,
+            Color::Accent,
+        )
     }
 
     fn refresh_threads(&mut self, cx: &mut Context<Self>) {
@@ -14154,6 +14268,21 @@ impl HarnessApp {
         }
     }
 
+    fn sync_chat_tail_indicator(&self, sending: bool) {
+        if let Some((range, replacement_count)) = turn_tail_list_splice(
+            self.chat_list_state.item_count(),
+            self.chat_messages.len(),
+            sending,
+        ) {
+            self.chat_list_state.splice(range, replacement_count);
+        }
+    }
+
+    fn set_chat_sending(&mut self, sending: bool) {
+        self.chat_sending = sending;
+        self.sync_chat_tail_indicator(sending);
+    }
+
     fn render_task(&mut self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let colors = cx.theme().colors().clone();
         let Some(row) = self.sidebar_threads.get(index).cloned() else {
@@ -17334,39 +17463,12 @@ impl HarnessApp {
         } else {
             Color::Accent
         };
-        div()
-            .id("transcript-turn-tail")
-            .w_full()
-            .px(if narrow { px(10.) } else { px(18.) })
-            .pt_1()
-            .pb_2()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .w(px(20.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                SpinnerLabel::dots()
-                                    .size(LabelSize::Large)
-                                    .color(activity_color),
-                            ),
-                    )
-                    .when_some(transient_status, |this, status| {
-                        this.child(
-                            Label::new(status)
-                                .size(LabelSize::Small)
-                                .color(Color::Warning),
-                        )
-                    }),
-            )
-            .into_any_element()
+        transcript_response_activity_indicator(
+            "transcript-turn-tail",
+            if narrow { px(10.) } else { px(18.) },
+            transient_status,
+            activity_color,
+        )
     }
 }
 
@@ -17418,9 +17520,7 @@ impl Render for HarnessApp {
         };
         let composer_status: Option<(SharedString, Color)> =
             if self.workspace_mode == WorkspaceMode::Chat {
-                if self.chat_sending {
-                    Some(("ChatGPT is responding…".into(), Color::Muted))
-                } else if self.chat_loading {
+                if self.chat_loading {
                     Some(("Loading ChatGPT conversation…".into(), Color::Muted))
                 } else {
                     None
@@ -17464,6 +17564,7 @@ impl Render for HarnessApp {
             };
         let turn_active = self.turn_active();
         self.sync_turn_tail_indicator(turn_active);
+        self.sync_chat_tail_indicator(self.chat_sending);
         let list_state = self.list_state.clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
@@ -17577,7 +17678,7 @@ impl Render for HarnessApp {
                     list(
                         chat_list_state.clone(),
                         cx.processor(|this, index, window, cx| {
-                            this.render_chat_message(index, window, cx)
+                            this.render_chat_transcript_list_item(index, window, cx)
                         }),
                     )
                     .flex_1()
@@ -21855,6 +21956,34 @@ mod tests {
         model.items[0].content = "complete".into();
         model.items[0].status = Some("completed".into());
         assert!(!transcript_has_inline_activity(&model));
+    }
+
+    #[test]
+    fn streamed_chat_text_owns_the_same_visible_tail_activity() {
+        let mut messages = vec![ChatMessage {
+            id: "assistant-stream".into(),
+            role: chatgpt_desktop::MessageRole::Assistant,
+            content: "The response has started".into(),
+            activity: None,
+        }];
+
+        assert!(chat_has_inline_activity(&messages, true));
+        assert!(!chat_has_inline_activity(&messages, false));
+        messages[0].content.clear();
+        assert!(
+            !chat_has_inline_activity(&messages, true),
+            "the shared list-tail spinner remains visible before the first text delta"
+        );
+        messages.push(ChatMessage {
+            id: "tool".into(),
+            role: chatgpt_desktop::MessageRole::Activity,
+            content: String::new(),
+            activity: None,
+        });
+        assert!(
+            !chat_has_inline_activity(&messages, true),
+            "activity after assistant text must retain a real tail-row spinner"
+        );
     }
 
     #[test]
