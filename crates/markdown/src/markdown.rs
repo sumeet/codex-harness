@@ -33,13 +33,13 @@ use std::time::Duration;
 
 use collections::{HashMap, HashSet};
 use gpui::{
-    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
-    StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
-    TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img,
-    point, quad,
+    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DefiniteLength,
+    DispatchPhase, Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId,
+    Hitbox, Hsla, Image, ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton,
+    MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle,
+    Stateful, StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task,
+    TextAlign, TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions,
+    canvas, img, point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -158,6 +158,12 @@ pub struct MarkdownStyle {
     pub heading: StyleRefinement,
     pub heading_level_styles: Option<HeadingLevelStyles>,
     pub heading_border_color: Option<Hsla>,
+    pub paragraph_spacing: Pixels,
+    pub paragraph_line_height: DefiniteLength,
+    /// Bottom margin of top-level lists only.
+    pub list_spacing: Pixels,
+    /// Horizontal (`x`) and vertical (`y`) padding of table cells.
+    pub table_cell_padding: Point<Pixels>,
     pub height_is_multiple_of_line_height: bool,
     pub prevent_mouse_interaction: bool,
     pub table_columns_min_size: bool,
@@ -185,6 +191,10 @@ impl Default for MarkdownStyle {
             heading: Default::default(),
             heading_level_styles: None,
             heading_border_color: None,
+            paragraph_spacing: px(8.),
+            paragraph_line_height: rems(1.3).into(),
+            list_spacing: px(0.),
+            table_cell_padding: point(px(4.), px(2.)),
             height_is_multiple_of_line_height: false,
             prevent_mouse_interaction: false,
             table_columns_min_size: false,
@@ -1969,7 +1979,8 @@ impl MarkdownElement {
     ) {
         let align = text_align_override.unwrap_or(self.style.base_text_style.text_align);
         let mut paragraph = div().when(!self.style.height_is_multiple_of_line_height, |el| {
-            el.mb_2().line_height(rems(1.3))
+            el.mb(self.style.paragraph_spacing)
+                .line_height(self.style.paragraph_line_height)
         });
 
         paragraph = match align {
@@ -2066,7 +2077,11 @@ impl MarkdownElement {
                 .into_any_element()
         });
 
-        let block_div = div().pl_4().mb_2().border_l_4().border_color(border_color);
+        let block_div = div()
+            .pl_4()
+            .mb(self.style.paragraph_spacing)
+            .border_l_4()
+            .border_color(border_color);
         let block_div = match header {
             Some(header) => block_div.child(header),
             None => block_div,
@@ -2199,7 +2214,9 @@ impl MarkdownElement {
         builder.push_div(
             div()
                 .when(!self.style.height_is_multiple_of_line_height, |el| {
-                    el.mb_1().gap_1().line_height(rems(1.3))
+                    el.mb_1()
+                        .gap_1()
+                        .line_height(self.style.paragraph_line_height)
                 })
                 .h_flex()
                 .items_start()
@@ -3017,7 +3034,14 @@ impl Element for MarkdownElement {
                         }
                         MarkdownTag::List(bullet_index) => {
                             builder.push_list(*bullet_index);
-                            builder.push_div(div().pl_2p5(), range, markdown_end);
+                            let is_top_level = builder.list_stack.len() == 1;
+                            builder.push_div(
+                                div()
+                                    .pl_2p5()
+                                    .when(is_top_level, |this| this.mb(self.style.list_spacing)),
+                                range,
+                                markdown_end,
+                            );
                         }
                         MarkdownTag::Item => {
                             let marker_range =
@@ -3132,7 +3156,7 @@ impl Element for MarkdownElement {
                                 div()
                                     .pt_1()
                                     .mb_1()
-                                    .line_height(rems(1.3))
+                                    .line_height(self.style.paragraph_line_height)
                                     .text_size(rems(0.85))
                                     .h_flex()
                                     .items_start()
@@ -3218,8 +3242,8 @@ impl Element for MarkdownElement {
                                 .when(col_index > 0, |this| this.border_l_1())
                                 .when(row_index > 0, |this| this.border_t_1())
                                 .border_color(cx.theme().colors().border)
-                                .px_1()
-                                .py_0p5()
+                                .px(self.style.table_cell_padding.x)
+                                .py(self.style.table_cell_padding.y)
                                 .when(is_header, |this| {
                                     this.bg(cx.theme().colors().title_bar_background)
                                 })
@@ -3446,12 +3470,18 @@ impl Element for MarkdownElement {
                     builder.push_text(&parsed_markdown.source[range.clone()], range.clone());
                 }
                 MarkdownEvent::Rule => {
-                    let rule = div().w_full().h(px(17.)).flex().items_center().child(
-                        div()
-                            .w_full()
-                            .border_b_1()
-                            .border_color(self.style.rule_color),
-                    );
+                    let rule = div()
+                        .w_full()
+                        .h(self.style.paragraph_spacing * 2. + px(1.))
+                        .min_h(px(3.))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .border_b_1()
+                                .border_color(self.style.rule_color),
+                        );
                     let rule =
                         builder.wrap_source_replacement(range.clone(), rule.into_any_element());
                     builder.push_sourced_element(range.clone(), rule);

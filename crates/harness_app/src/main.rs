@@ -154,6 +154,11 @@ const RICH_NESTED_OUTPUT_MAX_HEIGHT: f32 = 196.;
 const RICH_MIN_CODE_ROW_HEIGHT: f32 = 20.;
 const RICH_MIN_CARD_IDENTITY_ROW_HEIGHT: f32 = 20.;
 const RICH_CARD_LEADING_WIDTH: f32 = 16.;
+// Zed's default agent typography arrives at the same ratio indirectly
+// (12px code size * 1.75 / 16px prose size). Delta encodes it directly in
+// `thread_base_style`. Keep Harness's independently configurable reading and
+// code sizes from accidentally changing prose rhythm.
+const TRANSCRIPT_READING_LINE_HEIGHT: f32 = 1.3125;
 const PERFORMANCE_J_STEPS: u16 = 240;
 const PERFORMANCE_SCROLL_STEPS: u16 = 360;
 const PERFORMANCE_SCROLL_INTERVAL: Duration = Duration::from_nanos(8_333_333);
@@ -175,6 +180,8 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
 
 fn refine_harness_markdown_style(mut style: MarkdownStyle) -> MarkdownStyle {
     style.code_block_overflow_x_scroll = true;
+    style.base_text_style.line_height = relative(TRANSCRIPT_READING_LINE_HEIGHT);
+    style.paragraph_line_height = relative(TRANSCRIPT_READING_LINE_HEIGHT);
     style.strong_font_weight = Some(relative_strong_font_weight(
         style.base_text_style.font_weight,
     ));
@@ -196,7 +203,7 @@ fn relative_strong_font_weight(base: FontWeight) -> FontWeight {
 
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
     let size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
-    px((size.as_f32() * 1.25).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
+    px((size.as_f32() * TRANSCRIPT_READING_LINE_HEIGHT).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
 }
 
 fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
