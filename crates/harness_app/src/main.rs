@@ -23,12 +23,12 @@ use file_icons::FileIcons;
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
-    FocusHandle, Focusable, FollowMode, Image, ImageFormat, ImageSource, IntoElement, KeyBinding,
-    KeyContext, Keystroke, ListAlignment, ListSizingBehavior, ListState, Modifiers, MouseButton,
-    MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta, ScrollHandle, ScrollWheelEvent,
-    SharedString, StyledImage, StyledText, Task, TouchPhase, UpdateGlobal, WeakEntity, Window,
-    WindowBounds, WindowOptions, actions, canvas, deferred, div, list, point, prelude::*, px,
-    relative, size,
+    FocusHandle, Focusable, FollowMode, Font, FontStyle, FontWeight, Image, ImageFormat,
+    ImageSource, IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior,
+    ListState, Modifiers, MouseButton, MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TouchPhase,
+    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div,
+    list, point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -23956,6 +23956,34 @@ fn open_harness_window(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn prewarm_harness_fonts(cx: &mut App) {
+    let settings = theme::theme_settings(cx);
+    let ui_font = settings.ui_font(cx).clone();
+    let buffer_font = settings.buffer_font(cx).clone();
+    let mut fonts = vec![ui_font.clone(), buffer_font.clone()];
+    let mut add_variant = |base: &Font, weight, style| {
+        let mut font = base.clone();
+        font.weight = weight;
+        font.style = style;
+        fonts.push(font);
+    };
+
+    for weight in [FontWeight::MEDIUM, FontWeight::SEMIBOLD, FontWeight::BOLD] {
+        add_variant(&ui_font, weight, FontStyle::Normal);
+    }
+    add_variant(&ui_font, FontWeight::NORMAL, FontStyle::Italic);
+    add_variant(&buffer_font, FontWeight::BOLD, FontStyle::Normal);
+    add_variant(&buffer_font, FontWeight::NORMAL, FontStyle::Italic);
+    add_variant(&buffer_font, FontWeight::BOLD, FontStyle::Italic);
+
+    let text_system = cx.text_system().clone();
+    cx.background_spawn(async move {
+        text_system.prewarm_fonts(&fonts);
+    })
+    .detach();
+}
+
 fn main() {
     let scroll_diagnostics = std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
         .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"));
@@ -24020,6 +24048,8 @@ fn main() {
         // selected Harness theme as well instead of briefly (or permanently,
         // in short replay sessions) painting the system-mode fallback.
         theme_settings::reload_theme(cx);
+        #[cfg(target_os = "linux")]
+        prewarm_harness_fonts(cx);
         if let Err(error) = harness_editor::init(cx) {
             log::error!("failed to load editor keymaps: {error}");
             return;
