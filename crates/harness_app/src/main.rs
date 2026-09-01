@@ -16795,54 +16795,66 @@ impl Render for HarnessApp {
             };
             div()
                 .id("offscreen-tail-status")
-                .w_full()
-                .h(px(26.))
-                .flex_none()
-                .px(if transcript_narrow { px(10.) } else { px(18.) })
+                .absolute()
+                .left(if transcript_narrow { px(10.) } else { px(18.) })
+                .bottom(px(10.))
                 .flex()
                 .items_center()
                 .gap_1()
-                .border_t_1()
-                .border_color(visuals.divider)
-                .bg(visuals.transcript)
-                .cursor_pointer()
-                .hover(|style| style.bg(colors.element_hover))
-                .tooltip(Tooltip::text(
-                    "Return to the live transcript · G or Ctrl-End",
-                ))
                 .when(turn_active, |this| {
                     this.child(
-                        SpinnerLabel::dots()
-                            .size(LabelSize::Small)
-                            .color(activity_color),
-                    )
-                    .child(
-                        Label::new("Codex is working")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
+                        div()
+                            .id("offscreen-turn-activity")
+                            .size(px(28.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(colors.border_variant)
+                            .bg(visuals.raised_surface.opacity(0.96))
+                            .shadow_sm()
+                            .tooltip(Tooltip::text("Codex is still working"))
+                            .child(
+                                SpinnerLabel::dots()
+                                    .size(LabelSize::Large)
+                                    .color(activity_color),
+                            ),
                     )
                 })
-                .child(div().flex_1())
                 .child(
                     div()
+                        .id("transcript-latest-surface")
+                        .size(px(28.))
+                        .flex_none()
                         .flex()
                         .items_center()
-                        .gap_0p5()
-                        .text_color(if turn_active {
-                            colors.text_accent
-                        } else {
-                            colors.text_muted
-                        })
-                        .child(Label::new("Latest").size(LabelSize::XSmall))
-                        .child(Icon::new(IconName::ArrowDown).size(IconSize::XSmall).color(
-                            if turn_active {
-                                Color::Accent
-                            } else {
-                                Color::Muted
-                            },
-                        )),
+                        .justify_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(visuals.raised_surface.opacity(0.96))
+                        .shadow_sm()
+                        .child(
+                            IconButton::new("transcript-latest", IconName::ArrowDown)
+                                .shape(IconButtonShape::Square)
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .icon_color(if turn_active {
+                                    Color::Accent
+                                } else {
+                                    Color::Muted
+                                })
+                                .aria_label("Return to the live transcript")
+                                .tooltip(Tooltip::text(
+                                    "Return to the live transcript · G or Ctrl-End",
+                                ))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.go_to_transcript_tail(window, cx)
+                                })),
+                        ),
                 )
-                .on_click(cx.listener(|this, _, window, cx| this.go_to_transcript_tail(window, cx)))
                 .into_any_element()
         });
         let command_line_input = self
@@ -20801,7 +20813,7 @@ mod tests {
     }
 
     #[test]
-    fn offscreen_tail_status_docks_activity_beside_latest_navigation() {
+    fn offscreen_tail_status_floats_separate_activity_and_navigation_controls() {
         let source = include_str!("main.rs");
         let control = source
             .split_once("let transcript_tail_control =")
@@ -20812,17 +20824,19 @@ mod tests {
         assert!(control.contains("(!following_tail)"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
-        assert!(control.contains("Codex is working"));
-        assert!(control.contains("Label::new(\"Latest\")"));
-        assert!(control.contains(".flex_none()"));
-        assert!(control.contains(".border_t_1()"));
+        assert!(control.contains("offscreen-turn-activity"));
+        assert!(control.contains("transcript-latest-surface"));
+        assert!(control.contains(".absolute()"));
+        assert!(control.contains(".shadow_sm()"));
+        assert!(control.contains(".rounded_md()"));
         assert!(
-            !control.contains(".absolute()"),
-            "tail status must reserve space rather than cover transcript content"
+            !control.contains("Label::new(\"Latest\")")
+                && !control.contains("Label::new(\"Codex is working\")"),
+            "compact tail controls should not depend on cramped microcopy"
         );
         assert!(
-            !control.contains(".shadow_") && !control.contains(".rounded_"),
-            "tail status should remain a quiet edge strip, not another floating card"
+            control.matches(".size(px(28.))").count() >= 2,
+            "activity and navigation should remain equally sized but visually distinct"
         );
     }
 
