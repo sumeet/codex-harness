@@ -79,6 +79,7 @@ pub(crate) struct Conversation {
     pub title: String,
     pub current_node: Option<String>,
     pub default_model: Option<String>,
+    pub default_thinking_effort: Option<String>,
     pub messages: Vec<Message>,
 }
 
@@ -88,12 +89,14 @@ pub(crate) struct ModelChoice {
     pub label: String,
     pub tagline: Option<String>,
     pub lane: String,
+    pub thinking_effort: Option<String>,
     pub legacy: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelCatalog {
     pub default_model: String,
+    pub default_thinking_effort: Option<String>,
     pub choices: Vec<ModelChoice>,
 }
 
@@ -155,6 +158,29 @@ struct ModelCatalogResponse {
     default_model_slug: String,
     #[serde(default)]
     categories: Vec<ModelCategory>,
+    #[serde(default)]
+    versions: Vec<ModelVersion>,
+}
+
+#[derive(Deserialize)]
+struct ModelVersion {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    slugs: Vec<String>,
+    #[serde(default)]
+    intelligence_presets: Vec<IntelligencePreset>,
+}
+
+#[derive(Deserialize)]
+struct IntelligencePreset {
+    title: String,
+    model_slug: String,
+    lane: String,
+    #[serde(default)]
+    thinking_effort: Option<String>,
+    #[serde(default)]
+    preset_type: String,
 }
 
 #[derive(Deserialize)]
@@ -200,8 +226,53 @@ pub(crate) async fn list_models(client: Arc<dyn HttpClient>) -> anyhow::Result<M
 }
 
 fn project_model_catalog(response: ModelCatalogResponse) -> ModelCatalog {
-    let mut choices = response
-        .categories
+    let ModelCatalogResponse {
+        default_model_slug,
+        categories,
+        versions,
+    } = response;
+
+    // ChatGPT's current picker is described by the first-class version and
+    // intelligence-preset data. Categories remain for older clients, but
+    // flattening them loses Medium/High/Extra High because those presets share
+    // one model slug and differ by thinking effort.
+    let current_version = versions
+        .into_iter()
+        .filter(|version| version.enabled != Some(false))
+        .filter(|version| !version.intelligence_presets.is_empty())
+        .min_by_key(|version| !version.slugs.iter().any(|slug| slug == &default_model_slug));
+    if let Some(version) = current_version {
+        let choices = version
+            .intelligence_presets
+            .into_iter()
+            .filter(|preset| {
+                !preset.model_slug.trim().is_empty()
+                    && (preset.preset_type.is_empty() || preset.preset_type == "available")
+            })
+            .map(|preset| ModelChoice {
+                model: preset.model_slug,
+                label: preset.title,
+                tagline: None,
+                lane: preset.lane,
+                thinking_effort: preset.thinking_effort,
+                legacy: false,
+            })
+            .collect::<Vec<_>>();
+        if let Some(default_choice) = choices
+            .iter()
+            .find(|choice| choice.model == default_model_slug)
+            .or_else(|| choices.iter().find(|choice| choice.lane == "instant"))
+            .or_else(|| choices.first())
+        {
+            return ModelCatalog {
+                default_model: default_choice.model.clone(),
+                default_thinking_effort: default_choice.thinking_effort.clone(),
+                choices,
+            };
+        }
+    }
+
+    let mut choices = categories
         .into_iter()
         .filter(|category| !category.default_model.trim().is_empty())
         .map(|category| {
@@ -223,6 +294,7 @@ fn project_model_catalog(response: ModelCatalogResponse) -> ModelCatalog {
                 label,
                 tagline: (!category.tagline.trim().is_empty()).then_some(category.tagline),
                 lane: category.model_lane,
+                thinking_effort: None,
                 legacy: category.subcategory.is_some(),
             }
         })
@@ -240,7 +312,8 @@ fn project_model_catalog(response: ModelCatalogResponse) -> ModelCatalog {
     });
     choices.dedup_by(|left, right| left.model == right.model);
     ModelCatalog {
-        default_model: response.default_model_slug,
+        default_model: default_model_slug,
+        default_thinking_effort: None,
         choices,
     }
 }
@@ -249,6 +322,7 @@ pub(crate) async fn send_message(
     conversation_id: &str,
     parent_message_id: &str,
     model: &str,
+    thinking_effort: Option<&str>,
     prompt: &str,
     message_id: &str,
     stream_updates: UnboundedSender<Message>,
@@ -264,6 +338,15 @@ pub(crate) async fn send_message(
     {
         bail!("invalid ChatGPT model");
     }
+    if thinking_effort.is_some_and(|effort| {
+        effort.is_empty()
+            || effort.len() > 32
+            || !effort
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) {
+        bail!("invalid ChatGPT thinking effort");
+    }
     if prompt.trim().is_empty() {
         bail!("ChatGPT prompt is empty");
     }
@@ -272,6 +355,7 @@ pub(crate) async fn send_message(
         conversation_id,
         parent_message_id,
         model,
+        thinking_effort,
         prompt,
         message_id,
     );
@@ -349,10 +433,11 @@ fn build_send_request(
     conversation_id: &str,
     parent_message_id: &str,
     model: &str,
+    thinking_effort: Option<&str>,
     prompt: &str,
     message_id: &str,
 ) -> Value {
-    serde_json::json!({
+    let mut request = serde_json::json!({
         "action": "next",
         "client_prepare_state": "sent",
         "conversation_id": conversation_id,
@@ -365,7 +450,17 @@ fn build_send_request(
         "model": model,
         "parent_message_id": parent_message_id,
         "timezone": system_timezone(),
-    })
+    });
+    if let Some(thinking_effort) = thinking_effort {
+        request
+            .as_object_mut()
+            .expect("ChatGPT request is an object")
+            .insert(
+                "thinking_effort".into(),
+                Value::String(thinking_effort.into()),
+            );
+    }
+    request
 }
 
 fn validate_identifier(identifier: &str, label: &str) -> anyhow::Result<()> {
@@ -549,6 +644,18 @@ fn project_conversation(response: ConversationResponse) -> Conversation {
     }
     node_ids.reverse();
 
+    let default_thinking_effort = node_ids.iter().rev().find_map(|node_id| {
+        response
+            .mapping
+            .get(node_id)?
+            .message
+            .as_ref()?
+            .metadata
+            .get("thinking_effort")?
+            .as_str()
+            .map(ToOwned::to_owned)
+    });
+
     let messages = node_ids
         .into_iter()
         .filter_map(|node_id| response.mapping.get(&node_id)?.message.as_ref())
@@ -559,6 +666,7 @@ fn project_conversation(response: ConversationResponse) -> Conversation {
         title: response.title,
         current_node: response.current_node,
         default_model: response.default_model_slug,
+        default_thinking_effort,
         messages,
     }
 }
@@ -1091,7 +1199,8 @@ mod tests {
         let request = build_send_request(
             "conversation-1",
             "parent-1",
-            "gpt-5-6",
+            "gpt-5-6-thinking",
+            Some("extended"),
             "Hello",
             "message-1",
         );
@@ -1099,16 +1208,67 @@ mod tests {
         assert_eq!(request["action"], "next");
         assert_eq!(request["conversation_id"], "conversation-1");
         assert_eq!(request["parent_message_id"], "parent-1");
-        assert_eq!(request["model"], "gpt-5-6");
+        assert_eq!(request["model"], "gpt-5-6-thinking");
+        assert_eq!(request["thinking_effort"], "extended");
         assert_eq!(request["messages"][0]["id"], "message-1");
         assert_eq!(request["messages"][0]["content"]["parts"][0], "Hello");
     }
 
     #[test]
-    fn model_catalog_preserves_current_and_legacy_lanes() {
+    fn model_catalog_uses_the_official_intelligence_presets() {
         let catalog = project_model_catalog(
             serde_json::from_value(json!({
                 "default_model_slug": "gpt-5-6",
+                "versions": [{
+                    "id": "5.6",
+                    "enabled": true,
+                    "slugs": [
+                        "gpt-5-6",
+                        "gpt-5-6-instant",
+                        "gpt-5-6-thinking",
+                        "gpt-5-6-pro"
+                    ],
+                    "intelligence_presets": [
+                        {
+                            "id": 0,
+                            "title": "Instant",
+                            "model_slug": "gpt-5-6-instant",
+                            "lane": "instant",
+                            "preset_type": "available"
+                        },
+                        {
+                            "id": 1,
+                            "title": "Medium",
+                            "model_slug": "gpt-5-6-thinking",
+                            "lane": "thinking",
+                            "thinking_effort": "standard",
+                            "preset_type": "available"
+                        },
+                        {
+                            "id": 2,
+                            "title": "High",
+                            "model_slug": "gpt-5-6-thinking",
+                            "lane": "thinking",
+                            "thinking_effort": "extended",
+                            "preset_type": "available"
+                        },
+                        {
+                            "id": 6,
+                            "title": "Extra High",
+                            "model_slug": "gpt-5-6-thinking",
+                            "lane": "thinking",
+                            "thinking_effort": "max",
+                            "preset_type": "available"
+                        },
+                        {
+                            "id": 3,
+                            "title": "Pro",
+                            "model_slug": "gpt-5-6-pro",
+                            "lane": "pro",
+                            "preset_type": "available"
+                        }
+                    ]
+                }],
                 "categories": [
                     {
                         "default_model": "gpt-5-6-pro",
@@ -1137,11 +1297,41 @@ mod tests {
             .unwrap(),
         );
 
-        assert_eq!(catalog.default_model, "gpt-5-6");
-        assert_eq!(catalog.choices[0].model, "gpt-5-6");
-        assert_eq!(catalog.choices[1].model, "gpt-5-6-pro");
-        assert!(!catalog.choices[1].legacy);
-        assert!(catalog.choices[2].legacy);
+        assert_eq!(catalog.default_model, "gpt-5-6-instant");
+        assert_eq!(catalog.default_thinking_effort, None);
+        assert_eq!(catalog.choices.len(), 5);
+        assert_eq!(
+            catalog
+                .choices
+                .iter()
+                .map(|choice| choice.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Instant", "Medium", "High", "Extra High", "Pro"]
+        );
+        assert_eq!(
+            catalog.choices[1].thinking_effort.as_deref(),
+            Some("standard")
+        );
+        assert_eq!(
+            catalog.choices[2].thinking_effort.as_deref(),
+            Some("extended")
+        );
+        assert_eq!(catalog.choices[3].thinking_effort.as_deref(), Some("max"));
+        assert_eq!(catalog.choices[4].thinking_effort, None);
+    }
+
+    #[test]
+    fn send_request_omits_thinking_effort_when_the_preset_has_none() {
+        let request = build_send_request(
+            "conversation-1",
+            "parent-1",
+            "gpt-5-6-instant",
+            None,
+            "Hello",
+            "message-1",
+        );
+
+        assert!(request.get("thinking_effort").is_none());
     }
 
     #[test]

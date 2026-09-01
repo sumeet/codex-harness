@@ -4009,6 +4009,7 @@ struct HarnessApp {
     chat_current_node: Option<String>,
     chat_models: Vec<ChatModelChoice>,
     selected_chat_model: Option<String>,
+    selected_chat_effort: Option<String>,
     expanded_chat_activity: HashSet<String>,
     chat_loading: bool,
     chat_sending: bool,
@@ -6262,15 +6263,25 @@ impl HarnessApp {
 
     fn render_chat_model_selector(&self, cx: &Context<Self>) -> AnyElement {
         let selected = self.selected_chat_model.as_deref();
+        let selected_effort = self.selected_chat_effort.as_deref();
         let label: SharedString = self
             .chat_models
             .iter()
-            .find(|choice| Some(choice.model.as_str()) == selected)
+            .find(|choice| {
+                Some(choice.model.as_str()) == selected
+                    && choice.thinking_effort.as_deref() == selected_effort
+            })
+            .or_else(|| {
+                self.chat_models
+                    .iter()
+                    .find(|choice| Some(choice.model.as_str()) == selected)
+            })
             .map(|choice| choice.label.clone().into())
             .or_else(|| selected.map(SharedString::from))
             .unwrap_or_else(|| "Loading ChatGPT models…".into());
         let choices = self.chat_models.clone();
         let current_model = self.selected_chat_model.clone();
+        let current_effort = self.selected_chat_effort.clone();
         let menu_deployed = self.model_menu_handle.is_deployed();
         let trigger_color = if menu_deployed {
             Color::Accent
@@ -6308,6 +6319,7 @@ impl HarnessApp {
             .menu(move |window, cx| {
                 let choices = choices.clone();
                 let current_model = current_model.clone();
+                let current_effort = current_effort.clone();
                 let weak = weak.clone();
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
                     menu = menu.header("ChatGPT model");
@@ -6318,7 +6330,9 @@ impl HarnessApp {
                             legacy_header_shown = true;
                         }
                         let model = choice.model.clone();
-                        let selected = current_model.as_deref() == Some(choice.model.as_str());
+                        let thinking_effort = choice.thinking_effort.clone();
+                        let selected = current_model.as_deref() == Some(choice.model.as_str())
+                            && current_effort.as_deref() == choice.thinking_effort.as_deref();
                         let mut entry = ContextMenuEntry::new(choice.label)
                             .toggleable(IconPosition::End, selected);
                         if let Some(tagline) = choice.tagline {
@@ -6332,6 +6346,7 @@ impl HarnessApp {
                             move |_, cx| {
                                 weak.update(cx, |this, cx| {
                                     this.selected_chat_model = Some(model.clone());
+                                    this.selected_chat_effort = thinking_effort.clone();
                                     cx.notify();
                                 })
                                 .ok();
@@ -7760,6 +7775,7 @@ impl HarnessApp {
             chat_current_node: None,
             chat_models: Vec::new(),
             selected_chat_model: None,
+            selected_chat_effort: None,
             expanded_chat_activity: HashSet::default(),
             chat_loading: false,
             chat_sending: false,
@@ -9608,6 +9624,32 @@ impl HarnessApp {
         cx.notify();
     }
 
+    fn select_chat_model_from_conversation(
+        &mut self,
+        model: String,
+        thinking_effort: Option<String>,
+    ) {
+        let choice = self
+            .chat_models
+            .iter()
+            .find(|choice| {
+                choice.model == model
+                    && choice.thinking_effort.as_deref() == thinking_effort.as_deref()
+            })
+            .or_else(|| self.chat_models.iter().find(|choice| choice.model == model))
+            .map(|choice| (choice.model.clone(), choice.thinking_effort.clone()));
+        if let Some((model, thinking_effort)) = choice {
+            self.selected_chat_model = Some(model);
+            self.selected_chat_effort = thinking_effort;
+        } else if self.chat_models.is_empty() {
+            // Model data and conversation history load independently. Keep the
+            // conversation hint until the catalog arrives, then normalize it
+            // to one of the account's current picker presets.
+            self.selected_chat_model = Some(model);
+            self.selected_chat_effort = thinking_effort;
+        }
+    }
+
     fn refresh_chat_models(&mut self, cx: &mut Context<Self>) {
         let client = cx.http_client();
         self.chat_model_task = cx.spawn(async move |this, cx| {
@@ -9617,13 +9659,15 @@ impl HarnessApp {
                     Ok(catalog) => {
                         let selected_exists =
                             this.selected_chat_model.as_deref().is_some_and(|selected| {
-                                catalog
-                                    .choices
-                                    .iter()
-                                    .any(|choice| choice.model == selected)
+                                catalog.choices.iter().any(|choice| {
+                                    choice.model == selected
+                                        && choice.thinking_effort.as_deref()
+                                            == this.selected_chat_effort.as_deref()
+                                })
                             });
                         if !selected_exists {
                             this.selected_chat_model = Some(catalog.default_model);
+                            this.selected_chat_effort = catalog.default_thinking_effort;
                         }
                         this.chat_models = catalog.choices;
                     }
@@ -9703,7 +9747,10 @@ impl HarnessApp {
                         let new_len = conversation.messages.len();
                         this.chat_current_node = conversation.current_node;
                         if let Some(model) = conversation.default_model {
-                            this.selected_chat_model = Some(model);
+                            this.select_chat_model_from_conversation(
+                                model,
+                                conversation.default_thinking_effort,
+                            );
                         }
                         this.chat_messages = conversation.messages;
                         this.chat_list_state.splice(0..0, new_len);
@@ -9731,7 +9778,7 @@ impl HarnessApp {
         let new_len = conversation.messages.len();
         self.chat_current_node = conversation.current_node;
         if update_selected_model && let Some(model) = conversation.default_model {
-            self.selected_chat_model = Some(model);
+            self.select_chat_model_from_conversation(model, conversation.default_thinking_effort);
         }
         self.chat_messages = conversation.messages;
         self.chat_list_state.splice(0..old_len, new_len);
@@ -9791,6 +9838,7 @@ impl HarnessApp {
             cx.notify();
             return;
         };
+        let thinking_effort = self.selected_chat_effort.clone();
 
         let optimistic_id = uuid::Uuid::new_v4().to_string();
         let baseline_len = self.chat_messages.len();
@@ -9830,6 +9878,7 @@ impl HarnessApp {
                 &conversation_id,
                 &parent_message_id,
                 &model,
+                thinking_effort.as_deref(),
                 &prompt,
                 &optimistic_id,
                 stream_tx,
