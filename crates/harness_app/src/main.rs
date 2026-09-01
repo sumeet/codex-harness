@@ -6472,7 +6472,11 @@ impl HarnessApp {
                                 .group("queued-prompt")
                                 .h(px(32.))
                                 .flex_none()
-                                .px_2p5()
+                                // The handle owns the edge gutter; applying the
+                                // row's normal content inset before it made the
+                                // reorder affordance look doubly indented.
+                                .pl_0p5()
+                                .pr_2p5()
                                 .flex()
                                 .items_center()
                                 .gap_1()
@@ -19406,6 +19410,9 @@ mod tests {
         assert!(renderer.contains(".when_some(pending_outbound"));
         assert!(renderer.contains("IconName::SteeringWheel"));
         assert!(renderer.contains("IconName::InterruptAndRun"));
+        assert!(renderer.contains(".pl_0p5()"));
+        assert!(renderer.contains(".pr_2p5()"));
+        assert!(!renderer.contains(".px_2p5()"));
         assert!(!renderer.contains("queued-prompt-position"));
         assert!(!renderer.contains("move-queued-prompt-up"));
         assert!(!renderer.contains("move-queued-prompt-down"));
