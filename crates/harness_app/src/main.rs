@@ -179,6 +179,16 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
     px((harness_code_font_size(cx).as_f32() * 1.35).max(RICH_MIN_CODE_ROW_HEIGHT))
 }
 
+fn refine_harness_markdown_style(mut style: MarkdownStyle) -> MarkdownStyle {
+    style.code_block_overflow_x_scroll = true;
+    // The native composer represents inline code through typography alone.
+    // Markdown's glyph-sized background has no padding or corner geometry and
+    // becomes a visibly uneven pseudo-chip when the reading and code fonts use
+    // different metrics. Keep transcript and composer semantics consistent.
+    style.inline_code.background_color = None;
+    style
+}
+
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
     let size = ThemeSettings::get_global(cx).agent_ui_font_size(cx);
     px((size.as_f32() * 1.25).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
@@ -15131,8 +15141,8 @@ impl HarnessApp {
             None,
             cx,
         );
-        let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-        style.code_block_overflow_x_scroll = true;
+        let mut style =
+            refine_harness_markdown_style(MarkdownStyle::themed(MarkdownFont::Agent, window, cx));
         style.image_container = gpui::StyleRefinement {
             padding: gpui::EdgesRefinement {
                 top: Some(px(1.).into()),
@@ -15971,8 +15981,11 @@ impl HarnessApp {
         } else if item.content.is_empty() {
             None
         } else if let Some(markdown) = markdown {
-            let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-            style.code_block_overflow_x_scroll = true;
+            let mut style = refine_harness_markdown_style(MarkdownStyle::themed(
+                MarkdownFont::Agent,
+                window,
+                cx,
+            ));
             if let Some(navigation) = rich_navigation.as_ref() {
                 style.selection_background_color =
                     rich_navigation_markdown_highlight_background(navigation, cx);
@@ -22654,6 +22667,17 @@ mod tests {
         assert!((queued.0 / queued.1 - 1522. / 667.).abs() < 0.001);
         assert_eq!(queued.1, 22.);
         assert_eq!(queued_image_preview_size(None), (22., 22.));
+    }
+
+    #[test]
+    fn transcript_inline_code_uses_the_composers_typography_only_semantics() {
+        let mut style = MarkdownStyle::default();
+        style.inline_code.background_color = Some(gpui::Hsla::default());
+
+        let style = refine_harness_markdown_style(style);
+
+        assert!(style.inline_code.background_color.is_none());
+        assert!(style.code_block_overflow_x_scroll);
     }
 
     #[test]

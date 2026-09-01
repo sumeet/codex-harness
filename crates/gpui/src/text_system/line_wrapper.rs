@@ -479,8 +479,9 @@ impl LineWrapper {
         // Some other known special characters that should be treated as word characters,
         // e.g. `a-b`, `var_name`, `I'm`/`won’t`, '@mention`, `#hashtag`, `100%`, `3.1415`,
         // `2^3`, `a~b`, `a=1`, `Self::new`, etc. Trailing punctuation like `,`, `.`, `:`, `;`
-        // is included so it stays attached to the preceding word when wrapping.
-        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';') ||
+        // and closing punctuation is included so it stays attached to the preceding word when
+        // wrapping instead of becoming an orphan at the start of the next visual line.
+        matches!(c, '-' | '_' | '.' | '\'' | '’' | '‘' | '$' | '%' | '@' | '#' | '^' | '~' | ',' | '=' | ':' | ';' | ')' | ']' | '}') ||
         // `⋯` character is special used in Zed, to keep this at the end of the line.
         matches!(c, '⋯') ||
 
@@ -795,6 +796,13 @@ mod tests {
                 Boundary::new(12, 0),
                 Boundary::new(18, 0)
             ],
+        );
+        assert_eq!(
+            wrapper
+                .wrap_line(&[LineFragment::text("aa bb) cc")], px(50.))
+                .next(),
+            Some(Boundary::new(3, 0)),
+            "closing punctuation must stay with the word before it instead of starting a row"
         );
         assert_eq!(
             wrapper
@@ -1222,6 +1230,7 @@ mod tests {
         assert_word("a=1");
         assert_word("Self::is_word_char");
         assert_word("on;");
+        assert_word("done)]}");
         assert_word("more⋯");
         assert_word("won’t");
         assert_word("‘twas");
