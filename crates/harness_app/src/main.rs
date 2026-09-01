@@ -3172,7 +3172,16 @@ struct QueuedTurnSubmission {
     id: Option<String>,
     client_user_message_id: String,
     input: Value,
-    preview_images: Vec<Arc<Image>>,
+    preview_segments: Vec<QueuedPromptPreviewSegment>,
+}
+
+#[derive(Clone)]
+enum QueuedPromptPreviewSegment {
+    Text(SharedString),
+    Image {
+        image: Arc<Image>,
+        dimensions: Option<(u32, u32)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -3329,7 +3338,7 @@ fn queued_submission_from_value(value: &Value) -> Option<QueuedTurnSubmission> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        preview_images: queued_submission_preview_images(&input),
+        preview_segments: queued_submission_preview_segments(&input),
         input,
     })
 }
@@ -3364,20 +3373,6 @@ fn queued_submission_preview(input: &Value) -> String {
         .join(" ")
 }
 
-fn queued_submission_image_count(input: &Value) -> usize {
-    input
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|block| {
-            matches!(
-                block.get("type").and_then(Value::as_str),
-                Some("image" | "inputImage")
-            )
-        })
-        .count()
-}
-
 fn queued_submission_image(block: &Value) -> Option<Arc<Image>> {
     if !matches!(
         block.get("type").and_then(Value::as_str),
@@ -3409,14 +3404,38 @@ fn queued_submission_image(block: &Value) -> Option<Arc<Image>> {
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
-fn queued_submission_preview_images(input: &Value) -> Vec<Arc<Image>> {
-    input
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(queued_submission_image)
-        .take(QUEUED_PREVIEW_IMAGE_LIMIT)
-        .collect()
+fn queued_submission_preview_segments(input: &Value) -> Vec<QueuedPromptPreviewSegment> {
+    let mut image_index = 0;
+    let mut segments = Vec::new();
+
+    for block in input.as_array().into_iter().flatten() {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text" | "inputText") => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !text.is_empty() {
+                    segments.push(QueuedPromptPreviewSegment::Text(text.into()));
+                }
+            }
+            Some("image" | "inputImage") => {
+                if image_index < QUEUED_PREVIEW_IMAGE_LIMIT {
+                    if let Some(image) = queued_submission_image(block) {
+                        let dimensions = image_dimensions(image.bytes(), image.format());
+                        segments.push(QueuedPromptPreviewSegment::Image { image, dimensions });
+                    }
+                }
+                image_index += 1;
+            }
+            _ => {}
+        }
+    }
+
+    segments
 }
 
 fn composer_app_server_input(text: &str, images: &[ComposerImageAttachment]) -> Vec<Value> {
@@ -3531,6 +3550,12 @@ fn aspect_fit_preview_size(
 
 fn composer_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
     aspect_fit_preview_size(dimensions, 120., 30.)
+}
+
+fn queued_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
+    dimensions
+        .map(|dimensions| aspect_fit_preview_size(Some(dimensions), 56., 22.))
+        .unwrap_or((22., 22.))
 }
 
 fn legacy_request_controls_active(
@@ -6421,15 +6446,12 @@ impl HarnessApp {
                             let operation = operations.get(&client_id).copied();
                             let operation_pending = operation.is_some();
                             let preview = queued_submission_preview(&entry.input);
+                            let preview_segments = entry.preview_segments.clone();
                             let display_preview: SharedString = if preview.is_empty() {
                                 "Image prompt".into()
                             } else {
                                 preview.into()
                             };
-                            let image_count = queued_submission_image_count(&entry.input);
-                            let preview_image_count = entry.preview_images.len();
-                            let remaining_image_count =
-                                image_count.saturating_sub(preview_image_count);
                             let weak_edit = weak.clone();
                             let weak_steer = weak.clone();
                             let weak_send = weak.clone();
@@ -6516,44 +6538,48 @@ impl HarnessApp {
                                         .ok();
                                 })
                                 .child(drag_handle)
-                                .children(entry.preview_images.iter().map(|image| {
-                                    div()
-                                        .size(px(22.))
-                                        .flex_none()
-                                        .overflow_hidden()
-                                        .rounded_xs()
-                                        .border_1()
-                                        .border_color(colors.border_variant)
-                                        .bg(colors.editor_background)
-                                        .child(
-                                            gpui::img(image.clone())
-                                                .size_full()
-                                                .object_fit(ObjectFit::Cover),
-                                        )
-                                }))
-                                .when(remaining_image_count > 0, |this| {
-                                    this.child(
-                                        Label::new(if preview_image_count == 0 {
-                                            if remaining_image_count == 1 {
-                                                "1 image".into()
-                                            } else {
-                                                format!("{remaining_image_count} images")
-                                            }
-                                        } else {
-                                            format!("+{remaining_image_count}")
-                                        })
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                    )
-                                })
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w_0()
-                                        .truncate()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
                                         .text_sm()
                                         .text_color(colors.text)
-                                        .child(display_preview),
+                                        .children(preview_segments.into_iter().map(
+                                            |segment| match segment {
+                                                QueuedPromptPreviewSegment::Text(text) => div()
+                                                    .flex_none()
+                                                    .whitespace_nowrap()
+                                                    .child(text)
+                                                    .into_any_element(),
+                                                QueuedPromptPreviewSegment::Image {
+                                                    image,
+                                                    dimensions,
+                                                } => {
+                                                    let (width, height) =
+                                                        queued_image_preview_size(dimensions);
+                                                    div()
+                                                        .w(px(width))
+                                                        .h(px(height))
+                                                        .flex_none()
+                                                        .overflow_hidden()
+                                                        .rounded_xs()
+                                                        .border_1()
+                                                        .border_color(colors.border_variant)
+                                                        .bg(colors.editor_background)
+                                                        .child(
+                                                            gpui::img(image)
+                                                                .size_full()
+                                                                .object_fit(ObjectFit::Contain),
+                                                        )
+                                                        .into_any_element()
+                                                }
+                                            },
+                                        )),
                                 )
                                 .child(
                                     div()
@@ -10413,7 +10439,7 @@ impl HarnessApp {
         self.queued_turns.push_back(QueuedTurnSubmission {
             id: None,
             client_user_message_id: client_user_message_id.clone(),
-            preview_images: queued_submission_preview_images(&input),
+            preview_segments: queued_submission_preview_segments(&input),
             input: input.clone(),
         });
         cx.spawn(async move |this, cx| {
@@ -19377,8 +19403,34 @@ mod tests {
             queued_submission_preview(&queued[0].input),
             "first line second line"
         );
-        assert_eq!(queued_submission_image_count(&queued[0].input), 1);
-        assert_eq!(queued[0].preview_images.len(), 1);
+        assert_eq!(queued[0].preview_segments.len(), 3);
+        assert!(matches!(
+            &queued[0].preview_segments[..],
+            [
+                QueuedPromptPreviewSegment::Text(first),
+                QueuedPromptPreviewSegment::Text(second),
+                QueuedPromptPreviewSegment::Image { .. }
+            ] if first.as_ref() == "first line" && second.as_ref() == "second line"
+        ));
+    }
+
+    #[test]
+    fn queued_prompt_preview_keeps_images_at_their_semantic_position() {
+        let input = json!([
+            {"type": "text", "text": "before"},
+            {"type": "image", "url": "data:image/png;base64,AQID"},
+            {"type": "text", "text": "after"}
+        ]);
+
+        let segments = queued_submission_preview_segments(&input);
+        assert!(matches!(
+            &segments[..],
+            [
+                QueuedPromptPreviewSegment::Text(before),
+                QueuedPromptPreviewSegment::Image { .. },
+                QueuedPromptPreviewSegment::Text(after)
+            ] if before.as_ref() == "before" && after.as_ref() == "after"
+        ));
     }
 
     #[test]
@@ -22471,6 +22523,11 @@ mod tests {
         assert!((composer.0 / composer.1 - 1522. / 667.).abs() < 0.001);
         assert_eq!(composer.1, 30.);
         assert_eq!(composer_image_preview_size(None), (120., 30.));
+
+        let queued = queued_image_preview_size(Some((1522, 667)));
+        assert!((queued.0 / queued.1 - 1522. / 667.).abs() < 0.001);
+        assert_eq!(queued.1, 22.);
+        assert_eq!(queued_image_preview_size(None), (22., 22.));
     }
 
     #[test]
