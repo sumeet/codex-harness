@@ -1,10 +1,7 @@
 pub(super) mod blame;
 
 use super::*;
-use ::git::{
-    Oid, Restore, blame::BlameEntry, commit::ParsedCommitMessage, repository::RepoPath,
-    status::FileStatus,
-};
+use ::git::{Oid, Restore, blame::BlameEntry, commit::ParsedCommitMessage, repository::RepoPath};
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::git_store::Repository;
 

@@ -154,7 +154,7 @@ fn test_highlighted_display_rows_in_range(cx: &mut TestAppContext) {
                 let snapshot = editor.snapshot(window, cx);
                 let actual = editor.highlighted_display_rows_in_range(
                     buffer.anchor_before(Point::new(2, 0))..buffer.anchor_before(Point::new(5, 0)),
-                    display_row_range,
+                    display_row_range.clone(),
                     &snapshot.display_snapshot,
                     cx,
                 );
