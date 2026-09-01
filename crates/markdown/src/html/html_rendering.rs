@@ -449,7 +449,7 @@ impl MarkdownElement {
     }
 
     fn render_html_image(&self, image: &HtmlImage, builder: &mut MarkdownElementBuilder, cx: &App) {
-        let Some(source) = self
+        let Some(resolved) = self
             .image_resolver
             .as_ref()
             .and_then(|resolve| resolve(image.dest_url.as_ref(), cx))
@@ -460,11 +460,11 @@ impl MarkdownElement {
         self.push_markdown_image(
             builder,
             &image.source_range,
-            source,
+            resolved.source,
             image.dest_url.clone(),
             image.alt_text.clone(),
-            image.width,
-            image.height,
+            image.width.or(resolved.width),
+            image.height.or(resolved.height),
         );
     }
 }

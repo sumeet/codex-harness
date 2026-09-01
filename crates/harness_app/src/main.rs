@@ -840,34 +840,6 @@ impl RichNavigationPaint {
     }
 }
 
-fn rich_navigation_slice(
-    navigation: &RichNavigationPaint,
-    source_range: Range<usize>,
-    text: &str,
-) -> RichNavigationPaint {
-    let ranges = navigation
-        .ranges
-        .iter()
-        .filter_map(|range| {
-            let start = range.start.max(source_range.start);
-            let end = range.end.min(source_range.end);
-            (start < end).then(|| start - source_range.start..end - source_range.start)
-        })
-        .collect();
-    let head = navigation.head.and_then(|head| {
-        (source_range.start <= head && head <= source_range.end)
-            .then(|| (head - source_range.start).min(text.len()))
-    });
-    RichNavigationPaint {
-        body_text: Arc::from(text),
-        ranges,
-        head,
-        visual: navigation.visual,
-        linewise: navigation.linewise,
-        cursor_claimed: navigation.cursor_claimed.clone(),
-    }
-}
-
 /// Give hidden Rich navigation a stable proxy in the card header. Collapsed
 /// folds and non-text request/image surfaces show their full title for a
 /// Visual selection; a Normal cursor owns exactly its first glyph.
@@ -3270,6 +3242,62 @@ struct UserImagePreview {
     dimensions: Option<(u32, u32)>,
 }
 
+struct OrderedUserContentPresentation {
+    markdown: String,
+    logical_text: String,
+    images: HashMap<String, UserImagePreview>,
+    expanded_images: HashMap<String, ImageSource>,
+}
+
+fn ordered_user_image_url(marker: char, part_index: usize) -> String {
+    std::iter::repeat_n(marker, part_index + 1).collect()
+}
+
+fn ordered_user_content_presentation(
+    blocks: Vec<model::UserContentBlock>,
+    previews: &[UserImagePreview],
+) -> OrderedUserContentPresentation {
+    let mut markdown = String::new();
+    let mut logical_text = String::new();
+    let mut images = HashMap::new();
+    let mut expanded_images = HashMap::new();
+    for (part_index, block) in blocks.into_iter().enumerate() {
+        match block {
+            model::UserContentBlock::Text(text) => {
+                logical_text.push_str(&text);
+                markdown.push_str(&text);
+            }
+            model::UserContentBlock::Image(source) => {
+                // The model preserves the original text/image ordering, while
+                // previews are cached separately. Rejoin them by semantic
+                // source and let the surrounding text/newlines determine
+                // whether this is an inline chip or its own paragraph.
+                let Some(preview) = previews
+                    .iter()
+                    .find(|preview| preview.semantic_source == source)
+                    .cloned()
+                else {
+                    continue;
+                };
+                // Private-use-only destinations cannot steal character matches
+                // from the visible logical text when Markdown/Vim offsets are
+                // mapped through the generated source.
+                let image_url = ordered_user_image_url('\u{e000}', part_index);
+                let expand_url = ordered_user_image_url('\u{e001}', part_index);
+                markdown.push_str(&format!("[![](<{image_url}>)](<{expand_url}>)"));
+                expanded_images.insert(expand_url, preview.source.clone());
+                images.insert(image_url, preview);
+            }
+        }
+    }
+    OrderedUserContentPresentation {
+        markdown,
+        logical_text,
+        images,
+        expanded_images,
+    }
+}
+
 fn composer_is_empty(text: &str, image_count: usize) -> bool {
     text.trim().is_empty() && image_count == 0
 }
@@ -3503,10 +3531,6 @@ fn aspect_fit_preview_size(
 
 fn composer_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
     aspect_fit_preview_size(dimensions, 120., 30.)
-}
-
-fn transcript_user_image_preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
-    aspect_fit_preview_size(dimensions, 220., 96.)
 }
 
 fn legacy_request_controls_active(
@@ -13331,6 +13355,30 @@ impl HarnessApp {
         autoscroll_generation: Option<u64>,
         cx: &mut Context<Self>,
     ) -> Entity<Markdown> {
+        self.markdown_for_projected(
+            key,
+            source,
+            None,
+            search,
+            navigation,
+            autoscroll_generation,
+            cx,
+        )
+    }
+
+    /// Render generated Markdown while searching the visible logical text.
+    /// Attachment syntax belongs to the presentation layer and must not create
+    /// phantom search matches or shift the active-match ordinal.
+    fn markdown_for_projected(
+        &mut self,
+        key: &str,
+        source: &str,
+        logical_source: Option<&str>,
+        search: Option<&RichSearchPaint>,
+        navigation: Option<&RichNavigationPaint>,
+        autoscroll_generation: Option<u64>,
+        cx: &mut Context<Self>,
+    ) -> Entity<Markdown> {
         let pointer_gesture_active = self.rich_pointer_gesture.is_some();
         let cached = self
             .markdown_cache
@@ -13404,8 +13452,22 @@ impl HarnessApp {
         let desired = if let Some(search) = search {
             if cached.search_query.as_deref() != Some(search.query.as_ref()) {
                 cached.search_query = Some(search.query.to_string());
-                cached.search_ranges =
-                    search_match_byte_ranges(source, &search.query, RICH_SEARCH_HIGHLIGHT_LIMIT);
+                cached.search_ranges = if let Some(logical_source) = logical_source {
+                    search_match_byte_ranges(
+                        logical_source,
+                        &search.query,
+                        RICH_SEARCH_HIGHLIGHT_LIMIT,
+                    )
+                    .into_iter()
+                    .map(|range| {
+                        markdown_source_offset_for_logical(logical_source, source, range.start)
+                            ..markdown_source_offset_for_logical(logical_source, source, range.end)
+                    })
+                    .filter(|range| range.start < range.end)
+                    .collect()
+                } else {
+                    search_match_byte_ranges(source, &search.query, RICH_SEARCH_HIGHLIGHT_LIMIT)
+                };
             }
             search.decorate_ranges(cached.search_ranges.clone())
         } else {
@@ -14926,131 +14988,101 @@ impl HarnessApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors().clone();
-        let mut text_offset = 0;
-        let mut children = Vec::new();
-        for (part_index, block) in blocks.into_iter().enumerate() {
-            match block {
-                model::UserContentBlock::Text(text) => {
-                    let source_range = text_offset..text_offset + text.len();
-                    text_offset += text.len();
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    let part_navigation = navigation.map(|navigation| {
-                        rich_navigation_slice(navigation, source_range.clone(), &text)
-                    });
-                    let cache_key = format!("{item_key}:user-text:{part_index}");
-                    let markdown = self.markdown_for(
-                        &cache_key,
-                        &text,
-                        search,
-                        part_navigation.as_ref(),
-                        None,
-                        cx,
-                    );
-                    let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                    style.code_block_overflow_x_scroll = true;
-                    if let Some(navigation) = part_navigation.as_ref() {
-                        style.selection_background_color =
-                            rich_navigation_markdown_highlight_background(navigation, cx);
-                    }
-                    let click_boundary_id =
-                        format!("rich-user-markdown-click:{item_key}:{part_index}");
-                    let mut element = MarkdownElement::new(markdown, style);
-                    if rich_vim_experiment() {
-                        let owner = cx.weak_entity();
-                        let logical = text.clone();
-                        let source = text.clone();
-                        let base = source_range.start;
-                        let item_key = item_key.to_owned();
-                        let markdown_key = cache_key.clone();
-                        element = element.on_source_pointer(move |event, window, cx| {
-                            let body_offset = base
-                                + markdown_logical_offset_for_source(
-                                    &logical,
-                                    &source,
-                                    event.source_index,
-                                );
-                            owner
-                                .update(cx, |this, cx| {
-                                    if let Some(index) = this
-                                        .model
-                                        .items
-                                        .iter()
-                                        .position(|item| item.key == item_key)
-                                    {
-                                        this.handle_rich_markdown_pointer(
-                                            &markdown_key,
-                                            index,
-                                            body_offset,
-                                            event.phase,
-                                            event.modifiers,
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                })
-                                .ok();
-                        });
-                    }
-                    children.push(
-                        div()
-                            .id(click_boundary_id)
-                            .w_full()
-                            .min_w_0()
-                            .on_click(|_, _, cx| cx.stop_propagation())
-                            .child(element)
-                            .into_any_element(),
-                    );
-                }
-                model::UserContentBlock::Image(source) => {
-                    // Legacy transports may list the image payloads separately
-                    // and refer to them out of order via `[Image #N]` markers.
-                    // Match by semantic source rather than assuming that visual
-                    // order and payload order are identical.
-                    let preview = previews
-                        .iter()
-                        .find(|preview| preview.semantic_source == source)
-                        .cloned();
-                    let Some(preview) = preview else {
-                        continue;
-                    };
-                    let expanded_source = preview.source.clone();
-                    let (width, height) = transcript_user_image_preview_size(preview.dimensions);
-                    children.push(
-                        div()
-                            .id(format!("user-image-preview:{item_key}:{part_index}"))
-                            .w(px(width))
-                            .max_w_full()
-                            .h(px(height))
-                            .overflow_hidden()
-                            .rounded_xs()
-                            .border_1()
-                            .border_color(colors.border)
-                            .bg(colors.editor_background)
-                            .p(px(1.))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.expanded_user_image = Some(expanded_source.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                gpui::img(preview.source)
-                                    .size_full()
-                                    .object_fit(ObjectFit::ScaleDown),
-                            )
-                            .into_any_element(),
-                    );
-                }
-            }
+        let presentation = ordered_user_content_presentation(blocks, &previews);
+        let cache_key = format!("{item_key}:user-content");
+        let markdown = self.markdown_for_projected(
+            &cache_key,
+            &presentation.markdown,
+            Some(&presentation.logical_text),
+            search,
+            navigation,
+            None,
+            cx,
+        );
+        let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        style.code_block_overflow_x_scroll = true;
+        style.image_container = gpui::StyleRefinement {
+            padding: gpui::EdgesRefinement {
+                top: Some(px(1.).into()),
+                right: Some(px(1.).into()),
+                bottom: Some(px(1.).into()),
+                left: Some(px(1.).into()),
+            },
+            border_style: Some(gpui::BorderStyle::Solid),
+            border_widths: gpui::EdgesRefinement {
+                top: Some(gpui::AbsoluteLength::Pixels(px(1.))),
+                right: Some(gpui::AbsoluteLength::Pixels(px(1.))),
+                bottom: Some(gpui::AbsoluteLength::Pixels(px(1.))),
+                left: Some(gpui::AbsoluteLength::Pixels(px(1.))),
+            },
+            border_color: Some(colors.border),
+            background: Some(colors.editor_background.into()),
+            ..Default::default()
+        };
+        if let Some(navigation) = navigation {
+            style.selection_background_color =
+                rich_navigation_markdown_highlight_background(navigation, cx);
+        }
+        let image_previews = Arc::new(presentation.images);
+        let expanded_images = Arc::new(presentation.expanded_images);
+        let mut element =
+            MarkdownElement::new(markdown, style).image_resolver_with_size(move |url, _| {
+                let preview = image_previews.get(url)?;
+                let (width, height) = composer_image_preview_size(preview.dimensions);
+                Some((preview.source.clone(), px(width), px(height)))
+            });
+        {
+            let owner = cx.weak_entity();
+            element = element.on_url_click(move |url, _, cx| {
+                let Some(source) = expanded_images.get(url.as_ref()).cloned() else {
+                    cx.open_url(&url);
+                    return;
+                };
+                owner
+                    .update(cx, |this, cx| {
+                        this.expanded_user_image = Some(source);
+                        cx.notify();
+                    })
+                    .ok();
+            });
+        }
+        if rich_vim_experiment() {
+            let owner = cx.weak_entity();
+            let logical = presentation.logical_text;
+            let source = presentation.markdown;
+            let item_key = item_key.to_owned();
+            let markdown_key = cache_key.clone();
+            element = element.on_source_pointer(move |event, window, cx| {
+                let body_offset =
+                    markdown_logical_offset_for_source(&logical, &source, event.source_index);
+                owner
+                    .update(cx, |this, cx| {
+                        if let Some(index) = this
+                            .model
+                            .items
+                            .iter()
+                            .position(|item| item.key == item_key)
+                        {
+                            this.handle_rich_markdown_pointer(
+                                &markdown_key,
+                                index,
+                                body_offset,
+                                event.phase,
+                                event.modifiers,
+                                window,
+                                cx,
+                            );
+                        }
+                    })
+                    .ok();
+            });
         }
         div()
+            .id(format!("rich-user-markdown-click:{item_key}"))
             .w_full()
             .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(children)
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(element)
             .into_any_element()
     }
 
@@ -22427,16 +22459,50 @@ mod tests {
     }
 
     #[test]
-    fn inline_image_previews_preserve_aspect_ratio_at_both_scales() {
+    fn inline_image_previews_preserve_aspect_ratio() {
         let composer = composer_image_preview_size(Some((1522, 667)));
         assert!((composer.0 / composer.1 - 1522. / 667.).abs() < 0.001);
         assert_eq!(composer.1, 30.);
-
-        let transcript = transcript_user_image_preview_size(Some((1522, 667)));
-        assert!((transcript.0 / transcript.1 - 1522. / 667.).abs() < 0.001);
-        assert_eq!(transcript.1, 96.);
         assert_eq!(composer_image_preview_size(None), (120., 30.));
-        assert_eq!(transcript_user_image_preview_size(None), (220., 96.));
+    }
+
+    #[test]
+    fn ordered_user_images_remain_inline_with_their_surrounding_text() {
+        let source = model::UserImageSource::Url("https://example.test/image.png".into());
+        let presentation = ordered_user_content_presentation(
+            vec![
+                model::UserContentBlock::Text("before ".into()),
+                model::UserContentBlock::Image(source.clone()),
+                model::UserContentBlock::Text(" after\n\nnext paragraph".into()),
+            ],
+            &[UserImagePreview {
+                semantic_source: source,
+                source: "https://example.test/image.png".into(),
+                dimensions: Some((400, 100)),
+            }],
+        );
+
+        assert_eq!(presentation.logical_text, "before  after\n\nnext paragraph");
+        let image_url = ordered_user_image_url('\u{e000}', 1);
+        let expand_url = ordered_user_image_url('\u{e001}', 1);
+        assert_eq!(
+            presentation.markdown,
+            format!("before [![](<{image_url}>)](<{expand_url}>) after\n\nnext paragraph")
+        );
+        assert!(presentation.images.contains_key(&image_url));
+        assert!(presentation.expanded_images.contains_key(&expand_url));
+        assert_eq!(
+            markdown_source_offset_for_logical(
+                &presentation.logical_text,
+                &presentation.markdown,
+                "before  ".len()
+            ),
+            presentation
+                .markdown
+                .rfind("after")
+                .expect("visible suffix should remain the navigation target"),
+            "generated attachment URLs must not steal visible-text offset matches"
+        );
     }
 
     #[test]

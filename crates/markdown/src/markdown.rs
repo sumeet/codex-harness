@@ -36,9 +36,10 @@ use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
     ImageFormat, ImageSource, KeyContext, Length, Modifiers, MouseButton, MouseDownEvent,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
-    StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img, point, quad,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, Stateful,
+    StrikethroughStyle, StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign,
+    TextLayout, TextRun, TextStyle, TextStyleRefinement, WrappedLineLayout, actions, canvas, img,
+    point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -138,6 +139,9 @@ pub struct MarkdownStyle {
     pub base_text_style: TextStyle,
     pub container_style: StyleRefinement,
     pub code_block: StyleRefinement,
+    /// Optional framing for resolved inline images. The default is deliberately
+    /// empty so ordinary Markdown images retain their existing presentation.
+    pub image_container: StyleRefinement,
     pub code_block_overflow_x_scroll: bool,
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
@@ -163,6 +167,7 @@ impl Default for MarkdownStyle {
             base_text_style: Default::default(),
             container_style: Default::default(),
             code_block: Default::default(),
+            image_container: Default::default(),
             code_block_overflow_x_scroll: false,
             inline_code: Default::default(),
             block_quote: Default::default(),
@@ -1611,7 +1616,7 @@ pub struct MarkdownElement {
     on_source_pointer: Option<SourcePointerCallback>,
     on_checkbox_toggle: Option<CheckboxToggleCallback>,
     on_mermaid_zoom: Option<MermaidZoomCallback>,
-    image_resolver: Option<Box<dyn Fn(&str, &App) -> Option<ImageSource>>>,
+    image_resolver: Option<ImageResolver>,
     show_root_block_markers: bool,
     autoscroll: AutoscrollBehavior,
     /// Test-only hook to observe the laid-out text when this element is
@@ -1620,6 +1625,14 @@ pub struct MarkdownElement {
     #[cfg(test)]
     on_render: Option<Box<dyn Fn(RenderedText)>>,
 }
+
+struct ResolvedMarkdownImage {
+    source: ImageSource,
+    width: Option<DefiniteLength>,
+    height: Option<DefiniteLength>,
+}
+
+type ImageResolver = Box<dyn Fn(&str, &App) -> Option<ResolvedMarkdownImage>>;
 
 impl MarkdownElement {
     pub fn new(markdown: Entity<Markdown>, style: MarkdownStyle) -> Self {
@@ -1782,7 +1795,30 @@ impl MarkdownElement {
         mut self,
         resolver: impl Fn(&str, &App) -> Option<ImageSource> + 'static,
     ) -> Self {
-        self.image_resolver = Some(Box::new(resolver));
+        self.image_resolver = Some(Box::new(move |url, cx| {
+            resolver(url, cx).map(|source| ResolvedMarkdownImage {
+                source,
+                width: None,
+                height: None,
+            })
+        }));
+        self
+    }
+
+    /// Resolve an image together with the exact box it should occupy in the
+    /// inline Markdown flow. This is useful for attachment thumbnails whose
+    /// original pixels must not dictate paragraph geometry.
+    pub fn image_resolver_with_size(
+        mut self,
+        resolver: impl Fn(&str, &App) -> Option<(ImageSource, Pixels, Pixels)> + 'static,
+    ) -> Self {
+        self.image_resolver = Some(Box::new(move |url, cx| {
+            resolver(url, cx).map(|(source, width, height)| ResolvedMarkdownImage {
+                source,
+                width: Some(width.into()),
+                height: Some(height.into()),
+            })
+        }));
         self
     }
 
@@ -1855,7 +1891,12 @@ impl MarkdownElement {
         let fallback_opens_image_url = enclosing_link_url.is_none();
 
         let image_element = {
-            let wrapper = div().id(("markdown-image-link", range.start)).min_w_0();
+            let mut wrapper = div()
+                .id(("markdown-image-link", range.start))
+                .min_w_0()
+                .mr_1()
+                .mb_1();
+            wrapper.style().refine(&self.style.image_container);
             let wrapper = if !self.style.prevent_mouse_interaction
                 && let Some(url) = enclosing_link_url
             {
@@ -1900,8 +1941,6 @@ impl MarkdownElement {
                     .min_w_0()
                     .max_w_full()
                     .rounded_md()
-                    .mr_1()
-                    .mb_1()
                     .when_some(height, |this, height| this.h(height))
                     .when_some(width, |this, width| this.w(width))
                     .with_fallback(move || {
@@ -2792,7 +2831,7 @@ impl Element for MarkdownElement {
                                     None,
                                     None,
                                 );
-                            } else if let Some(source) = self
+                            } else if let Some(resolved) = self
                                 .image_resolver
                                 .as_ref()
                                 .and_then(|resolve| resolve(dest_url.as_ref(), cx))
@@ -2801,11 +2840,11 @@ impl Element for MarkdownElement {
                                 self.push_markdown_image(
                                     &mut builder,
                                     range,
-                                    source,
+                                    resolved.source,
                                     dest_url.clone(),
                                     alt_text,
-                                    None,
-                                    None,
+                                    resolved.width,
+                                    resolved.height,
                                 );
                             }
                         }
@@ -5607,6 +5646,38 @@ mod tests {
         rendered.text
     }
 
+    fn render_markdown_with_sized_image_resolver(
+        markdown: &str,
+        resolver: impl Fn(&str, &App) -> Option<(ImageSource, Pixels, Pixels)> + 'static,
+        cx: &mut TestAppContext,
+    ) -> RenderedText {
+        ensure_theme_initialized(cx);
+
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown = cx.new(|cx| Markdown::new(markdown.to_string().into(), None, None, cx));
+        cx.run_until_parked();
+        let (rendered, _) = cx.draw(
+            Default::default(),
+            size(px(600.0), px(600.0)),
+            |_window, _cx| {
+                MarkdownElement::new(
+                    markdown,
+                    MarkdownStyle {
+                        prevent_mouse_interaction: true,
+                        ..MarkdownStyle::default()
+                    },
+                )
+                .image_resolver_with_size(resolver)
+                .code_block_renderer(CodeBlockRenderer::Default {
+                    copy_button_visibility: CopyButtonVisibility::Hidden,
+                    wrap_button_visibility: WrapButtonVisibility::Hidden,
+                    border: false,
+                })
+            },
+        );
+        rendered.text
+    }
+
     fn test_image(cx: &mut TestAppContext) -> Arc<RenderImage> {
         cx.update(|cx| {
             cx.svg_renderer()
@@ -5640,6 +5711,32 @@ mod tests {
             !text.contains("textthat"),
             "soft break between words must not be dropped; got: {text:?}"
         );
+    }
+
+    #[gpui::test]
+    fn test_sized_linked_image_stays_in_the_surrounding_text_flow(cx: &mut TestAppContext) {
+        let image = test_image(cx);
+        let resolved_urls = Rc::new(RefCell::new(Vec::new()));
+        let rendered = render_markdown_with_sized_image_resolver(
+            "before [![](<\u{e000}>)](<\u{e001}>) after",
+            {
+                let resolved_urls = resolved_urls.clone();
+                move |url, _| {
+                    resolved_urls.borrow_mut().push(url.to_owned());
+                    Some((ImageSource::Render(image.clone()), px(120.), px(30.)))
+                }
+            },
+            cx,
+        );
+        let text = rendered
+            .lines
+            .iter()
+            .map(|line| line.layout.wrapped_text())
+            .collect::<String>();
+
+        assert!(text.contains("before"));
+        assert!(text.contains("after"));
+        assert_eq!(resolved_urls.borrow().as_slice(), ["\u{e000}"]);
     }
 
     #[gpui::test]

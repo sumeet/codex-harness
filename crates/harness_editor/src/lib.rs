@@ -405,8 +405,14 @@ impl LocalEditor {
             editor.remove_creases(previous, cx);
             let text = editor.text(cx);
             let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let line_height = editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+                .as_f32();
             let mut creases = Vec::new();
             for (token, image, (width, height)) in tokens {
+                let (width, height) = inline_image_token_content_size((width, height), line_height);
                 for (start, _) in text.match_indices(&token) {
                     let range = clipped_anchor_range(&snapshot, start..start + token.len());
                     let image = image.clone();
@@ -5159,6 +5165,16 @@ impl TranscriptEditor {
     }
 }
 
+/// GPUI lays a fold replacement into exactly one editor line. Leave room for
+/// the chip's border, padding, and antialiasing inside that line instead of
+/// painting a nominal 30px preview beyond the replacement's clipped bounds.
+fn inline_image_token_content_size((width, height): (f32, f32), line_height: f32) -> (f32, f32) {
+    const VERTICAL_CHROME: f32 = 6.;
+    let available_height = (line_height - VERTICAL_CHROME).max(1.);
+    let scale = (available_height / height.max(1.)).min(1.);
+    (width * scale, height * scale)
+}
+
 fn previous_char_boundary(text: &str, offset: usize) -> usize {
     (0..=offset.min(text.len()))
         .rev()
@@ -5206,6 +5222,20 @@ impl Render for TranscriptEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_image_chip_fits_inside_the_editor_line_box() {
+        let fitted = inline_image_token_content_size((120., 30.), 28.);
+        assert_eq!(fitted, (88., 22.));
+        assert_eq!(fitted.1 + 6., 28.);
+        assert!((fitted.0 / fitted.1 - 4.).abs() < f32::EPSILON);
+
+        assert_eq!(
+            inline_image_token_content_size((20., 10.), 28.),
+            (20., 10.),
+            "already-small chips should not be enlarged"
+        );
+    }
 
     #[test]
     fn linewise_selection_does_not_claim_a_row_at_its_exclusive_boundary() {
