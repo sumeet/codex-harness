@@ -146,6 +146,9 @@ pub struct MarkdownStyle {
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
+    /// Overrides the weight used by `**strong**` spans. When unset, strong
+    /// text retains Markdown's conventional bold weight.
+    pub strong_font_weight: Option<FontWeight>,
     pub link_callback: Option<LinkStyleCallback>,
     pub rule_color: Hsla,
     pub block_quote_border_color: Hsla,
@@ -172,6 +175,7 @@ impl Default for MarkdownStyle {
             inline_code: Default::default(),
             block_quote: Default::default(),
             link: Default::default(),
+            strong_font_weight: None,
             link_callback: None,
             rule_color: Default::default(),
             block_quote_border_color: Default::default(),
@@ -3083,7 +3087,9 @@ impl Element for MarkdownElement {
                             ..Default::default()
                         }),
                         MarkdownTag::Strong => builder.push_text_style(TextStyleRefinement {
-                            font_weight: Some(FontWeight::BOLD),
+                            font_weight: Some(
+                                self.style.strong_font_weight.unwrap_or(FontWeight::BOLD),
+                            ),
                             color: Some(cx.theme().colors().text),
                             ..Default::default()
                         }),

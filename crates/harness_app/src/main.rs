@@ -175,12 +175,23 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
 
 fn refine_harness_markdown_style(mut style: MarkdownStyle) -> MarkdownStyle {
     style.code_block_overflow_x_scroll = true;
+    style.strong_font_weight = Some(relative_strong_font_weight(
+        style.base_text_style.font_weight,
+    ));
     // The native composer represents inline code through typography alone.
     // Markdown's glyph-sized background has no padding or corner geometry and
     // becomes a visibly uneven pseudo-chip when the reading and code fonts use
     // different metrics. Keep transcript and composer semantics consistent.
     style.inline_code.background_color = None;
     style
+}
+
+fn relative_strong_font_weight(base: FontWeight) -> FontWeight {
+    if base >= FontWeight::BOLD {
+        base
+    } else {
+        FontWeight((base.0 + 100.).min(FontWeight::BOLD.0))
+    }
 }
 
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
@@ -18896,6 +18907,30 @@ fn load_harness_keymaps(cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::AssetSource as _;
+
+    #[test]
+    fn transcript_strong_weight_advances_one_step_without_exceeding_bold() {
+        assert_eq!(
+            relative_strong_font_weight(FontWeight::LIGHT),
+            FontWeight::NORMAL
+        );
+        assert_eq!(
+            relative_strong_font_weight(FontWeight::NORMAL),
+            FontWeight::MEDIUM
+        );
+        assert_eq!(
+            relative_strong_font_weight(FontWeight::SEMIBOLD),
+            FontWeight::BOLD
+        );
+        assert_eq!(
+            relative_strong_font_weight(FontWeight::BOLD),
+            FontWeight::BOLD
+        );
+        assert_eq!(
+            relative_strong_font_weight(FontWeight::EXTRA_BOLD),
+            FontWeight::EXTRA_BOLD
+        );
+    }
 
     fn cached_thread(id: &str, updated_at: i64) -> CodexThread {
         CodexThread {
