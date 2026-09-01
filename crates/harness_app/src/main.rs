@@ -49,10 +49,10 @@ use ui::prelude::{ActiveTheme, StyledTypography};
 use ui::{
     AgentThreadStatus, Button, ButtonCommon, ButtonSize, ButtonStyle, CircularProgress, Clickable,
     Color, ContextMenu, ContextMenuEntry, DiffStat, Disableable, Disclosure, DocumentationSide,
-    Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label, LabelCommon,
-    LabelSize, LineHeightStyle, ListItem, ListItemSpacing, PopoverMenu, PopoverMenuHandle,
-    ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem, TintColor, Toggleable,
-    Tooltip, WithScrollbar, right_click_menu,
+    FixedWidth, Icon, IconButton, IconButtonShape, IconName, IconPosition, IconSize, Label,
+    LabelCommon, LabelSize, LineHeightStyle, ListItem, ListItemSpacing, PopoverMenu,
+    PopoverMenuHandle, ScrollAxes, Scrollbars, SelectableButton, SpinnerLabel, ThreadItem,
+    TintColor, Toggleable, Tooltip, WithScrollbar, right_click_menu,
 };
 use uuid::Uuid;
 
@@ -3673,6 +3673,14 @@ fn composer_send_blocked(
         || !transport_available
 }
 
+fn new_thread_requires_project(
+    replay_mode: bool,
+    selected_thread_id: Option<&str>,
+    pending_thread_cwd: Option<&str>,
+) -> bool {
+    !replay_mode && selected_thread_id.is_none() && pending_thread_cwd.is_none()
+}
+
 fn should_reattach_cached_thread(
     selected_thread_id: Option<&str>,
     requested_thread_id: &str,
@@ -4050,6 +4058,8 @@ fn hybrid_structured_rows(item: &TranscriptItem) -> u32 {
 
 struct HarnessApp {
     cwd: String,
+    pending_thread_cwd: Option<String>,
+    new_task_picker_open: bool,
     replay_count: Option<usize>,
     workspace_mode: WorkspaceMode,
     chat_conversations: Vec<ChatConversationSummary>,
@@ -7816,6 +7826,8 @@ impl HarnessApp {
 
         let mut this = Self {
             cwd,
+            pending_thread_cwd: None,
+            new_task_picker_open: false,
             replay_count,
             workspace_mode: WorkspaceMode::Codex,
             chat_conversations: Vec::new(),
@@ -10724,6 +10736,7 @@ impl HarnessApp {
             self.queued_turns.clear();
         }
         self.selected_thread_id = Some(thread_id.clone());
+        self.pending_thread_cwd = None;
         self.set_transcript_history_complete(false);
         self.loaded_thread_updated_at = None;
         self.loading_thread = true;
@@ -10974,6 +10987,7 @@ impl HarnessApp {
         let load_started_at = Instant::now();
         let old_len = self.model.items.len();
         self.selected_thread_id = Some(thread.id.clone());
+        self.pending_thread_cwd = None;
         self.loaded_thread_updated_at = Some(thread.updated_at);
         if !thread.cwd.is_empty() {
             self.cwd = thread.cwd.clone();
@@ -11125,6 +11139,55 @@ impl HarnessApp {
     }
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode != WorkspaceMode::Codex || self.new_task_picker_open {
+            return;
+        }
+        self.new_task_picker_open = true;
+        self.error = None;
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Start Codex Here".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let selection = paths.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                this.new_task_picker_open = false;
+                match selection {
+                    Ok(Ok(Some(paths))) => {
+                        let Some(path) = paths.into_iter().next() else {
+                            cx.notify();
+                            return;
+                        };
+                        if !path.is_dir() {
+                            this.error = Some("Choose a project folder for the new thread.".into());
+                            cx.notify();
+                            return;
+                        }
+                        let Some(cwd) = path.to_str().map(ToOwned::to_owned) else {
+                            this.error = Some(
+                                "The selected folder path is not valid UTF-8 and cannot be sent to Codex."
+                                    .into(),
+                            );
+                            cx.notify();
+                            return;
+                        };
+                        this.begin_new_task(cwd, window, cx);
+                    }
+                    Ok(Ok(None)) | Err(_) => cx.notify(),
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("Could not choose a project folder: {error}").into());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn begin_new_task(&mut self, cwd: String, window: &mut Window, cx: &mut Context<Self>) {
         self.switch_composer_draft_context(None, cx);
         self.reject_pending_requests(cx);
         self.thread_open_task = Task::ready(());
@@ -11151,6 +11214,8 @@ impl HarnessApp {
         self.retire_all_request_surfaces();
         self.list_state.splice(0..old_len, 0);
         self.selected_thread_id = None;
+        self.cwd = cwd.clone();
+        self.pending_thread_cwd = Some(cwd);
         self.set_transcript_history_complete(true);
         self.loaded_thread_updated_at = None;
         self.loading_thread = false;
@@ -11172,6 +11237,7 @@ impl HarnessApp {
             self.transcript_editor
                 .update(cx, |editor, cx| editor.reveal_tail(cx));
         }
+        self.load_server_options(cx);
         self.focus_composer(window, cx);
     }
 
@@ -11298,6 +11364,17 @@ impl HarnessApp {
             self.send_chatgpt(window, cx);
             return;
         }
+        if new_thread_requires_project(
+            self.replay_count.is_some(),
+            self.selected_thread_id.as_deref(),
+            self.pending_thread_cwd.as_deref(),
+        ) {
+            // Never let a brand-new thread silently inherit the process or
+            // previously selected task directory. Keep the draft intact and
+            // ask for the missing project context.
+            self.new_task(window, cx);
+            return;
+        }
         // Starting a brand-new task is the only moment at which no stable
         // thread id exists for the server-owned queue. Leave the composer
         // untouched until thread/start returns instead of losing a fast second
@@ -11355,7 +11432,10 @@ impl HarnessApp {
         } = submission;
         let existing_thread_id = self.selected_thread_id.clone();
         let origin_thread_id = existing_thread_id.clone();
-        let cwd = self.cwd.clone();
+        let cwd = self
+            .pending_thread_cwd
+            .clone()
+            .unwrap_or_else(|| self.cwd.clone());
         self.transient_turn_status = None;
         self.turn_start_pending = true;
         self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
@@ -11400,6 +11480,7 @@ impl HarnessApp {
                     match result {
                         Ok((thread_id, opened_thread, response)) => {
                             this.selected_thread_id = Some(thread_id.clone());
+                            this.pending_thread_cwd = None;
                             if opened_thread.is_some() {
                                 this.switch_composer_draft_context(Some(thread_id), cx);
                             }
@@ -17501,6 +17582,12 @@ impl Render for HarnessApp {
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
         let composer_empty = composer_is_empty(&composer_text, self.composer_images.len());
+        let new_thread_needs_project = self.workspace_mode == WorkspaceMode::Codex
+            && new_thread_requires_project(
+                self.replay_count.is_some(),
+                self.selected_thread_id.as_deref(),
+                self.pending_thread_cwd.as_deref(),
+            );
         let send_blocked = if self.workspace_mode == WorkspaceMode::Chat {
             composer_empty
                 || self.chat_sending
@@ -17516,7 +17603,8 @@ impl Render for HarnessApp {
                 self.settings_update_pending,
                 self.thread_read_only_reason.is_some(),
                 self.client.is_some() || self.replay_count.is_some(),
-            )
+            ) || new_thread_needs_project
+                || self.new_task_picker_open
         };
         let composer_status: Option<(SharedString, Color)> =
             if self.workspace_mode == WorkspaceMode::Chat {
@@ -17889,6 +17977,53 @@ impl Render for HarnessApp {
             self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
         let pending_outbound_proxy = self.render_pending_outbound_proxy(following_tail, cx);
         let outbound_tray = self.render_outbound_tray(pending_outbound_proxy, cx);
+        let new_thread_project_control = (self.workspace_mode == WorkspaceMode::Codex
+            && self.replay_count.is_none()
+            && self.selected_thread_id.is_none())
+        .then(|| {
+            let selected_path = self.pending_thread_cwd.clone();
+            let choosing = self.new_task_picker_open;
+            let label: SharedString = if choosing {
+                "Choosing project…".into()
+            } else {
+                selected_path
+                    .clone()
+                    .map(Into::into)
+                    .unwrap_or_else(|| "Choose project folder".into())
+            };
+            let tooltip: SharedString = selected_path
+                .map(|path| format!("Working directory: {path}\nClick to change").into())
+                .unwrap_or_else(|| "Choose the working directory for this Codex thread".into());
+            div()
+                .w_full()
+                .min_w_0()
+                .px_1()
+                .pb_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Label::new("Project")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    div().min_w_0().flex_1().child(
+                        Button::new("new-thread-project", label)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Subtle)
+                            .start_icon(Icon::new(IconName::FolderOpen))
+                            .end_icon(Icon::new(IconName::ChevronDown))
+                            .loading(choosing)
+                            .disabled(choosing)
+                            .truncate(true)
+                            .full_width()
+                            .tooltip(Tooltip::text(tooltip))
+                            .on_click(cx.listener(|this, _, window, cx| this.new_task(window, cx))),
+                    ),
+                )
+                .into_any_element()
+        });
 
         let surface_error = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_error.clone()
@@ -18186,11 +18321,14 @@ impl Render for HarnessApp {
                                         .shape(IconButtonShape::Square)
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
-                                        .disabled(self.workspace_mode == WorkspaceMode::Chat)
+                                        .disabled(
+                                            self.workspace_mode == WorkspaceMode::Chat
+                                                || self.new_task_picker_open,
+                                        )
                                         .aria_label(if self.workspace_mode == WorkspaceMode::Chat {
                                             "New ChatGPT conversation is coming next"
                                         } else {
-                                            "New thread"
+                                            "Choose a project folder for a new thread"
                                         })
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.new_task(window, cx)
@@ -18296,6 +18434,8 @@ impl Render for HarnessApp {
                                     }
                                 } else if self.loading_thread {
                                     "Loading task history…"
+                                } else if new_thread_needs_project {
+                                    "Choose a project folder to start a Codex thread"
                                 } else {
                                     "What should we build?"
                                 }),
@@ -18318,6 +18458,9 @@ impl Render for HarnessApp {
                             .flex()
                             .flex_col()
                             .gap_2()
+                            .when_some(new_thread_project_control, |this, control| {
+                                this.child(control)
+                            })
                             .child(
                                 div()
                                     .relative()
@@ -23728,6 +23871,43 @@ mod tests {
         assert!(!composer_send_blocked(
             false, false, false, false, false, true
         ));
+    }
+
+    #[test]
+    fn a_new_codex_thread_requires_an_explicit_project_directory() {
+        assert!(new_thread_requires_project(false, None, None));
+        assert!(
+            !new_thread_requires_project(false, None, Some("/work/project")),
+            "a directory chosen for the pending thread makes it sendable"
+        );
+        assert!(
+            !new_thread_requires_project(false, Some("thread-a"), None),
+            "existing threads already own their working directory"
+        );
+        assert!(
+            !new_thread_requires_project(true, None, None),
+            "fixture replay does not create a real app-server thread"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_new_thread_picker_cannot_destroy_the_visible_thread() {
+        let source = include_str!("main.rs");
+        let picker = source
+            .split_once("fn new_task(")
+            .and_then(|(_, after)| after.split_once("fn begin_new_task("))
+            .map(|(method, _)| method)
+            .expect("the picker and destructive transition must remain separate");
+        let transition = source
+            .split_once("fn begin_new_task(")
+            .and_then(|(_, after)| after.split_once("fn paste_composer("))
+            .map(|(method, _)| method)
+            .expect("the explicit new-thread transition must remain auditable");
+
+        assert!(picker.contains("prompt_for_paths"));
+        assert!(!picker.contains("self.model.clear()"));
+        assert!(transition.contains("self.model.clear()"));
+        assert!(transition.contains("self.pending_thread_cwd = Some(cwd)"));
     }
 
     #[test]
