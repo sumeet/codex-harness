@@ -518,6 +518,20 @@ enum DaemonLifecycleStatus {
     AlreadyRunning,
 }
 
+/// Connection metadata reported by Codex's managed app-server lifecycle
+/// command. Retaining this on the client lets presentation layers explain
+/// exactly which binary is running without launching a second diagnostic
+/// command or guessing from `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedDaemonInfo {
+    pub managed_codex_path: PathBuf,
+    pub managed_codex_version: String,
+    pub socket_path: PathBuf,
+    pub cli_version: String,
+    pub app_server_version: String,
+    pub already_running: bool,
+}
+
 struct SplitDuplex<R, W> {
     reader: R,
     writer: W,
@@ -562,6 +576,7 @@ pub struct Client {
     events: async_channel::Receiver<Event>,
     pending: PendingRequests,
     next_id: AtomicU64,
+    managed_daemon: Option<ManagedDaemonInfo>,
     _child: Child,
     _reader_task: smol::Task<()>,
     _writer_task: smol::Task<()>,
@@ -673,6 +688,7 @@ impl Client {
             events: event_rx,
             pending,
             next_id: AtomicU64::new(0),
+            managed_daemon: None,
             _child: child,
             _reader_task: reader_task,
             _writer_task: writer_task,
@@ -686,12 +702,12 @@ impl Client {
     /// proxy; daemon socket and process lifecycle remain owned by Codex.
     pub async fn launch_managed(codex: impl AsRef<OsStr>) -> Result<Self, Error> {
         let codex = codex.as_ref();
-        let socket_path = start_managed_daemon(codex).await?;
+        let managed_daemon = start_managed_daemon(codex).await?;
 
         let mut command = Command::new(codex);
         command
             .args(["app-server", "proxy", "--sock"])
-            .arg(socket_path)
+            .arg(&managed_daemon.socket_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -801,6 +817,7 @@ impl Client {
             events: event_rx,
             pending,
             next_id: AtomicU64::new(0),
+            managed_daemon: Some(managed_daemon),
             _child: child,
             _reader_task: reader_task,
             _writer_task: writer_task,
@@ -830,6 +847,12 @@ impl Client {
             .await?;
         self.notify("initialized", json!({})).await?;
         Ok(result)
+    }
+
+    /// Metadata for the managed daemon behind this connection. Direct stdio
+    /// clients return `None` because they own an app-server child instead.
+    pub fn managed_daemon_info(&self) -> Option<&ManagedDaemonInfo> {
+        self.managed_daemon.as_ref()
     }
 
     pub async fn list_threads(
@@ -1188,7 +1211,7 @@ impl Client {
     }
 }
 
-async fn start_managed_daemon(codex: &OsStr) -> Result<PathBuf, Error> {
+async fn start_managed_daemon(codex: &OsStr) -> Result<ManagedDaemonInfo, Error> {
     let output = Command::new(codex)
         .args(["app-server", "daemon", "start"])
         .stdin(Stdio::null())
@@ -1208,7 +1231,7 @@ async fn start_managed_daemon(codex: &OsStr) -> Result<PathBuf, Error> {
     parse_daemon_lifecycle(&output.stdout)
 }
 
-fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<PathBuf, Error> {
+fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<ManagedDaemonInfo, Error> {
     let lifecycle: DaemonLifecycleOutput = serde_json::from_slice(stdout)
         .map_err(|error| Error::InvalidDaemonLifecycle(error.to_string()))?;
 
@@ -1216,7 +1239,6 @@ fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<PathBuf, Error> {
     // daemon path. Newer Codex releases no longer include the older
     // informational `backend` and `pid` fields, so only validate fields that
     // are part of the usable connection contract.
-    let _ = &lifecycle.status;
     if lifecycle.managed_codex_path.as_os_str().is_empty() {
         return Err(Error::InvalidDaemonLifecycle(
             "managedCodexPath must not be empty".into(),
@@ -1244,7 +1266,14 @@ fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<PathBuf, Error> {
         )));
     }
 
-    Ok(lifecycle.socket_path)
+    Ok(ManagedDaemonInfo {
+        managed_codex_path: lifecycle.managed_codex_path,
+        managed_codex_version: lifecycle.managed_codex_version,
+        socket_path: lifecycle.socket_path,
+        cli_version: lifecycle.cli_version,
+        app_server_version: lifecycle.app_server_version,
+        already_running: matches!(lifecycle.status, DaemonLifecycleStatus::AlreadyRunning),
+    })
 }
 
 async fn dispatch_incoming(
@@ -1585,13 +1614,24 @@ mod tests {
 
     #[test]
     fn accepts_started_and_already_running_managed_daemons() {
-        for status in ["started", "alreadyRunning"] {
-            assert_eq!(
-                parse_daemon_lifecycle(&daemon_lifecycle_json(status))
-                    .expect("managed lifecycle should validate"),
-                PathBuf::from("/tmp/codex/app-server-control.sock")
-            );
-        }
+        let started = parse_daemon_lifecycle(&daemon_lifecycle_json("started"))
+            .expect("started managed lifecycle should validate");
+        assert_eq!(
+            started.managed_codex_path,
+            PathBuf::from("/opt/codex/bin/codex")
+        );
+        assert_eq!(started.managed_codex_version, "0.151.0");
+        assert_eq!(
+            started.socket_path,
+            PathBuf::from("/tmp/codex/app-server-control.sock")
+        );
+        assert_eq!(started.cli_version, "0.151.0");
+        assert_eq!(started.app_server_version, "0.151.0");
+        assert!(!started.already_running);
+
+        let reused = parse_daemon_lifecycle(&daemon_lifecycle_json("alreadyRunning"))
+            .expect("running managed lifecycle should validate");
+        assert!(reused.already_running);
 
         let mut newer_lifecycle: Value =
             serde_json::from_slice(&daemon_lifecycle_json("started")).unwrap();

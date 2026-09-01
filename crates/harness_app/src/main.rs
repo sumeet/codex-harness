@@ -14,7 +14,7 @@ use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{
     Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus, CodexTurn,
-    Event as AppServerEvent, SortDirection, ThreadItemEntry, ThreadOpenResponse,
+    Event as AppServerEvent, ManagedDaemonInfo, SortDirection, ThreadItemEntry, ThreadOpenResponse,
     ThreadTurnsListParams, TurnItemsView,
 };
 use file_icons::FileIcons;
@@ -4182,6 +4182,26 @@ fn sort_root_threads(threads: &mut [CodexThread]) {
             .cmp(&left.updated_at)
             .then_with(|| left.id.cmp(&right.id))
     });
+}
+
+fn managed_daemon_tooltip(info: Option<&ManagedDaemonInfo>, connecting: bool) -> SharedString {
+    match info {
+        Some(info) => format!(
+            "Refresh tasks\nCodex App Server {}\nManaged binary: {} ({})\nClient CLI: {}\n{}",
+            info.app_server_version,
+            info.managed_codex_path.display(),
+            info.managed_codex_version,
+            info.cli_version,
+            if info.already_running {
+                "Reused the running managed daemon"
+            } else {
+                "Started the managed daemon for this connection"
+            },
+        )
+        .into(),
+        None if connecting => "Refresh tasks\nConnecting to the managed Codex App Server…".into(),
+        None => "Refresh tasks\nCodex App Server is offline".into(),
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -16571,6 +16591,10 @@ impl Render for HarnessApp {
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
+        let daemon_tooltip = managed_daemon_tooltip(
+            self.client.as_deref().and_then(Client::managed_daemon_info),
+            self.connecting,
+        );
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
@@ -17121,6 +17145,7 @@ impl Render for HarnessApp {
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
                                         .aria_label("Refresh threads")
+                                        .tooltip(Tooltip::text(daemon_tooltip.clone()))
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.refresh_threads(cx)),
                                         ),
@@ -18835,6 +18860,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["newest", "middle", "older"]
         );
+    }
+
+    #[test]
+    fn refresh_tooltip_exposes_the_exact_managed_runtime() {
+        let info = ManagedDaemonInfo {
+            managed_codex_path: PathBuf::from("/opt/codex/current/codex"),
+            managed_codex_version: "0.151.0".into(),
+            socket_path: PathBuf::from("/tmp/codex.sock"),
+            cli_version: "0.151.0".into(),
+            app_server_version: "0.151.0".into(),
+            already_running: true,
+        };
+        let tooltip = managed_daemon_tooltip(Some(&info), false);
+        assert!(tooltip.contains("Codex App Server 0.151.0"));
+        assert!(tooltip.contains("/opt/codex/current/codex (0.151.0)"));
+        assert!(tooltip.contains("Client CLI: 0.151.0"));
+        assert!(tooltip.contains("Reused the running managed daemon"));
+
+        assert!(managed_daemon_tooltip(None, true).contains("Connecting"));
+        assert!(managed_daemon_tooltip(None, false).contains("offline"));
     }
 
     #[test]

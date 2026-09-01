@@ -65,10 +65,12 @@ must survive conversation compaction and hand-offs.
   outbound journal, partial request answers, and practical scroll/Vim/fold
   anchors. Flush atomically on mutation/shutdown and recover from an interrupted
   write without corrupting prior state.
-- [ ] Expose the resolved Codex binary path plus installed and running App
-  Server versions; refuse or prominently gate a stale managed daemon, detect an
-  available update, and provide a controlled restart. Never restart while any
-  thread is active or awaiting interaction without explicit user override.
+- [x] Retain and expose the managed Codex binary path plus client, managed, and
+  running App Server versions; refuse a managed daemon whose three reported
+  versions disagree.
+- [ ] Detect an available Codex update and provide a controlled managed-daemon
+  restart. Never restart while any thread is active or awaiting interaction
+  without explicit user override.
 - [ ] Surface multi-agent capacity and allocation failures truthfully enough to
   distinguish an App Server/protocol limitation from the outer Codex
   orchestration runtime and from exhausted local child slots.
