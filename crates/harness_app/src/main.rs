@@ -26,9 +26,9 @@ use gpui::{
     FocusHandle, Focusable, FollowMode, Font, FontStyle, FontWeight, Image, ImageFormat,
     ImageSource, IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior,
     ListState, Modifiers, MouseButton, MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TouchPhase,
-    UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas, deferred, div,
-    list, point, prelude::*, px, relative, size,
+    ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TextRenderingMode,
+    TouchPhase, UpdateGlobal, WeakEntity, Window, WindowBounds, WindowOptions, actions, canvas,
+    deferred, div, list, point, prelude::*, px, relative, size,
 };
 use gpui_platform::application;
 use harness_editor::{
@@ -57,6 +57,7 @@ use ui::{
 use uuid::Uuid;
 
 mod chatgpt_desktop;
+mod comparison_profile;
 mod image_surface;
 mod palette;
 mod performance;
@@ -176,7 +177,19 @@ fn harness_code_row_height(cx: &App) -> gpui::Pixels {
 
 fn refine_harness_markdown_style(mut style: MarkdownStyle, cx: &App) -> MarkdownStyle {
     refine_harness_markdown_style_with_font_size(&mut style, thread_reading_font_size(cx));
+    if let Some(color) = comparison_profile::profile()
+        .and_then(|profile| profile.transcript_foreground(cx.theme().colors()))
+    {
+        style.base_text_style.color = color;
+        style.container_style.text.color = Some(color);
+    }
     style
+}
+
+fn harness_reading_line_height() -> f32 {
+    comparison_profile::profile()
+        .and_then(|profile| profile.line_height)
+        .unwrap_or(THREAD_READING_LINE_HEIGHT)
 }
 
 fn refine_harness_markdown_style_with_font_size(
@@ -185,13 +198,14 @@ fn refine_harness_markdown_style_with_font_size(
 ) {
     style.code_block_overflow_x_scroll = true;
     style.base_text_style.font_size = reading_font_size.into();
-    style.base_text_style.line_height = relative(THREAD_READING_LINE_HEIGHT);
+    let line_height = harness_reading_line_height();
+    style.base_text_style.line_height = relative(line_height);
     // Markdown's TextRuns carry family, weight, and paint but intentionally do
     // not carry font size. The containing Div therefore owns the metrics that
     // are actually shaped and painted; keep both layers on the same role.
     style.container_style.text.font_size = Some(reading_font_size.into());
-    style.container_style.text.line_height = Some(relative(THREAD_READING_LINE_HEIGHT));
-    style.paragraph_line_height = relative(THREAD_READING_LINE_HEIGHT);
+    style.container_style.text.line_height = Some(relative(line_height));
+    style.paragraph_line_height = relative(line_height);
     // Zed's generic Markdown renderer gives every non-H1 heading a 24px top
     // margin. In a continuous thread that stacks with the preceding block's
     // own 8px boundary (especially visibly after blockquotes). Delta's thread
@@ -229,7 +243,7 @@ fn structural_heading_font_weight(base: FontWeight) -> FontWeight {
 
 fn harness_reading_row_height(cx: &App) -> gpui::Pixels {
     let size = thread_reading_font_size(cx);
-    px((size.as_f32() * THREAD_READING_LINE_HEIGHT).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
+    px((size.as_f32() * harness_reading_line_height()).max(RICH_MIN_CARD_IDENTITY_ROW_HEIGHT))
 }
 
 fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
@@ -260,7 +274,7 @@ trait HarnessStyledTypography: gpui::Styled + Sized {
         self.font_family(settings.agent_ui_font_family().clone())
             .font_weight(settings.ui_font.weight)
             .text_size(thread_reading_font_size(cx))
-            .line_height(relative(THREAD_READING_LINE_HEIGHT))
+            .line_height(relative(harness_reading_line_height()))
     }
 
     fn font_harness_code(self, cx: &App) -> Self {
@@ -16710,11 +16724,18 @@ impl Render for HarnessApp {
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
-        let transcript_surface = if comparison_fixture_uses_zed_transcript_surface() {
-            colors.surface_background
-        } else {
-            visuals.transcript
-        };
+        let transcript_surface = comparison_profile::profile()
+            .and_then(|profile| profile.transcript_background(&colors))
+            .unwrap_or_else(|| {
+                if comparison_fixture_uses_zed_transcript_surface() {
+                    colors.surface_background
+                } else {
+                    visuals.transcript
+                }
+            });
+        let transcript_foreground = comparison_profile::profile()
+            .and_then(|profile| profile.transcript_foreground(&colors))
+            .unwrap_or(colors.text);
         let daemon_tooltip = managed_daemon_tooltip(
             self.client.as_deref().and_then(Client::managed_daemon_info),
             self.connecting,
@@ -16927,6 +16948,7 @@ impl Render for HarnessApp {
                 .flex_col()
                 .overflow_hidden()
                 .bg(transcript_surface)
+                .text_color(transcript_foreground)
                 .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     if event.button == MouseButton::Left {
                         this.finish_rich_pointer_selection(window, cx);
@@ -23889,7 +23911,21 @@ fn main() {
         logger.filter_module("gpui_scroll", log::LevelFilter::Info);
     }
     logger.init();
-    let replay_count = comparison_fixture_path().map(|_| 0).or_else(replay_count);
+    let comparison_fixture = comparison_fixture_path();
+    if let Some(error) =
+        comparison_profile::initialization_error(comparison_fixture.as_ref().is_some())
+    {
+        log::error!("invalid Harness comparison configuration: {error}");
+        eprintln!("invalid Harness comparison configuration: {error}");
+        return;
+    }
+    if let Some(profile) = comparison_profile::profile() {
+        log::info!(
+            "using Harness comparison profile: {}",
+            profile.name.as_deref().unwrap_or("unnamed")
+        );
+    }
+    let replay_count = comparison_fixture.as_ref().map(|_| 0).or_else(replay_count);
     let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")
         .ok()
         .filter(|thread_id| !thread_id.trim().is_empty());
@@ -23901,6 +23937,12 @@ fn main() {
 
     application().with_assets(Assets).run(move |cx| {
         cx.set_app_identity("dev.harness.app", "Harness");
+        if let Some(mode) = comparison_profile::profile()
+            .and_then(|profile| profile.text_rendering)
+            .map(TextRenderingMode::from)
+        {
+            cx.set_text_rendering_mode(mode);
+        }
         // Standalone Harness does not construct Zed's production Client,
         // which ordinarily installs the process-wide HTTP implementation.
         // Register the same native reqwest stack explicitly so catalog and
@@ -23932,7 +23974,11 @@ fn main() {
             log::error!("failed to load fonts: {error}");
             return;
         }
-        let initial_settings = preferred_preferences().settings_json();
+        let mut preferences = preferred_preferences();
+        if let Some(profile) = comparison_profile::profile() {
+            profile.apply_typography(&mut preferences);
+        }
+        let initial_settings = preferences.settings_json();
         SettingsStore::update_global(cx, |store, cx| {
             if let Err(error) = store.set_user_settings(&initial_settings, cx).result() {
                 log::error!("failed to initialize Harness settings: {error}");
