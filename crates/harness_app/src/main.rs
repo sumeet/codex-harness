@@ -7601,9 +7601,21 @@ impl HarnessApp {
             },
         )
         .detach();
-        let mut model = replay_count
-            .map(TranscriptModel::replay)
-            .unwrap_or_default();
+        let mut model = match comparison_fixture_path() {
+            Some(path) => match load_comparison_fixture(&path) {
+                Ok(model) => model,
+                Err(error) => {
+                    log::error!(
+                        "failed to load interface comparison fixture {}: {error:#}",
+                        path.display()
+                    );
+                    TranscriptModel::default()
+                }
+            },
+            None => replay_count
+                .map(TranscriptModel::replay)
+                .unwrap_or_default(),
+        };
         if replay_count.is_some() && replay_streaming() {
             if let Some(agent) = model
                 .items
@@ -18801,6 +18813,250 @@ fn replay_count() -> Option<usize> {
         .and_then(|count| count.parse().ok())
 }
 
+fn comparison_fixture_path() -> Option<PathBuf> {
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--comparison-fixture" {
+            return arguments.next().map(PathBuf::from);
+        }
+        if let Some(path) = argument.strip_prefix("--comparison-fixture=") {
+            return Some(PathBuf::from(path));
+        }
+    }
+    std::env::var_os("HARNESS_COMPARISON_FIXTURE").map(PathBuf::from)
+}
+
+fn load_comparison_fixture(path: &Path) -> anyhow::Result<TranscriptModel> {
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let fixture: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    comparison_fixture_model(&fixture)
+}
+
+fn comparison_fixture_model(fixture: &Value) -> anyhow::Result<TranscriptModel> {
+    let mut items = Vec::new();
+    let user_markdown = fixture
+        .pointer("/user/markdown")
+        .and_then(Value::as_str)
+        .context("comparison fixture is missing user.markdown")?;
+    items.push(comparison_fixture_item(
+        0,
+        model::TranscriptKind::User,
+        "You",
+        user_markdown,
+        json!({
+            "id": "comparison-user",
+            "type": "userMessage",
+            "content": [{"type": "text", "text": user_markdown}],
+        }),
+        true,
+        "completed",
+    ));
+
+    let events = fixture
+        .get("events")
+        .and_then(Value::as_array)
+        .context("comparison fixture is missing events")?;
+    for (event_index, event) in events.iter().enumerate() {
+        let index = event_index + 1;
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .context("comparison fixture event is missing type")?;
+        let status = event
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("completed");
+        let (kind, title, content, raw, expanded) = match event_type {
+            "thought" => (
+                model::TranscriptKind::Reasoning,
+                "Reasoning".to_owned(),
+                fixture_string(event, "markdown")?.to_owned(),
+                json!({
+                    "id": format!("comparison-{index}"),
+                    "type": "reasoning",
+                    "summary": [fixture_string(event, "markdown")?],
+                }),
+                true,
+            ),
+            "plan" => {
+                let title = event
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Plan")
+                    .to_owned();
+                let plan = event
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .context("plan event is missing items")?;
+                let content = plan
+                    .iter()
+                    .map(|item| {
+                        let marker = match item.get("status").and_then(Value::as_str) {
+                            Some("completed") => "x",
+                            Some("in_progress") => "~",
+                            _ => " ",
+                        };
+                        format!(
+                            "- [{marker}] {}",
+                            item.get("text").and_then(Value::as_str).unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (
+                    model::TranscriptKind::Plan,
+                    title,
+                    content,
+                    json!({"type": "plan", "plan": plan}),
+                    true,
+                )
+            }
+            "tool" => comparison_fixture_tool(event, index)?,
+            "message" => (
+                model::TranscriptKind::Agent,
+                "Codex".to_owned(),
+                fixture_string(event, "markdown")?.to_owned(),
+                json!({
+                    "id": format!("comparison-{index}"),
+                    "type": "agentMessage",
+                    "text": fixture_string(event, "markdown")?,
+                }),
+                true,
+            ),
+            other => anyhow::bail!("unsupported comparison fixture event type {other}"),
+        };
+        items.push(comparison_fixture_item(
+            index, kind, &title, &content, raw, expanded, status,
+        ));
+    }
+
+    let mut model = TranscriptModel::default();
+    model.replace_presentational_items(items);
+    Ok(model)
+}
+
+fn fixture_string<'a>(event: &'a Value, field: &str) -> anyhow::Result<&'a str> {
+    event
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("comparison fixture event is missing {field}"))
+}
+
+fn comparison_fixture_tool(
+    event: &Value,
+    index: usize,
+) -> anyhow::Result<(model::TranscriptKind, String, String, Value, bool)> {
+    let fixture_kind = fixture_string(event, "kind")?;
+    let title = fixture_string(event, "title")?.to_owned();
+    let input = fixture_string(event, "input")?;
+    let output = fixture_string(event, "output")?;
+    let status = event
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let id = event
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("comparison-{index}"));
+    Ok(match fixture_kind {
+        "terminal" => (
+            model::TranscriptKind::Command,
+            title,
+            format!("$ {input}\n\n{output}"),
+            json!({
+                "id": id,
+                "type": "commandExecution",
+                "command": input,
+                "cwd": "/tmp/interface-comparison",
+                "status": status,
+                "exitCode": if status == "completed" { 0 } else { 1 },
+            }),
+            false,
+        ),
+        "web" => (
+            model::TranscriptKind::Web,
+            title,
+            output.to_owned(),
+            json!({
+                "id": id,
+                "type": "webSearch",
+                "status": status,
+                "query": input,
+                "action": {"type": "search", "queries": [input]},
+                "results": event.get("results").cloned().unwrap_or_else(|| json!([])),
+            }),
+            false,
+        ),
+        "edit" => (
+            model::TranscriptKind::FileChange,
+            title,
+            output.to_owned(),
+            json!({
+                "id": id,
+                "type": "fileChange",
+                "status": status,
+                "changes": [{
+                    "path": input,
+                    "kind": "update",
+                    "diff": output,
+                }],
+            }),
+            true,
+        ),
+        "image" => (
+            model::TranscriptKind::Image,
+            title,
+            output.to_owned(),
+            json!({
+                "id": id,
+                "type": "imageView",
+                "status": status,
+                "path": "/home/smt/harness/interface-comparison/assets/transcript-reference.svg",
+            }),
+            true,
+        ),
+        _ => (
+            model::TranscriptKind::Tool,
+            title,
+            output.to_owned(),
+            json!({
+                "id": id,
+                "type": "dynamicToolCall",
+                "tool": fixture_kind,
+                "status": status,
+                "arguments": {"input": input},
+                "contentItems": [{"type": "outputText", "text": output}],
+            }),
+            false,
+        ),
+    })
+}
+
+fn comparison_fixture_item(
+    index: usize,
+    kind: model::TranscriptKind,
+    title: &str,
+    content: &str,
+    raw: Value,
+    expanded: bool,
+    status: &str,
+) -> TranscriptItem {
+    TranscriptItem {
+        key: format!("comparison:{index}"),
+        protocol_id: Some(format!("comparison-{index}")),
+        kind,
+        title: title.to_owned(),
+        status: Some(status.to_owned()),
+        content: content.to_owned(),
+        raw,
+        event_count: 1,
+        expanded,
+        pending_request: None,
+    }
+}
+
 fn replay_streaming() -> bool {
     std::env::args().any(|argument| argument == "--replay-streaming")
         || std::env::var_os("HARNESS_REPLAY_STREAMING")
@@ -19008,6 +19264,53 @@ fn load_harness_keymaps(cx: &mut App) {
 mod tests {
     use super::*;
     use gpui::AssetSource as _;
+
+    #[test]
+    fn comparison_fixture_preserves_semantic_event_kinds() {
+        let fixture = json!({
+            "user": {"markdown": "same prompt"},
+            "events": [
+                {"type": "thought", "markdown": "thinking"},
+                {"type": "plan", "items": [{"text": "step", "status": "in_progress"}]},
+                {
+                    "type": "tool",
+                    "id": "command",
+                    "kind": "terminal",
+                    "title": "cargo test",
+                    "input": "cargo test",
+                    "output": "ok",
+                    "status": "completed"
+                },
+                {
+                    "type": "tool",
+                    "id": "search",
+                    "kind": "web",
+                    "title": "Web search",
+                    "input": "query",
+                    "output": "result",
+                    "results": [],
+                    "status": "completed"
+                },
+                {"type": "message", "markdown": "done"}
+            ]
+        });
+
+        let model = comparison_fixture_model(&fixture).expect("fixture should parse");
+        assert_eq!(model.items[0].content, "same prompt");
+        assert_eq!(
+            model.items.iter().map(|item| item.kind).collect::<Vec<_>>(),
+            vec![
+                model::TranscriptKind::User,
+                model::TranscriptKind::Reasoning,
+                model::TranscriptKind::Plan,
+                model::TranscriptKind::Command,
+                model::TranscriptKind::Web,
+                model::TranscriptKind::Agent,
+            ]
+        );
+        assert_eq!(model.items[2].content, "- [~] step");
+        assert_eq!(model.items[3].raw["command"], "cargo test");
+    }
 
     #[test]
     fn transcript_strong_weight_advances_one_step_without_exceeding_bold() {
@@ -23448,7 +23751,7 @@ fn main() {
         logger.filter_module("gpui_scroll", log::LevelFilter::Info);
     }
     logger.init();
-    let replay_count = replay_count();
+    let replay_count = comparison_fixture_path().map(|_| 0).or_else(replay_count);
     let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")
         .ok()
         .filter(|thread_id| !thread_id.trim().is_empty());
