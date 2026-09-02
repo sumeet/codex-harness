@@ -16710,6 +16710,11 @@ impl Render for HarnessApp {
         self.sync_request_surfaces(window, cx);
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
+        let transcript_surface = if comparison_fixture_uses_zed_transcript_surface() {
+            colors.surface_background
+        } else {
+            visuals.transcript
+        };
         let daemon_tooltip = managed_daemon_tooltip(
             self.client.as_deref().and_then(Client::managed_daemon_info),
             self.connecting,
@@ -16921,7 +16926,7 @@ impl Render for HarnessApp {
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(visuals.transcript)
+                .bg(transcript_surface)
                 .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                     if event.button == MouseButton::Left {
                         this.finish_rich_pointer_selection(window, cx);
@@ -18889,6 +18894,24 @@ fn comparison_fixture_path() -> Option<PathBuf> {
     std::env::var_os("HARNESS_COMPARISON_FIXTURE").map(PathBuf::from)
 }
 
+fn comparison_fixture_uses_zed_transcript_surface() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        let surface = std::env::var("HARNESS_COMPARISON_TRANSCRIPT_SURFACE").ok();
+        comparison_fixture_uses_zed_transcript_surface_value(
+            comparison_fixture_path().is_some(),
+            surface.as_deref(),
+        )
+    });
+    *ENABLED
+}
+
+fn comparison_fixture_uses_zed_transcript_surface_value(
+    fixture_present: bool,
+    surface: Option<&str>,
+) -> bool {
+    fixture_present && surface.is_some_and(|value| value.eq_ignore_ascii_case("zed"))
+}
+
 fn load_comparison_fixture(path: &Path) -> anyhow::Result<TranscriptModel> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let fixture: Value =
@@ -19373,6 +19396,29 @@ mod tests {
         );
         assert_eq!(model.items[2].content, "- [~] step");
         assert_eq!(model.items[3].raw["command"], "cargo test");
+    }
+
+    #[test]
+    fn comparison_surface_override_is_scoped_to_the_fixture() {
+        assert!(comparison_fixture_uses_zed_transcript_surface_value(
+            true,
+            Some("zed")
+        ));
+        assert!(comparison_fixture_uses_zed_transcript_surface_value(
+            true,
+            Some("ZED")
+        ));
+        assert!(!comparison_fixture_uses_zed_transcript_surface_value(
+            false,
+            Some("zed")
+        ));
+        assert!(!comparison_fixture_uses_zed_transcript_surface_value(
+            true,
+            Some("editor")
+        ));
+        assert!(!comparison_fixture_uses_zed_transcript_surface_value(
+            true, None
+        ));
     }
 
     #[test]
