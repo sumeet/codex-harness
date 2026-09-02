@@ -16,8 +16,8 @@ use assets::Assets;
 use base64::Engine as _;
 use codex_app_server_client::{
     Client, CodexSessionSource, CodexSubagentSource, CodexThread, CodexThreadStatus, CodexTurn,
-    Event as AppServerEvent, ManagedDaemonInfo, SortDirection, ThreadItemEntry, ThreadOpenResponse,
-    ThreadTurnsListParams, TurnItemsView,
+    Error as AppServerClientError, Event as AppServerEvent, ManagedDaemonInfo, SortDirection,
+    ThreadItemEntry, ThreadOpenResponse, ThreadTurnsListParams, TurnItemsView,
 };
 use file_icons::FileIcons;
 use futures::{StreamExt as _, channel::mpsc};
@@ -3904,6 +3904,7 @@ struct HarnessApp {
     model_menu_handle: PopoverMenuHandle<ContextMenu>,
     permission_menu_handle: PopoverMenuHandle<ContextMenu>,
     settings_update_pending: bool,
+    live_step_model_switching_supported: Option<bool>,
     appearance_settings_open: bool,
     appearance_settings_section: AppearanceSettingsSection,
     appearance_font_role: AppearanceFontRole,
@@ -4104,6 +4105,30 @@ fn managed_daemon_tooltip(info: Option<&ManagedDaemonInfo>, connecting: bool) ->
     }
 }
 
+fn managed_daemon_version_mismatch(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<AppServerClientError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                AppServerClientError::InvalidDaemonLifecycle(details)
+                    if details.contains("version mismatch")
+            )
+        })
+}
+
+fn codex_connection_error(error: &anyhow::Error, reconnect_exhausted: bool) -> SharedString {
+    if managed_daemon_version_mismatch(error) {
+        return "Codex was upgraded while its App Server was still running. Finish any active Codex turns, run `codex app-server daemon restart`, then refresh tasks."
+            .into();
+    }
+    if reconnect_exhausted {
+        format!("Could not reconnect to Codex: {error}. Refresh the task list to try again.").into()
+    } else {
+        format!("Could not connect to Codex: {error}").into()
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SubagentActivityPresentation {
     title: String,
@@ -4289,6 +4314,22 @@ fn model_supports_fast_mode(choice: Option<&ModelChoice>) -> bool {
 
 fn turn_settings_update_applied(response: &Value) -> bool {
     response.get("status").and_then(Value::as_str) == Some("applied")
+}
+
+fn turn_settings_update_requires_step_model_switching(error: &AppServerClientError) -> bool {
+    matches!(
+        error,
+        AppServerClientError::Rpc { code: -32600, message, .. }
+            if message.contains("step_model_switching")
+    )
+}
+
+fn deferred_task_speed_status(service_tier: &str) -> SharedString {
+    if service_tier_is_fast(Some(service_tier)) {
+        "Fast applies next turn".into()
+    } else {
+        "Standard speed applies next turn".into()
+    }
 }
 
 fn apply_harness_preferences(preferences: &HarnessPreferences, cx: &mut App) -> bool {
@@ -5862,7 +5903,13 @@ impl HarnessApp {
             .get("serviceTier")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let deferred_speed_status = running_service_tier
+            .as_deref()
+            .map(deferred_task_speed_status);
         let running_turn_id = self.model.current_turn_id.clone();
+        let defer_live_update = self.live_step_model_switching_supported == Some(false)
+            && running_turn_id.is_some()
+            && running_service_tier.is_some();
         let mut params = fields.as_object().cloned().unwrap_or_default();
         params.insert("threadId".into(), thread_id.into());
         self.settings_update_pending = true;
@@ -5872,7 +5919,7 @@ impl HarnessApp {
             let result = client
                 .request("thread/settings/update", Value::Object(params))
                 .await;
-            let running_result = if result.is_ok() {
+            let running_result = if result.is_ok() && !defer_live_update {
                 match (running_turn_id, running_service_tier) {
                     (Some(turn_id), Some(service_tier)) => Some(
                         client
@@ -5899,27 +5946,37 @@ impl HarnessApp {
                 this.settings_update_pending = false;
                 if let Err(error) = result {
                     this.error = Some(format!("Could not update task settings: {error}").into());
+                } else if defer_live_update {
+                    this.transient_turn_status = deferred_speed_status;
                 } else if let Some(running_result) = running_result {
                     match running_result {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            this.live_step_model_switching_supported = Some(true);
+                        }
                         Ok(false) => {
                             // The durable task setting succeeded, but App
                             // Server reports `targetUnavailable` when the turn
                             // ends between the two publications.
-                            this.error = Some(
-                                "Task speed was updated for future turns, but the running turn was no longer available."
-                                    .into(),
-                            );
+                            this.transient_turn_status = deferred_speed_status;
                         }
                         Err(error) => {
-                            // Retain the future setting even if the narrower
-                            // live publication fails.
-                            this.error = Some(
-                                format!(
-                                    "Task speed was updated for future turns, but the running turn did not change: {error}"
-                                )
-                                .into(),
-                            );
+                            if turn_settings_update_requires_step_model_switching(&error) {
+                                // This is a process feature, not a failed
+                                // durable setting. Remember it for this
+                                // connection so subsequent toggles do not send
+                                // a request the running daemon cannot honor.
+                                this.live_step_model_switching_supported = Some(false);
+                                this.transient_turn_status = deferred_speed_status;
+                            } else {
+                                // Retain the future setting even if the
+                                // narrower live publication fails.
+                                this.error = Some(
+                                    format!(
+                                        "Task speed was updated for future turns, but the running turn did not change: {error}"
+                                    )
+                                    .into(),
+                                );
+                            }
                         }
                     }
                 }
@@ -7733,6 +7790,7 @@ impl HarnessApp {
             model_menu_handle: PopoverMenuHandle::default(),
             permission_menu_handle: PopoverMenuHandle::default(),
             settings_update_pending: false,
+            live_step_model_switching_supported: None,
             appearance_settings_open: false,
             appearance_settings_section: AppearanceSettingsSection::Themes,
             appearance_font_role: AppearanceFontRole::Reading,
@@ -8302,17 +8360,21 @@ impl HarnessApp {
                     if this
                         .update(cx, |this, cx| {
                             this.connecting = false;
-                            this.error = Some(
-                                if this.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                                    format!(
-                                        "Could not reconnect to Codex: {error}. Refresh the task list to try again."
-                                    )
-                                } else {
-                                    format!("Could not connect to Codex: {error}")
-                                }
-                                .into(),
-                            );
-                            this.schedule_reconnect(cx);
+                            let version_mismatch = managed_daemon_version_mismatch(&error);
+                            this.error = Some(codex_connection_error(
+                                &error,
+                                this.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS,
+                            ));
+                            if version_mismatch {
+                                // The idempotent daemon-start command will
+                                // keep returning the same mixed lifecycle
+                                // until the user deliberately restarts the
+                                // shared server. Do not obscure the actionable
+                                // message with a futile reconnect countdown.
+                                this.reconnect_attempts = MAX_RECONNECT_ATTEMPTS;
+                            } else {
+                                this.schedule_reconnect(cx);
+                            }
                             cx.notify();
                         })
                         .is_err()
@@ -8793,6 +8855,7 @@ impl HarnessApp {
         self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
         self.queue_operations.clear();
         self.settings_update_pending = false;
+        self.live_step_model_switching_supported = None;
         self.queued_turns.clear();
         self.model.current_turn_id = None;
         self.transient_turn_status = None;
@@ -19585,6 +19648,19 @@ mod tests {
     }
 
     #[test]
+    fn managed_daemon_version_drift_has_an_actionable_connection_error() {
+        let error = anyhow::Error::new(AppServerClientError::InvalidDaemonLifecycle(
+            "version mismatch: cliVersion=0.152.1, managedCodexVersion=0.152.1, appServerVersion=0.151.0"
+                .into(),
+        ));
+        assert!(managed_daemon_version_mismatch(&error));
+        let message = codex_connection_error(&error, false);
+        assert!(message.contains("Codex was upgraded"));
+        assert!(message.contains("codex app-server daemon restart"));
+        assert!(!message.contains("Reconnecting"));
+    }
+
+    #[test]
     fn sidebar_uses_a_variable_height_list_for_compact_disclosures() {
         let source = include_str!("main.rs");
         let render = source
@@ -20199,6 +20275,22 @@ mod tests {
             &json!({"status": "targetUnavailable"})
         ));
         assert!(!turn_settings_update_applied(&json!({})));
+        let disabled_live_switching = AppServerClientError::Rpc {
+            code: -32600,
+            message: "turn settings updates require the step_model_switching feature".into(),
+            data: None,
+        };
+        assert!(turn_settings_update_requires_step_model_switching(
+            &disabled_live_switching
+        ));
+        assert_eq!(
+            deferred_task_speed_status("priority").as_ref(),
+            "Fast applies next turn"
+        );
+        assert_eq!(
+            deferred_task_speed_status("default").as_ref(),
+            "Standard speed applies next turn"
+        );
 
         let deprecated_fast_model = model_choices_from_response(&json!({
             "data": [{
