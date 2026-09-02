@@ -198,6 +198,9 @@ fn refine_harness_markdown_style_with_font_size(
     // composition uses a compact semantic spacer instead of that document-
     // preview gap.
     style.heading.margin.top = Some(gpui::Length::Definite(px(8.).into()));
+    style.heading.text.font_weight = Some(structural_heading_font_weight(
+        style.base_text_style.font_weight,
+    ));
     style.strong_font_weight = Some(relative_strong_font_weight(
         style.base_text_style.font_weight,
     ));
@@ -213,6 +216,14 @@ fn relative_strong_font_weight(base: FontWeight) -> FontWeight {
         base
     } else {
         FontWeight((base.0 + 100.).min(FontWeight::BOLD.0))
+    }
+}
+
+fn structural_heading_font_weight(base: FontWeight) -> FontWeight {
+    if base >= FontWeight::SEMIBOLD {
+        base
+    } else {
+        FontWeight((base.0 + 200.).min(FontWeight::SEMIBOLD.0))
     }
 }
 
@@ -5443,6 +5454,7 @@ impl HarnessApp {
                         || preferences.code_font_weight.is_some()
                 };
                 let reset_owner = owner.clone();
+                let editorial_owner = owner.clone();
                 let mut font_rows = Vec::with_capacity(fonts.len());
                 for (index, font) in fonts.into_iter().enumerate() {
                     let selected = font == current_font;
@@ -5561,6 +5573,22 @@ impl HarnessApp {
                                     .text_ui_sm(cx)
                                     .text_color(colors.text_muted)
                                     .child(format!("Font family · {current_font}")),
+                            )
+                            .child(
+                                Button::new("appearance-editorial-typography", "Use Zed / Delta")
+                                    .size(ButtonSize::Compact)
+                                    .style(ButtonStyle::Subtle)
+                                    .tooltip(Tooltip::text(
+                                        "IBM Plex Sans Regular for reading and Lilex Regular for code",
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        Self::update_appearance(
+                                            &editorial_owner,
+                                            window,
+                                            cx,
+                                            HarnessPreferences::apply_editorial_typography,
+                                        )
+                                    }),
                             )
                             .child(
                                 Button::new("appearance-reset-typography", "Reset")
@@ -15753,6 +15781,10 @@ impl HarnessApp {
         let raw_visible = self.raw_visible.contains(&item.key);
         let compact_trace = item.kind == model::TranscriptKind::Trace && !item.expanded;
         let routine_activity = transcript_item_is_routine_activity(&item);
+        let compact_routine_activity = routine_activity && !item.expanded;
+        let expanded_routine_activity = routine_activity && item.expanded;
+        let unboxed_media =
+            item.kind == model::TranscriptKind::Image && item.pending_request.is_none();
         let (routine_activity_above, routine_activity_below) =
             routine_activity_run_neighbors(&self.active_transcript_model().items, index);
         let request_method = item
@@ -16204,9 +16236,10 @@ impl HarnessApp {
                 this.h(harness_routine_activity_row_height(cx))
             })
             .when(!narrative && !compact_trace, |this| {
-                this.px_1().when(!routine_activity, |this| {
-                    this.bg(visuals.tool_header_surface)
-                })
+                this.px_1()
+                    .when(!routine_activity && !unboxed_media, |this| {
+                        this.bg(visuals.tool_header_surface)
+                    })
             })
             .when(item.kind == model::TranscriptKind::Command, |this| {
                 this.child(rich_command_identity_icon(
@@ -16366,27 +16399,42 @@ impl HarnessApp {
                 model::TranscriptKind::Command
                     | model::TranscriptKind::Diff
                     | model::TranscriptKind::FileChange
+                    | model::TranscriptKind::Image
             );
             div()
                 .w_full()
                 .relative()
                 .flex()
                 .flex_col()
-                .when(!compact_trace && !routine_activity, |this| {
-                    this.rounded_md()
-                        .border_1()
-                        .border_color(colors.border.opacity(0.6))
-                        .bg(colors.editor_background)
-                        .overflow_hidden()
-                })
-                .when(routine_activity, |this| {
+                .when(
+                    !compact_trace && !routine_activity && !unboxed_media,
+                    |this| {
+                        this.rounded_md()
+                            .border_1()
+                            .border_color(visuals.tool_border)
+                            .bg(visuals.tool_surface)
+                            .overflow_hidden()
+                    },
+                )
+                .when(compact_routine_activity, |this| {
                     this.border_l_1()
                         .border_color(visuals.divider)
                         .overflow_hidden()
                 })
-                .when(routine_activity && command_succeeded, |this| {
+                .when(expanded_routine_activity, |this| {
+                    this.rounded_sm()
+                        .border_1()
+                        .border_color(visuals.tool_border)
+                        .bg(visuals.tool_surface)
+                        .overflow_hidden()
+                })
+                .when(compact_routine_activity && command_succeeded, |this| {
                     this.border_color(cx.theme().status().success.opacity(0.42))
                         .bg(cx.theme().status().success_background.opacity(0.07))
+                })
+                .when(expanded_routine_activity && command_succeeded, |this| {
+                    this.border_color(cx.theme().status().success.opacity(0.28))
+                        .bg(cx.theme().status().success_background.opacity(0.035))
                 })
                 .when(
                     matches!(
@@ -16418,7 +16466,7 @@ impl HarnessApp {
                             div()
                                 .px_2()
                                 .py_1()
-                                .when(routine_activity, |this| {
+                                .when(expanded_routine_activity, |this| {
                                     this.border_t_1().border_color(visuals.divider)
                                 })
                                 .child(body),
@@ -16465,12 +16513,12 @@ impl HarnessApp {
             .id(("transcript-item", index))
             .w_full()
             .px(if narrow { px(10.) } else { px(18.) })
-            .pt(if routine_activity && routine_activity_above {
+            .pt(if compact_routine_activity && routine_activity_above {
                 px(0.)
             } else {
                 normal_vertical_padding
             })
-            .pb(if routine_activity && routine_activity_below {
+            .pb(if compact_routine_activity && routine_activity_below {
                 px(0.)
             } else {
                 normal_vertical_padding
@@ -18960,6 +19008,26 @@ mod tests {
         assert_eq!(
             relative_strong_font_weight(FontWeight::EXTRA_BOLD),
             FontWeight::EXTRA_BOLD
+        );
+    }
+
+    #[test]
+    fn transcript_headings_keep_structural_contrast_across_body_weights() {
+        assert_eq!(
+            structural_heading_font_weight(FontWeight::LIGHT),
+            FontWeight::MEDIUM
+        );
+        assert_eq!(
+            structural_heading_font_weight(FontWeight::NORMAL),
+            FontWeight::SEMIBOLD
+        );
+        assert_eq!(
+            structural_heading_font_weight(FontWeight::SEMIBOLD),
+            FontWeight::SEMIBOLD
+        );
+        assert_eq!(
+            structural_heading_font_weight(FontWeight::BOLD),
+            FontWeight::BOLD
         );
     }
 
@@ -21506,9 +21574,11 @@ mod tests {
         assert!(command_status.contains("CommandExecutionStatus::Running => return None"));
         assert!(command_status.contains("CommandExecutionStatus::Succeeded => return None"));
         assert!(command_status.contains("format!(\"exit {code}\")"));
-        assert!(item_renderer.contains(".when(!compact_trace && !routine_activity"));
-        assert!(item_renderer.contains(".when(routine_activity, |this|"));
+        assert!(item_renderer.contains("!compact_trace && !routine_activity && !unboxed_media"));
+        assert!(item_renderer.contains(".when(compact_routine_activity, |this|"));
+        assert!(item_renderer.contains(".when(expanded_routine_activity, |this|"));
         assert!(item_renderer.contains("this.border_l_1()"));
+        assert!(item_renderer.contains(".bg(visuals.tool_surface)"));
         assert!(item_renderer.contains("success_background.opacity(0.07)"));
         assert!(item_renderer.contains("routine_activity && routine_activity_above"));
         assert!(item_renderer.contains("routine_activity && routine_activity_below"));
@@ -23047,6 +23117,7 @@ mod tests {
             style.heading.margin.top,
             Some(gpui::Length::Definite(px(8.).into()))
         );
+        assert_eq!(style.heading.text.font_weight, Some(FontWeight::SEMIBOLD));
     }
 
     #[test]

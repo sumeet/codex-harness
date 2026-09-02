@@ -11,6 +11,11 @@ pub(crate) const MIN_HARNESS_FONT_SIZE: f32 = 10.;
 pub(crate) const MAX_HARNESS_FONT_SIZE: f32 = 28.;
 pub(crate) const MIN_HARNESS_FONT_WEIGHT: f32 = 100.;
 pub(crate) const MAX_HARNESS_FONT_WEIGHT: f32 = 900.;
+pub(crate) const EDITORIAL_READING_FONT: &str = ".ZedSans";
+pub(crate) const EDITORIAL_CODE_FONT: &str = ".ZedMono";
+pub(crate) const EDITORIAL_READING_SIZE: f32 = 16.;
+pub(crate) const EDITORIAL_CODE_SIZE: f32 = 14.;
+pub(crate) const EDITORIAL_FONT_WEIGHT: f32 = 400.;
 
 /// The deliberately small set of Harness-owned appearance preferences.
 ///
@@ -101,6 +106,18 @@ impl HarnessPreferences {
         self.code_font_size = None;
         self.code_font_weight = None;
     }
+
+    /// Applies the typography shared by Delta and current Zed: IBM Plex Sans
+    /// for reading and Lilex for code, both at regular weight. Keep this an
+    /// explicit preset rather than silently replacing a user's chosen fonts.
+    pub(crate) fn apply_editorial_typography(&mut self) {
+        self.reading_font_family = Some(EDITORIAL_READING_FONT.to_owned());
+        self.reading_font_size = Some(EDITORIAL_READING_SIZE);
+        self.reading_font_weight = Some(EDITORIAL_FONT_WEIGHT);
+        self.code_font_family = Some(EDITORIAL_CODE_FONT.to_owned());
+        self.code_font_size = Some(EDITORIAL_CODE_SIZE);
+        self.code_font_weight = Some(EDITORIAL_FONT_WEIGHT);
+    }
 }
 
 fn nonempty(value: String) -> Option<String> {
@@ -168,6 +185,8 @@ pub(crate) struct HarnessVisualTheme {
     pub(crate) transcript: Hsla,
     pub(crate) rail: Hsla,
     pub(crate) raised_surface: Hsla,
+    pub(crate) tool_surface: Hsla,
+    pub(crate) tool_border: Hsla,
     pub(crate) tool_header_surface: Hsla,
     pub(crate) pending_surface: Hsla,
     pub(crate) error_surface: Hsla,
@@ -181,17 +200,23 @@ pub(crate) struct HarnessVisualTheme {
 
 impl HarnessVisualTheme {
     pub(crate) fn from_zed(colors: &ThemeColors, status: &StatusColors) -> Self {
+        // Delta's rich tools and Zed's terminal cards both use a single quiet
+        // evidence surface. The body should lead; a separately tinted title
+        // bar makes every tool look like a miniature window.
+        let tool_surface = colors
+            .editor_background
+            .blend(colors.surface_background.opacity(0.28));
         Self {
             canvas: colors.background,
             transcript: colors.editor_background,
             rail: colors.panel_background,
             raised_surface: colors.surface_background,
-            // Match the header wash used by Zed's agent tool cards. This is
-            // intentionally subtler than `surface_background`: it separates
-            // identity from output without turning every tool into a banner.
-            tool_header_surface: colors
-                .element_background
-                .blend(colors.editor_foreground.opacity(0.025)),
+            tool_surface,
+            tool_border: colors.border_variant.opacity(0.68),
+            // Headers and bodies intentionally share one surface. Structure
+            // comes from typography, icons, and local dividers rather than a
+            // heavy full-width band.
+            tool_header_surface: tool_surface,
             pending_surface: colors
                 .editor_background
                 .blend(colors.surface_background.opacity(0.86)),
@@ -253,6 +278,24 @@ mod tests {
         assert_eq!(settings["ui_font_weight"], 300.);
         assert_eq!(settings["agent_buffer_font_size"], 15.);
         assert_eq!(settings["buffer_font_weight"], 500.);
+    }
+
+    #[test]
+    fn editorial_typography_preset_uses_the_fonts_shipped_by_zed_and_delta() {
+        let mut preferences = HarnessPreferences::default();
+        preferences.apply_editorial_typography();
+        assert_eq!(
+            preferences.reading_font_family.as_deref(),
+            Some(EDITORIAL_READING_FONT)
+        );
+        assert_eq!(preferences.reading_font_size, Some(EDITORIAL_READING_SIZE));
+        assert_eq!(preferences.reading_font_weight, Some(EDITORIAL_FONT_WEIGHT));
+        assert_eq!(
+            preferences.code_font_family.as_deref(),
+            Some(EDITORIAL_CODE_FONT)
+        );
+        assert_eq!(preferences.code_font_size, Some(EDITORIAL_CODE_SIZE));
+        assert_eq!(preferences.code_font_weight, Some(EDITORIAL_FONT_WEIGHT));
     }
 
     #[test]
