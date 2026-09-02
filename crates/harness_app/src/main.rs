@@ -238,6 +238,10 @@ fn harness_routine_activity_row_height(cx: &App) -> gpui::Pixels {
         .max(harness_reading_row_height(cx).as_f32()))
 }
 
+fn transcript_horizontal_gutter(narrow: bool) -> gpui::Pixels {
+    if narrow { px(10.) } else { px(18.) }
+}
+
 /// Apply Harness's semantic code role as one indivisible family/size choice.
 ///
 /// Zed's `font_buffer` and `text_ui_sm` helpers intentionally represent two
@@ -1913,6 +1917,20 @@ fn rich_item_defers_navigation_claim(item: &TranscriptItem) -> bool {
     item.expanded
         && item.kind == model::TranscriptKind::Command
         && item.command_transcript().is_some()
+}
+
+fn rich_item_body_left_normal_cursor_unclaimed(
+    item: &TranscriptItem,
+    navigation: Option<&RichNavigationPaint>,
+) -> bool {
+    !rich_item_defers_navigation_claim(item)
+        && navigation.is_some_and(|navigation| {
+            // Visual selections can be painted by several body fragments and
+            // deliberately never set the single-owner Normal cursor flag.
+            // Treating that as an unclaimed cursor duplicates the selection
+            // over the card header.
+            !navigation.visual && !navigation.cursor_claimed.get()
+        })
 }
 
 fn item_matches_search_query(item: &TranscriptItem, query: &str) -> bool {
@@ -16188,10 +16206,8 @@ impl HarnessApp {
         // a renderer deliberately has no glyph for a protocol-only offset,
         // keep Vim visible on the header instead of mounting a second,
         // progressively expanded copy of the body.
-        let body_left_navigation_unclaimed = !rich_item_defers_navigation_claim(&item)
-            && rich_navigation
-                .as_ref()
-                .is_some_and(|navigation| !navigation.cursor_claimed.get());
+        let body_left_navigation_unclaimed =
+            rich_item_body_left_normal_cursor_unclaimed(&item, rich_navigation.as_ref());
         let header_cursor_range = render_header
             .then(|| {
                 rich_header_navigation_range(
@@ -16512,7 +16528,7 @@ impl HarnessApp {
         let element = div()
             .id(("transcript-item", index))
             .w_full()
-            .px(if narrow { px(10.) } else { px(18.) })
+            .px(transcript_horizontal_gutter(narrow))
             .pt(if compact_routine_activity && routine_activity_above {
                 px(0.)
             } else {
@@ -16862,6 +16878,12 @@ impl Render for HarnessApp {
                             // layout local to the cursor neighborhood.
                             .w_full()
                             .h(px(120.))
+                            // Match the horizontal content gutter used by
+                            // every visible transcript item. Without this the
+                            // hidden Editor wraps later than Rich text, so Vim
+                            // j/k can stay on what the user sees as the next
+                            // visual row.
+                            .px(transcript_horizontal_gutter(transcript_narrow))
                             .opacity(0.)
                             .child(self.transcript_editor.clone()),
                     )
@@ -19031,6 +19053,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rich_navigation_editor_uses_the_visible_transcript_gutter() {
+        assert_eq!(transcript_horizontal_gutter(false), px(18.));
+        assert_eq!(transcript_horizontal_gutter(true), px(10.));
+
+        let source = include_str!("main.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]\nmod tests")
+            .map(|(production, _)| production)
+            .expect("the production/test boundary must remain explicit");
+        let uses = production
+            .matches(".px(transcript_horizontal_gutter(")
+            .count();
+        assert_eq!(
+            uses, 2,
+            "visible transcript items and the hidden Vim editor must share one gutter"
+        );
+    }
+
     fn cached_thread(id: &str, updated_at: i64) -> CodexThread {
         CodexThread {
             id: id.into(),
@@ -20912,6 +20953,44 @@ mod tests {
             rich_header_navigation_range("Command", Some(&visual), false),
             None,
             "an expanded card paints Visual mode on its body fragments"
+        );
+    }
+
+    #[test]
+    fn expanded_visual_selection_never_falls_back_to_the_card_header() {
+        let item = TranscriptItem {
+            key: "reasoning".into(),
+            protocol_id: None,
+            kind: model::TranscriptKind::Reasoning,
+            title: "Thinking".into(),
+            status: None,
+            content: "selected body".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        };
+        let visual = RichNavigationPaint {
+            body_text: "selected body".into(),
+            ranges: vec![2..9],
+            head: Some(8),
+            visual: true,
+            linewise: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+
+        assert!(!rich_item_body_left_normal_cursor_unclaimed(
+            &item,
+            Some(&visual)
+        ));
+        assert_eq!(
+            rich_header_navigation_range(
+                "Thinking",
+                Some(&visual),
+                !rich_item_body_paints_navigation(&item)
+                    || rich_item_body_left_normal_cursor_unclaimed(&item, Some(&visual)),
+            ),
+            None,
         );
     }
 

@@ -744,19 +744,15 @@ pub enum TranscriptTypographyProfile {
     Reading,
 }
 
-/// Delta's `thread_base_style` encodes prose at 0.9375rem with a 1.3125
-/// relative line height. Keep those two recovered values together and apply
-/// them to every Harness surface that represents thread prose: rendered
-/// Markdown, the Vim transcript, and the composer.
-pub const THREAD_READING_FONT_SCALE: f32 = 0.9375;
+/// Delta's `thread_base_style` uses a deliberate 1.3125 relative line height.
+/// Harness applies that rhythm to every thread-prose surface, while preserving
+/// the user's configured font size verbatim. Delta's `0.9375rem` resolves to
+/// 15px only because its own root is 16px; treating it as a multiplier would
+/// make Harness's explicit size preference dishonest.
 pub const THREAD_READING_LINE_HEIGHT: f32 = 1.3125;
 
-fn scaled_thread_reading_font_size(base_size: Pixels) -> Pixels {
-    base_size * THREAD_READING_FONT_SCALE
-}
-
 pub fn thread_reading_font_size(cx: &App) -> Pixels {
-    scaled_thread_reading_font_size(ThemeSettings::get_global(cx).agent_ui_font_size(cx))
+    ThemeSettings::get_global(cx).agent_ui_font_size(cx)
 }
 
 fn typography_profile_changed(
@@ -4857,15 +4853,12 @@ mod tests {
     }
 
     #[test]
-    fn delta_thread_role_scales_prose_and_pins_its_line_height() {
-        assert_eq!(
-            scaled_thread_reading_font_size(gpui::px(16.)),
-            gpui::px(15.)
-        );
-
+    fn thread_role_preserves_the_explicit_size_and_pins_its_line_height() {
         let font = gpui::font("Harness Reading");
+        let configured_size = gpui::px(17.);
         let refinement =
-            typography_refinement(&font, gpui::px(15.), Some(THREAD_READING_LINE_HEIGHT));
+            typography_refinement(&font, configured_size, Some(THREAD_READING_LINE_HEIGHT));
+        assert_eq!(refinement.font_size, Some(configured_size.into()));
         assert_eq!(refinement.line_height, Some(gpui::relative(1.3125)));
 
         let mut style = TextStyle {
@@ -4875,9 +4868,10 @@ mod tests {
         apply_typography_font(
             &mut style,
             &font,
-            gpui::px(15.),
+            configured_size,
             Some(THREAD_READING_LINE_HEIGHT),
         );
+        assert_eq!(style.font_size, configured_size.into());
         assert_eq!(style.line_height, gpui::relative(1.3125));
     }
 
