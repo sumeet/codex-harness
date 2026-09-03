@@ -4206,6 +4206,7 @@ fn codex_connection_error(error: &anyhow::Error, reconnect_exhausted: bool) -> S
 enum CodexUpdateStage {
     Install,
     Restart,
+    Replace,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -8345,14 +8346,20 @@ impl HarnessApp {
                             return;
                         }
                         match result {
-                            Ok(Some(update))
+                            Ok(codex_runtime::UpdateCheck::Available(update))
                                 if this.dismissed_codex_update.as_deref()
                                     != Some(update.latest_version.as_str()) =>
                             {
                                 this.codex_update_status = CodexUpdateStatus::Available(update);
                                 cx.notify();
                             }
-                            Ok(_) => {
+                            Ok(codex_runtime::UpdateCheck::RestartRequired(update)) => {
+                                this.codex_update_status =
+                                    CodexUpdateStatus::RestartPending(update);
+                                cx.notify();
+                            }
+                            Ok(codex_runtime::UpdateCheck::Current)
+                            | Ok(codex_runtime::UpdateCheck::Available(_)) => {
                                 if !matches!(this.codex_update_status, CodexUpdateStatus::Current) {
                                     this.codex_update_status = CodexUpdateStatus::Current;
                                     cx.notify();
@@ -8452,35 +8459,61 @@ impl HarnessApp {
     }
 
     fn restart_codex_app_server(&mut self, cx: &mut Context<Self>) {
-        let update = match &self.codex_update_status {
-            CodexUpdateStatus::RestartPending(update)
-            | CodexUpdateStatus::Failed {
-                update,
-                stage: CodexUpdateStage::Restart,
-                ..
-            } => update.clone(),
+        let (mut update, replace) = match &self.codex_update_status {
+            CodexUpdateStatus::RestartPending(update) => {
+                (update.clone(), update.app_server_managed == Some(false))
+            }
+            CodexUpdateStatus::Failed { update, stage, .. }
+                if matches!(stage, CodexUpdateStage::Restart | CodexUpdateStage::Replace) =>
+            {
+                (update.clone(), *stage == CodexUpdateStage::Replace)
+            }
             _ => return,
         };
         if self.codex_restart_blocker().is_some() {
             return;
         }
+        if replace {
+            update.app_server_managed = Some(false);
+        }
 
         self.codex_restart_initiated = true;
         self.codex_update_status = CodexUpdateStatus::Restarting(update.clone());
         self.codex_update_action_task = cx.spawn(async move |this, cx| {
-            let result = codex_runtime::restart_app_server().await;
+            let result = if replace {
+                codex_runtime::replace_unmanaged_app_server().await
+            } else {
+                codex_runtime::restart_app_server().await
+            };
             if let Err(error) = this.update(cx, |this, cx| {
-                this.codex_update_status = match result {
-                    Ok(()) => CodexUpdateStatus::Current,
-                    Err(error) => {
-                        this.codex_restart_initiated = false;
-                        CodexUpdateStatus::Failed {
-                            update,
-                            stage: CodexUpdateStage::Restart,
-                            message: format!("{error:#}").into(),
+                match result {
+                    Ok(()) => {
+                        this.codex_update_status = CodexUpdateStatus::Current;
+                        this.reconnect_attempts = 0;
+                        if this.client.is_none() && !this.connecting {
+                            this.connect(cx);
                         }
                     }
-                };
+                    Err(error) => {
+                        this.codex_restart_initiated = false;
+                        let unmanaged = codex_runtime::is_unmanaged_app_server_error(&error);
+                        let stage = if replace || unmanaged {
+                            CodexUpdateStage::Replace
+                        } else {
+                            CodexUpdateStage::Restart
+                        };
+                        this.codex_update_status = CodexUpdateStatus::Failed {
+                            update,
+                            stage,
+                            message: if unmanaged {
+                                "The running App Server was started outside daemon management. Replace it to finish applying the Codex update."
+                                    .into()
+                            } else {
+                                format!("{error:#}").into()
+                            },
+                        };
+                    }
+                }
                 cx.notify();
             }) {
                 log::debug!("Codex App Server restart finished after Harness closed: {error}");
@@ -17566,23 +17599,53 @@ impl Render for HarnessApp {
                 false,
                 None,
             )),
-            CodexUpdateStatus::RestartPending(update) => Some((
-                format!("Codex {} is installed", update.latest_version).into(),
-                if codex_restart_blocker.is_some() {
-                    "Restart the App Server after active Codex work finishes.".into()
-                } else {
-                    "Restart the App Server to apply it; Harness will reconnect.".into()
-                },
-                "Restart".into(),
-                Some(CodexUpdateStage::Restart),
-                false,
-                false,
-                None,
-            )),
+            CodexUpdateStatus::RestartPending(update) => {
+                let replace = update.app_server_managed == Some(false);
+                Some((
+                    format!("Codex {} is installed", update.latest_version).into(),
+                    if codex_restart_blocker.is_some() {
+                        "Apply it after active Codex work finishes.".into()
+                    } else if replace {
+                        match update.app_server_version {
+                            Some(version) => format!(
+                                "App Server {version} was started outside daemon management; replace it and reconnect."
+                            )
+                            .into(),
+                            None => {
+                                "Replace the unmanaged App Server and reconnect Harness.".into()
+                            }
+                        }
+                    } else {
+                        "Restart the App Server to apply it; Harness will reconnect.".into()
+                    },
+                    if replace {
+                        "Replace server".into()
+                    } else {
+                        "Restart".into()
+                    },
+                    Some(if replace {
+                        CodexUpdateStage::Replace
+                    } else {
+                        CodexUpdateStage::Restart
+                    }),
+                    false,
+                    false,
+                    None,
+                ))
+            }
             CodexUpdateStatus::Restarting(update) => Some((
                 format!("Applying Codex {}…", update.latest_version).into(),
-                "Restarting the App Server; Harness will reconnect automatically.".into(),
-                "Restarting…".into(),
+                if update.app_server_managed == Some(false) {
+                    "Replacing the unmanaged App Server; Harness will reconnect automatically."
+                        .into()
+                } else {
+                    "Restarting the App Server; Harness will reconnect automatically.".into()
+                },
+                if update.app_server_managed == Some(false) {
+                    "Replacing…".into()
+                } else {
+                    "Restarting…".into()
+                },
                 None,
                 true,
                 false,
@@ -17598,11 +17661,13 @@ impl Render for HarnessApp {
                     match stage {
                         CodexUpdateStage::Install => "Codex update failed".into(),
                         CodexUpdateStage::Restart => "App Server restart failed".into(),
+                        CodexUpdateStage::Replace => "App Server replacement needed".into(),
                     },
                     message,
                     match stage {
                         CodexUpdateStage::Install => "Retry update".into(),
                         CodexUpdateStage::Restart => "Retry restart".into(),
+                        CodexUpdateStage::Replace => "Replace server".into(),
                     },
                     Some(stage),
                     false,
@@ -17621,12 +17686,16 @@ impl Render for HarnessApp {
                 bool,
                 Option<SharedString>,
             )| {
-                let restart_blocked = action == Some(CodexUpdateStage::Restart)
+                let app_server_action = matches!(
+                    action,
+                    Some(CodexUpdateStage::Restart | CodexUpdateStage::Replace)
+                );
+                let restart_blocked = app_server_action
                     && codex_restart_blocker.is_some();
                 let action_tooltip = failure.clone().unwrap_or_else(|| {
                     codex_restart_blocker
                         .clone()
-                        .filter(|_| action == Some(CodexUpdateStage::Restart))
+                        .filter(|_| app_server_action)
                         .unwrap_or_else(|| match action {
                         Some(CodexUpdateStage::Install) => {
                             "Install the latest Codex runtime without stopping the current App Server"
@@ -17634,6 +17703,10 @@ impl Render for HarnessApp {
                         }
                         Some(CodexUpdateStage::Restart) => {
                             "Restart the shared Codex App Server and reconnect Harness".into()
+                        }
+                        Some(CodexUpdateStage::Replace) => {
+                            "Stop the verified unmanaged App Server, start its managed replacement, and reconnect Harness"
+                                .into()
                         }
                         None => "Codex runtime operation in progress".into(),
                     })
@@ -17691,7 +17764,7 @@ impl Render for HarnessApp {
                         Button::new("apply-codex-update", action_label)
                             .size(ButtonSize::Compact)
                             .style(ButtonStyle::Tinted(TintColor::Accent))
-                            .start_icon(Icon::new(if action == Some(CodexUpdateStage::Restart) {
+                            .start_icon(Icon::new(if app_server_action {
                                 IconName::RotateCw
                             } else {
                                 IconName::Download
@@ -17702,6 +17775,9 @@ impl Render for HarnessApp {
                             .on_click(cx.listener(move |this, _, _, cx| match action_for_click {
                                 Some(CodexUpdateStage::Install) => this.install_codex_update(cx),
                                 Some(CodexUpdateStage::Restart) => {
+                                    this.restart_codex_app_server(cx)
+                                }
+                                Some(CodexUpdateStage::Replace) => {
                                     this.restart_codex_app_server(cx)
                                 }
                                 None => {}

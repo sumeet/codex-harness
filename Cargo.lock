@@ -8355,6 +8355,8 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "smol",
+ "sysinfo 0.37.2",
  "theme",
  "theme_settings",
  "ui",
