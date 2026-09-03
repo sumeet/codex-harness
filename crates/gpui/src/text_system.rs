@@ -231,6 +231,7 @@ impl TextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size,
                 }],
             )
             .width
@@ -570,8 +571,10 @@ impl WindowTextSystem {
                 };
 
                 let font_id = self.resolve_font(&run.font);
+                let run_font_size = run.font_size.unwrap_or(font_size);
                 if let Some(font_run) = font_runs.last_mut()
                     && font_id == font_run.font_id
+                    && run_font_size == font_run.font_size
                     && !decoration_changed
                 {
                     font_run.len += run_len_within_line;
@@ -579,6 +582,7 @@ impl WindowTextSystem {
                     font_runs.push(FontRun {
                         len: run_len_within_line,
                         font_id,
+                        font_size: run_font_size,
                     });
                 }
 
@@ -684,8 +688,10 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
+            let run_font_size = run.font_size.unwrap_or(font_size);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run_font_size == font_run.font_size
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -693,6 +699,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run_font_size,
                 });
             }
         }
@@ -720,6 +727,7 @@ impl WindowTextSystem {
                 &[FontRun {
                     len: buffer.len(),
                     font_id,
+                    font_size,
                 }],
                 None,
             )
@@ -766,8 +774,10 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
+            let run_font_size = run.font_size.unwrap_or(font_size);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run_font_size == font_run.font_size
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -775,6 +785,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run_font_size,
                 });
             }
         }
@@ -828,8 +839,10 @@ impl WindowTextSystem {
             };
 
             let font_id = self.resolve_font(&run.font);
+            let run_font_size = run.font_size.unwrap_or(font_size);
             if let Some(font_run) = font_runs.last_mut()
                 && font_id == font_run.font_id
+                && run_font_size == font_run.font_size
                 && !decoration_changed
             {
                 font_run.len += run.len;
@@ -837,6 +850,7 @@ impl WindowTextSystem {
                 font_runs.push(FontRun {
                     len: run.len,
                     font_id,
+                    font_size: run_font_size,
                 });
             }
         }
@@ -1005,6 +1019,10 @@ pub struct TextRun {
     pub len: usize,
     /// The font to use for this run.
     pub font: Font,
+    /// An optional font size override for this run.
+    ///
+    /// When absent, the containing line's font size is used.
+    pub font_size: Option<Pixels>,
     /// The color
     pub color: Hsla,
     /// The background color (if any)

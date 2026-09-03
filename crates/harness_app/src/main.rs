@@ -200,9 +200,8 @@ fn refine_harness_markdown_style_with_font_size(
     style.base_text_style.font_size = reading_font_size.into();
     let line_height = harness_reading_line_height();
     style.base_text_style.line_height = relative(line_height);
-    // Markdown's TextRuns carry family, weight, and paint but intentionally do
-    // not carry font size. The containing Div therefore owns the metrics that
-    // are actually shaped and painted; keep both layers on the same role.
+    // The containing Div establishes the reading size. Inline and block code
+    // retain the independently configured agent buffer size on their TextRuns.
     style.container_style.text.font_size = Some(reading_font_size.into());
     style.container_style.text.line_height = Some(relative(line_height));
     style.paragraph_line_height = relative(line_height);
@@ -23906,10 +23905,12 @@ mod tests {
     fn transcript_inline_code_uses_the_composers_typography_only_semantics() {
         let mut style = MarkdownStyle::default();
         style.inline_code.background_color = Some(gpui::Hsla::default());
+        style.inline_code.font_size = Some(px(13.).into());
 
         refine_harness_markdown_style_with_font_size(&mut style, px(15.));
 
         assert!(style.inline_code.background_color.is_none());
+        assert_eq!(style.inline_code.font_size, Some(px(13.).into()));
         assert!(style.code_block_overflow_x_scroll);
         assert_eq!(style.base_text_style.font_size, px(15.).into());
         assert_eq!(style.base_text_style.line_height, relative(1.3125));

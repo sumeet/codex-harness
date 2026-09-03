@@ -7417,6 +7417,7 @@ impl LineWithInvisibles {
                         let run = TextRun {
                             len: x.len(),
                             font: text_style.font(),
+                            font_size: None,
                             color: text_style.color,
                             background_color: text_style.background_color,
                             underline: text_style.underline,
@@ -7494,6 +7495,7 @@ impl LineWithInvisibles {
                         styles.push(TextRun {
                             len: line_chunk.len(),
                             font: text_style.font(),
+                            font_size: None,
                             color: text_style.color,
                             background_color: text_style.background_color,
                             underline: text_style.underline,
@@ -7577,6 +7579,7 @@ impl LineWithInvisibles {
                     output_runs.push(TextRun {
                         len: span_len,
                         font: text_run.font.clone(),
+                        font_size: text_run.font_size,
                         color: text_run.color,
                         background_color: text_run.background_color,
                         underline: text_run.underline,
@@ -7591,6 +7594,7 @@ impl LineWithInvisibles {
                     output_runs.push(TextRun {
                         len: segment_slice_end_col - cursor_col,
                         font: text_run.font.clone(),
+                        font_size: text_run.font_size,
                         color: new_text_color,
                         background_color: text_run.background_color,
                         underline: text_run.underline,
@@ -7607,6 +7611,7 @@ impl LineWithInvisibles {
                 output_runs.push(TextRun {
                     len: run_end_col - cursor_col,
                     font: text_run.font.clone(),
+                    font_size: text_run.font_size,
                     color: text_run.color,
                     background_color: text_run.background_color,
                     underline: text_run.underline,

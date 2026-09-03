@@ -33,6 +33,8 @@ pub struct LineLayout {
 pub struct ShapedRun {
     /// The font id for this run
     pub font_id: FontId,
+    /// The font size used to shape and paint this run.
+    pub font_size: Pixels,
     /// The glyphs that make up this run
     pub glyphs: Vec<ShapedGlyph>,
 }
@@ -815,6 +817,7 @@ fn apply_force_width_to_layout(layout: &mut LineLayout, force_width: Pixels) {
 pub struct FontRun {
     pub len: usize,
     pub font_id: FontId,
+    pub font_size: Pixels,
 }
 
 trait AsCacheKeyRef {
@@ -979,6 +982,7 @@ mod tests {
             descent: px(4.),
             runs: vec![ShapedRun {
                 font_id: FontId(0),
+                font_size: px(16.),
                 glyphs,
             }],
             len: 0,

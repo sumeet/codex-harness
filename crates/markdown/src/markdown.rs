@@ -2753,6 +2753,7 @@ impl Element for MarkdownElement {
             &self.style.container_style,
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
+            window.rem_size(),
         );
         let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
             let markdown = self.markdown.read(cx);
@@ -3985,6 +3986,7 @@ struct MarkdownElementBuilder {
     list_stack: Vec<ListStackEntry>,
     table: TableState,
     syntax_theme: Arc<SyntaxTheme>,
+    rem_size: Pixels,
 }
 
 struct DivStackEntry {
@@ -4025,6 +4027,7 @@ impl MarkdownElementBuilder {
         container_style: &StyleRefinement,
         base_text_style: TextStyle,
         syntax_theme: Arc<SyntaxTheme>,
+        rem_size: Pixels,
     ) -> Self {
         Self {
             div_stack: vec![{
@@ -4048,6 +4051,7 @@ impl MarkdownElementBuilder {
             list_stack: Vec::new(),
             table: TableState::default(),
             syntax_theme,
+            rem_size,
         }
     }
 
@@ -4291,18 +4295,23 @@ impl MarkdownElementBuilder {
             let mut offset = 0;
             for (range, highlight_id) in language.highlight_text(&Rope::from(text), 0..text.len()) {
                 if range.start > offset {
-                    self.pending_line
-                        .runs
-                        .push(text_style.to_run(range.start - offset));
+                    self.pending_line.runs.push(
+                        text_style.to_run_with_font_size(range.start - offset, self.rem_size),
+                    );
                 }
 
                 let run_len = range.len();
                 if let Some(highlight) = self.syntax_theme.get(highlight_id).cloned() {
+                    self.pending_line.runs.push(
+                        text_style
+                            .clone()
+                            .highlight(highlight)
+                            .to_run_with_font_size(run_len, self.rem_size),
+                    );
+                } else {
                     self.pending_line
                         .runs
-                        .push(text_style.clone().highlight(highlight).to_run(run_len));
-                } else {
-                    self.pending_line.runs.push(text_style.to_run(run_len));
+                        .push(text_style.to_run_with_font_size(run_len, self.rem_size));
                 }
                 offset = range.end;
             }
@@ -4310,10 +4319,12 @@ impl MarkdownElementBuilder {
             if offset < text.len() {
                 self.pending_line
                     .runs
-                    .push(text_style.to_run(text.len() - offset));
+                    .push(text_style.to_run_with_font_size(text.len() - offset, self.rem_size));
             }
         } else {
-            self.pending_line.runs.push(text_style.to_run(text.len()));
+            self.pending_line
+                .runs
+                .push(text_style.to_run_with_font_size(text.len(), self.rem_size));
         }
     }
 
@@ -4343,21 +4354,25 @@ impl MarkdownElementBuilder {
             placeholder_style.color = Hsla::transparent_black();
             self.pending_line
                 .runs
-                .push(placeholder_style.to_run(PLACEHOLDER.len()));
+                .push(placeholder_style.to_run_with_font_size(PLACEHOLDER.len(), self.rem_size));
 
             if !glyph.is_empty() {
                 let label = format!(" {glyph}");
                 self.pending_line.text.push_str(&label);
                 let mut label_style = self.base_text_style.clone();
                 label_style.color = color;
-                self.pending_line.runs.push(label_style.to_run(label.len()));
+                self.pending_line
+                    .runs
+                    .push(label_style.to_run_with_font_size(label.len(), self.rem_size));
             }
         } else {
             let text = format!(" {glyph}");
             self.pending_line.text.push_str(&text);
             let mut style = self.base_text_style.clone();
             style.color = color;
-            self.pending_line.runs.push(style.to_run(text.len()));
+            self.pending_line
+                .runs
+                .push(style.to_run_with_font_size(text.len(), self.rem_size));
         }
 
         self.pending_line.source_mappings.push(SourceMapping {
@@ -4440,7 +4455,9 @@ impl MarkdownElementBuilder {
         let mut text_style = self.base_text_style.clone();
         text_style.color = Hsla::transparent_black();
         let text = "\u{200B}";
-        let styled_text = StyledText::new(text).with_runs(vec![text_style.to_run(text.len())]);
+        let styled_text = StyledText::new(text).with_runs(vec![
+            text_style.to_run_with_font_size(text.len(), self.rem_size),
+        ]);
         self.rendered_lines.push(RenderedLine {
             layout: styled_text.layout().clone(),
             source_mappings: vec![SourceMapping {
@@ -4684,7 +4701,7 @@ fn list_item_marker_source_range(source: &str, item: &Range<usize>) -> Option<Ra
     let line_end = source[start..end]
         .find('\n')
         .map_or(end, |offset| start + offset);
-    let bytes = source[start..line_end].as_bytes();
+    let bytes = &source.as_bytes()[start..line_end];
     let mut cursor = 0;
     while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
         cursor += 1;
@@ -5525,6 +5542,40 @@ mod tests {
 
     fn render_markdown(markdown: &str, cx: &mut TestAppContext) -> RenderedText {
         render_markdown_with_language_registry(markdown, None, cx)
+    }
+
+    #[test]
+    fn inline_code_retains_its_own_font_size() {
+        let body_size = px(17.0);
+        let code_size = px(13.0);
+        let mut base_style = TextStyle::default();
+        base_style.font_size = body_size.into();
+        let mut builder = MarkdownElementBuilder::new(
+            &StyleRefinement::default(),
+            base_style,
+            Arc::new(SyntaxTheme::default()),
+            px(16.0),
+        );
+
+        builder.push_text("before ", 0..7);
+        builder.push_text_style(TextStyleRefinement {
+            font_size: Some(code_size.into()),
+            ..Default::default()
+        });
+        builder.push_text("code", 7..11);
+        builder.pop_text_style();
+        builder.push_text(" after", 11..17);
+
+        let actual_sizes: Vec<_> = builder
+            .pending_line
+            .runs
+            .iter()
+            .map(|run| run.font_size)
+            .collect();
+        assert_eq!(
+            actual_sizes,
+            vec![Some(body_size), Some(code_size), Some(body_size)]
+        );
     }
 
     #[gpui::test]

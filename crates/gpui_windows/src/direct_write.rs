@@ -543,7 +543,7 @@ impl DirectWriteState {
                         font_info.font_face.GetWeight(),
                         font_info.font_face.GetStyle(),
                         DWRITE_FONT_STRETCH_NORMAL,
-                        font_size.as_f32(),
+                        first_run.font_size.as_f32(),
                         &components.locale,
                     )?
                     .cast()?;
@@ -570,15 +570,6 @@ impl DirectWriteState {
                 layout
             };
 
-            let (ascent, descent) = {
-                let mut first_metrics = [DWRITE_LINE_METRICS::default(); 4];
-                let mut line_count = 0u32;
-                text_layout.GetLineMetrics(Some(&mut first_metrics), &mut line_count)?;
-                (
-                    px(first_metrics[0].baseline),
-                    px(first_metrics[0].height - first_metrics[0].baseline),
-                )
-            };
             let mut break_ligatures = true;
             for run in &font_runs[1..] {
                 let font_info = &self.fonts[run.font_id.0];
@@ -594,18 +585,28 @@ impl DirectWriteState {
                 utf16_offset += current_text_utf16_length;
                 text_layout.SetFontCollection(collection, text_range)?;
                 text_layout.SetFontFamilyName(&font_info.font_family_h, text_range)?;
-                let font_size = if break_ligatures {
-                    font_size.as_f32().next_up()
+                let run_font_size = if break_ligatures {
+                    run.font_size.as_f32().next_up()
                 } else {
-                    font_size.as_f32()
+                    run.font_size.as_f32()
                 };
-                text_layout.SetFontSize(font_size, text_range)?;
+                text_layout.SetFontSize(run_font_size, text_range)?;
                 text_layout.SetFontStyle(font_info.font_face.GetStyle(), text_range)?;
                 text_layout.SetFontWeight(font_info.font_face.GetWeight(), text_range)?;
                 text_layout.SetTypography(&font_info.features, text_range)?;
 
                 break_ligatures = !break_ligatures;
             }
+
+            let (ascent, descent) = {
+                let mut first_metrics = [DWRITE_LINE_METRICS::default(); 4];
+                let mut line_count = 0u32;
+                text_layout.GetLineMetrics(Some(&mut first_metrics), &mut line_count)?;
+                (
+                    px(first_metrics[0].baseline),
+                    px(first_metrics[0].height - first_metrics[0].baseline),
+                )
+            };
 
             let mut runs = Vec::new();
             let mut renderer_context = RendererContext {
@@ -1585,7 +1586,11 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
             }
             glyph_idx += cluster_glyph_count;
         }
-        context.runs.push(ShapedRun { font_id, glyphs });
+        context.runs.push(ShapedRun {
+            font_id,
+            font_size: px(glyphrun.fontEmSize),
+            glyphs,
+        });
         Ok(())
     }
 

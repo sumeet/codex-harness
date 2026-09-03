@@ -569,11 +569,20 @@ impl TextStyle {
                 weight: self.font_weight,
                 style: self.font_style,
             },
+            font_size: None,
             color: self.color,
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
         }
+    }
+
+    /// Convert this text style into a [`TextRun`] that retains its resolved
+    /// font size instead of inheriting the size of the containing line.
+    pub fn to_run_with_font_size(&self, len: usize, rem_size: Pixels) -> TextRun {
+        let mut run = self.to_run(len);
+        run.font_size = Some(self.font_size.to_pixels(rem_size));
+        run
     }
 }
 
