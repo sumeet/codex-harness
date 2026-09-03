@@ -6994,7 +6994,7 @@ impl HarnessApp {
 
     fn render_pending_outbound_proxy(
         &self,
-        following_tail: bool,
+        tail_offscreen: bool,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
         let pending = self.model.items.iter().rev().find(|item| {
@@ -7030,7 +7030,7 @@ impl HarnessApp {
             div()
                 .id("pending-outbound-proxy")
                 .tooltip(Tooltip::text(status_tooltip))
-                .when(!following_tail, |this| {
+                .when(tail_offscreen, |this| {
                     this.cursor_pointer().on_click(move |_, window, cx| {
                         weak.update(cx, |this, cx| this.go_to_transcript_tail(window, cx))
                             .ok();
@@ -7085,7 +7085,7 @@ impl HarnessApp {
                             weak_stop.update(cx, |this, cx| this.stop(cx)).ok();
                         }),
                 )
-                .when(!following_tail, |this| {
+                .when(tail_offscreen, |this| {
                     this.child(
                         IconButton::new("pending-outbound-tail", IconName::ArrowDown)
                             .shape(IconButtonShape::Square)
@@ -17062,6 +17062,13 @@ impl Render for HarnessApp {
                 .into_any_element()
         };
         let following_tail = list_state.is_following_tail();
+        // Vim motions intentionally pause automatic tail following so a
+        // streaming response cannot pull the user's cursor away. That pause
+        // does not itself mean the live edge is offscreen: while the viewport
+        // is still at the end, ListState will re-engage following during its
+        // next layout. Only show navigation UI when the last completed layout
+        // positively establishes that content exists below the viewport.
+        let tail_offscreen = !following_tail && list_state.is_scrolled_to_end() == Some(false);
         let transcript_narrow = window.viewport_size().width < px(720.);
         let transcript_body = {
             let rich_list = div()
@@ -17142,7 +17149,7 @@ impl Render for HarnessApp {
                 })
                 .into_any_element()
         };
-        let transcript_tail_control = (!following_tail).then(|| {
+        let transcript_tail_control = tail_offscreen.then(|| {
             let activity_color = if self.workspace_mode == WorkspaceMode::Codex
                 && self.transient_turn_status.is_some()
             {
@@ -17256,7 +17263,7 @@ impl Render for HarnessApp {
         let permission_selector = self.render_permission_selector(cx);
         let composer_actions =
             self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
-        let pending_outbound_proxy = self.render_pending_outbound_proxy(following_tail, cx);
+        let pending_outbound_proxy = self.render_pending_outbound_proxy(tail_offscreen, cx);
         let outbound_tray = self.render_outbound_tray(pending_outbound_proxy, cx);
         let new_thread_project_control = (self.workspace_mode == WorkspaceMode::Codex
             && self.replay_count.is_none()
@@ -20663,8 +20670,8 @@ mod tests {
         assert!(proxy.contains("cannot be withdrawn separately"));
         assert!(proxy.contains("pending-outbound-tail"));
         assert!(proxy.contains("item.protocol_id.is_none()"));
-        assert!(proxy.contains(".when(!following_tail"));
-        assert!(!proxy.contains("if following_tail"));
+        assert_eq!(proxy.matches(".when(tail_offscreen").count(), 2);
+        assert!(!proxy.contains("following_tail"));
         assert!(!proxy.contains(".border_t_1()"));
         assert!(!proxy.contains(".bg("));
         assert!(!proxy.contains(".opacity("));
@@ -22034,7 +22041,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("offscreen transcript tail control must remain auditable");
 
-        assert!(control.contains("(!following_tail)"));
+        assert!(control.contains("tail_offscreen.then"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
         assert!(control.contains("offscreen-tail-activity"));
