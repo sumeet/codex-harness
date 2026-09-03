@@ -3879,7 +3879,38 @@ impl TranscriptEditor {
         });
     }
 
-    pub fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) -> bool {
+    /// Synchronize selectable text and its semantic byte index at one owner.
+    /// Buffer normalizes line endings while editing, so verify the resulting
+    /// text before publishing ranges derived from the requested document.
+    pub fn synchronize_document(
+        &mut self,
+        document: &TranscriptDocument,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !document_has_valid_segment_ranges(document) {
+            return false;
+        }
+
+        let old_text = self.buffer.read(cx).text();
+        if old_text != document.text {
+            let (old_range, replacement) = minimal_text_edit(&old_text, &document.text);
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.edit([(old_range, replacement)], None, cx);
+            });
+        }
+        if self.buffer.read(cx).text() != document.text {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.set_text(document.text.clone(), cx);
+            });
+        }
+        if self.buffer.read(cx).text() != document.text {
+            return false;
+        }
+
+        self.decorate(document, cx) && self.navigation_index_matches_buffer(cx)
+    }
+
+    fn decorate(&mut self, document: &TranscriptDocument, cx: &mut Context<Self>) -> bool {
         if !document_has_valid_segment_ranges(document) {
             // Keep the raw Buffer readable/selectable, but discard every
             // decoration whose semantic ownership can no longer be proven.
@@ -4166,26 +4197,44 @@ impl TranscriptEditor {
             .iter()
             .any(|edit| !edit.old_range.is_empty() || !edit.replacement.is_empty())
             || !append_text.is_empty();
-        self.buffer.update(cx, |buffer, cx| {
-            for edit in pending_edits {
-                buffer.edit([(edit.old_range, edit.replacement)], None, cx);
-            }
-            if !append_text.is_empty() {
-                let end = buffer.len();
-                buffer.edit([(end..end, append_text)], None, cx);
-            }
-        });
-
         let appended_segment_start = next_segments.len();
         next_segments.extend(appended_segments);
         next_body_texts.extend(appended_bodies);
-        if self.buffer.read(cx).len()
-            != next_segments
-                .last()
-                .map_or(0, |segment| segment.whole_range.end)
-        {
-            // The caller immediately performs a full document sync. Do not
-            // publish offsets for a Buffer shape they do not describe.
+        let indexed_length = next_segments
+            .last()
+            .map_or(0, |segment| segment.whole_range.end);
+        let Some(edited_length) =
+            pending_edits
+                .iter()
+                .try_fold(self.buffer.read(cx).len(), |length, edit| {
+                    length
+                        .checked_sub(edit.old_range.len())?
+                        .checked_add(edit.replacement.len())
+                })
+        else {
+            return false;
+        };
+        let Some(edited_length) = edited_length.checked_add(append_text.len()) else {
+            return false;
+        };
+        if edited_length != indexed_length {
+            return false;
+        }
+
+        let mut edits = pending_edits
+            .into_iter()
+            .map(|edit| (edit.old_range, edit.replacement))
+            .collect::<Vec<_>>();
+        if !append_text.is_empty() {
+            let end = self.buffer.read(cx).len();
+            edits.push((end..end, append_text));
+        }
+        if !edits.is_empty() {
+            self.buffer.update(cx, |buffer, cx| {
+                buffer.edit(edits, None, cx);
+            });
+        }
+        if self.buffer.read(cx).len() != indexed_length {
             return false;
         }
         self.segments = next_segments;

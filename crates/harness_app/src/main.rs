@@ -40,7 +40,7 @@ use harness_editor::{
 };
 use harness_protocol as model;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle, SourcePointerPhase};
-use model::{TranscriptItem, TranscriptModel, minimal_text_edit};
+use model::{TranscriptItem, TranscriptModel};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use settings::{Settings as _, SettingsStore};
@@ -2156,7 +2156,7 @@ fn command_output_for_display(output: &str) -> &str {
     output.trim_end_matches(['\r', '\n'])
 }
 
-fn normalize_command_line_endings(mut text: String) -> String {
+fn normalize_transcript_line_endings(mut text: String) -> String {
     if text.contains('\r') {
         text = text.replace("\r\n", "\n").replace('\r', "\n");
     }
@@ -2174,10 +2174,10 @@ fn command_line_ranges(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
 
 fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
     let transcript = item.command_transcript()?;
-    let command: Arc<str> = Arc::from(normalize_command_line_endings(
+    let command: Arc<str> = Arc::from(normalize_transcript_line_endings(
         transcript.command.trim_end_matches(['\r', '\n']).to_owned(),
     ));
-    let output: Arc<str> = Arc::from(normalize_command_line_endings(
+    let output: Arc<str> = Arc::from(normalize_transcript_line_endings(
         command_output_for_display(&transcript.output).to_owned(),
     ));
     let mut rows = command_line_ranges(&command)
@@ -2874,7 +2874,7 @@ fn append_rich_navigation_fragment(output: &mut String, fragment: &str) {
     if !output.is_empty() {
         output.push('\n');
     }
-    output.push_str(fragment);
+    output.push_str(&normalize_transcript_line_endings(fragment.to_owned()));
 }
 
 /// Build the text native Vim navigates from the same semantic presentations
@@ -2894,7 +2894,9 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
                 )
             }) =>
         {
-            return model::rich_markdown_navigation_text(&item.content);
+            return normalize_transcript_line_endings(model::rich_markdown_navigation_text(
+                &item.content,
+            ));
         }
         model::TranscriptKind::Reasoning => {
             for summary in reasoning_summary_lines(&item.content) {
@@ -2921,7 +2923,7 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
         }
         model::TranscriptKind::Command => {
             let Some(command) = item.command_transcript() else {
-                return fallback.to_owned();
+                return normalize_transcript_line_endings(fallback.to_owned());
             };
             append_rich_navigation_fragment(&mut output, &command.command);
             append_rich_navigation_fragment(
@@ -2932,7 +2934,7 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
         model::TranscriptKind::Web => {
             let presentation = web_search_presentation(&item.raw);
             if presentation.queries.is_empty() && presentation.results.is_empty() {
-                return fallback.to_owned();
+                return normalize_transcript_line_endings(fallback.to_owned());
             }
             for query in presentation.queries {
                 append_rich_navigation_fragment(&mut output, &query);
@@ -2947,13 +2949,16 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
         model::TranscriptKind::Tool
         | model::TranscriptKind::Subagent
         | model::TranscriptKind::Review => {
-            let sections = activity_text_sections(&item.content);
+            let content = normalize_transcript_line_endings(item.content.clone());
+            let sections = activity_text_sections(&content);
             if !sections.iter().any(|section| section.heading.is_some()) {
-                return sections
-                    .into_iter()
-                    .map(|section| section.body)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                return normalize_transcript_line_endings(
+                    sections
+                        .into_iter()
+                        .map(|section| section.body)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
             }
             for section in sections {
                 if let Some(heading) = section.heading {
@@ -2966,10 +2971,10 @@ fn rich_navigation_body_for_item(item: &TranscriptItem, fallback: &str) -> Strin
             if let Some(caption) = image_caption_for_display(item) {
                 append_rich_navigation_fragment(&mut output, caption);
             } else {
-                return fallback.to_owned();
+                return normalize_transcript_line_endings(fallback.to_owned());
             }
         }
-        _ => return fallback.to_owned(),
+        _ => return normalize_transcript_line_endings(fallback.to_owned()),
     }
     output
 }
@@ -2983,7 +2988,7 @@ fn rich_navigation_item_projection(
     let body = if item.expanded {
         rich_navigation_body_for_item(item, projection.body_text())
     } else {
-        transcript_item_header_title(item)
+        normalize_transcript_line_endings(transcript_item_header_title(item))
     };
     let projection = if body == projection.body_text() {
         projection
@@ -9604,20 +9609,18 @@ impl HarnessApp {
             return None;
         }
         let document = rich_navigation_document(self.active_transcript_model());
-        let old_text = self.transcript_editor.read(cx).text(cx);
-        if old_text == document.text {
-            self.transcript_editor
-                .update(cx, |editor, cx| editor.decorate(&document, cx));
-            return Some(document);
+        let synchronized = self
+            .transcript_editor
+            .update(cx, |editor, cx| editor.synchronize_document(&document, cx));
+        if !synchronized {
+            log::error!(
+                "could not synchronize transcript navigation document: items={} bytes={}",
+                document.segments.len(),
+                document.text.len()
+            );
+            return None;
         }
-        let (old_range, replacement) = minimal_text_edit(&old_text, &document.text);
-        self.transcript_editor.update(cx, |editor, cx| {
-            editor.edit(old_range, replacement, cx);
-            editor.decorate(&document, cx);
-        });
-        if rich_vim_experiment() {
-            self.rich_navigation_selection = None;
-        }
+        self.rich_navigation_selection = None;
         Some(document)
     }
 
@@ -14577,6 +14580,7 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let content = normalize_transcript_line_endings(content);
         let colors = cx.theme().colors().clone();
         let mut logical_cursor = 0;
         let body_range = rich_navigation_fragment_range(navigation, &content, &mut logical_cursor);
@@ -14648,6 +14652,7 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let content = normalize_transcript_line_endings(content);
         let sections = activity_text_sections(&content);
         if !sections.iter().any(|section| section.heading.is_some()) {
             let content = sections
@@ -21201,7 +21206,7 @@ mod tests {
         assert_eq!(
             project(
                 model::TranscriptKind::Tool,
-                "Arguments\n{\"query\":\"x\"}\n\nResult\nok",
+                "Arguments\r\n{\"query\":\"x\"}\r\n\r\nResult\rok",
                 Value::Null,
             ),
             "Arguments\n{\"query\":\"x\"}\nResult\nok"
@@ -21237,6 +21242,50 @@ mod tests {
             ),
             "zed\nZed Docs\nzed.dev"
         );
+    }
+
+    #[test]
+    fn rich_navigation_document_uses_the_buffers_canonical_line_endings() {
+        let mut model = TranscriptModel::default();
+        model.items.push(TranscriptItem {
+            key: "crlf-agent".into(),
+            protocol_id: Some("crlf-agent".into()),
+            kind: model::TranscriptKind::Agent,
+            title: "Codex".into(),
+            status: None,
+            content: "first\r\nsecond\rthird".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        });
+        model.items.push(TranscriptItem {
+            key: "crlf-tool".into(),
+            protocol_id: Some("crlf-tool".into()),
+            kind: model::TranscriptKind::Tool,
+            title: "Tool".into(),
+            status: None,
+            content: "Arguments\r\nquery\r\n\r\nResult\rok".into(),
+            raw: Value::Null,
+            event_count: 1,
+            expanded: true,
+            pending_request: None,
+        });
+
+        let document = rich_navigation_document(&model);
+        assert!(!document.text.contains('\r'));
+        assert_eq!(
+            document
+                .segments
+                .last()
+                .map(|segment| segment.whole_range.end),
+            Some(document.text.len())
+        );
+        assert!(document.segments.iter().all(|segment| {
+            segment.header_range.end <= segment.body_range.start
+                && segment.body_range.end <= segment.whole_range.end
+                && segment.whole_range.end <= document.text.len()
+        }));
     }
 
     #[test]
@@ -21329,7 +21378,7 @@ mod tests {
 
     #[test]
     fn command_row_ranges_normalize_line_endings_and_drop_only_terminal_newlines() {
-        let normalized = normalize_command_line_endings("one\r\ntwo\rthree\r\n".into());
+        let normalized = normalize_transcript_line_endings("one\r\ntwo\rthree\r\n".into());
         assert_eq!(normalized, "one\ntwo\nthree\n");
         assert_eq!(command_output_for_display(&normalized), "one\ntwo\nthree");
         assert_eq!(
