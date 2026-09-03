@@ -1002,8 +1002,8 @@ impl RichNavigationPaint {
 }
 
 /// Give hidden Rich navigation a stable proxy in the card header. Collapsed
-/// folds and non-text request/image surfaces show their full title for a
-/// Visual selection; a Normal cursor owns exactly its first glyph.
+/// titles preserve their exact cursor or Visual range; non-text surfaces use
+/// the full title for Visual mode and its first glyph for Normal mode.
 fn rich_header_navigation_range(
     title: &str,
     navigation: Option<&RichNavigationPaint>,
@@ -1011,14 +1011,39 @@ fn rich_header_navigation_range(
 ) -> Option<Range<usize>> {
     let navigation = navigation?;
     if navigation.visual {
-        return (proxy_body && !navigation.ranges.is_empty()).then(|| 0..title.len());
+        if !proxy_body || navigation.ranges.is_empty() {
+            return None;
+        }
+        if navigation.body_text.as_ref() == title {
+            let start = navigation
+                .ranges
+                .iter()
+                .map(|range| range.start.min(title.len()))
+                .min()?;
+            let end = navigation
+                .ranges
+                .iter()
+                .map(|range| range.end.min(title.len()))
+                .max()?;
+            return (start < end).then_some(start..end);
+        }
+        return Some(0..title.len());
     }
     if !proxy_body || navigation.head.is_none() || navigation.cursor_claimed.get() {
         return None;
     }
-    let end = title.chars().next().map(char::len_utf8)?;
+    let range = if navigation.body_text.as_ref() == title {
+        let range = navigation.cursor_range()?;
+        range.start.min(title.len())..range.end.min(title.len())
+    } else {
+        let end = title.chars().next().map(char::len_utf8)?;
+        0..end
+    };
+    if range.is_empty() {
+        return None;
+    }
     navigation.cursor_claimed.set(true);
-    Some(0..end)
+    Some(range)
 }
 
 /// Locate a visible Rich fragment in the logical transcript body, preserving
@@ -7447,6 +7472,33 @@ impl HarnessApp {
         true
     }
 
+    fn clear_cached_markdown_navigation_outside_snapshot(
+        &mut self,
+        snapshot: &TranscriptSelectionSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        let retained_keys = snapshot
+            .items
+            .iter()
+            .filter_map(|selection| {
+                self.active_transcript_model()
+                    .items
+                    .get(selection.item_index)
+                    .map(|item| item.key.clone())
+            })
+            .flat_map(|key| [key.clone(), format!("{key}:user-content")])
+            .collect::<HashSet<_>>();
+
+        for (key, cached) in &mut self.markdown_cache {
+            if retained_keys.contains(key) || cached.navigation.take().is_none() {
+                continue;
+            }
+            cached.entity.update(cx, |markdown, cx| {
+                markdown.set_external_navigation(None, None, cx);
+            });
+        }
+    }
+
     fn new(
         cwd: String,
         replay_count: Option<usize>,
@@ -7637,6 +7689,9 @@ impl HarnessApp {
                 let body_offset = snapshot.items.iter().find_map(|item| item.head);
                 let rich_selection_changed = rich_vim_experiment()
                     && this.rich_navigation_selection.as_ref() != Some(&snapshot);
+                if rich_selection_changed {
+                    this.clear_cached_markdown_navigation_outside_snapshot(&snapshot, cx);
+                }
                 let local_markdown_repaint = rich_selection_changed
                     && item_index.is_some_and(|item_index| {
                         this.rich_navigation_selection
@@ -21513,6 +21568,34 @@ mod tests {
             rich_header_navigation_range("Command", Some(&visual), false),
             None,
             "an expanded card paints Visual mode on its body fragments"
+        );
+
+        let collapsed = RichNavigationPaint {
+            body_text: "Searched the web".into(),
+            ranges: Vec::new(),
+            head: Some("Searched the web".len()),
+            visual: false,
+            linewise: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            rich_header_navigation_range("Searched the web", Some(&collapsed), true),
+            Some("Searched the we".len().."Searched the web".len()),
+            "a collapsed row should paint the native cursor at its real title column"
+        );
+
+        let collapsed_visual = RichNavigationPaint {
+            body_text: "Searched the web".into(),
+            ranges: vec![9..12],
+            head: Some(11),
+            visual: true,
+            linewise: false,
+            cursor_claimed: Rc::new(Cell::new(false)),
+        };
+        assert_eq!(
+            rich_header_navigation_range("Searched the web", Some(&collapsed_visual), true),
+            Some(9..12),
+            "a collapsed row should preserve the native Visual range"
         );
     }
 
