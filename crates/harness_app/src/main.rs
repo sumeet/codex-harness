@@ -521,6 +521,26 @@ fn transcript_has_inline_activity(transcript: &TranscriptModel) -> bool {
     })
 }
 
+fn transcript_tail_is_offscreen(list_state: &ListState, following_tail: bool) -> bool {
+    if following_tail || list_state.item_count() == 0 {
+        return false;
+    }
+
+    let viewport = list_state.viewport_bounds();
+    if viewport.size.height <= px(0.) {
+        // There is no trustworthy geometry before the list's first layout.
+        return false;
+    }
+
+    let tail_index = list_state.item_count() - 1;
+    list_state.bounds_for_item(tail_index).map_or(true, |tail| {
+        // List layout and scrollbar arithmetic both allow a one-pixel tail
+        // tolerance. Use the same allowance so fractional scaling cannot
+        // flicker the control at the live edge.
+        tail.bottom() > viewport.bottom() + px(1.)
+    })
+}
+
 fn chat_transcript_items(
     messages: &[ChatMessage],
     sending: bool,
@@ -17064,11 +17084,9 @@ impl Render for HarnessApp {
         let following_tail = list_state.is_following_tail();
         // Vim motions intentionally pause automatic tail following so a
         // streaming response cannot pull the user's cursor away. That pause
-        // does not itself mean the live edge is offscreen: while the viewport
-        // is still at the end, ListState will re-engage following during its
-        // next layout. Only show navigation UI when the last completed layout
-        // positively establishes that content exists below the viewport.
-        let tail_offscreen = !following_tail && list_state.is_scrolled_to_end() == Some(false);
+        // does not itself mean the live edge is offscreen, so derive the
+        // navigation state from the actual tail row's layout geometry.
+        let tail_offscreen = transcript_tail_is_offscreen(&list_state, following_tail);
         let transcript_narrow = window.viewport_size().width < px(720.);
         let transcript_body = {
             let rich_list = div()
@@ -22035,12 +22053,20 @@ mod tests {
     #[test]
     fn offscreen_tail_status_uses_one_stateful_navigation_control() {
         let source = include_str!("main.rs");
+        let visibility = source
+            .split_once("fn transcript_tail_is_offscreen(")
+            .and_then(|(_, after)| after.split_once("fn chat_transcript_items("))
+            .map(|(body, _)| body)
+            .expect("tail visibility rule must remain auditable");
         let control = source
             .split_once("let transcript_tail_control =")
             .and_then(|(_, after)| after.split_once("let command_line_input ="))
             .map(|(body, _)| body)
             .expect("offscreen transcript tail control must remain auditable");
 
+        assert!(visibility.contains("bounds_for_item(tail_index)"));
+        assert!(visibility.contains("tail.bottom() > viewport.bottom() + px(1.)"));
+        assert!(!visibility.contains("is_scrolled_to_end"));
         assert!(control.contains("tail_offscreen.then"));
         assert!(control.contains("SpinnerLabel::dots()"));
         assert!(control.contains("IconName::ArrowDown"));
