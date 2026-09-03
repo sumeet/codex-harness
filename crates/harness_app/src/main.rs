@@ -12569,26 +12569,6 @@ impl HarnessApp {
         cx.notify();
     }
 
-    /// Keep the hidden native Editor and its item-relative semantic index in
-    /// lockstep before either mouse or keyboard navigation addresses it. A
-    /// failed incremental projection leaves the Buffer readable, but its old
-    /// offsets must be rebuilt before they can safely drive the Rich surface.
-    fn ensure_transcript_navigation_index(&mut self, cx: &mut Context<Self>) -> bool {
-        if self
-            .transcript_editor
-            .read(cx)
-            .navigation_index_matches_buffer(cx)
-        {
-            return true;
-        }
-
-        log::warn!("repairing stale transcript navigation index before input");
-        drop(self.sync_transcript_document(cx));
-        self.transcript_editor
-            .read(cx)
-            .navigation_index_matches_buffer(cx)
-    }
-
     fn note_rich_pointer_position(&mut self, position: RichPointerPosition) {
         self.rich_pointer_autoscroll_suppression = Some(position);
         let Some(item_key) = self
@@ -12615,10 +12595,6 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.ensure_transcript_navigation_index(cx) {
-            log::error!("could not repair transcript navigation index for pointer input");
-            return;
-        }
         let existing_anchor = extend_existing
             .then(|| {
                 self.transcript_editor
@@ -12681,9 +12657,6 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.ensure_transcript_navigation_index(cx) {
-            return;
-        }
         let Some(mut gesture) = self.rich_pointer_gesture else {
             return;
         };
@@ -12713,11 +12686,6 @@ impl HarnessApp {
     /// The outer Rich transcript calls this during mouse-up capture, so a drag
     /// crossing items never remaps release through its originating layout.
     fn finish_rich_pointer_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.ensure_transcript_navigation_index(cx) {
-            self.rich_pointer_gesture = None;
-            self.rich_pointer_autoscroll_suppression = None;
-            return;
-        }
         let Some(gesture) = self.rich_pointer_gesture else {
             return;
         };
@@ -12805,9 +12773,6 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.ensure_transcript_navigation_index(cx) {
-            return false;
-        }
         let placed = self.transcript_editor.update(cx, |editor, cx| {
             editor.set_cursor_in_item(item_index, body_offset, window, cx)
         });
@@ -12826,9 +12791,6 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.ensure_transcript_navigation_index(cx) {
-            return false;
-        }
         let placed = self.transcript_editor.update(cx, |editor, cx| {
             editor.set_cursor_at_item_last_line(item_index, window, cx)
         });
