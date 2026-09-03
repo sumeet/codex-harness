@@ -2790,6 +2790,20 @@ impl TranscriptEditor {
         self.item_at_offset(cursor_offset)
     }
 
+    /// Whether the item-relative index still covers the exact byte length of
+    /// the canonical Buffer. This intentionally checks only invariants owned
+    /// by the incremental updater; header and body ranges may contain
+    /// presentation gaps and therefore are not inferred from cached strings.
+    pub fn navigation_index_matches_buffer(&self, cx: &App) -> bool {
+        self.segment_header_texts.len() == self.segments.len()
+            && self.segment_body_texts.len() == self.segments.len()
+            && self.buffer.read(cx).len()
+                == self
+                    .segments
+                    .last()
+                    .map_or(0, |segment| segment.whole_range.end)
+    }
+
     /// Return the semantic item intersecting the top of the visible Editor
     /// viewport. Hosts use this as a scroll anchor when switching between a
     /// rich list projection and the selectable text projection.
@@ -4009,13 +4023,7 @@ impl TranscriptEditor {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.model_item_count != old_model_item_count
-            || self.segment_header_texts.len() != self.segments.len()
-            || self.segment_body_texts.len() != self.segments.len()
-            || self.buffer.read(cx).len()
-                != self
-                    .segments
-                    .last()
-                    .map_or(0, |segment| segment.whole_range.end)
+            || !self.navigation_index_matches_buffer(cx)
         {
             return false;
         }
@@ -4171,6 +4179,15 @@ impl TranscriptEditor {
         let appended_segment_start = next_segments.len();
         next_segments.extend(appended_segments);
         next_body_texts.extend(appended_bodies);
+        if self.buffer.read(cx).len()
+            != next_segments
+                .last()
+                .map_or(0, |segment| segment.whole_range.end)
+        {
+            // The caller immediately performs a full document sync. Do not
+            // publish offsets for a Buffer shape they do not describe.
+            return false;
+        }
         self.segments = next_segments;
         self.segment_header_texts.extend(appended_headers);
         self.segment_body_texts = next_body_texts;

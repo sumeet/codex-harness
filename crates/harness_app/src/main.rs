@@ -12587,6 +12587,24 @@ impl HarnessApp {
         }
     }
 
+    /// Repair an interrupted incremental projection once, at gesture entry.
+    /// Never rebuild during move/up: doing so changes the native selection
+    /// underneath an active drag and makes visible and actual ranges diverge.
+    fn repair_transcript_navigation_for_pointer(&mut self, cx: &mut Context<Self>) -> bool {
+        if self
+            .transcript_editor
+            .read(cx)
+            .navigation_index_matches_buffer(cx)
+        {
+            return true;
+        }
+        log::warn!("repairing stale transcript navigation index before pointer gesture");
+        drop(self.sync_transcript_document(cx));
+        self.transcript_editor
+            .read(cx)
+            .navigation_index_matches_buffer(cx)
+    }
+
     fn begin_rich_pointer_selection(
         &mut self,
         position: RichPointerPosition,
@@ -12595,6 +12613,10 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.repair_transcript_navigation_for_pointer(cx) {
+            log::error!("could not repair transcript navigation index for pointer gesture");
+            return;
+        }
         let existing_anchor = extend_existing
             .then(|| {
                 self.transcript_editor
@@ -20837,6 +20859,7 @@ mod tests {
             .map(|(method, _)| method)
             .expect("renderer-neutral pointer host must remain auditable");
         for required in [
+            "repair_transcript_navigation_for_pointer(",
             "set_pointer_selection(",
             "pause_following_tail()",
             "focus_handle(cx).focus(window, cx)",
@@ -20848,6 +20871,11 @@ mod tests {
                 "pointer host must call {required}"
             );
         }
+        assert_eq!(
+            handler.matches("sync_transcript_document(cx)").count(),
+            1,
+            "a stale index may be rebuilt only once at pointer-down, never during drag or release"
+        );
         for forbidden in [
             "place_rich_cursor_in_item(",
             "reveal_rich_navigation_item(",
