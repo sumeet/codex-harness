@@ -68,7 +68,7 @@ must survive conversation compaction and hand-offs.
 - [x] Retain and expose the managed Codex binary path plus client, managed, and
   running App Server versions; refuse a managed daemon whose three reported
   versions disagree.
-- [ ] Detect an available Codex update and provide a controlled managed-daemon
+- [x] Detect an available Codex update and provide a controlled managed-daemon
   restart. Never restart while any thread is active or awaiting interaction
   without explicit user override.
 - [ ] Surface multi-agent capacity and allocation failures truthfully enough to

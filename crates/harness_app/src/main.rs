@@ -57,6 +57,7 @@ use ui::{
 use uuid::Uuid;
 
 mod chatgpt_desktop;
+mod codex_runtime;
 mod comparison_profile;
 mod image_surface;
 mod palette;
@@ -69,6 +70,7 @@ use chatgpt_desktop::{
     ActivityKind as ChatActivityKind, ConversationSummary as ChatConversationSummary,
     Message as ChatMessage, ModelChoice as ChatModelChoice,
 };
+use codex_runtime::AvailableUpdate as AvailableCodexUpdate;
 use image_surface::{
     ImageSurface, SurfaceSyncDecision as ImageSurfaceSyncDecision,
     keys_to_sync as image_surface_keys_to_sync,
@@ -3937,6 +3939,11 @@ struct HarnessApp {
     binary_update_candidate: Option<ExecutableFingerprint>,
     dismissed_binary_update: Option<ExecutableFingerprint>,
     binary_update_available: bool,
+    codex_update_status: CodexUpdateStatus,
+    dismissed_codex_update: Option<String>,
+    codex_update_watch_task: Task<()>,
+    codex_update_action_task: Task<()>,
+    codex_restart_initiated: bool,
     replay_count: Option<usize>,
     workspace_mode: WorkspaceMode,
     chat_conversations: Vec<ChatConversationSummary>,
@@ -4192,6 +4199,34 @@ fn codex_connection_error(error: &anyhow::Error, reconnect_exhausted: bool) -> S
         format!("Could not reconnect to Codex: {error}. Refresh the task list to try again.").into()
     } else {
         format!("Could not connect to Codex: {error}").into()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexUpdateStage {
+    Install,
+    Restart,
+}
+
+#[derive(Clone, Debug, Default)]
+enum CodexUpdateStatus {
+    #[default]
+    Checking,
+    Current,
+    Available(AvailableCodexUpdate),
+    Updating(AvailableCodexUpdate),
+    RestartPending(AvailableCodexUpdate),
+    Restarting(AvailableCodexUpdate),
+    Failed {
+        update: AvailableCodexUpdate,
+        stage: CodexUpdateStage,
+        message: SharedString,
+    },
+}
+
+impl CodexUpdateStatus {
+    fn is_busy(&self) -> bool {
+        matches!(self, Self::Updating(_) | Self::Restarting(_))
     }
 }
 
@@ -7855,6 +7890,11 @@ impl HarnessApp {
             binary_update_candidate: None,
             dismissed_binary_update: None,
             binary_update_available: false,
+            codex_update_status: CodexUpdateStatus::Checking,
+            dismissed_codex_update: None,
+            codex_update_watch_task: Task::ready(()),
+            codex_update_action_task: Task::ready(()),
+            codex_restart_initiated: false,
             replay_count,
             workspace_mode,
             chat_conversations: Vec::new(),
@@ -8215,6 +8255,7 @@ impl HarnessApp {
         }
         this.start_binary_update_watcher(cx);
         if replay_count.is_none() {
+            this.start_codex_update_watcher(cx);
             this.connect(cx);
             if this.workspace_mode == WorkspaceMode::Chat {
                 this.refresh_chat_conversations(cx);
@@ -8286,6 +8327,166 @@ impl HarnessApp {
             }
         })
         .detach();
+    }
+
+    fn start_codex_update_watcher(&mut self, cx: &mut Context<Self>) {
+        self.codex_update_watch_task = cx.spawn(async move |this, cx| {
+            loop {
+                let result = codex_runtime::check_for_update().await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.codex_update_status.is_busy()
+                            || matches!(
+                                this.codex_update_status,
+                                CodexUpdateStatus::RestartPending(_)
+                                    | CodexUpdateStatus::Failed { .. }
+                            )
+                        {
+                            return;
+                        }
+                        match result {
+                            Ok(Some(update))
+                                if this.dismissed_codex_update.as_deref()
+                                    != Some(update.latest_version.as_str()) =>
+                            {
+                                this.codex_update_status = CodexUpdateStatus::Available(update);
+                                cx.notify();
+                            }
+                            Ok(_) => {
+                                if !matches!(this.codex_update_status, CodexUpdateStatus::Current) {
+                                    this.codex_update_status = CodexUpdateStatus::Current;
+                                    cx.notify();
+                                }
+                            }
+                            Err(error) => {
+                                log::warn!("could not check for a Codex update: {error:#}");
+                                if matches!(this.codex_update_status, CodexUpdateStatus::Checking) {
+                                    this.codex_update_status = CodexUpdateStatus::Current;
+                                }
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                cx.background_executor()
+                    .timer(codex_runtime::UPDATE_CHECK_INTERVAL)
+                    .await;
+            }
+        });
+    }
+
+    fn dismiss_codex_update(&mut self, cx: &mut Context<Self>) {
+        let latest_version = match &self.codex_update_status {
+            CodexUpdateStatus::Available(update)
+            | CodexUpdateStatus::Failed {
+                update,
+                stage: CodexUpdateStage::Install,
+                ..
+            } => Some(update.latest_version.clone()),
+            _ => None,
+        };
+        if let Some(latest_version) = latest_version {
+            self.dismissed_codex_update = Some(latest_version);
+            self.codex_update_status = CodexUpdateStatus::Current;
+            cx.notify();
+        }
+    }
+
+    fn install_codex_update(&mut self, cx: &mut Context<Self>) {
+        let update = match &self.codex_update_status {
+            CodexUpdateStatus::Available(update)
+            | CodexUpdateStatus::Failed {
+                update,
+                stage: CodexUpdateStage::Install,
+                ..
+            } => update.clone(),
+            _ => return,
+        };
+        self.codex_update_status = CodexUpdateStatus::Updating(update.clone());
+        self.codex_update_action_task = cx.spawn(async move |this, cx| {
+            let result = codex_runtime::install_update().await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.codex_update_status = match result {
+                    Ok(()) => {
+                        this.dismissed_codex_update = None;
+                        CodexUpdateStatus::RestartPending(update)
+                    }
+                    Err(error) => CodexUpdateStatus::Failed {
+                        update,
+                        stage: CodexUpdateStage::Install,
+                        message: format!("{error:#}").into(),
+                    },
+                };
+                cx.notify();
+            }) {
+                log::debug!("Codex update finished after Harness closed: {error}");
+            }
+        });
+        cx.notify();
+    }
+
+    fn codex_restart_blocker(&self) -> Option<SharedString> {
+        let has_active_turn = self.turn_active()
+            || self
+                .threads
+                .iter()
+                .any(|thread| matches!(thread.status, CodexThreadStatus::Active { .. }))
+            || self
+                .child_threads
+                .by_id
+                .values()
+                .any(|thread| matches!(thread.status, CodexThreadStatus::Active { .. }));
+        if has_active_turn {
+            return Some("Wait for active Codex turns to finish before restarting".into());
+        }
+        if self.model.items.iter().any(|item| {
+            item.pending_request
+                .as_ref()
+                .is_some_and(|request| !request.resolved)
+        }) {
+            return Some("Resolve pending Codex requests before restarting".into());
+        }
+        None
+    }
+
+    fn restart_codex_app_server(&mut self, cx: &mut Context<Self>) {
+        let update = match &self.codex_update_status {
+            CodexUpdateStatus::RestartPending(update)
+            | CodexUpdateStatus::Failed {
+                update,
+                stage: CodexUpdateStage::Restart,
+                ..
+            } => update.clone(),
+            _ => return,
+        };
+        if self.codex_restart_blocker().is_some() {
+            return;
+        }
+
+        self.codex_restart_initiated = true;
+        self.codex_update_status = CodexUpdateStatus::Restarting(update.clone());
+        self.codex_update_action_task = cx.spawn(async move |this, cx| {
+            let result = codex_runtime::restart_app_server().await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.codex_update_status = match result {
+                    Ok(()) => CodexUpdateStatus::Current,
+                    Err(error) => {
+                        this.codex_restart_initiated = false;
+                        CodexUpdateStatus::Failed {
+                            update,
+                            stage: CodexUpdateStage::Restart,
+                            message: format!("{error:#}").into(),
+                        }
+                    }
+                };
+                cx.notify();
+            }) {
+                log::debug!("Codex App Server restart finished after Harness closed: {error}");
+            }
+        });
+        cx.notify();
     }
 
     fn dismiss_binary_update(&mut self, cx: &mut Context<Self>) {
@@ -8933,6 +9134,7 @@ impl HarnessApp {
                 .then_some(index)
             })
             .collect::<Vec<_>>();
+        let intentional_restart = std::mem::take(&mut self.codex_restart_initiated);
         self.client = None;
         self.connecting = false;
         self.thread_list_task = Task::ready(());
@@ -8962,7 +9164,14 @@ impl HarnessApp {
         self.deferred_server_requests.clear();
         self.background_parent_thread_id = None;
         self.preserved_work_thread_id = None;
-        self.error = Some("Codex app server disconnected.".into());
+        self.error = Some(
+            if intentional_restart {
+                "Applying the Codex update; reconnecting to the App Server…"
+            } else {
+                "Codex app server disconnected."
+            }
+            .into(),
+        );
         self.retire_all_request_surfaces();
         mark_unbacked_requests_inactive(&mut self.model, &self.live_request_keys);
         for index in &dirty_requests {
@@ -8975,6 +9184,9 @@ impl HarnessApp {
             }
         }
         self.schedule_reconnect(cx);
+        if intentional_restart {
+            self.error = Some("Applying the Codex update; reconnecting to the App Server…".into());
+        }
         cx.notify();
     }
 
@@ -17329,6 +17541,175 @@ impl Render for HarnessApp {
                 )
                 .into_any_element()
         });
+        let codex_restart_blocker = self.codex_restart_blocker();
+        let codex_update_prompt = match self.codex_update_status.clone() {
+            CodexUpdateStatus::Checking | CodexUpdateStatus::Current => None,
+            CodexUpdateStatus::Available(update) => Some((
+                format!("Codex {} is available", update.latest_version).into(),
+                format!(
+                    "Installed {} · Update now; the current App Server keeps running until restart.",
+                    update.installed_version
+                )
+                .into(),
+                "Update".into(),
+                Some(CodexUpdateStage::Install),
+                false,
+                true,
+                None,
+            )),
+            CodexUpdateStatus::Updating(update) => Some((
+                format!("Updating Codex to {}…", update.latest_version).into(),
+                "The current App Server remains available during installation.".into(),
+                "Updating…".into(),
+                None,
+                true,
+                false,
+                None,
+            )),
+            CodexUpdateStatus::RestartPending(update) => Some((
+                format!("Codex {} is installed", update.latest_version).into(),
+                if codex_restart_blocker.is_some() {
+                    "Restart the App Server after active Codex work finishes.".into()
+                } else {
+                    "Restart the App Server to apply it; Harness will reconnect.".into()
+                },
+                "Restart".into(),
+                Some(CodexUpdateStage::Restart),
+                false,
+                false,
+                None,
+            )),
+            CodexUpdateStatus::Restarting(update) => Some((
+                format!("Applying Codex {}…", update.latest_version).into(),
+                "Restarting the App Server; Harness will reconnect automatically.".into(),
+                "Restarting…".into(),
+                None,
+                true,
+                false,
+                None,
+            )),
+            CodexUpdateStatus::Failed {
+                update: _,
+                stage,
+                message,
+            } => {
+                let failure = message.clone();
+                Some((
+                    match stage {
+                        CodexUpdateStage::Install => "Codex update failed".into(),
+                        CodexUpdateStage::Restart => "App Server restart failed".into(),
+                    },
+                    message,
+                    match stage {
+                        CodexUpdateStage::Install => "Retry update".into(),
+                        CodexUpdateStage::Restart => "Retry restart".into(),
+                    },
+                    Some(stage),
+                    false,
+                    stage == CodexUpdateStage::Install,
+                    Some(failure),
+                ))
+            }
+        }
+        .map(
+            |(title, description, action_label, action, busy, dismissible, failure): (
+                SharedString,
+                SharedString,
+                SharedString,
+                Option<CodexUpdateStage>,
+                bool,
+                bool,
+                Option<SharedString>,
+            )| {
+                let restart_blocked = action == Some(CodexUpdateStage::Restart)
+                    && codex_restart_blocker.is_some();
+                let action_tooltip = failure.clone().unwrap_or_else(|| {
+                    codex_restart_blocker
+                        .clone()
+                        .filter(|_| action == Some(CodexUpdateStage::Restart))
+                        .unwrap_or_else(|| match action {
+                        Some(CodexUpdateStage::Install) => {
+                            "Install the latest Codex runtime without stopping the current App Server"
+                                .into()
+                        }
+                        Some(CodexUpdateStage::Restart) => {
+                            "Restart the shared Codex App Server and reconnect Harness".into()
+                        }
+                        None => "Codex runtime operation in progress".into(),
+                    })
+                });
+                let border = if failure.is_some() {
+                    cx.theme().status().error_border
+                } else {
+                    cx.theme().status().info_border
+                };
+                let background = if failure.is_some() {
+                    cx.theme().status().error_background
+                } else {
+                    cx.theme().status().info_background
+                };
+                let action_for_click = action;
+                div()
+                    .flex_none()
+                    .w_full()
+                    .min_w_0()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(border)
+                    .bg(background)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .child(
+                                Label::new(title)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Default),
+                            )
+                            .child(
+                                Label::new(description)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted)
+                                    .truncate(),
+                            ),
+                    )
+                    .when(dismissible, |this| {
+                        this.child(
+                            Button::new("dismiss-codex-update", "Later")
+                                .size(ButtonSize::Compact)
+                                .style(ButtonStyle::Subtle)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.dismiss_codex_update(cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("apply-codex-update", action_label)
+                            .size(ButtonSize::Compact)
+                            .style(ButtonStyle::Tinted(TintColor::Accent))
+                            .start_icon(Icon::new(if action == Some(CodexUpdateStage::Restart) {
+                                IconName::RotateCw
+                            } else {
+                                IconName::Download
+                            }))
+                            .loading(busy)
+                            .disabled(busy || restart_blocked || action.is_none())
+                            .tooltip(Tooltip::text(action_tooltip))
+                            .on_click(cx.listener(move |this, _, _, cx| match action_for_click {
+                                Some(CodexUpdateStage::Install) => this.install_codex_update(cx),
+                                Some(CodexUpdateStage::Restart) => {
+                                    this.restart_codex_app_server(cx)
+                                }
+                                None => {}
+                            })),
+                    )
+                    .into_any_element()
+            },
+        );
         let binary_update_prompt = self.binary_update_available.then(|| {
             let relaunch_blocked = self.chat_sending || self.new_task_picker_open;
             let relaunch_tooltip: SharedString = if self.chat_sending {
@@ -17697,6 +18078,7 @@ impl Render for HarnessApp {
                     .flex()
                     .flex_col()
                     .relative()
+                    .when_some(codex_update_prompt, |this, prompt| this.child(prompt))
                     .when_some(binary_update_prompt, |this, prompt| this.child(prompt))
                     .when_some(surface_error, |this, error| {
                         this.child(
