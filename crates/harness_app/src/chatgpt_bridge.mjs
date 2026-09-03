@@ -9,17 +9,73 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
-const playwrightRoot = process.env.HARNESS_PLAYWRIGHT_ROOT
-  ?? "/opt/codex-desktop/resources/cua_node/lib/node_modules/playwright";
-const { chromium } = require(playwrightRoot);
-const sourceDirectory = path.dirname(fileURLToPath(import.meta.url));
-const sentinelSource = fs.readFileSync(path.join(sourceDirectory, "chatgpt_sentinel.js"), "utf8");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
+const sentinelSource = input?.sentinel_source;
 const BROWSER_STAGE_TIMEOUT_MS = 15_000;
 const NETWORK_STAGE_TIMEOUT_MS = 45_000;
+const SSE_IDLE_TIMEOUT_MS = 120_000;
+
+function loadChromium() {
+  const nodeRoot = path.resolve(path.dirname(process.execPath), "..");
+  const playwrightCli = executableOnPath("playwright-cli");
+  const playwrightCliPackage = playwrightCli
+    ? path.join(path.dirname(fs.realpathSync(playwrightCli)), "node_modules/playwright")
+    : null;
+  const candidates = [
+    process.env.HARNESS_PLAYWRIGHT_ROOT,
+    "/opt/codex-desktop/resources/cua_node/lib/node_modules/playwright",
+    playwrightCliPackage,
+    path.join(nodeRoot, "lib/node_modules/@playwright/cli/node_modules/playwright"),
+    "playwright",
+    "playwright-core",
+  ].filter(Boolean);
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      const loaded = require(candidate);
+      if (loaded?.chromium) return loaded.chromium;
+      failures.push(`${candidate} did not export Chromium`);
+    } catch (error) {
+      failures.push(`${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(
+    "ChatGPT sending needs Playwright. Install Codex Desktop or playwright-cli, "
+      + "or set HARNESS_PLAYWRIGHT_ROOT. Tried: " + failures.join("; "),
+  );
+}
+
+function executableOnPath(name) {
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, name);
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep searching PATH.
+    }
+  }
+  return null;
+}
+
+function chromiumExecutable() {
+  if (process.env.HARNESS_CHROMIUM) {
+    try {
+      fs.accessSync(process.env.HARNESS_CHROMIUM, fs.constants.X_OK);
+      return process.env.HARNESS_CHROMIUM;
+    } catch {
+      throw new Error(`HARNESS_CHROMIUM is not executable: ${process.env.HARNESS_CHROMIUM}`);
+    }
+  }
+  for (const name of ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"]) {
+    const executable = executableOnPath(name);
+    if (executable) return executable;
+  }
+  return null;
+}
 
 async function fetchWithHeadersTimeout(url, options) {
   const controller = new AbortController();
@@ -101,6 +157,7 @@ async function drainSse(response) {
   const decoder = new TextDecoder();
   let buffered = "";
   let dataLines = [];
+  let conversationId = null;
 
   const dispatch = () => {
     if (dataLines.length === 0) return;
@@ -108,7 +165,9 @@ async function drainSse(response) {
     dataLines = [];
     if (data === "[DONE]") return;
     try {
-      emit({ type: "event", data: JSON.parse(data) });
+      const parsed = JSON.parse(data);
+      if (typeof parsed?.conversation_id === "string") conversationId = parsed.conversation_id;
+      emit({ type: "event", data: parsed });
     } catch {
       // Comments, keep-alives, and future non-JSON event types are not
       // transcript content. The final canonical conversation remains the
@@ -117,7 +176,28 @@ async function drainSse(response) {
   };
 
   while (true) {
-    const { done, value } = await reader.read();
+    let timeout;
+    const read = reader.read();
+    const stalled = new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("ChatGPT response stream was idle for 120 seconds")),
+        SSE_IDLE_TIMEOUT_MS,
+      );
+    });
+    let chunk;
+    try {
+      chunk = await Promise.race([read, stalled]);
+    } catch (error) {
+      try {
+        await reader.cancel(error);
+      } catch {
+        // Preserve the original idle/read failure.
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+    const { done, value } = chunk;
     buffered += decoder.decode(value ?? new Uint8Array(), { stream: !done });
     const lines = buffered.split(/\r?\n/);
     buffered = done ? "" : lines.pop() ?? "";
@@ -128,7 +208,7 @@ async function drainSse(response) {
     if (done) {
       if (buffered.startsWith("data:")) dataLines.push(buffered.slice(5).trimStart());
       dispatch();
-      return;
+      return conversationId;
     }
   }
 }
@@ -137,13 +217,18 @@ async function main() {
   if (input?.request == null || typeof input.request !== "object") {
     throw new Error("ChatGPT bridge input is missing request");
   }
+  if (typeof sentinelSource !== "string" || sentinelSource.length === 0) {
+    throw new Error("ChatGPT bridge input is missing its embedded integrity worker");
+  }
   const tokens = authTokens();
   const deviceId = typeof input.device_id === "string" && input.device_id.length > 0
     ? input.device_id
     : crypto.randomUUID();
   const headers = baseHeaders(tokens, deviceId);
+  const chromium = loadChromium();
+  const executablePath = chromiumExecutable();
   const browser = await chromium.launch({
-    executablePath: process.env.HARNESS_CHROMIUM ?? "/usr/bin/chromium",
+    ...(executablePath ? { executablePath } : {}),
     headless: true,
     args: ["--disable-dev-shm-usage"],
     timeout: BROWSER_STAGE_TIMEOUT_MS,
@@ -210,8 +295,8 @@ async function main() {
       throw new Error(`ChatGPT send returned HTTP ${response.status}: ${body.slice(0, 300)}`);
     }
     emit({ type: "accepted" });
-    await drainSse(response);
-    emit({ type: "complete" });
+    const conversationId = await drainSse(response);
+    emit({ type: "complete", conversation_id: conversationId });
   } finally {
     await browser.close();
   }

@@ -11,6 +11,7 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use anyhow::{Context as _, bail};
@@ -19,7 +20,7 @@ use futures::{
     AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, StreamExt as _,
     channel::mpsc::UnboundedSender, io::BufReader,
 };
-use http_client::{AsyncBody, HttpClient, http};
+use http_client::{AsyncBody, HttpClient, HttpRequestExt as _, http};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -27,6 +28,7 @@ const API_BASE: &str = "https://chatgpt.com/backend-api";
 const DESKTOP_ORIGINATOR: &str = "Codex Desktop";
 const DEFAULT_DESKTOP_VERSION: &str = "26.825.51511";
 const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const HISTORY_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub(crate) struct ConversationSummary {
@@ -98,6 +100,12 @@ pub(crate) struct ModelCatalog {
     pub default_model: String,
     pub default_thinking_effort: Option<String>,
     pub choices: Vec<ModelChoice>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SendOutcome {
+    pub conversation_id: String,
+    pub current_node: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -319,15 +327,17 @@ fn project_model_catalog(response: ModelCatalogResponse) -> ModelCatalog {
 }
 
 pub(crate) async fn send_message(
-    conversation_id: &str,
+    conversation_id: Option<&str>,
     parent_message_id: &str,
     model: &str,
     thinking_effort: Option<&str>,
     prompt: &str,
     message_id: &str,
     stream_updates: UnboundedSender<Message>,
-) -> anyhow::Result<()> {
-    validate_identifier(conversation_id, "conversation")?;
+) -> anyhow::Result<SendOutcome> {
+    if let Some(conversation_id) = conversation_id {
+        validate_identifier(conversation_id, "conversation")?;
+    }
     validate_identifier(parent_message_id, "parent message")?;
     validate_identifier(message_id, "message")?;
     if model.is_empty()
@@ -362,11 +372,16 @@ pub(crate) async fn send_message(
     let bridge_input = serde_json::json!({
         "device_id": chatgpt_device_id(),
         "request": request,
+        "sentinel_source": include_str!("chatgpt_sentinel.js"),
     });
 
     let mut command = AsyncCommand::new(chatgpt_node());
     command
-        .arg(chatgpt_bridge_path())
+        .args([
+            "--input-type=module",
+            "--eval",
+            include_str!("chatgpt_bridge.mjs"),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -384,6 +399,8 @@ pub(crate) async fn send_message(
 
     let mut accepted = false;
     let mut worker_error = None;
+    let mut resolved_conversation_id = conversation_id.map(ToOwned::to_owned);
+    let mut current_node = None;
     let mut lines = BufReader::new(stdout).lines();
     while let Some(line) = lines.next().await {
         let line = line.context("reading ChatGPT worker status")?;
@@ -392,9 +409,37 @@ pub(crate) async fn send_message(
             Some("accepted") => accepted = true,
             Some("event") => {
                 if let Some(payload) = event.get("data") {
+                    if let Some(conversation_id) = payload
+                        .get("conversation_id")
+                        .and_then(Value::as_str)
+                        .filter(|conversation_id| {
+                            validate_identifier(conversation_id, "conversation").is_ok()
+                        })
+                    {
+                        resolved_conversation_id = Some(conversation_id.to_owned());
+                    }
+                    if let Some(message_id) = payload
+                        .get("message")
+                        .and_then(|message| message.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|message_id| validate_identifier(message_id, "message").is_ok())
+                    {
+                        current_node = Some(message_id.to_owned());
+                    }
                     for message in project_stream_messages(payload) {
                         _ = stream_updates.unbounded_send(message);
                     }
+                }
+            }
+            Some("complete") => {
+                if let Some(conversation_id) = event
+                    .get("conversation_id")
+                    .and_then(Value::as_str)
+                    .filter(|conversation_id| {
+                        validate_identifier(conversation_id, "conversation").is_ok()
+                    })
+                {
+                    resolved_conversation_id = Some(conversation_id.to_owned());
                 }
             }
             Some("error") => {
@@ -419,7 +464,12 @@ pub(crate) async fn send_message(
     if !accepted {
         bail!("ChatGPT conversation request ended before it was accepted");
     }
-    Ok(())
+    let conversation_id = resolved_conversation_id
+        .context("ChatGPT accepted the new conversation but did not return its id")?;
+    Ok(SendOutcome {
+        conversation_id,
+        current_node,
+    })
 }
 
 async fn write_worker_input(mut stdin: ChildStdin, input: &[u8]) -> anyhow::Result<()> {
@@ -440,7 +490,7 @@ async fn write_worker_input(mut stdin: ChildStdin, input: &[u8]) -> anyhow::Resu
 }
 
 fn build_send_request(
-    conversation_id: &str,
+    conversation_id: Option<&str>,
     parent_message_id: &str,
     model: &str,
     thinking_effort: Option<&str>,
@@ -450,7 +500,6 @@ fn build_send_request(
     let mut request = serde_json::json!({
         "action": "next",
         "client_prepare_state": "sent",
-        "conversation_id": conversation_id,
         "messages": [{
             "author": {"role": "user"},
             "content": {"content_type": "text", "parts": [prompt]},
@@ -461,6 +510,15 @@ fn build_send_request(
         "parent_message_id": parent_message_id,
         "timezone": system_timezone(),
     });
+    if let Some(conversation_id) = conversation_id {
+        request
+            .as_object_mut()
+            .expect("ChatGPT request is an object")
+            .insert(
+                "conversation_id".into(),
+                Value::String(conversation_id.into()),
+            );
+    }
     if let Some(thinking_effort) = thinking_effort {
         request
             .as_object_mut()
@@ -494,10 +552,6 @@ fn chatgpt_node() -> PathBuf {
             bundled.is_file().then_some(bundled)
         })
         .unwrap_or_else(|| PathBuf::from("node"))
-}
-
-fn chatgpt_bridge_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/chatgpt_bridge.mjs")
 }
 
 fn chatgpt_device_id() -> &'static str {
@@ -567,6 +621,7 @@ fn build_request(route: &str, auth: &AuthTokens) -> anyhow::Result<http::Request
     http::Request::builder()
         .method(http::Method::GET)
         .uri(format!("{API_BASE}{route}"))
+        .timeout(HISTORY_REQUEST_TIMEOUT)
         .header(
             http::header::AUTHORIZATION,
             format!("Bearer {}", auth.access_token),
@@ -1084,6 +1139,52 @@ mod tests {
     }
 
     #[test]
+    fn long_conversations_are_not_truncated_by_the_projection() {
+        let mut mapping = serde_json::Map::new();
+        mapping.insert("root".into(), json!({"parent": null, "message": null}));
+        let mut parent = "root".to_owned();
+        for index in 0..250 {
+            let node_id = format!("node-{index}");
+            mapping.insert(
+                node_id.clone(),
+                json!({
+                    "parent": parent,
+                    "message": {
+                        "id": format!("message-{index}"),
+                        "author": {"role": if index % 2 == 0 { "user" } else { "assistant" }},
+                        "content": {"content_type": "text", "parts": [format!("message {index}")]}
+                    }
+                }),
+            );
+            parent = node_id;
+        }
+        let response = serde_json::from_value::<ConversationResponse>(json!({
+            "conversation_id": "conversation-long",
+            "title": "A long chat",
+            "current_node": parent,
+            "mapping": mapping,
+        }))
+        .expect("decode long conversation");
+
+        let projected = project_conversation(response);
+        assert_eq!(projected.messages.len(), 250);
+        assert_eq!(
+            projected
+                .messages
+                .first()
+                .map(|message| message.content.as_str()),
+            Some("message 0")
+        );
+        assert_eq!(
+            projected
+                .messages
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("message 249")
+        );
+    }
+
+    #[test]
     fn projects_code_and_reasoning_without_tool_noise() {
         let code = ApiMessage {
             id: "code".into(),
@@ -1231,7 +1332,7 @@ mod tests {
     #[test]
     fn send_request_uses_the_optimistic_message_identity() {
         let request = build_send_request(
-            "conversation-1",
+            Some("conversation-1"),
             "parent-1",
             "gpt-5-6-thinking",
             Some("extended"),
@@ -1357,7 +1458,7 @@ mod tests {
     #[test]
     fn send_request_omits_thinking_effort_when_the_preset_has_none() {
         let request = build_send_request(
-            "conversation-1",
+            Some("conversation-1"),
             "parent-1",
             "gpt-5-6-instant",
             None,
@@ -1366,6 +1467,21 @@ mod tests {
         );
 
         assert!(request.get("thinking_effort").is_none());
+    }
+
+    #[test]
+    fn new_conversation_request_omits_conversation_identity() {
+        let request = build_send_request(
+            None,
+            "root-message",
+            "gpt-5-6-instant",
+            None,
+            "Hello",
+            "message-1",
+        );
+
+        assert!(request.get("conversation_id").is_none());
+        assert_eq!(request["parent_message_id"], "root-message");
     }
 
     #[test]

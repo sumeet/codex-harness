@@ -3095,6 +3095,7 @@ struct HarnessSessionState {
     workspace_mode: WorkspaceMode,
     selected_thread_id: Option<String>,
     selected_chat_id: Option<String>,
+    chat_new_draft: bool,
     pending_thread_cwd: Option<String>,
     sidebar_open: bool,
 }
@@ -3105,6 +3106,7 @@ impl Default for HarnessSessionState {
             workspace_mode: WorkspaceMode::Codex,
             selected_thread_id: None,
             selected_chat_id: None,
+            chat_new_draft: false,
             pending_thread_cwd: None,
             sidebar_open: true,
         }
@@ -3890,6 +3892,7 @@ struct HarnessApp {
     workspace_mode: WorkspaceMode,
     chat_conversations: Vec<ChatConversationSummary>,
     selected_chat_id: Option<String>,
+    chat_new_draft: bool,
     chat_messages: Vec<ChatMessage>,
     chat_transcript: TranscriptModel,
     chat_current_node: Option<String>,
@@ -6264,7 +6267,7 @@ impl HarnessApp {
                 .size(IconSize::XSmall)
                 .color(Color::Muted),
             )
-            .disabled(choices.is_empty() || self.selected_chat_id.is_none() || self.chat_sending)
+            .disabled(choices.is_empty() || self.chat_sending)
             .aria_label("Change ChatGPT model");
 
         PopoverMenu::new("chat-model-selector")
@@ -6487,8 +6490,8 @@ impl HarnessApp {
         if self.workspace_mode == WorkspaceMode::Chat {
             let label = if self.chat_sending {
                 "Wait for the current ChatGPT response"
-            } else if self.selected_chat_id.is_none() {
-                "Open a ChatGPT conversation before sending"
+            } else if self.selected_chat_id.is_none() && !self.chat_new_draft {
+                "Start or open a ChatGPT conversation before sending"
             } else if self.chat_current_node.is_none() {
                 "Wait for the ChatGPT conversation to finish loading"
             } else if self.selected_chat_model.is_none() {
@@ -7464,6 +7467,7 @@ impl HarnessApp {
         } else {
             session.workspace_mode
         };
+        let chat_new_draft = session.chat_new_draft && session.selected_chat_id.is_none();
         let pending_thread_cwd = initial_thread_id
             .is_none()
             .then(|| session.pending_thread_cwd.clone())
@@ -7776,9 +7780,10 @@ impl HarnessApp {
             workspace_mode,
             chat_conversations: Vec::new(),
             selected_chat_id: session.selected_chat_id,
+            chat_new_draft,
             chat_messages: Vec::new(),
             chat_transcript: TranscriptModel::default(),
-            chat_current_node: None,
+            chat_current_node: chat_new_draft.then(|| uuid::Uuid::new_v4().to_string()),
             chat_models: Vec::new(),
             selected_chat_model: None,
             selected_chat_effort: None,
@@ -8145,6 +8150,7 @@ impl HarnessApp {
             workspace_mode: self.workspace_mode,
             selected_thread_id: self.selected_thread_id.clone(),
             selected_chat_id: self.selected_chat_id.clone(),
+            chat_new_draft: self.chat_new_draft,
             pending_thread_cwd: self.pending_thread_cwd.clone(),
             sidebar_open: self.sidebar_open,
         }
@@ -9694,11 +9700,13 @@ impl HarnessApp {
                                 .iter()
                                 .any(|conversation| conversation.id == id)
                         });
-                        if !selected_exists {
+                        if !selected_exists && !this.chat_new_draft {
                             this.selected_chat_id = None;
                             if let Some(first) = this.chat_conversations.first() {
                                 let id = first.id.clone();
                                 this.open_chat_conversation(&id, cx);
+                            } else {
+                                this.reset_new_chat_draft(cx);
                             }
                         } else if this.chat_messages.is_empty()
                             && let Some(id) = this.selected_chat_id.clone()
@@ -9716,6 +9724,40 @@ impl HarnessApp {
         });
     }
 
+    fn reset_chat_navigation(&mut self) {
+        self.selected_item = 0;
+        self.rich_navigation_selection = None;
+        self.transcript_cursor_initialized = false;
+    }
+
+    fn reset_new_chat_draft(&mut self, cx: &mut Context<Self>) {
+        self.chat_open_task = Task::ready(());
+        self.selected_chat_id = None;
+        self.chat_new_draft = true;
+        self.chat_loading = false;
+        self.chat_error = None;
+        self.chat_messages.clear();
+        self.chat_current_node = Some(uuid::Uuid::new_v4().to_string());
+        self.expanded_chat_activity.clear();
+        self.rebuild_chat_transcript(cx);
+        self.chat_list_state.reset(0);
+        self.chat_list_state.set_follow_mode(FollowMode::Tail);
+        self.reset_chat_navigation();
+        self.persist_session();
+    }
+
+    fn begin_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat_sending {
+            self.chat_error =
+                Some("Wait for the current ChatGPT response before starting another chat.".into());
+            cx.notify();
+            return;
+        }
+        self.reset_new_chat_draft(cx);
+        self.focus_composer(window, cx);
+        cx.notify();
+    }
+
     fn open_chat_conversation(&mut self, conversation_id: &str, cx: &mut Context<Self>) {
         if self.selected_chat_id.as_deref() == Some(conversation_id)
             && !self.chat_messages.is_empty()
@@ -9731,14 +9773,16 @@ impl HarnessApp {
         }
         let conversation_id = conversation_id.to_owned();
         self.selected_chat_id = Some(conversation_id.clone());
+        self.chat_new_draft = false;
         self.persist_session();
         self.chat_loading = true;
         self.chat_error = None;
-        let old_len = self.chat_messages.len();
         self.chat_messages.clear();
         self.rebuild_chat_transcript(cx);
         self.chat_current_node = None;
-        self.chat_list_state.splice(0..old_len, 0);
+        self.chat_list_state.reset(0);
+        self.chat_list_state.set_follow_mode(FollowMode::Tail);
+        self.reset_chat_navigation();
         let client = cx.http_client();
         self.chat_open_task = cx.spawn(async move |this, cx| {
             let result = chatgpt_desktop::get_conversation(client, &conversation_id).await;
@@ -9759,9 +9803,12 @@ impl HarnessApp {
                         }
                         this.chat_messages = conversation.messages;
                         this.rebuild_chat_transcript(cx);
-                        this.chat_list_state.splice(0..0, new_len);
+                        this.chat_list_state.reset(new_len);
                         this.chat_list_state.set_follow_mode(FollowMode::Tail);
                         this.chat_list_state.scroll_to_end();
+                        this.selected_item = new_len.saturating_sub(1);
+                        this.rich_navigation_selection = None;
+                        this.transcript_cursor_initialized = false;
                         this.chat_error = None;
                     }
                     Err(error) => {
@@ -9783,6 +9830,7 @@ impl HarnessApp {
     ) {
         let old_len = self.chat_messages.len();
         let new_len = conversation.messages.len();
+        let was_following_tail = self.chat_list_state.is_following_tail();
         self.chat_current_node = conversation.current_node;
         if update_selected_model && let Some(model) = conversation.default_model {
             self.select_chat_model_from_conversation(model, conversation.default_thinking_effort);
@@ -9790,8 +9838,15 @@ impl HarnessApp {
         self.chat_messages = conversation.messages;
         self.rebuild_chat_transcript(cx);
         self.chat_list_state.splice(0..old_len, new_len);
-        self.chat_list_state.set_follow_mode(FollowMode::Tail);
-        self.chat_list_state.scroll_to_end();
+        if was_following_tail {
+            self.chat_list_state.set_follow_mode(FollowMode::Tail);
+            self.chat_list_state.scroll_to_end();
+            self.selected_item = new_len.saturating_sub(1);
+        } else {
+            self.selected_item = self.selected_item.min(new_len.saturating_sub(1));
+        }
+        self.rich_navigation_selection = None;
+        self.transcript_cursor_initialized = false;
     }
 
     fn apply_chat_stream_message(&mut self, message: ChatMessage, cx: &mut Context<Self>) {
@@ -9832,11 +9887,12 @@ impl HarnessApp {
         if prompt.trim().is_empty() {
             return;
         }
-        let Some(conversation_id) = self.selected_chat_id.clone() else {
-            self.chat_error = Some("Open a ChatGPT conversation before sending.".into());
+        let conversation_id = self.selected_chat_id.clone();
+        if conversation_id.is_none() && !self.chat_new_draft {
+            self.chat_error = Some("Start or open a ChatGPT conversation before sending.".into());
             cx.notify();
             return;
-        };
+        }
         let Some(parent_message_id) = self.chat_current_node.clone() else {
             self.chat_error = Some("This ChatGPT conversation has not finished loading.".into());
             cx.notify();
@@ -9876,7 +9932,11 @@ impl HarnessApp {
             while let Some(message) = stream_rx.next().await {
                 _ = this.update(cx, |this, cx| {
                     if this.chat_send_generation == generation
-                        && this.selected_chat_id.as_deref() == Some(stream_conversation_id.as_str())
+                        && stream_conversation_id
+                            .as_deref()
+                            .is_none_or(|conversation_id| {
+                                this.selected_chat_id.as_deref() == Some(conversation_id)
+                            })
                     {
                         this.apply_chat_stream_message(message, cx);
                         cx.notify();
@@ -9887,7 +9947,7 @@ impl HarnessApp {
 
         self.chat_send_task = cx.spawn(async move |this, cx| {
             let send_result = chatgpt_desktop::send_message(
-                &conversation_id,
+                conversation_id.as_deref(),
                 &parent_message_id,
                 &model,
                 thinking_effort.as_deref(),
@@ -9896,12 +9956,11 @@ impl HarnessApp {
                 stream_tx,
             )
             .await;
-            let final_conversation = if send_result.is_ok() {
-                chatgpt_desktop::get_conversation(client, &conversation_id)
+            let final_conversation = match &send_result {
+                Ok(outcome) => chatgpt_desktop::get_conversation(client, &outcome.conversation_id)
                     .await
-                    .ok()
-            } else {
-                None
+                    .ok(),
+                Err(_) => None,
             };
             _ = this.update(cx, |this, cx| {
                 if this.chat_send_generation != generation {
@@ -9909,10 +9968,15 @@ impl HarnessApp {
                 }
                 this.set_chat_sending(false, cx);
                 match send_result {
-                    Ok(()) => {
+                    Ok(outcome) => {
+                        this.selected_chat_id = Some(outcome.conversation_id);
+                        this.chat_new_draft = false;
                         if let Some(conversation) = final_conversation {
                             this.apply_chat_conversation(conversation, false, cx);
+                        } else if let Some(current_node) = outcome.current_node {
+                            this.chat_current_node = Some(current_node);
                         }
+                        this.persist_session();
                         this.chat_error = None;
                         this.refresh_chat_conversations(cx);
                     }
@@ -10791,7 +10855,11 @@ impl HarnessApp {
     }
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workspace_mode != WorkspaceMode::Codex || self.new_task_picker_open {
+        if self.workspace_mode == WorkspaceMode::Chat {
+            self.begin_new_chat(window, cx);
+            return;
+        }
+        if self.new_task_picker_open {
             return;
         }
         self.new_task_picker_open = true;
@@ -16754,7 +16822,7 @@ impl Render for HarnessApp {
             composer_empty
                 || self.chat_sending
                 || self.chat_loading
-                || self.selected_chat_id.is_none()
+                || (self.selected_chat_id.is_none() && !self.chat_new_draft)
                 || self.chat_current_node.is_none()
                 || self.selected_chat_model.is_none()
         } else {
@@ -17465,11 +17533,10 @@ impl Render for HarnessApp {
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
                                         .disabled(
-                                            self.workspace_mode == WorkspaceMode::Chat
-                                                || self.new_task_picker_open,
+                                            self.chat_sending || self.new_task_picker_open,
                                         )
                                         .aria_label(if self.workspace_mode == WorkspaceMode::Chat {
-                                            "New ChatGPT conversation is coming next"
+                                            "Start a new ChatGPT conversation"
                                         } else {
                                             "Choose a project folder for a new thread"
                                         })
@@ -17573,6 +17640,8 @@ impl Render for HarnessApp {
                                 .child(if self.workspace_mode == WorkspaceMode::Chat {
                                     if self.chat_loading {
                                         "Loading ChatGPT conversation…"
+                                    } else if self.chat_new_draft {
+                                        "What would you like to talk about?"
                                     } else {
                                         "Choose a ChatGPT conversation"
                                     }
@@ -23397,6 +23466,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Chat,
             selected_thread_id: Some("codex-thread".into()),
             selected_chat_id: Some("chat-thread".into()),
+            chat_new_draft: false,
             pending_thread_cwd: Some("/work/project".into()),
             sidebar_open: false,
         };
