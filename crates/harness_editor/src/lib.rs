@@ -2039,6 +2039,40 @@ fn pointer_selection_document_range(
     Some(anchor..head)
 }
 
+/// Check the cheap structural invariant shared by every semantic navigation
+/// path. The Buffer owns the selectable bytes; the parallel segment table is
+/// usable only while its cached text lengths and final endpoint describe that
+/// exact Buffer shape.
+fn semantic_index_matches_buffer_shape(
+    buffer_len: usize,
+    segments: &[TranscriptDocumentSegment],
+    header_texts: &[String],
+    body_texts: &[Arc<str>],
+) -> bool {
+    if header_texts.len() != segments.len() || body_texts.len() != segments.len() {
+        return false;
+    }
+
+    let mut previous_end = 0;
+    for ((segment, header), body) in segments.iter().zip(header_texts).zip(body_texts) {
+        if previous_end > segment.whole_range.start
+            || segment.header_range.start != segment.whole_range.start
+            || segment.header_range.end > segment.body_range.start
+            || segment.body_range.end > segment.whole_range.end
+            || segment.whole_range.end > buffer_len
+            || segment.header_range.len() != header.len()
+            || segment.body_range.len() != body.len()
+        {
+            return false;
+        }
+        previous_end = segment.whole_range.end;
+    }
+
+    segments.last().map_or(buffer_len == 0, |segment| {
+        segment.whole_range.end == buffer_len
+    })
+}
+
 fn projection_has_valid_relative_ranges(projection: &TranscriptItemProjection) -> bool {
     projection.has_valid_ranges()
 }
@@ -2691,15 +2725,11 @@ impl TranscriptEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(segment) = self
-            .segments
-            .iter()
-            .find(|segment| segment.item_index == item_index)
+        let text = self.buffer.read(cx).text();
+        let Some(offset) = pointer_document_offset(&text, &self.segments, item_index, body_offset)
         else {
             return false;
         };
-        let offset = (segment.body_range.start + body_offset).min(segment.body_range.end);
-        let text = self.buffer.read(cx).text();
         let point = offset_to_point(&text, offset);
         self.editor.update(cx, |editor, cx| {
             editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
@@ -2788,6 +2818,18 @@ impl TranscriptEditor {
     pub fn selected_item(&self, cx: &mut App) -> Option<usize> {
         let cursor_offset = self.cursor_offset(cx);
         self.item_at_offset(cursor_offset)
+    }
+
+    /// Whether item-relative navigation can safely address the canonical
+    /// Buffer. Hosts use this to repair an interrupted incremental update
+    /// before routing mouse or keyboard input through the hidden Editor.
+    pub fn navigation_index_matches_buffer(&self, cx: &App) -> bool {
+        semantic_index_matches_buffer_shape(
+            self.buffer.read(cx).len(),
+            &self.segments,
+            &self.segment_header_texts,
+            &self.segment_body_texts,
+        )
     }
 
     /// Return the semantic item intersecting the top of the visible Editor
@@ -3999,8 +4041,10 @@ impl TranscriptEditor {
     /// Existing updates must preserve item identity, kind, and header text; only
     /// their selectable body/tail may change. New model items are represented in
     /// order by `appended`, with `None` for trace-only items. Any structural
-    /// ambiguity returns `false` before mutating the buffer so the caller can
-    /// perform an explicit full rebuild.
+    /// ambiguity returns `false` so the caller can perform an explicit full
+    /// rebuild. A failed post-edit invariant can return `false` after mutation;
+    /// in that case the old semantic index remains installed and must not be
+    /// used before that rebuild.
     pub fn apply_item_projections(
         &mut self,
         old_model_item_count: usize,
@@ -4009,13 +4053,7 @@ impl TranscriptEditor {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.model_item_count != old_model_item_count
-            || self.segment_header_texts.len() != self.segments.len()
-            || self.segment_body_texts.len() != self.segments.len()
-            || self.buffer.read(cx).len()
-                != self
-                    .segments
-                    .last()
-                    .map_or(0, |segment| segment.whole_range.end)
+            || !self.navigation_index_matches_buffer(cx)
         {
             return false;
         }
@@ -4171,6 +4209,13 @@ impl TranscriptEditor {
         let appended_segment_start = next_segments.len();
         next_segments.extend(appended_segments);
         next_body_texts.extend(appended_bodies);
+        let expected_buffer_len = next_segments
+            .last()
+            .map_or(0, |segment| segment.whole_range.end);
+        let actual_buffer_len = self.buffer.read(cx).len();
+        if actual_buffer_len != expected_buffer_len {
+            return false;
+        }
         self.segments = next_segments;
         self.segment_header_texts.extend(appended_headers);
         self.segment_body_texts = next_body_texts;
@@ -5308,6 +5353,35 @@ mod tests {
             Some(body.end)
         );
         assert_eq!(pointer_document_offset(text, &segments, 99, 0), None);
+    }
+
+    #[test]
+    fn semantic_navigation_index_rejects_buffer_and_cache_drift() {
+        let text = "H\nbody\n";
+        let segments = [segment(0, 0..text.len(), 0..1, 2..6)];
+        let headers = ["H".to_owned()];
+        let bodies = [Arc::<str>::from("body")];
+
+        assert!(semantic_index_matches_buffer_shape(
+            text.len(),
+            &segments,
+            &headers,
+            &bodies,
+        ));
+        assert!(!semantic_index_matches_buffer_shape(
+            text.len() - 1,
+            &segments,
+            &headers,
+            &bodies,
+        ));
+
+        let stale_bodies = [Arc::<str>::from("body grew")];
+        assert!(!semantic_index_matches_buffer_shape(
+            text.len(),
+            &segments,
+            &headers,
+            &stale_bodies,
+        ));
     }
 
     #[test]
