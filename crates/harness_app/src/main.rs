@@ -3292,6 +3292,13 @@ struct ComposerSubmission {
 #[serde(default)]
 struct ComposerDraftStore {
     drafts: HashMap<String, String>,
+    pending_sends: HashMap<String, Vec<PersistedPendingSend>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedPendingSend {
+    client_user_message_id: String,
+    input: Value,
 }
 
 const NEW_TASK_DRAFT_KEY: &str = "__new_task__";
@@ -3329,6 +3336,59 @@ struct QueuedTurnSubmission {
     client_user_message_id: String,
     input: Value,
     preview_segments: Vec<QueuedPromptPreviewSegment>,
+}
+
+fn pending_sends_for_thread(
+    store: &ComposerDraftStore,
+    thread_id: &str,
+) -> VecDeque<QueuedTurnSubmission> {
+    store
+        .pending_sends
+        .get(thread_id)
+        .into_iter()
+        .flatten()
+        .map(|pending| QueuedTurnSubmission {
+            id: None,
+            client_user_message_id: pending.client_user_message_id.clone(),
+            preview_segments: queued_submission_preview_segments(&pending.input),
+            input: pending.input.clone(),
+        })
+        .collect()
+}
+
+fn remember_pending_send(
+    store: &mut ComposerDraftStore,
+    thread_id: &str,
+    submission: &ComposerSubmission,
+) {
+    let entries = store.pending_sends.entry(thread_id.to_owned()).or_default();
+    if entries
+        .iter()
+        .any(|entry| entry.client_user_message_id == submission.client_user_message_id)
+    {
+        return;
+    }
+    entries.push(PersistedPendingSend {
+        client_user_message_id: submission.client_user_message_id.clone(),
+        input: submission.input.clone(),
+    });
+}
+
+fn forget_pending_send(
+    store: &mut ComposerDraftStore,
+    thread_id: &str,
+    client_user_message_id: &str,
+) -> bool {
+    let Some(entries) = store.pending_sends.get_mut(thread_id) else {
+        return false;
+    };
+    let old_len = entries.len();
+    entries.retain(|entry| entry.client_user_message_id != client_user_message_id);
+    let changed = entries.len() != old_len;
+    if entries.is_empty() {
+        store.pending_sends.remove(thread_id);
+    }
+    changed
 }
 
 #[derive(Clone)]
@@ -3788,17 +3848,11 @@ fn legacy_request_controls_active(
 fn composer_send_blocked(
     composer_empty: bool,
     loading_thread: bool,
-    attaching_thread: bool,
     settings_update_pending: bool,
     read_only: bool,
     transport_available: bool,
 ) -> bool {
-    composer_empty
-        || loading_thread
-        || attaching_thread
-        || settings_update_pending
-        || read_only
-        || !transport_available
+    composer_empty || loading_thread || settings_update_pending || read_only || !transport_available
 }
 
 fn new_thread_requires_project(
@@ -4073,8 +4127,12 @@ struct HarnessApp {
     queue_refresh_generation: u64,
     queue_operations: HashMap<String, QueueOperation>,
     queued_turns: VecDeque<QueuedTurnSubmission>,
+    pending_send_flushes: HashSet<String>,
+    pending_send_errors: HashMap<String, SharedString>,
     server_task: Task<()>,
     turn_task: Task<()>,
+    turn_interrupt_task: Task<()>,
+    turn_interrupt_pending: bool,
     thread_list_task: Task<()>,
     thread_open_task: Task<()>,
     child_hierarchy_task: Task<()>,
@@ -5984,6 +6042,9 @@ impl HarnessApp {
                         this.queued_turns = queued;
                         if origin_is_visible {
                             this.error = None;
+                            if this.model.current_turn_id.is_none() && !this.turn_start_pending {
+                                this.start_next_queued_turn(cx);
+                            }
                         }
                     }
                     Err(error) => log::warn!("could not refresh queued prompts: {error}"),
@@ -6615,7 +6676,7 @@ impl HarnessApp {
                 if self.loading_thread {
                     "Wait for task history to finish loading".into()
                 } else if self.attaching_thread {
-                    "Wait for the live task connection".into()
+                    "Save now; this prompt will send when the live session is restored".into()
                 } else if self.settings_update_pending {
                     "Wait for task settings to finish updating".into()
                 } else if self.thread_read_only_reason.is_some() {
@@ -6648,7 +6709,7 @@ impl HarnessApp {
             return draft_action;
         }
 
-        let stop_ready = self.model.current_turn_id.is_some();
+        let stop_ready = self.model.current_turn_id.is_some() && !self.turn_interrupt_pending;
         let stop_action = IconButton::new("stop-turn", IconName::Stop)
             .style(ButtonStyle::Subtle)
             .disabled(!stop_ready)
@@ -6658,8 +6719,10 @@ impl HarnessApp {
                 Color::Muted
             })
             .aria_label("Stop the current response")
-            .tooltip(Tooltip::text(if stop_ready {
-                "Stop response"
+            .tooltip(Tooltip::text(if self.turn_interrupt_pending {
+                "Stopping response…"
+            } else if stop_ready {
+                "Stop response · Esc"
             } else {
                 "Restoring active-turn controls…"
             }))
@@ -6723,6 +6786,13 @@ impl HarnessApp {
                                 operation == Some(QueueOperation::Interrupting);
                             let edit_pending = operation == Some(QueueOperation::Editing);
                             let remove_pending = operation == Some(QueueOperation::Removing);
+                            let local_pending = self.selected_thread_id.as_deref().is_some_and(
+                                |thread_id| self.pending_send_is_local(thread_id, &client_id),
+                            );
+                            let local_pending_busy = self.selected_thread_id.as_deref().is_some_and(
+                                |thread_id| self.pending_send_flushes.contains(thread_id),
+                            );
+                            let local_pending_error = self.pending_send_errors.get(&client_id).cloned();
                             let preview = queued_submission_preview(&entry.input);
                             let preview_segments = entry.preview_segments.clone();
                             let display_preview: SharedString = if preview.is_empty() {
@@ -6735,6 +6805,99 @@ impl HarnessApp {
                             let weak_send = weak.clone();
                             let weak_remove = weak.clone();
                             let weak_drop = weak.clone();
+                            let pending_controls = (!queue_ready && operation.is_none()).then(|| {
+                                let weak_retry = weak.clone();
+                                let weak_pending_edit = weak.clone();
+                                let weak_pending_remove = weak.clone();
+                                let retry_id = client_id.clone();
+                                let edit_id = client_id.clone();
+                                let remove_id = client_id.clone();
+                                div()
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .gap_0p5()
+                                    .when(local_pending_error.is_none(), |this| {
+                                        this.child(SpinnerLabel::new().size(LabelSize::Small))
+                                            .child(
+                                                Label::new(if local_pending_busy {
+                                                    "Sending…"
+                                                } else if self.attaching_thread {
+                                                    "Waiting for session…"
+                                                } else {
+                                                    "Saving…"
+                                                })
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted),
+                                            )
+                                    })
+                                    .when_some(local_pending_error.clone(), |this, error| {
+                                        this.child(
+                                            IconButton::new(
+                                                ("retry-pending-prompt", index),
+                                                IconName::RotateCw,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Subtle)
+                                            .aria_label("Retry pending prompt")
+                                            .tooltip(Tooltip::text(error))
+                                            .on_click(move |_, _, cx| {
+                                                weak_retry
+                                                    .update(cx, |this, cx| {
+                                                        this.retry_pending_send(&retry_id, cx)
+                                                    })
+                                                    .ok();
+                                            }),
+                                        )
+                                    })
+                                    .when(local_pending && !local_pending_busy, |this| {
+                                        this.child(
+                                            IconButton::new(
+                                                ("edit-pending-prompt", index),
+                                                IconName::Pencil,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Subtle)
+                                            .aria_label("Edit pending prompt")
+                                            .tooltip(Tooltip::text("Return prompt to the composer"))
+                                            .on_click(move |_, window, cx| {
+                                                weak_pending_edit
+                                                    .update(cx, |this, cx| {
+                                                        this.edit_queued_turn(
+                                                            edit_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .ok();
+                                            }),
+                                        )
+                                        .child(
+                                            IconButton::new(
+                                                ("remove-pending-prompt", index),
+                                                IconName::Trash,
+                                            )
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Compact)
+                                            .style(ButtonStyle::Subtle)
+                                            .aria_label("Remove pending prompt")
+                                            .tooltip(Tooltip::text("Remove pending prompt"))
+                                            .on_click(move |_, _, cx| {
+                                                weak_pending_remove
+                                                    .update(cx, |this, cx| {
+                                                        this.cancel_queued_turn(
+                                                            remove_id.clone(),
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .ok();
+                                            }),
+                                        )
+                                    })
+                                    .into_any_element()
+                            });
                             let target_client_id = entry.client_user_message_id.clone();
                             let can_drag = queue_ready && !operation_pending;
                             let drag_handle = if can_drag {
@@ -6874,13 +7037,8 @@ impl HarnessApp {
                                         .flex()
                                         .items_center()
                                         .gap_0p5()
-                                        .when(!queue_ready && operation.is_none(), |this| {
-                                            this.child(SpinnerLabel::new().size(LabelSize::Small))
-                                                .child(
-                                                    Label::new("Saving…")
-                                                        .size(LabelSize::XSmall)
-                                                        .color(Color::Muted),
-                                                )
+                                        .when_some(pending_controls, |this, controls| {
+                                            this.child(controls)
                                         })
                                         .when(queue_ready, |this| {
                                             this.when(
@@ -7077,7 +7235,7 @@ impl HarnessApp {
             pending.status.as_deref(),
             Some("adding to response" | "awaiting incorporation")
         );
-        let stop_ready = self.model.current_turn_id.is_some();
+        let stop_ready = self.model.current_turn_id.is_some() && !self.turn_interrupt_pending;
         let weak = cx.weak_entity();
         let weak_jump = weak.clone();
         let weak_stop = weak.clone();
@@ -7131,8 +7289,10 @@ impl HarnessApp {
                             Color::Muted
                         })
                         .aria_label("Stop the active response")
-                        .tooltip(Tooltip::text(if stop_ready {
-                            "Stop response · the submitted prompt cannot be withdrawn separately"
+                        .tooltip(Tooltip::text(if self.turn_interrupt_pending {
+                            "Stopping response…"
+                        } else if stop_ready {
+                            "Stop response · Esc · the submitted prompt cannot be withdrawn separately"
                         } else {
                             "Restoring active-turn controls…"
                         }))
@@ -7599,6 +7759,10 @@ impl HarnessApp {
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
         let composer_drafts = load_composer_drafts();
         let composer_draft_thread_id = initial_thread_id.clone();
+        let queued_turns = initial_thread_id
+            .as_deref()
+            .map(|thread_id| pending_sends_for_thread(&composer_drafts, thread_id))
+            .unwrap_or_default();
         if let Some(draft) = composer_drafts
             .drafts
             .get(composer_draft_key(composer_draft_thread_id.as_deref()))
@@ -8024,9 +8188,13 @@ impl HarnessApp {
             queue_start_generation: 0,
             queue_refresh_generation: 0,
             queue_operations: HashMap::new(),
-            queued_turns: VecDeque::new(),
+            queued_turns,
+            pending_send_flushes: HashSet::new(),
+            pending_send_errors: HashMap::new(),
             server_task: Task::ready(()),
             turn_task: Task::ready(()),
+            turn_interrupt_task: Task::ready(()),
+            turn_interrupt_pending: false,
             thread_list_task: Task::ready(()),
             thread_open_task: Task::ready(()),
             child_hierarchy_task: Task::ready(()),
@@ -9176,6 +9344,8 @@ impl HarnessApp {
         self.child_hierarchy_generation = self.child_hierarchy_generation.wrapping_add(1);
         self.read_only_refresh_task = Task::ready(());
         self.turn_task = Task::ready(());
+        self.turn_interrupt_task = Task::ready(());
+        self.turn_interrupt_pending = false;
         self.loading_thread = false;
         self.attaching_thread = false;
         self.attach_cache_bytes = None;
@@ -9188,6 +9358,7 @@ impl HarnessApp {
         self.queue_start_generation = self.queue_start_generation.wrapping_add(1);
         self.queue_refresh_generation = self.queue_refresh_generation.wrapping_add(1);
         self.queue_operations.clear();
+        self.pending_send_flushes.clear();
         self.settings_update_pending = false;
         self.live_step_model_switching_supported = None;
         self.queued_turns.clear();
@@ -9276,6 +9447,19 @@ impl HarnessApp {
             self.turn_start_pending = false;
         }
         let completed_turn = lifecycle_ended_active_turn(&outcome.turn_lifecycle);
+        if outcome.turn_lifecycle.iter().any(|event| {
+            matches!(
+                event,
+                model::TurnLifecycleEvent::Started { .. }
+                    | model::TurnLifecycleEvent::Completed {
+                        was_active: true,
+                        ..
+                    }
+            )
+        }) {
+            self.turn_interrupt_pending = false;
+            self.turn_interrupt_task = Task::ready(());
+        }
         let new_len = self.model.items.len();
         let mut dirty_items = outcome.dirty.into_iter().collect::<Vec<_>>();
         dirty_items.sort_unstable();
@@ -10692,6 +10876,10 @@ impl HarnessApp {
         }
         self.replay_deferred_requests_for_selected(cx);
         if authoritative_turn_state_loaded {
+            if let Some(thread_id) = self.selected_thread_id.clone() {
+                self.merge_pending_sends_into_visible_queue(&thread_id);
+                self.flush_pending_sends(&thread_id, cx);
+            }
             self.start_next_queued_turn(cx);
         }
     }
@@ -10767,6 +10955,8 @@ impl HarnessApp {
         self.read_only_refresh_task = Task::ready(());
         if !preserve_background_work {
             self.turn_task = Task::ready(());
+            self.turn_interrupt_task = Task::ready(());
+            self.turn_interrupt_pending = false;
             self.turn_start_pending = false;
             self.queue_start_pending = false;
             self.queue_refresh_pending = false;
@@ -10777,6 +10967,9 @@ impl HarnessApp {
             self.queued_turns.clear();
         }
         self.selected_thread_id = Some(thread_id.clone());
+        if !preserve_background_work {
+            self.merge_pending_sends_into_visible_queue(&thread_id);
+        }
         self.pending_thread_cwd = None;
         self.persist_session();
         self.set_transcript_history_complete(false);
@@ -11153,6 +11346,229 @@ impl HarnessApp {
         .detach();
     }
 
+    fn persist_composer_state_now(&mut self) -> anyhow::Result<()> {
+        // Invalidate any debounced draft snapshot taken before this pending
+        // send was added or removed. Pending sends are a delivery journal, so
+        // their filesystem commit must happen before the UI reports success.
+        self.composer_draft_generation = self.composer_draft_generation.wrapping_add(1);
+        persist_composer_drafts(&self.composer_drafts)
+    }
+
+    fn merge_pending_sends_into_visible_queue(&mut self, thread_id: &str) {
+        for pending in pending_sends_for_thread(&self.composer_drafts, thread_id) {
+            if !self
+                .queued_turns
+                .iter()
+                .any(|entry| entry.client_user_message_id == pending.client_user_message_id)
+            {
+                self.queued_turns.push_back(pending);
+            }
+        }
+    }
+
+    fn pending_send_is_local(&self, thread_id: &str, client_user_message_id: &str) -> bool {
+        self.composer_drafts
+            .pending_sends
+            .get(thread_id)
+            .is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.client_user_message_id == client_user_message_id)
+            })
+    }
+
+    fn defer_send_until_attached(
+        &mut self,
+        thread_id: String,
+        submission: ComposerSubmission,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        remember_pending_send(&mut self.composer_drafts, &thread_id, &submission);
+        if let Err(error) = self.persist_composer_state_now() {
+            forget_pending_send(
+                &mut self.composer_drafts,
+                &thread_id,
+                &submission.client_user_message_id,
+            );
+            let queued = QueuedTurnSubmission {
+                id: None,
+                client_user_message_id: submission.client_user_message_id,
+                preview_segments: queued_submission_preview_segments(&submission.input),
+                input: submission.input,
+            };
+            self.place_queued_turn_in_composer(&queued, window, cx);
+            self.error = Some(
+                format!(
+                    "Could not save the pending prompt; it was restored to the composer: {error}"
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+
+        let client_user_message_id = submission.client_user_message_id.clone();
+        if !self
+            .queued_turns
+            .iter()
+            .any(|entry| entry.client_user_message_id == client_user_message_id)
+        {
+            self.queued_turns.push_back(QueuedTurnSubmission {
+                id: None,
+                client_user_message_id: submission.client_user_message_id,
+                preview_segments: queued_submission_preview_segments(&submission.input),
+                input: submission.input,
+            });
+        }
+        self.pending_send_errors.remove(&client_user_message_id);
+        self.error = None;
+        cx.notify();
+    }
+
+    fn flush_pending_sends(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+        if self.loading_thread
+            || self.attaching_thread
+            || self.thread_read_only_reason.is_some()
+            || self.pending_send_flushes.contains(thread_id)
+        {
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let pending = self
+            .composer_drafts
+            .pending_sends
+            .get(thread_id)
+            .cloned()
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        let thread_id = thread_id.to_owned();
+        self.pending_send_flushes.insert(thread_id.clone());
+        for entry in &pending {
+            self.pending_send_errors
+                .remove(&entry.client_user_message_id);
+        }
+        cx.spawn(async move |this, cx| {
+            let existing = client
+                .list_queued_turns(&thread_id)
+                .await
+                .ok()
+                .map(|response| queued_submissions_from_response(&response))
+                .unwrap_or_default();
+            let mut failed = false;
+
+            for pending in pending {
+                let existing_entry = existing
+                    .iter()
+                    .find(|entry| entry.client_user_message_id == pending.client_user_message_id)
+                    .cloned();
+                let result = if let Some(existing_entry) = existing_entry {
+                    Ok(Some(existing_entry))
+                } else {
+                    client
+                        .queue_turn(
+                            &thread_id,
+                            pending.input.clone(),
+                            &pending.client_user_message_id,
+                        )
+                        .await
+                        .map(|response| {
+                            response
+                                .get("queuedSubmission")
+                                .and_then(queued_submission_from_value)
+                        })
+                };
+
+                let should_continue = this
+                    .update(cx, |this, cx| match result {
+                        Ok(queued) => {
+                            forget_pending_send(
+                                &mut this.composer_drafts,
+                                &thread_id,
+                                &pending.client_user_message_id,
+                            );
+                            if let Err(error) = this.persist_composer_state_now() {
+                                log::warn!(
+                                    "could not remove delivered pending prompt from disk: {error:#}"
+                                );
+                            }
+                            this.pending_send_errors
+                                .remove(&pending.client_user_message_id);
+                            if queue_state_belongs_to_thread(
+                                &thread_id,
+                                this.selected_thread_id.as_deref(),
+                                this.preserved_work_thread_id.as_deref(),
+                            ) {
+                                if let Some(queued) = queued {
+                                    if let Some(index) =
+                                        this.queued_turns.iter().position(|entry| {
+                                            entry.client_user_message_id
+                                                == pending.client_user_message_id
+                                        })
+                                    {
+                                        this.queued_turns[index] = queued;
+                                    } else {
+                                        this.queued_turns.push_back(queued);
+                                    }
+                                } else {
+                                    this.refresh_queued_turns(cx);
+                                }
+                                this.error = None;
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            let message: SharedString =
+                                format!("Could not send pending prompt: {error}").into();
+                            this.pending_send_errors
+                                .insert(pending.client_user_message_id.clone(), message.clone());
+                            if callback_origin_is_visible(
+                                &thread_id,
+                                this.selected_thread_id.as_deref(),
+                            ) {
+                                this.error = Some(message);
+                            } else {
+                                log::warn!("could not send background pending prompt: {error}");
+                            }
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    failed = true;
+                    break;
+                }
+            }
+
+            _ = this.update(cx, |this, cx| {
+                this.pending_send_flushes.remove(&thread_id);
+                if !failed
+                    && callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref())
+                {
+                    this.start_next_queued_turn(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn retry_pending_send(&mut self, client_user_message_id: &str, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        if !self.pending_send_is_local(&thread_id, client_user_message_id) {
+            return;
+        }
+        self.pending_send_errors.remove(client_user_message_id);
+        self.flush_pending_sends(&thread_id, cx);
+    }
+
     fn switch_composer_draft_context(
         &mut self,
         next_thread_id: Option<String>,
@@ -11235,6 +11651,8 @@ impl HarnessApp {
         self.thread_open_task = Task::ready(());
         self.read_only_refresh_task = Task::ready(());
         self.turn_task = Task::ready(());
+        self.turn_interrupt_task = Task::ready(());
+        self.turn_interrupt_pending = false;
         self.turn_start_pending = false;
         self.queue_start_pending = false;
         self.queue_refresh_pending = false;
@@ -11347,7 +11765,6 @@ impl HarnessApp {
         if composer_send_blocked(
             composer_is_empty(&text, self.composer_images.len()),
             self.loading_thread,
-            self.attaching_thread,
             self.settings_update_pending,
             self.thread_read_only_reason.is_some(),
             self.client.is_some() || self.replay_count.is_some(),
@@ -11408,9 +11825,10 @@ impl HarnessApp {
             cx.notify();
             return;
         }
+        let restoring_live_session = self.attaching_thread;
         let turn_active = self.turn_active();
         let Some(submission) = self.take_composer_submission(
-            show_submission_optimistically_in_transcript(turn_active),
+            !restoring_live_session && show_submission_optimistically_in_transcript(turn_active),
             window,
             cx,
         ) else {
@@ -11424,6 +11842,16 @@ impl HarnessApp {
             let index = self.model.items.len().saturating_sub(1);
             self.list_state.splice(index..index + 1, 1);
             cx.notify();
+            return;
+        }
+
+        if restoring_live_session {
+            let Some(thread_id) = self.selected_thread_id.clone() else {
+                self.error = Some("The task is not ready to save a pending prompt yet".into());
+                cx.notify();
+                return;
+            };
+            self.defer_send_until_attached(thread_id, submission, window, cx);
             return;
         }
 
@@ -11673,12 +12101,19 @@ impl HarnessApp {
     }
 
     fn start_next_queued_turn(&mut self, cx: &mut Context<Self>) {
-        if self.queue_start_pending
+        if self.loading_thread
+            || self.attaching_thread
+            || self.thread_read_only_reason.is_some()
+            || self.queue_start_pending
             || self.turn_start_pending
             || self.model.current_turn_id.is_some()
             || self.selected_thread_reported_active()
             || self.has_unresolved_live_request()
             || self.queued_turns.is_empty()
+            || self
+                .queued_turns
+                .front()
+                .is_some_and(|entry| entry.id.is_none())
             || !queue_state_is_visible(
                 self.selected_thread_id.as_deref(),
                 self.preserved_work_thread_id.as_deref(),
@@ -11846,11 +12281,33 @@ impl HarnessApp {
         else {
             return;
         };
-        let (Some(client), Some(thread_id), Some(queued_submission_id)) = (
-            self.client.clone(),
-            self.selected_thread_id.clone(),
-            entry.id.clone(),
-        ) else {
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        if entry.id.is_none() && self.pending_send_is_local(&thread_id, &client_user_message_id) {
+            if self.pending_send_flushes.contains(&thread_id) {
+                return;
+            }
+            let previous_store = self.composer_drafts.clone();
+            self.remove_queued_entry_locally(&client_user_message_id);
+            forget_pending_send(
+                &mut self.composer_drafts,
+                &thread_id,
+                &client_user_message_id,
+            );
+            self.pending_send_errors.remove(&client_user_message_id);
+            if let Err(error) = self.persist_composer_state_now() {
+                self.composer_drafts = previous_store;
+                self.merge_pending_sends_into_visible_queue(&thread_id);
+                self.error = Some(format!("Could not remove saved pending prompt: {error}").into());
+            } else {
+                self.error = None;
+            }
+            cx.notify();
+            return;
+        }
+        let (Some(client), Some(queued_submission_id)) = (self.client.clone(), entry.id.clone())
+        else {
             return;
         };
         if !queue_state_is_visible(
@@ -11961,11 +12418,34 @@ impl HarnessApp {
         else {
             return;
         };
-        let (Some(client), Some(thread_id), Some(queued_submission_id)) = (
-            self.client.clone(),
-            self.selected_thread_id.clone(),
-            entry.id.clone(),
-        ) else {
+        let Some(thread_id) = self.selected_thread_id.clone() else {
+            return;
+        };
+        if entry.id.is_none() && self.pending_send_is_local(&thread_id, &client_user_message_id) {
+            if self.pending_send_flushes.contains(&thread_id) {
+                return;
+            }
+            let previous_store = self.composer_drafts.clone();
+            self.remove_queued_entry_locally(&client_user_message_id);
+            forget_pending_send(
+                &mut self.composer_drafts,
+                &thread_id,
+                &client_user_message_id,
+            );
+            self.pending_send_errors.remove(&client_user_message_id);
+            if let Err(error) = self.persist_composer_state_now() {
+                self.composer_drafts = previous_store;
+                self.merge_pending_sends_into_visible_queue(&thread_id);
+                self.error = Some(format!("Could not update saved pending prompt: {error}").into());
+            } else {
+                self.error = None;
+                self.place_queued_turn_in_composer(&entry, window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let (Some(client), Some(queued_submission_id)) = (self.client.clone(), entry.id.clone())
+        else {
             return;
         };
         if !queue_state_is_visible(
@@ -12296,6 +12776,9 @@ impl HarnessApp {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        if self.turn_interrupt_pending {
+            return;
+        }
         let (Some(client), Some(thread_id), Some(turn_id)) = (
             self.client.clone(),
             self.selected_thread_id.clone(),
@@ -12303,11 +12786,13 @@ impl HarnessApp {
         ) else {
             return;
         };
-        self.turn_task = cx.spawn(async move |this, cx| {
+        self.turn_interrupt_pending = true;
+        self.turn_interrupt_task = cx.spawn(async move |this, cx| {
             let result = client.interrupt_turn(&thread_id, &turn_id).await;
             if let Err(error) = result {
                 if this
                     .update(cx, |this, cx| {
+                        this.turn_interrupt_pending = false;
                         if callback_origin_is_visible(
                             &thread_id,
                             this.selected_thread_id.as_deref(),
@@ -12324,6 +12809,7 @@ impl HarnessApp {
                 }
             }
         });
+        cx.notify();
     }
 
     fn respond_with_choice(&mut self, index: usize, choice: RequestChoice, cx: &mut Context<Self>) {
@@ -14160,6 +14646,9 @@ impl HarnessApp {
         if self.turn_active() {
             context.add("HarnessTurnActive");
         }
+        if self.local_escape_target_active() {
+            context.add("HarnessLocalEscape");
+        }
         if self.search_visible {
             context.add("HarnessSearchVisible");
         }
@@ -14173,6 +14662,17 @@ impl HarnessApp {
             FocusMode::Buffer => context.add("HarnessBuffer"),
         }
         context
+    }
+
+    fn local_escape_target_active(&self) -> bool {
+        self.search_visible
+            || self.command_palette.is_some()
+            || self.appearance_settings_open
+            || self.expanded_user_image.is_some()
+            || matches!(
+                self.focus_mode,
+                FocusMode::Search | FocusMode::Request | FocusMode::Approval
+            )
     }
 
     fn turn_active(&self) -> bool {
@@ -16294,6 +16794,11 @@ impl HarnessApp {
         if !item.is_presentationally_visible() {
             return div().into_any_element();
         }
+        let final_answer_separator = self.workspace_mode == WorkspaceMode::Codex
+            && transcript_has_work_before_final_answer(
+                &self.active_transcript_model().items,
+                index,
+            );
         let rich_navigation = self.rich_navigation_for_item(index);
         let visual = !rich_vim_experiment()
             && self.visual_anchor.is_some_and(|anchor| {
@@ -16894,6 +17399,9 @@ impl HarnessApp {
                 .when(item.kind == model::TranscriptKind::Plan, |this| {
                     this.gap_1().py_0p5()
                 })
+                .when(final_answer_separator, |this| {
+                    this.child(div().w_full().h(px(1.)).bg(visuals.divider.opacity(0.72)))
+                })
                 .when(show_header, |this| this.child(header))
                 .when_some(reasoning_preview, |this, preview| {
                     let highlighted =
@@ -17175,7 +17683,6 @@ impl Render for HarnessApp {
             composer_send_blocked(
                 composer_empty,
                 self.loading_thread,
-                self.attaching_thread,
                 self.settings_update_pending,
                 self.thread_read_only_reason.is_some(),
                 self.client.is_some() || self.replay_count.is_some(),
@@ -17872,8 +18379,10 @@ impl Render for HarnessApp {
             .on_action(
                 cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
             )
-            .on_action(cx.listener(|_this, _: &NormalEscape, window, cx| {
-                if let Ok(action) = cx.build_action("vim::ClearOperators", None) {
+            .on_action(cx.listener(|this, _: &NormalEscape, window, cx| {
+                if this.turn_active() && !this.local_escape_target_active() {
+                    this.stop(cx);
+                } else if let Ok(action) = cx.build_action("vim::ClearOperators", None) {
                     window.dispatch_action(action, cx);
                 }
             }))
@@ -19469,6 +19978,47 @@ fn lifecycle_ended_active_turn(events: &[model::TurnLifecycleEvent]) -> bool {
     })
 }
 
+fn transcript_item_is_final_answer(item: &TranscriptItem) -> bool {
+    item.kind == model::TranscriptKind::Agent
+        && match item.raw.get("phase").and_then(Value::as_str) {
+            Some("commentary") => false,
+            Some("final_answer") => true,
+            // `phase` is optional in App Server. Like the Codex TUI, treat an
+            // ordinary agent message as final unless it explicitly identifies
+            // itself as commentary. Bare delta placeholders do not yet carry
+            // an item type and must not grow a separator mid-stream.
+            _ => item.raw.get("type").and_then(Value::as_str) == Some("agentMessage"),
+        }
+}
+
+fn transcript_has_work_before_final_answer(items: &[TranscriptItem], index: usize) -> bool {
+    let Some(item) = items.get(index) else {
+        return false;
+    };
+    if !transcript_item_is_final_answer(item) {
+        return false;
+    }
+
+    for previous in items[..index].iter().rev() {
+        if previous.kind == model::TranscriptKind::User || transcript_item_is_final_answer(previous)
+        {
+            break;
+        }
+        if matches!(
+            previous.kind,
+            model::TranscriptKind::Command
+                | model::TranscriptKind::FileChange
+                | model::TranscriptKind::Tool
+                | model::TranscriptKind::Diff
+                | model::TranscriptKind::Subagent
+                | model::TranscriptKind::Web
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 fn relative_time(timestamp: i64) -> String {
     let timestamp = if timestamp > 10_000_000_000 {
         timestamp / 1000
@@ -19859,6 +20409,13 @@ fn load_harness_keymaps(cx: &mut App) {
             Some("HarnessComposer && Editor"),
         ),
         KeyBinding::new("ctrl-c", Stop, Some("Harness && !Editor")),
+        KeyBinding::new(
+            "escape",
+            Stop,
+            Some(
+                "HarnessTurnActive && !Editor && !HarnessLocalEscape",
+            ),
+        ),
         KeyBinding::new(
             "ctrl-w k",
             FocusTranscript,
@@ -24070,27 +24627,86 @@ mod tests {
 
     #[test]
     fn composer_send_is_blocked_while_loading_or_read_only() {
-        assert!(composer_send_blocked(
-            true, false, false, false, false, true
-        ));
-        assert!(composer_send_blocked(
-            false, true, false, false, false, true
-        ));
-        assert!(composer_send_blocked(
-            false, false, true, false, false, true
-        ));
-        assert!(composer_send_blocked(
-            false, false, false, true, false, true
-        ));
-        assert!(composer_send_blocked(
-            false, false, false, false, true, true
-        ));
-        assert!(composer_send_blocked(
-            false, false, false, false, false, false
-        ));
-        assert!(!composer_send_blocked(
-            false, false, false, false, false, true
-        ));
+        assert!(composer_send_blocked(true, false, false, false, true));
+        assert!(composer_send_blocked(false, true, false, false, true));
+        assert!(composer_send_blocked(false, false, true, false, true));
+        assert!(composer_send_blocked(false, false, false, true, true));
+        assert!(composer_send_blocked(false, false, false, false, false));
+        assert!(!composer_send_blocked(false, false, false, false, true));
+    }
+
+    #[test]
+    fn restoring_session_sends_are_journaled_by_thread() {
+        let mut store = ComposerDraftStore::default();
+        let submission = ComposerSubmission {
+            key: None,
+            client_user_message_id: "client-1".into(),
+            input: json!([{"type": "text", "text": "send after restore"}]),
+        };
+
+        remember_pending_send(&mut store, "thread-a", &submission);
+        remember_pending_send(&mut store, "thread-a", &submission);
+        assert_eq!(store.pending_sends["thread-a"].len(), 1);
+        let visible = pending_sends_for_thread(&store, "thread-a");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].client_user_message_id, "client-1");
+        assert_eq!(
+            queued_submission_text(&visible[0].input),
+            "send after restore"
+        );
+        assert!(forget_pending_send(&mut store, "thread-a", "client-1"));
+        assert!(!store.pending_sends.contains_key("thread-a"));
+    }
+
+    #[test]
+    fn final_answer_separator_requires_concrete_work_in_the_current_turn() {
+        let item = |index, kind, raw| {
+            comparison_fixture_item(index, kind, "", "body", raw, true, "completed")
+        };
+        let items = vec![
+            item(
+                0,
+                model::TranscriptKind::User,
+                json!({"type": "userMessage"}),
+            ),
+            item(
+                1,
+                model::TranscriptKind::Agent,
+                json!({"type": "agentMessage", "phase": "commentary"}),
+            ),
+            item(
+                2,
+                model::TranscriptKind::Command,
+                json!({"type": "commandExecution"}),
+            ),
+            item(
+                3,
+                model::TranscriptKind::Agent,
+                json!({"type": "agentMessage", "phase": "commentary"}),
+            ),
+            item(
+                4,
+                model::TranscriptKind::Agent,
+                json!({"type": "agentMessage", "phase": "final_answer"}),
+            ),
+        ];
+        assert!(!transcript_has_work_before_final_answer(&items, 1));
+        assert!(!transcript_has_work_before_final_answer(&items, 3));
+        assert!(transcript_has_work_before_final_answer(&items, 4));
+
+        let prose_only = vec![
+            item(
+                0,
+                model::TranscriptKind::User,
+                json!({"type": "userMessage"}),
+            ),
+            item(
+                1,
+                model::TranscriptKind::Agent,
+                json!({"type": "agentMessage", "phase": "final_answer"}),
+            ),
+        ];
+        assert!(!transcript_has_work_before_final_answer(&prose_only, 1));
     }
 
     #[test]
