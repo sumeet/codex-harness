@@ -14,6 +14,7 @@ use serde_json::Value;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, Signal, System, UpdateKind};
 
 pub const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub const RESTART_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 const UNMANAGED_SERVER_ERROR: &str =
     "app server is running but is not managed by codex app-server daemon";
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(60);
@@ -72,6 +73,20 @@ pub async fn check_for_update() -> anyhow::Result<UpdateCheck> {
         return Ok(UpdateCheck::Current);
     };
     Ok(UpdateCheck::RestartRequired(update))
+}
+
+/// An installed update can be applied outside Harness. Check only the local
+/// runtime while waiting for that restart, without repeating the network and
+/// database work performed by `codex doctor`.
+pub async fn check_for_restart() -> anyhow::Result<UpdateCheck> {
+    let runtime = daemon_runtime().await?;
+    let installed_version = runtime.cli_version.clone();
+    Ok(
+        match restart_required_update(&installed_version, runtime)? {
+            Some(update) => UpdateCheck::RestartRequired(update),
+            None => UpdateCheck::Current,
+        },
+    )
 }
 
 fn restart_required_update(

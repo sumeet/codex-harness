@@ -4027,7 +4027,10 @@ struct HarnessApp {
     sidebar_threads: Vec<SidebarThreadRow>,
     expanded_child_history_roots: HashSet<String>,
     available_models: Vec<ModelChoice>,
+    model_catalog_task: Task<()>,
+    model_catalog_error: Option<SharedString>,
     permission_profiles: Vec<PermissionProfileChoice>,
+    permission_profiles_task: Task<()>,
     model_menu_handle: PopoverMenuHandle<ContextMenu>,
     permission_menu_handle: PopoverMenuHandle<ContextMenu>,
     settings_update_pending: bool,
@@ -4267,7 +4270,7 @@ enum CodexUpdateStage {
     Replace,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 enum CodexUpdateStatus {
     #[default]
     Checking,
@@ -4286,6 +4289,55 @@ enum CodexUpdateStatus {
 impl CodexUpdateStatus {
     fn is_busy(&self) -> bool {
         matches!(self, Self::Updating(_) | Self::Restarting(_))
+    }
+
+    fn awaits_restart(&self) -> bool {
+        matches!(
+            self,
+            Self::RestartPending(_)
+                | Self::Failed {
+                    stage: CodexUpdateStage::Restart | CodexUpdateStage::Replace,
+                    ..
+                }
+        )
+    }
+
+    fn reconcile(&mut self, check: codex_runtime::UpdateCheck, dismissed: Option<&str>) {
+        if self.is_busy() {
+            return;
+        }
+        *self = match check {
+            codex_runtime::UpdateCheck::Current => Self::Current,
+            codex_runtime::UpdateCheck::Available(update) => {
+                if dismissed == Some(update.latest_version.as_str()) {
+                    Self::Current
+                } else if matches!(self, Self::Failed { update: failed, stage: CodexUpdateStage::Install, .. }
+                    if failed.latest_version == update.latest_version)
+                {
+                    return;
+                } else {
+                    Self::Available(update)
+                }
+            }
+            codex_runtime::UpdateCheck::RestartRequired(update) => {
+                if let Self::Failed {
+                    stage,
+                    message,
+                    update: failed,
+                } = self
+                    && matches!(stage, CodexUpdateStage::Restart | CodexUpdateStage::Replace)
+                    && failed.latest_version == update.latest_version
+                {
+                    Self::Failed {
+                        update,
+                        stage: *stage,
+                        message: message.clone(),
+                    }
+                } else {
+                    Self::RestartPending(update)
+                }
+            }
+        };
     }
 }
 
@@ -5957,14 +6009,43 @@ impl HarnessApp {
         );
     }
 
+    fn load_model_catalog(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.model_catalog_error = None;
+        self.model_catalog_task = cx.spawn(async move |this, cx| {
+            let result = client.request("model/list", json!({ "limit": 100 })).await;
+            _ = this.update(cx, |this, cx| {
+                if !this
+                    .client
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &client))
+                {
+                    return;
+                }
+                match result {
+                    Ok(response) => this.available_models = model_choices_from_response(&response),
+                    Err(error) => {
+                        log::warn!("could not load Codex model catalog: {error}");
+                        this.model_catalog_error =
+                            Some(format!("Could not refresh models: {error}").into());
+                    }
+                }
+                cx.notify();
+            });
+        });
+        cx.notify();
+    }
+
     fn load_server_options(&mut self, cx: &mut Context<Self>) {
+        self.load_model_catalog(cx);
         let Some(client) = self.client.clone() else {
             return;
         };
         let cwd = self.cwd.clone();
         let requested_cwd = cwd.clone();
-        cx.spawn(async move |this, cx| {
-            let models = client.request("model/list", json!({ "limit": 100 })).await;
+        self.permission_profiles_task = cx.spawn(async move |this, cx| {
             let permissions = client
                 .request(
                     "permissionProfile/list",
@@ -5972,9 +6053,12 @@ impl HarnessApp {
                 )
                 .await;
             _ = this.update(cx, |this, cx| {
-                match models {
-                    Ok(response) => this.available_models = model_choices_from_response(&response),
-                    Err(error) => log::warn!("could not load Codex model catalog: {error}"),
+                if !this
+                    .client
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &client))
+                {
+                    return;
                 }
                 match permissions {
                     Ok(response) if this.cwd == requested_cwd => {
@@ -5986,8 +6070,7 @@ impl HarnessApp {
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        });
     }
 
     fn refresh_queued_turns(&mut self, cx: &mut Context<Self>) {
@@ -6254,6 +6337,8 @@ impl HarnessApp {
             .map(|effort| format!("{model_label} · {effort}").into())
             .unwrap_or(model_label);
         let choices = self.available_models.clone();
+        let catalog_error = self.model_catalog_error.clone();
+        let can_refresh = self.client.is_some();
         let current_model = selected_choice
             .map(|choice| choice.model.clone())
             .or_else(|| selected_model.map(ToOwned::to_owned));
@@ -6300,6 +6385,7 @@ impl HarnessApp {
             })
             .menu(move |window, cx| {
                 let choices = choices.clone();
+                let catalog_error = catalog_error.clone();
                 let current_model = current_model.clone();
                 let current_effort = current_effort.clone();
                 let effort_choices = effort_choices.clone();
@@ -6361,6 +6447,20 @@ impl HarnessApp {
                             );
                         }
                     }
+                    menu = menu.separator();
+                    if let Some(error) = catalog_error.clone() {
+                        menu = menu.item(ContextMenuEntry::new(error).disabled(true));
+                    }
+                    menu = menu.item(
+                        ContextMenuEntry::new("Refresh models")
+                            .disabled(!can_refresh)
+                            .handler({
+                                let weak = weak.clone();
+                                move |_, cx| {
+                                    _ = weak.update(cx, |this, cx| this.load_model_catalog(cx));
+                                }
+                            }),
+                    );
                     menu
                 }))
             })
@@ -8089,7 +8189,10 @@ impl HarnessApp {
             sidebar_threads: Vec::new(),
             expanded_child_history_roots: HashSet::new(),
             available_models,
+            model_catalog_task: Task::ready(()),
+            model_catalog_error: None,
             permission_profiles,
+            permission_profiles_task: Task::ready(()),
             model_menu_handle: PopoverMenuHandle::default(),
             permission_menu_handle: PopoverMenuHandle::default(),
             settings_update_pending: false,
@@ -8499,54 +8602,53 @@ impl HarnessApp {
     }
 
     fn start_codex_update_watcher(&mut self, cx: &mut Context<Self>) {
+        if self.replay_count.is_some() {
+            return;
+        }
         self.codex_update_watch_task = cx.spawn(async move |this, cx| {
+            let mut last_release_check: Option<Instant> = None;
             loop {
-                let result = codex_runtime::check_for_update().await;
-                if this
-                    .update(cx, |this, cx| {
-                        if this.codex_update_status.is_busy()
-                            || matches!(
-                                this.codex_update_status,
-                                CodexUpdateStatus::RestartPending(_)
-                                    | CodexUpdateStatus::Failed { .. }
-                            )
-                        {
-                            return;
-                        }
-                        match result {
-                            Ok(codex_runtime::UpdateCheck::Available(update))
-                                if this.dismissed_codex_update.as_deref()
-                                    != Some(update.latest_version.as_str()) =>
-                            {
-                                this.codex_update_status = CodexUpdateStatus::Available(update);
-                                cx.notify();
-                            }
-                            Ok(codex_runtime::UpdateCheck::RestartRequired(update)) => {
-                                this.codex_update_status =
-                                    CodexUpdateStatus::RestartPending(update);
-                                cx.notify();
-                            }
-                            Ok(codex_runtime::UpdateCheck::Current)
-                            | Ok(codex_runtime::UpdateCheck::Available(_)) => {
-                                if !matches!(this.codex_update_status, CodexUpdateStatus::Current) {
-                                    this.codex_update_status = CodexUpdateStatus::Current;
-                                    cx.notify();
-                                }
-                            }
-                            Err(error) => {
-                                log::warn!("could not check for a Codex update: {error:#}");
-                                if matches!(this.codex_update_status, CodexUpdateStatus::Checking) {
-                                    this.codex_update_status = CodexUpdateStatus::Current;
-                                }
-                            }
-                        }
-                    })
-                    .is_err()
-                {
+                let Ok(before) = this.update(cx, |this, _| this.codex_update_status.clone()) else {
                     return;
+                };
+                let release_check_due = last_release_check
+                    .is_none_or(|last| last.elapsed() >= codex_runtime::UPDATE_CHECK_INTERVAL);
+                if !before.is_busy() && (before.awaits_restart() || release_check_due) {
+                    let result = if before.awaits_restart() {
+                        codex_runtime::check_for_restart().await
+                    } else {
+                        last_release_check = Some(Instant::now());
+                        codex_runtime::check_for_update().await
+                    };
+                    if this
+                        .update(cx, |this, cx| {
+                            // A check begun before an install/restart must not
+                            // overwrite the result of that newer action.
+                            if this.codex_update_status != before {
+                                return;
+                            }
+                            match result {
+                                Ok(check) => {
+                                    this.codex_update_status
+                                        .reconcile(check, this.dismissed_codex_update.as_deref());
+                                    if this.codex_update_status != before {
+                                        cx.notify();
+                                    }
+                                }
+                                Err(error) => {
+                                    // A temporarily absent daemon is not evidence
+                                    // that its pending restart has completed.
+                                    log::warn!("could not check for a Codex update: {error:#}");
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 cx.background_executor()
-                    .timer(codex_runtime::UPDATE_CHECK_INTERVAL)
+                    .timer(codex_runtime::RESTART_CHECK_INTERVAL)
                     .await;
             }
         });
@@ -8594,6 +8696,7 @@ impl HarnessApp {
                         message: format!("{error:#}").into(),
                     },
                 };
+                this.start_codex_update_watcher(cx);
                 cx.notify();
             }) {
                 log::debug!("Codex update finished after Harness closed: {error}");
@@ -8816,6 +8919,7 @@ impl HarnessApp {
                             this.connecting = false;
                             this.error = None;
                             this.load_server_options(cx);
+                            this.start_codex_update_watcher(cx);
                             let mut reattaching_cached_thread = false;
                             if let Some(query) = initial_thread_query.as_deref() {
                                 let query = query.to_lowercase();
@@ -9337,6 +9441,8 @@ impl HarnessApp {
             .collect::<Vec<_>>();
         let intentional_restart = std::mem::take(&mut self.codex_restart_initiated);
         self.client = None;
+        self.model_catalog_task = Task::ready(());
+        self.permission_profiles_task = Task::ready(());
         self.connecting = false;
         self.thread_list_task = Task::ready(());
         self.thread_open_task = Task::ready(());
@@ -10566,6 +10672,12 @@ impl HarnessApp {
             }
         });
         self.schedule_child_hierarchy_refresh(cx);
+    }
+
+    fn refresh_codex(&mut self, cx: &mut Context<Self>) {
+        self.load_server_options(cx);
+        self.refresh_threads(cx);
+        self.start_codex_update_watcher(cx);
     }
 
     fn schedule_child_hierarchy_refresh(&mut self, cx: &mut Context<Self>) {
@@ -18545,7 +18657,7 @@ impl Render for HarnessApp {
                 this.move_search_match(-1, window, cx)
             }))
             .on_action(cx.listener(|this, _: &NewTask, window, cx| this.new_task(window, cx)))
-            .on_action(cx.listener(|this, _: &RefreshTasks, _, cx| this.refresh_threads(cx)))
+            .on_action(cx.listener(|this, _: &RefreshTasks, _, cx| this.refresh_codex(cx)))
             .on_action(
                 cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)),
             )
@@ -18595,7 +18707,7 @@ impl Render for HarnessApp {
                                             if this.workspace_mode == WorkspaceMode::Chat {
                                                 this.refresh_chat_conversations(cx)
                                             } else {
-                                                this.refresh_threads(cx)
+                                                this.refresh_codex(cx)
                                             }
                                         })),
                                 )
@@ -21476,6 +21588,57 @@ mod tests {
         assert_eq!(cache.take("thread-0").unwrap().updated_at, 1);
         cache.insert(cached_thread("overflow", 2));
         assert_eq!(cache.take("overflow").unwrap().updated_at, 2);
+    }
+
+    #[test]
+    fn codex_update_banner_recovers_after_an_external_restart() {
+        let update = AvailableCodexUpdate {
+            installed_version: "0.153.4".into(),
+            latest_version: "0.153.4".into(),
+            update_action: None,
+            app_server_version: Some("0.152.1".into()),
+            app_server_managed: Some(true),
+        };
+        for mut status in [
+            CodexUpdateStatus::RestartPending(update.clone()),
+            CodexUpdateStatus::Failed {
+                update: update.clone(),
+                stage: CodexUpdateStage::Restart,
+                message: "Restart failed".into(),
+            },
+            CodexUpdateStatus::Failed {
+                update: update.clone(),
+                stage: CodexUpdateStage::Replace,
+                message: "Replacement failed".into(),
+            },
+        ] {
+            assert!(status.awaits_restart());
+            status.reconcile(codex_runtime::UpdateCheck::Current, None);
+            assert_eq!(status, CodexUpdateStatus::Current);
+        }
+
+        let mut failed = CodexUpdateStatus::Failed {
+            update: update.clone(),
+            stage: CodexUpdateStage::Restart,
+            message: "Restart failed".into(),
+        };
+        let before = failed.clone();
+        failed.reconcile(
+            codex_runtime::UpdateCheck::RestartRequired(update.clone()),
+            None,
+        );
+        assert_eq!(
+            failed, before,
+            "keep actionable errors while a restart is still needed"
+        );
+
+        let mut busy = CodexUpdateStatus::Restarting(update);
+        let before = busy.clone();
+        busy.reconcile(codex_runtime::UpdateCheck::Current, None);
+        assert_eq!(
+            busy, before,
+            "a check must not complete an in-flight restart action"
+        );
     }
 
     #[test]

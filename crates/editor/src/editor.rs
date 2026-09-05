@@ -1066,6 +1066,7 @@ pub struct Editor {
     /// Handles soft wraps, folds, fake inlay text insertions, etc.
     pub display_map: Entity<DisplayMap>,
     placeholder_display_map: Option<Entity<DisplayMap>>,
+    placeholder_text_color: Option<fn(&App) -> Hsla>,
     pub selections: SelectionsCollection,
     /// Manages the scroll position for the given editor.
     ///
@@ -1428,6 +1429,7 @@ pub struct EditorSnapshot {
     git_blame_gutter_max_author_length: Option<usize>,
     pub display_snapshot: DisplaySnapshot,
     pub placeholder_display_snapshot: Option<DisplaySnapshot>,
+    placeholder_text_color: Option<Hsla>,
     is_focused: bool,
     scroll_anchor: SharedScrollAnchor,
     current_line_highlight: CurrentLineHighlight,
@@ -2655,6 +2657,7 @@ impl Editor {
             buffer: multi_buffer.clone(),
             display_map: display_map.clone(),
             placeholder_display_map: None,
+            placeholder_text_color: None,
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
@@ -3699,6 +3702,7 @@ impl Editor {
                 .placeholder_display_map
                 .as_ref()
                 .map(|display_map| display_map.update(cx, |map, cx| map.snapshot(cx))),
+            placeholder_text_color: self.placeholder_text_color.map(|color| color(cx)),
             is_focused: self.focus_handle.is_focused(window),
             current_line_highlight: self
                 .current_line_highlight

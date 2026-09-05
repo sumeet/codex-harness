@@ -29,6 +29,17 @@ impl Editor {
         self.text_style_refinement = Some(style);
     }
 
+    /// Override the placeholder color without changing typed text. Resolve it
+    /// against the current theme on each snapshot so live theme changes work.
+    pub fn set_placeholder_text_color(
+        &mut self,
+        color: Option<fn(&App) -> Hsla>,
+        cx: &mut Context<Self>,
+    ) {
+        self.placeholder_text_color = color;
+        cx.notify();
+    }
+
     /// called by the Element so we know what style we were most recently rendered with.
     pub fn set_style(&mut self, style: EditorStyle, window: &mut Window, cx: &mut Context<Self>) {
         // We intentionally do not inform the display map about the minimap style

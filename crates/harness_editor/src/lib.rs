@@ -289,6 +289,10 @@ impl LocalEditor {
             // longer risk painting the caret underneath host-owned controls.
             let mut editor = Editor::auto_height(3, 8, window, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
+            // The empty composer is a secondary invitation. Some themes (in
+            // particular Base16 light palettes) make text.placeholder darker
+            // than actual prose; use their muted text role for this surface.
+            editor.set_placeholder_text_color(Some(|cx| cx.theme().colors().text_muted), cx);
             editor.set_use_modal_editing(true);
             editor.register_addon(ComposerKeyContextAddon);
             if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
