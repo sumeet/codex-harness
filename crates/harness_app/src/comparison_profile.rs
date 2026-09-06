@@ -20,6 +20,16 @@ pub(crate) struct ComparisonProfile {
     pub(crate) code: ComparisonFont,
     pub(crate) line_height: Option<f32>,
     pub(crate) text_rendering: Option<ComparisonTextRendering>,
+    pub(crate) tool_spacing: Option<ComparisonToolSpacing>,
+    pub(crate) sidebar_open: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ComparisonToolSpacing {
+    Baseline,
+    Balanced,
+    Relaxed,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -245,5 +255,17 @@ mod tests {
         assert!(ComparisonProfile::parse(r#"{"line_height":3}"#).is_err());
         assert!(ComparisonProfile::parse(r#"{"transcript_background":"not-a-color"}"#).is_err());
         assert!(ComparisonProfile::parse(r#"{"unknown":true}"#).is_err());
+        assert!(ComparisonProfile::parse(r#"{"tool_spacing":"unknown"}"#).is_err());
+    }
+
+    #[test]
+    fn spacing_profiles_do_not_override_typography() {
+        let profile = ComparisonProfile::parse(r#"{"tool_spacing":"balanced"}"#)
+            .expect("valid spacing comparison");
+        assert_eq!(profile.tool_spacing, Some(ComparisonToolSpacing::Balanced));
+        assert_eq!(profile.reading, ComparisonFont::default());
+        assert_eq!(profile.code, ComparisonFont::default());
+        assert_eq!(profile.line_height, None);
+        assert_eq!(profile.text_rendering, None);
     }
 }

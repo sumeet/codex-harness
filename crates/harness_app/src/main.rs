@@ -1791,17 +1791,69 @@ fn adjacent_visible_item(
     }
 }
 
-fn routine_activity_run_neighbors(items: &[TranscriptItem], index: usize) -> (bool, bool) {
-    if !items
-        .get(index)
-        .is_some_and(transcript_item_is_routine_activity)
-    {
-        return (false, false);
-    }
-    (
-        adjacent_visible_item(items, index, -1).is_some_and(transcript_item_is_routine_activity),
-        adjacent_visible_item(items, index, 1).is_some_and(transcript_item_is_routine_activity),
-    )
+fn transcript_item_vertical_padding(
+    items: &[TranscriptItem],
+    index: usize,
+    narrow: bool,
+    spacing: comparison_profile::ComparisonToolSpacing,
+) -> (gpui::Pixels, gpui::Pixels) {
+    use comparison_profile::ComparisonToolSpacing;
+
+    let Some(item) = items.get(index) else {
+        return (px(0.), px(0.));
+    };
+    let narrative = matches!(
+        item.kind,
+        model::TranscriptKind::User
+            | model::TranscriptKind::Agent
+            | model::TranscriptKind::Reasoning
+            | model::TranscriptKind::Plan
+    );
+    let compact_activity =
+        |item: &TranscriptItem| transcript_item_is_routine_activity(item) && !item.expanded;
+    let normal_padding = if item.kind == model::TranscriptKind::Trace && !item.expanded {
+        px(3.)
+    } else if narrative {
+        px(8.)
+    } else if narrow {
+        px(4.)
+    } else {
+        px(5.)
+    };
+    let above = adjacent_visible_item(items, index, -1);
+    let below = adjacent_visible_item(items, index, 1);
+    let edge_padding = |neighbor: Option<&TranscriptItem>| {
+        if spacing == ComparisonToolSpacing::Baseline {
+            return if compact_activity(item)
+                && neighbor.is_some_and(transcript_item_is_routine_activity)
+            {
+                px(0.)
+            } else {
+                normal_padding
+            };
+        }
+        let (row_padding, group_padding) = match spacing {
+            ComparisonToolSpacing::Balanced => (px(2.), px(4.)),
+            ComparisonToolSpacing::Relaxed => (px(4.), px(6.)),
+            ComparisonToolSpacing::Baseline => (px(0.), normal_padding),
+        };
+        if compact_activity(item) {
+            if neighbor.is_some_and(compact_activity) {
+                row_padding
+            } else {
+                group_padding
+            }
+        } else if item.kind == model::TranscriptKind::Agent
+            && neighbor.is_some_and(compact_activity)
+        {
+            // Each boundary is the sum of both rows' padding. Keep prose and
+            // its tool run connected without tightening ordinary paragraphs.
+            px(6.)
+        } else {
+            normal_padding
+        }
+    };
+    (edge_padding(above), edge_padding(below))
 }
 
 fn plan_progress(raw: &Value) -> Option<(usize, usize)> {
@@ -8282,7 +8334,9 @@ impl HarnessApp {
             user_image_previews: HashMap::default(),
             expanded_user_image: None,
             rich_nested_scrolls: HashMap::default(),
-            sidebar_open: session.sidebar_open,
+            sidebar_open: comparison_profile::profile()
+                .and_then(|profile| profile.sidebar_open)
+                .unwrap_or(session.sidebar_open),
             sidebar_user_override: false,
             turn_start_pending: false,
             queue_start_pending: false,
@@ -9544,7 +9598,11 @@ impl HarnessApp {
         let outcome = self
             .model
             .apply_batch(events, self.selected_thread_id.as_deref());
-        if self.model.current_turn_id.is_some()
+        if (self.model.current_turn_id.is_some()
+            || outcome
+                .turn_lifecycle
+                .iter()
+                .any(|event| matches!(event, model::TurnLifecycleEvent::Started { .. })))
             && queue_state_is_visible(
                 self.selected_thread_id.as_deref(),
                 self.preserved_work_thread_id.as_deref(),
@@ -11972,6 +12030,85 @@ impl HarnessApp {
         } else {
             self.start_submission(submission, cx);
         }
+    }
+
+    fn continuable_stop_key(&self) -> Option<&str> {
+        if self.workspace_mode != WorkspaceMode::Codex
+            || self.client.is_none()
+            || self.selected_thread_id.is_none()
+            || self.connecting
+            || self.loading_thread
+            || self.attaching_thread
+            || self.history_hydrating
+            || self.thread_read_only_reason.is_some()
+            || self.turn_active()
+            || self.turn_interrupt_pending
+            || self.settings_update_pending
+            || self.queue_refresh_pending
+            || !self.queued_turns.is_empty()
+            || self.selected_thread_id.as_ref().is_some_and(|thread_id| {
+                self.pending_send_flushes.contains(thread_id)
+                    || self
+                        .composer_drafts
+                        .pending_sends
+                        .get(thread_id)
+                        .is_some_and(|sends| !sends.is_empty())
+            })
+            || self.has_unresolved_live_request()
+        {
+            return None;
+        }
+        self.model.continuable_stop_key()
+    }
+
+    fn continue_stopped_turn(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.continuable_stop_key() != Some(key) {
+            return;
+        }
+        let (Some(client), Some(thread_id)) =
+            (self.client.clone(), self.selected_thread_id.clone())
+        else {
+            return;
+        };
+        self.transient_turn_status = None;
+        self.turn_start_pending = true;
+        self.turn_start_generation = self.turn_start_generation.wrapping_add(1);
+        let generation = self.turn_start_generation;
+        self.turn_task = cx.spawn(async move |this, cx| {
+            // Empty input is an explicit new generation, not a fabricated user
+            // message. Do not consume the draft or attachments to continue.
+            let result = client.start_turn(&thread_id, json!([])).await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                if this.turn_start_generation != generation {
+                    return;
+                }
+                let awaiting_lifecycle = this.turn_start_pending;
+                this.turn_start_pending = false;
+                if !callback_origin_is_visible(&thread_id, this.selected_thread_id.as_deref()) {
+                    this.refresh_threads(cx);
+                    return;
+                }
+                match result {
+                    Ok(response) => {
+                        // Events may already have started AND completed this turn
+                        // before its RPC acknowledgement. Never resurrect it.
+                        if let Some(turn_id) =
+                            continuation_acknowledged_turn(awaiting_lifecycle, &response)
+                        {
+                            this.model.current_turn_id = Some(turn_id);
+                        }
+                        this.error = None;
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Could not continue: {error}").into());
+                    }
+                }
+                cx.notify();
+            }) {
+                log::debug!("Continue acknowledgement outlived the view: {error}");
+            }
+        });
+        cx.notify();
     }
 
     fn start_submission(&mut self, submission: ComposerSubmission, cx: &mut Context<Self>) {
@@ -15370,18 +15507,11 @@ impl HarnessApp {
             .w_full()
             .min_w_0()
             .max_h(px(RICH_NESTED_OUTPUT_MAX_HEIGHT))
+            // Scroll wide output without painting a scrollbar over its last line.
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&horizontal_handle)
             .child(vertical)
-            .custom_scrollbars(
-                Scrollbars::new(ScrollAxes::Horizontal)
-                    .id(("file-change-horizontal-scrollbar", index))
-                    .with_thumb_color(colors.scrollbar_thumb_background)
-                    .tracked_scroll_handle(&horizontal_handle),
-                window,
-                cx,
-            )
             .into_any_element()
     }
 
@@ -15416,8 +15546,6 @@ impl HarnessApp {
             .gap_1()
             .ml_1p5()
             .pl_3p5()
-            .border_l_1()
-            .border_color(colors.border_variant)
             .children(steps.into_iter().map(|(start, step)| {
                 let end = start + step.len();
                 let highlighted_step = navigation_searchable_styled_text(
@@ -15773,17 +15901,33 @@ impl HarnessApp {
                         this.pr(px(status_padding))
                     })
                     .when(first_command_row, |this| {
-                        this.child(rich_command_identity_icon(
-                            format!("rich-{index}"),
-                            command_status,
-                        ))
+                        this.child(
+                            rich_command_identity_icon(format!("rich-{index}"), command_status)
+                                .h(harness_routine_activity_row_height(cx)),
+                        )
                     })
-                    .child(div().min_w_0().flex_1().child(clickable))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .when(first_command_row, |this| {
+                                // Match the collapsed header's centered first
+                                // line without centering the icon against an
+                                // entire wrapped command paragraph.
+                                this.pt((harness_routine_activity_row_height(cx)
+                                    - harness_code_row_height(cx))
+                                    / 2.)
+                            })
+                            .child(clickable),
+                    )
                     .when_some(visual_status, |this, (_, status)| {
                         this.child(
                             div()
                                 .absolute()
                                 .top(px(0.))
+                                .h(harness_routine_activity_row_height(cx))
+                                .flex()
+                                .items_center()
                                 // The outer card's disclosure owns the
                                 // rightmost 20 px. Status sits immediately
                                 // before it, as in Zed's terminal header.
@@ -15900,18 +16044,11 @@ impl HarnessApp {
                 .border_color(colors.border_variant)
                 .px_1p5()
                 .py_1()
+                // Scroll wide output without painting a scrollbar over its last line.
                 .overflow_x_scroll()
                 .overflow_y_hidden()
                 .track_scroll(&output_horizontal_handle)
                 .child(vertical)
-                .custom_scrollbars(
-                    Scrollbars::new(ScrollAxes::Horizontal)
-                        .id(("command-output-horizontal-scrollbar", index))
-                        .with_thumb_color(colors.scrollbar_thumb_background)
-                        .tracked_scroll_handle(&output_horizontal_handle),
-                    window,
-                    cx,
-                )
         });
 
         Some(
@@ -16923,8 +17060,8 @@ impl HarnessApp {
         let expanded_routine_activity = routine_activity && item.expanded;
         let unboxed_media =
             item.kind == model::TranscriptKind::Image && item.pending_request.is_none();
-        let (routine_activity_above, routine_activity_below) =
-            routine_activity_run_neighbors(&self.active_transcript_model().items, index);
+        let quiet_stop = item.is_quiet_stop();
+        let continue_stop = self.continuable_stop_key() == Some(item.key.as_str());
         let request_method = item
             .pending_request
             .as_ref()
@@ -17371,8 +17508,11 @@ impl HarnessApp {
             .when(routine_activity, |this| {
                 this.h(harness_routine_activity_row_height(cx))
             })
-            .when(!narrative && !compact_trace, |this| {
+            .when(!narrative && !compact_trace && !quiet_stop, |this| {
                 this.px_1()
+                    // Unboxed rows align with prose; bordered cards still
+                    // need their inner inset.
+                    .when(compact_routine_activity, |this| this.pl_0())
                     .when(!routine_activity && !unboxed_media, |this| {
                         this.bg(visuals.tool_header_surface)
                     })
@@ -17383,7 +17523,7 @@ impl HarnessApp {
                     item.command_execution_status(),
                 ))
             })
-            .when(item.kind != model::TranscriptKind::Command, |this| {
+            .when(item.kind != model::TranscriptKind::Command && !quiet_stop, |this| {
                 this.child(rich_card_identity_icon(
                     icon,
                     IconSize::Small,
@@ -17395,13 +17535,27 @@ impl HarnessApp {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .when(header_uses_command_font, |this| this.font_harness_code(cx))
+                    .when(header_uses_command_font, |this| {
+                        this.font_harness_code(cx).line_height(relative(1.35))
+                    })
                     .when(!header_uses_command_font, |this| {
                         this.font_harness_reading(cx)
                     })
                     .text_color(colors.text_muted)
                     .child(highlighted_header_title),
             )
+            .when(continue_stop, |this| {
+                let key = item.key.clone();
+                this.child(
+                    Button::new(format!("continue-stop:{}", key), "Continue")
+                        .style(ButtonStyle::Subtle)
+                        .tooltip(Tooltip::text("Start another generation from this conversation. Does not restart interrupted commands or send your draft."))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.continue_stopped_turn(&key, cx);
+                        })),
+                )
+            })
             .when_some(header_activity_summary, |this, summary| {
                 this.child(
                     div()
@@ -17453,6 +17607,11 @@ impl HarnessApp {
                 .id(format!("item-floating-disclosure:{}", item.key))
                 .absolute()
                 .top(px(1.))
+                .when(item.kind == model::TranscriptKind::Command, |this| {
+                    // The command body has 2px top padding. Align disclosure
+                    // with its first line, just like the ordinary header.
+                    this.top(px(2.) + (harness_routine_activity_row_height(cx) - px(18.)) / 2.)
+                })
                 .right(px(1.))
                 .size(px(18.))
                 .flex()
@@ -17546,7 +17705,7 @@ impl HarnessApp {
                 .flex()
                 .flex_col()
                 .when(
-                    !compact_trace && !routine_activity && !unboxed_media,
+                    !compact_trace && !routine_activity && !unboxed_media && !quiet_stop,
                     |this| {
                         this.rounded_md()
                             .border_1()
@@ -17555,11 +17714,7 @@ impl HarnessApp {
                             .overflow_hidden()
                     },
                 )
-                .when(compact_routine_activity, |this| {
-                    this.border_l_1()
-                        .border_color(visuals.divider)
-                        .overflow_hidden()
-                })
+                .when(compact_routine_activity, |this| this.overflow_hidden())
                 .when(expanded_routine_activity, |this| {
                     this.rounded_sm()
                         .border_1()
@@ -17568,8 +17723,7 @@ impl HarnessApp {
                         .overflow_hidden()
                 })
                 .when(compact_routine_activity && command_succeeded, |this| {
-                    this.border_color(cx.theme().status().success.opacity(0.42))
-                        .bg(cx.theme().status().success_background.opacity(0.07))
+                    this.bg(cx.theme().status().success_background.opacity(0.07))
                 })
                 .when(expanded_routine_activity && command_succeeded, |this| {
                     this.border_color(cx.theme().status().success.opacity(0.28))
@@ -17641,27 +17795,20 @@ impl HarnessApp {
                 .into_any_element()
         };
 
-        let normal_vertical_padding = if compact_trace {
-            px(3.)
-        } else if !narrative {
-            if narrow { px(4.) } else { px(5.) }
-        } else {
-            px(8.)
-        };
+        let (padding_top, padding_bottom) = transcript_item_vertical_padding(
+            &self.active_transcript_model().items,
+            index,
+            narrow,
+            comparison_profile::profile()
+                .and_then(|profile| profile.tool_spacing)
+                .unwrap_or(comparison_profile::ComparisonToolSpacing::Balanced),
+        );
         let element = div()
             .id(("transcript-item", index))
             .w_full()
             .px(transcript_horizontal_gutter(narrow))
-            .pt(if compact_routine_activity && routine_activity_above {
-                px(0.)
-            } else {
-                normal_vertical_padding
-            })
-            .pb(if compact_routine_activity && routine_activity_below {
-                px(0.)
-            } else {
-                normal_vertical_padding
-            })
+            .pt(padding_top)
+            .pb(padding_bottom)
             .when(visual, |this| {
                 this.bg(visuals.selection_surface.opacity(0.45))
             })
@@ -18046,7 +18193,7 @@ impl Render for HarnessApp {
             div()
                 .id("offscreen-tail-status")
                 .absolute()
-                .left(if transcript_narrow { px(10.) } else { px(18.) })
+                .left(transcript_horizontal_gutter(transcript_narrow))
                 .bottom(px(10.))
                 .size(px(28.))
                 .flex_none()
@@ -18852,7 +18999,7 @@ impl Render for HarnessApp {
                             .border_color(colors.border)
                             .bg(colors.editor_background)
                             .py_2()
-                            .px_2()
+                            .px(transcript_horizontal_gutter(transcript_narrow))
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -18866,7 +19013,6 @@ impl Render for HarnessApp {
                                     .min_h_0()
                                     .min_w_0()
                                     .pt_1()
-                                    .pr_2()
                                     .child(self.composer.clone()),
                             )
                             .child(
@@ -20078,6 +20224,18 @@ fn thread_has_active_turn(thread: &CodexThread) -> bool {
     active_thread_turn_id(thread).is_some()
 }
 
+fn continuation_acknowledged_turn(awaiting_lifecycle: bool, response: &Value) -> Option<String> {
+    (awaiting_lifecycle
+        && response.pointer("/turn/status").and_then(Value::as_str) == Some("inProgress"))
+    .then(|| {
+        response
+            .pointer("/turn/id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+    .flatten()
+}
+
 fn lifecycle_ended_active_turn(events: &[model::TurnLifecycleEvent]) -> bool {
     events.iter().fold(false, |ended, event| match event {
         model::TurnLifecycleEvent::Started { .. } => false,
@@ -20270,6 +20428,21 @@ fn comparison_fixture_model(fixture: &Value) -> anyhow::Result<TranscriptModel> 
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("completed");
+        if event_type == "turn_completed" {
+            let mut completion = TranscriptModel::default();
+            completion.apply_batch(
+                vec![AppServerEvent::Notification {
+                    method: "turn/completed".into(),
+                    params: json!({"threadId": "comparison", "turn": {
+                        "id": format!("comparison-{index}"), "status": status,
+                        "items": [], "error": event.get("error").cloned(),
+                    }}),
+                }],
+                Some("comparison"),
+            );
+            items.extend(completion.items);
+            continue;
+        }
         let (kind, title, content, raw, expanded) = match event_type {
             "thought" => (
                 model::TranscriptKind::Reasoning,
@@ -20324,11 +20497,16 @@ fn comparison_fixture_model(fixture: &Value) -> anyhow::Result<TranscriptModel> 
                     "id": format!("comparison-{index}"),
                     "type": "agentMessage",
                     "text": fixture_string(event, "markdown")?,
+                    "phase": event.get("phase").cloned(),
                 }),
                 true,
             ),
             other => anyhow::bail!("unsupported comparison fixture event type {other}"),
         };
+        let expanded = event
+            .get("expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(expanded);
         items.push(comparison_fixture_item(
             index, kind, &title, &content, raw, expanded, status,
         ));
@@ -20498,17 +20676,19 @@ fn thread_load_diagnostics_enabled() -> bool {
 }
 
 fn load_harness_keymaps(cx: &mut App) {
-    cx.bind_keys([
+    cx.bind_keys(harness_keybindings());
+}
+
+fn harness_keybindings() -> Vec<KeyBinding> {
+    vec![
         KeyBinding::new("ctrl-shift-p", OpenActionPalette, Some("Harness")),
-        // Ctrl-V is always ordinary paste inside the composer. The composer can
-        // retain Vim Normal mode across focus changes; allowing stock Vim to
-        // consume Ctrl-V there enters Visual Block, and a subsequent change can
-        // overwrite an image clipboard with the selected text. Vim Ctrl-V stays
-        // available everywhere outside the composer.
+        // Clipboard contents must not decide whether Ctrl-V pastes or selects:
+        // a leftover image would otherwise prevent deliberate Visual Block use.
+        // Leave non-Insert Vim bindings intact, including pending operators.
         KeyBinding::new(
             "ctrl-v",
             PasteComposer,
-            Some("HarnessComposer && Editor"),
+            Some("HarnessComposer && Editor && (!vim_mode || vim_mode == insert)"),
         ),
         KeyBinding::new(
             "ctrl-shift-v",
@@ -20524,9 +20704,7 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new(
             "escape",
             Stop,
-            Some(
-                "HarnessTurnActive && !Editor && !HarnessLocalEscape",
-            ),
+            Some("HarnessTurnActive && !Editor && !HarnessLocalEscape"),
         ),
         KeyBinding::new(
             "ctrl-w k",
@@ -20667,7 +20845,8 @@ fn load_harness_keymaps(cx: &mut App) {
         KeyBinding::new("ctrl-n", NewTask, Some("Harness")),
         KeyBinding::new("ctrl-r", RefreshTasks, Some("HarnessTranscript")),
         KeyBinding::new("ctrl-b", ToggleSidebar, Some("Harness")),
-    ]);
+        KeyBinding::new("ctrl-shift-s", ToggleSidebar, Some("Harness")),
+    ]
 }
 
 #[cfg(test)]
@@ -20746,6 +20925,26 @@ mod tests {
     }
 
     #[test]
+    fn comparison_fixture_preserves_expansion_and_commentary_boundaries() {
+        let fixture = json!({
+            "user": {"markdown": "check"},
+            "events": [
+                {
+                    "type": "tool", "kind": "terminal", "title": "Command",
+                    "input": "cargo test", "output": "ok", "expanded": true
+                },
+                {"type": "message", "phase": "commentary", "markdown": "still working"},
+                {"type": "message", "phase": "final_answer", "markdown": "done"}
+            ]
+        });
+        let model = comparison_fixture_model(&fixture).expect("fixture should parse");
+        assert!(model.items[1].expanded);
+        assert_eq!(model.items[2].raw["phase"], "commentary");
+        assert!(!transcript_has_work_before_final_answer(&model.items, 2));
+        assert!(transcript_has_work_before_final_answer(&model.items, 3));
+    }
+
+    #[test]
     fn transcript_strong_weight_advances_one_step_without_exceeding_bold() {
         assert_eq!(
             relative_strong_font_weight(FontWeight::LIGHT),
@@ -20790,7 +20989,7 @@ mod tests {
     }
 
     #[test]
-    fn rich_navigation_editor_uses_the_visible_transcript_gutter() {
+    fn transcript_composer_and_navigation_editor_share_the_content_gutter() {
         assert_eq!(transcript_horizontal_gutter(false), px(18.));
         assert_eq!(transcript_horizontal_gutter(true), px(10.));
 
@@ -20803,9 +21002,10 @@ mod tests {
             .matches(".px(transcript_horizontal_gutter(")
             .count();
         assert_eq!(
-            uses, 2,
-            "visible transcript items and the hidden Vim editor must share one gutter"
+            uses, 3,
+            "transcript items, composer, and hidden Vim editor must share one gutter"
         );
+        assert!(production.contains(".left(transcript_horizontal_gutter(transcript_narrow))"));
     }
 
     fn cached_thread(id: &str, updated_at: i64) -> CodexThread {
@@ -20983,18 +21183,148 @@ mod tests {
     }
 
     #[test]
-    fn composer_ctrl_v_is_paste_in_every_vim_mode() {
-        let source = include_str!("main.rs");
-        let keymaps = source
-            .split_once("fn load_harness_keymaps(cx: &mut App)")
-            .and_then(|(_, source)| source.split_once("#[cfg(test)]\nmod tests"))
-            .map(|(keymaps, _)| keymaps)
-            .expect("Harness keymaps must remain independently auditable");
+    fn continuation_ack_does_not_resurrect_an_already_observed_turn() {
+        let response = json!({"turn": {"id": "new-turn", "status": "inProgress"}});
+        assert_eq!(
+            continuation_acknowledged_turn(true, &response).as_deref(),
+            Some("new-turn")
+        );
+        assert_eq!(continuation_acknowledged_turn(false, &response), None);
+        for status in ["completed", "interrupted", "failed"] {
+            assert_eq!(
+                continuation_acknowledged_turn(
+                    true,
+                    &json!({"turn": {"id": "new-turn", "status": status}})
+                ),
+                None
+            );
+        }
+        assert_eq!(continuation_acknowledged_turn(true, &json!({})), None);
+    }
 
-        assert!(keymaps.contains(
-            "KeyBinding::new(\n            \"ctrl-v\",\n            PasteComposer,\n            Some(\"HarnessComposer && Editor\"),"
-        ));
-        assert!(!keymaps.contains("HarnessComposer && Editor && vim_mode == insert"));
+    #[test]
+    fn stopped_fixture_keeps_a_single_selectable_header_without_boilerplate() {
+        let fixture = json!({"user": {"markdown": "Inspect this project"}, "events": [
+            {"type": "message", "markdown": "I will inspect the project.", "phase": "commentary"},
+            {"type": "turn_completed", "status": "interrupted"},
+        ]});
+        let model = comparison_fixture_model(&fixture).expect("valid fixture");
+        let item = model.items.last().expect("stop marker");
+        assert!(item.is_quiet_stop());
+        assert_eq!(transcript_item_header_title(item), "Stopped");
+        assert!(transcript_item_shows_header(item));
+        let projection = rich_navigation_item_projection(&model, 2).expect("selectable stop");
+        assert_eq!(projection.body_text(), "Stopped");
+        assert_eq!(projection.text, "Stopped");
+    }
+
+    #[test]
+    fn composer_ctrl_v_pastes_only_in_insert_or_without_vim() {
+        let keymap = gpui::Keymap::new(harness_keybindings());
+        let keystrokes = [Keystroke::parse("ctrl-v").expect("valid shortcut")];
+        for (editor_context, should_paste) in [
+            ("Editor HarnessComposer", true),
+            ("Editor HarnessComposer vim_mode=insert", true),
+            ("Editor HarnessComposer VimControl vim_mode=normal", false),
+            ("Editor HarnessComposer VimControl vim_mode=visual", false),
+            ("Editor HarnessComposer VimControl vim_mode=operator", false),
+            ("Editor HarnessComposer vim_mode=replace", false),
+            ("Editor HarnessComposer vim_mode=waiting", false),
+            ("Editor HarnessComposer vim_mode=literal", false),
+            (
+                "Editor HarnessComposer VimControl vim_mode=helix_normal",
+                false,
+            ),
+            (
+                "Editor HarnessComposer VimControl vim_mode=helix_select",
+                false,
+            ),
+            ("Editor HarnessBuffer vim_mode=insert", false),
+            ("Editor HarnessBuffer VimControl vim_mode=normal", false),
+        ] {
+            let contexts = [
+                KeyContext::parse("Harness").expect("valid context"),
+                KeyContext::parse(editor_context).expect("valid editor context"),
+            ];
+            let (bindings, pending) = keymap.bindings_for_input(&keystrokes, &contexts);
+            assert!(!pending, "{editor_context}");
+            if should_paste {
+                assert_eq!(bindings.len(), 1, "{editor_context}");
+                assert!(bindings[0].action().partial_eq(&PasteComposer));
+            } else {
+                assert!(
+                    bindings.is_empty(),
+                    "leave native Vim/Editor binding: {editor_context}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_composer_paste_remains_available_in_every_vim_mode() {
+        let keymap = gpui::Keymap::new(harness_keybindings());
+        for mode in [
+            None,
+            Some("insert"),
+            Some("normal"),
+            Some("visual"),
+            Some("operator"),
+            Some("replace"),
+            Some("waiting"),
+            Some("literal"),
+            Some("helix_normal"),
+            Some("helix_select"),
+        ] {
+            let mut editor_context =
+                KeyContext::parse("Editor HarnessComposer").expect("valid composer context");
+            if let Some(mode) = mode {
+                editor_context.set("vim_mode", mode);
+            }
+            let contexts = [
+                KeyContext::parse("Harness").expect("valid context"),
+                editor_context,
+            ];
+            for shortcut in ["ctrl-shift-v", "shift-insert"] {
+                let keystrokes = [Keystroke::parse(shortcut).expect("valid shortcut")];
+                let (bindings, pending) = keymap.bindings_for_input(&keystrokes, &contexts);
+                assert!(!pending);
+                assert_eq!(bindings.len(), 1, "{shortcut} in {mode:?}");
+                assert!(bindings[0].action().partial_eq(&PasteComposer));
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_shortcut_is_available_across_harness_focus_contexts() {
+        let keymap = gpui::Keymap::new(harness_keybindings());
+        let keystrokes = [Keystroke::parse("ctrl-shift-s").expect("valid shortcut")];
+        for focus_context in [
+            "HarnessTasks",
+            "HarnessTranscript",
+            "HarnessSearch",
+            "Editor HarnessComposer vim_mode=insert",
+            "Editor HarnessComposer VimControl vim_mode=normal",
+            "Editor HarnessBuffer VimControl vim_mode=visual",
+            "Editor HarnessRequest",
+            "Picker",
+        ] {
+            let contexts = [
+                KeyContext::parse("Harness").expect("valid context"),
+                KeyContext::parse(focus_context).expect("valid focus context"),
+            ];
+            let (bindings, pending) = keymap.bindings_for_input(&keystrokes, &contexts);
+            assert!(!pending);
+            assert_eq!(bindings.len(), 1, "{focus_context}");
+            assert!(bindings[0].action().partial_eq(&ToggleSidebar));
+        }
+
+        let unrelated_context = [KeyContext::parse("Workspace").expect("valid context")];
+        assert!(
+            keymap
+                .bindings_for_input(&keystrokes, &unrelated_context)
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
@@ -23475,9 +23805,80 @@ mod tests {
             activity(model::TranscriptKind::Web),
             activity(model::TranscriptKind::Diff),
         ];
-        assert_eq!(routine_activity_run_neighbors(&items, 0), (false, true));
-        assert_eq!(routine_activity_run_neighbors(&items, 2), (true, false));
-        assert_eq!(routine_activity_run_neighbors(&items, 3), (false, false));
+        assert_eq!(
+            adjacent_visible_item(&items, 0, 1).map(|item| item.kind),
+            Some(model::TranscriptKind::Web)
+        );
+        assert_eq!(
+            adjacent_visible_item(&items, 2, -1).map(|item| item.kind),
+            Some(model::TranscriptKind::Command)
+        );
+    }
+
+    #[test]
+    fn tool_spacing_balances_rows_and_prose_boundaries_without_changing_paragraphs() {
+        use comparison_profile::ComparisonToolSpacing;
+        let item = |index, kind| {
+            comparison_fixture_item(index, kind, "", "body", json!({}), false, "completed")
+        };
+        let items = vec![
+            item(0, model::TranscriptKind::Agent),
+            item(1, model::TranscriptKind::Command),
+            item(2, model::TranscriptKind::Web),
+            item(3, model::TranscriptKind::Agent),
+            item(4, model::TranscriptKind::Agent),
+        ];
+        for (spacing, row_gap, prose_boundary) in [
+            (ComparisonToolSpacing::Baseline, 0., 13.),
+            (ComparisonToolSpacing::Balanced, 4., 10.),
+            (ComparisonToolSpacing::Relaxed, 8., 12.),
+        ] {
+            let padding: Vec<_> = (0..items.len())
+                .map(|index| transcript_item_vertical_padding(&items, index, false, spacing))
+                .collect();
+            assert_eq!(padding[1].1 + padding[2].0, px(row_gap));
+            assert_eq!(padding[0].1 + padding[1].0, px(prose_boundary));
+            assert_eq!(padding[2].1 + padding[3].0, px(prose_boundary));
+            assert_eq!(padding[3].1 + padding[4].0, px(16.));
+        }
+    }
+
+    #[test]
+    fn tool_spacing_skips_hidden_items_and_gives_expanded_output_its_own_boundary() {
+        use comparison_profile::ComparisonToolSpacing::Balanced;
+        let item = |index, kind, content, expanded| {
+            comparison_fixture_item(index, kind, "", content, json!({}), expanded, "completed")
+        };
+        let mut items = vec![
+            item(0, model::TranscriptKind::Command, "one", false),
+            item(1, model::TranscriptKind::Reasoning, "", false),
+            item(2, model::TranscriptKind::Web, "two", false),
+        ];
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 0, false, Balanced),
+            (px(4.), px(2.))
+        );
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 2, false, Balanced),
+            (px(2.), px(4.))
+        );
+        items[2].expanded = true;
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 0, false, Balanced),
+            (px(4.), px(4.))
+        );
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 2, false, Balanced),
+            (px(5.), px(5.))
+        );
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 2, true, Balanced),
+            (px(4.), px(4.))
+        );
+        assert_eq!(
+            transcript_item_vertical_padding(&items, 99, false, Balanced),
+            (px(0.), px(0.))
+        );
     }
 
     #[test]
@@ -23557,14 +23958,42 @@ mod tests {
         assert!(command_status.contains("format!(\"exit {code}\")"));
         assert!(item_renderer.contains("!compact_trace && !routine_activity && !unboxed_media"));
         assert!(item_renderer.contains(".when(compact_routine_activity, |this|"));
+        assert!(item_renderer.contains(".when(compact_routine_activity, |this| this.pl_0())"));
         assert!(item_renderer.contains(".when(expanded_routine_activity, |this|"));
-        assert!(item_renderer.contains("this.border_l_1()"));
         assert!(item_renderer.contains(".bg(visuals.tool_surface)"));
         assert!(item_renderer.contains("success_background.opacity(0.07)"));
-        assert!(item_renderer.contains("routine_activity && routine_activity_above"));
-        assert!(item_renderer.contains("routine_activity && routine_activity_below"));
+        assert!(item_renderer.contains("transcript_item_vertical_padding("));
+        assert!(item_renderer.contains(".pt(padding_top)"));
+        assert!(item_renderer.contains(".pb(padding_bottom)"));
         assert!(web_renderer.contains("query.clone(),\n                    Vec::new(),"));
         assert!(!web_renderer.contains("shell_highlights(query"));
+    }
+
+    #[test]
+    fn tool_output_keeps_horizontal_scrolling_without_overlaying_the_last_line() {
+        let source = include_str!("main.rs");
+        for (start, end, handle) in [
+            (
+                "fn render_file_change(",
+                "fn render_reasoning(",
+                ".track_scroll(&horizontal_handle)",
+            ),
+            (
+                "fn render_rich_command_content(",
+                "fn render_web_search(",
+                ".track_scroll(&output_horizontal_handle)",
+            ),
+        ] {
+            let renderer = source
+                .split_once(start)
+                .and_then(|(_, after)| after.split_once(end))
+                .map(|(renderer, _)| renderer)
+                .expect("tool output renderer must remain auditable");
+            assert!(renderer.contains(".overflow_x_scroll()"), "{start}");
+            assert!(renderer.contains(handle), "{start}");
+            assert!(renderer.contains("ScrollAxes::Vertical"), "{start}");
+            assert!(!renderer.contains("ScrollAxes::Horizontal"), "{start}");
+        }
     }
 
     #[test]

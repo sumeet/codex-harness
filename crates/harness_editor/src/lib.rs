@@ -288,6 +288,9 @@ impl LocalEditor {
             // now outside this Editor's layout, so three intrinsic rows no
             // longer risk painting the caret underneath host-owned controls.
             let mut editor = Editor::auto_height(3, 8, window, cx);
+            // The host owns the shared transcript/composer content gutter.
+            // Editor's default font-descent inset would shift text again.
+            editor.set_offset_content(false, cx);
             editor.set_placeholder_text("Ask Codex…", window, cx);
             // The empty composer is a secondary invitation. Some themes (in
             // particular Base16 light palettes) make text.placeholder darker
@@ -2396,6 +2399,8 @@ impl TranscriptEditor {
                 editor.set_current_line_highlight(None);
                 editor.set_soft_wrap();
                 editor.set_show_gutter(false, cx);
+                // Match the visible Rich column, whose host owns its gutter.
+                editor.set_offset_content(false, cx);
                 editor.set_show_indent_guides(false, cx);
                 editor.set_show_wrap_guides(false, cx);
                 editor.set_show_horizontal_scrollbar(false, cx);
@@ -4797,6 +4802,13 @@ mod tests {
             .map(|(constructor, _)| constructor)
             .expect("the modal composer constructor must remain independently auditable");
         assert!(composer_constructor.contains("register_addon(ComposerKeyContextAddon)"));
+        assert!(composer_constructor.contains("set_offset_content(false, cx)"));
+        let transcript_constructor = transcript_source
+            .split_once("pub fn read_only(")
+            .and_then(|(_, after)| after.split_once("pub fn "))
+            .map(|(constructor, _)| constructor)
+            .expect("the read-only transcript constructor must remain auditable");
+        assert!(transcript_constructor.contains("set_offset_content(false, cx)"));
 
         let yank_source = include_str!("../../vim/src/normal/yank.rs");
         let yank_method = yank_source

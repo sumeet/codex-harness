@@ -266,6 +266,22 @@ impl PreparedTranscriptSnapshot {
 }
 
 impl TranscriptItem {
+    pub fn is_quiet_stop(&self) -> bool {
+        self.key.starts_with("turn-completion:")
+            && self.kind == TranscriptKind::Review
+            && self.status.as_deref() == Some("interrupted")
+            && self.pending_request.is_none()
+            && self.raw.get("error").is_none_or(Value::is_null)
+    }
+
+    fn normalize_stop_presentation(&mut self) {
+        if self.is_quiet_stop() {
+            self.title = "Stopped".into();
+            self.content.clear();
+            self.expanded = false;
+        }
+    }
+
     pub fn client_user_message_id(&self) -> Option<&str> {
         (self.kind == TranscriptKind::User)
             .then(|| client_user_message_id_at(&self.raw))
@@ -273,6 +289,9 @@ impl TranscriptItem {
     }
 
     pub fn display_status(&self) -> Option<&str> {
+        if self.is_quiet_stop() {
+            return None;
+        }
         match self.status.as_deref()? {
             status
                 if is_routine_terminal_status(status)
@@ -1133,6 +1152,12 @@ fn selectable_transcript_body(
     item: &TranscriptItem,
     normalized_content: &str,
 ) -> SelectableBodyProjection {
+    if item.is_quiet_stop() {
+        return SelectableBodyProjection {
+            text: item.title.clone(),
+            semantic_spans: Vec::new(),
+        };
+    }
     let append_stable_stream = item.status.as_deref().is_some_and(|status| {
         matches!(
             status,
@@ -1244,8 +1269,9 @@ fn project_transcript_item_with_header(
 
     let mut text = String::new();
     let header_start = text.len();
-    let show_header =
-        include_header && !matches!(item.kind, TranscriptKind::Agent | TranscriptKind::User);
+    let show_header = include_header
+        && !item.is_quiet_stop()
+        && !matches!(item.kind, TranscriptKind::Agent | TranscriptKind::User);
     if show_header {
         text.push_str("━━━━ ");
         text.push_str(&normalize_buffer_line_endings(item.title.clone()));
@@ -1639,6 +1665,18 @@ pub struct TranscriptModel {
 }
 
 impl TranscriptModel {
+    pub fn continuable_stop_key(&self) -> Option<&str> {
+        let item = self.items.last()?;
+        (self.current_turn_id.is_none()
+            && item.is_quiet_stop()
+            && item
+                .raw
+                .get("harnessTurnSuperseded")
+                .and_then(Value::as_bool)
+                != Some(true))
+        .then_some(item.key.as_str())
+    }
+
     /// Replace a presentation-only transcript projection.
     ///
     /// Provider adapters that do not speak the Codex App Server protocol can
@@ -2586,6 +2624,16 @@ impl TranscriptModel {
                         let turn = params.get("turn").cloned().unwrap_or(Value::Null);
                         let turn_id = string_at(&turn, "/id").unwrap_or("unknown");
                         if method == "turn/started" {
+                            // A new generation can complete without emitting an item. Keep
+                            // its predecessor's Continue action retired even after reload.
+                            if let Some(index) =
+                                self.items.iter().rposition(TranscriptItem::is_quiet_stop)
+                                && string_at(&self.items[index].raw, "/id") != Some(turn_id)
+                                && let Some(raw) = self.items[index].raw.as_object_mut()
+                            {
+                                raw.insert("harnessTurnSuperseded".into(), Value::Bool(true));
+                                outcome.dirty.insert(index);
+                            }
                             self.current_turn_id = Some(turn_id.to_string());
                             outcome.turn_lifecycle.push(TurnLifecycleEvent::Started {
                                 turn_id: turn_id.to_string(),
@@ -2629,6 +2677,7 @@ impl TranscriptModel {
                                     turn,
                                 );
                                 self.items[index].status = Some(protocol_status_text(&status));
+                                self.items[index].normalize_stop_presentation();
                                 outcome.dirty.insert(index);
                             }
                         }
@@ -4395,7 +4444,8 @@ fn normalize_transcript_items(items: Vec<TranscriptItem>) -> Vec<TranscriptItem>
     unique.reverse();
 
     let mut normalized: Vec<TranscriptItem> = Vec::with_capacity(unique.len());
-    for item in unique {
+    for mut item in unique {
+        item.normalize_stop_presentation();
         if is_context_compaction_item(&item)
             && let Some(previous) = normalized.last_mut()
             && is_context_compaction_item(previous)
@@ -9559,13 +9609,105 @@ mod tests {
         );
         assert!(model.items[0].content.contains("Retry the turn"));
         assert_eq!(model.items[1].kind, TranscriptKind::Review);
-        assert_eq!(model.items[1].title, "Turn interrupted");
+        assert_eq!(model.items[1].title, "Stopped");
         assert_eq!(model.items[1].status.as_deref(), Some("interrupted"));
-        assert!(
-            model.items[1]
-                .content
-                .contains("interrupted before it completed")
+        assert!(model.items[1].content.is_empty());
+        assert!(!model.items[1].expanded);
+        assert!(model.items[1].is_presentationally_visible());
+        assert_eq!(model.items[1].display_status(), None);
+        assert_eq!(
+            model.continuable_stop_key(),
+            Some("turn-completion:turn-interrupted")
         );
+    }
+
+    #[test]
+    fn cached_stop_is_quiet_but_error_details_are_preserved() {
+        let mut stopped = replay_item(
+            0,
+            TranscriptKind::Review,
+            "Turn interrupted",
+            "The turn was interrupted before it completed.",
+            json!({"id": "stopped", "status": "interrupted"}),
+        );
+        stopped.key = "turn-completion:stopped".into();
+        stopped.status = Some("interrupted".into());
+        let mut with_error = stopped.clone();
+        with_error.key = "turn-completion:error".into();
+        with_error.raw["error"] = json!({"message": "Permission denied"});
+        with_error.content = "Permission denied".into();
+        let mut unrelated = stopped.clone();
+        unrelated.key = "review:unrelated".into();
+        let mut model = TranscriptModel::default();
+        model.restore_persisted_snapshot(PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            items: vec![stopped, with_error, unrelated],
+        });
+        assert_eq!(model.items[0].title, "Stopped");
+        assert!(model.items[0].content.is_empty());
+        assert!(!model.items[0].expanded);
+        assert_eq!(model.items[1].content, "Permission denied");
+        assert!(!model.items[1].is_quiet_stop());
+        assert!(!model.items[2].is_quiet_stop());
+        assert_eq!(model.continuable_stop_key(), None);
+    }
+
+    #[test]
+    fn continue_is_only_for_the_latest_stop_and_retires_even_after_an_empty_turn() {
+        let mut model = TranscriptModel::default();
+        let notification = |method: &str, id: &str, status: &str| Event::Notification {
+            method: method.into(),
+            params: json!({"threadId": "thread-1", "turn": {"id": id, "status": status, "items": []}}),
+        };
+        model.apply_batch(
+            vec![notification("turn/completed", "stopped", "interrupted")],
+            Some("thread-1"),
+        );
+        assert_eq!(
+            model.continuable_stop_key(),
+            Some("turn-completion:stopped")
+        );
+        model.current_turn_id = Some("active".into());
+        assert_eq!(model.continuable_stop_key(), None);
+        model.current_turn_id = None;
+        let outcome = model.apply_batch(
+            vec![
+                notification("turn/started", "next", "inProgress"),
+                notification("turn/completed", "next", "completed"),
+            ],
+            Some("thread-1"),
+        );
+        assert!(outcome.dirty.contains(&0));
+        assert!(model.current_turn_id.is_none());
+        assert_eq!(model.continuable_stop_key(), None);
+        let snapshot = PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            items: model.items.clone(),
+        };
+        model.restore_persisted_snapshot(snapshot);
+        assert_eq!(model.continuable_stop_key(), None);
+        model.apply_batch(
+            vec![notification(
+                "turn/completed",
+                "another-stop",
+                "interrupted",
+            )],
+            Some("thread-1"),
+        );
+        assert_eq!(
+            model.continuable_stop_key(),
+            Some("turn-completion:another-stop")
+        );
+        model.items.push(replay_item(
+            2,
+            TranscriptKind::User,
+            "You",
+            "New direction",
+            json!(null),
+        ));
+        assert_eq!(model.continuable_stop_key(), None);
     }
 
     #[test]
