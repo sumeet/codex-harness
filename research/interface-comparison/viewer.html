@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harness / Zed / Delta / Web comparison</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #242529; background: #fafafa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { position: sticky; top: 0; z-index: 2; padding: 12px 16px; border-bottom: 1px solid #c9c9ca; background: rgba(250,250,250,.96); }
+    h1 { margin: 0 0 4px; font-size: 16px; }
+    p { margin: 0; color: #58585a; font-size: 13px; }
+    nav { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    button, a { border: 1px solid #c9c9ca; border-radius: 5px; background: #fff; color: inherit; padding: 5px 9px; font: inherit; text-decoration: none; cursor: pointer; }
+    button[aria-pressed="true"] { border-color: #5c78e2; background: #eef1fc; }
+    main { padding: 14px 16px 28px; }
+    .native { width: 100%; overflow: auto; border: 1px solid #c9c9ca; background: #ebebec; }
+    .native img { display: block; width: 1270px; height: auto; max-width: none; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+    figure { margin: 0; min-width: 0; }
+    figcaption { margin-bottom: 5px; color: #58585a; font-size: 12px; }
+    figure img { display: block; width: 100%; border: 1px solid #c9c9ca; }
+    .note { margin-top: 12px; max-width: 1000px; font-size: 12px; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>One fixture, native renderers, exact 1270×710 viewport</h1>
+    <p>Delta One Light · IBM Plex Sans Condensed 16/400 · captures made at a 1270×710 logical viewport and 1.5× display scale.</p>
+    <nav id="controls">
+      <button data-image="lab-01-ibm400-editor-subpixel.png" aria-pressed="true">1 · Editor / subpixel</button>
+      <button data-image="lab-02-ibm400-surface-subpixel.png">2 · Surface / subpixel</button>
+      <button data-image="lab-03-ibm400-editor-grayscale.png">3 · Editor / grayscale</button>
+      <button data-image="lab-04-ibm400-surface-grayscale.png">4 · Surface / grayscale</button>
+      <button data-image="harness-matched-400-top.png">Harness 400 top</button>
+      <button data-image="harness-matched-400-bottom.png">Harness 400 bottom</button>
+      <button data-image="zed-matched-400-top.png">Zed 400 · prose 21 top</button>
+      <button data-image="zed-matched-400-bottom.png">Zed 400 · prose 21 bottom</button>
+      <button data-image="delta-matched-400-top.png">Delta top</button>
+      <button data-image="delta-matched-400-bottom.png">Delta bottom</button>
+      <button data-image="web-helium-matched-400.png">Plain Helium 400</button>
+      <button data-image="harness-matched-300-top.png">Harness 300 top</button>
+      <button data-image="harness-matched-300-bottom.png">Harness 300 bottom</button>
+      <button data-image="zed-prose21-matched-300-top.png">Zed 300 · prose 21 top</button>
+      <button data-image="zed-prose21-matched-300-bottom.png">Zed 300 · prose 21 bottom</button>
+      <button data-image="web-helium-matched-300.png">Plain Helium 300</button>
+      <button data-image="zed-code14-400-top.png">Zed 400 · code 14 top</button>
+      <button data-image="zed-code14-400-bottom.png">Zed 400 · code 14 bottom</button>
+      <a href="web/font-matrix.html">Interactive web font matrix</a>
+    </nav>
+    <nav id="scale-controls">
+      <button data-scale="logical" aria-pressed="true">Original logical viewport</button>
+      <button data-scale="pixel">1:1 screen pixels</button>
+      <p id="scale-note"></p>
+    </nav>
+  </header>
+  <main>
+    <section class="native"><img id="native-image" src="lab-01-ibm400-editor-subpixel.png" alt="1 · Editor / subpixel"></section>
+    <section class="grid">
+      <figure><figcaption>Harness — native transcript</figcaption><img src="harness-matched-400-top.png" alt="Harness comparison"></figure>
+      <figure><figcaption>Zed — native agent panel</figcaption><img src="zed-matched-400-top.png" alt="Zed comparison"></figure>
+      <figure><figcaption>Delta — native transcript</figcaption><img src="delta-matched-400-top.png" alt="Delta comparison"></figure>
+      <figure><figcaption>Plain Helium — typography baseline</figcaption><img src="web-helium-matched-400.png" alt="Plain web comparison"></figure>
+    </section>
+    <p class="note"><strong>Controlled 2×2 renderer lab:</strong> captures 1–4 use the same Harness binary, fixture, semantic position, Delta One Light theme, IBM Plex Sans Condensed 16/400 typography, theme text foreground, 1.3125 line height, viewport, and 1.5× display. One axis changes the transcript canvas between the theme’s editor and surface roles. The other changes GPUI’s real application-level text rendering between subpixel and grayscale. The composer intentionally stays on its normal surface. This separates the background-contrast hunch from rasterization instead of changing both at once.</p>
+    <p class="note">Native-policy differences are intentionally visible in the broader four-client captures. Zed renders editable user messages in its agent-buffer (monospace) font and derives prose line height from that size: the “prose 21” captures use a 12 px code font to match the 21 px prose line box, while the “code 14” captures preserve the shared 14 px code setting and consequently use Zed’s native 24.5 px prose line box. Delta has no reading-weight control. This accountless Delta replay has no attached worktree, so patch and image operations show authentic failed states. The plain-web panel isolates browser rasterization and is not presented as a fourth agent-client layout.</p>
+  </main>
+  <script>
+    const image = document.getElementById('native-image');
+    const scaleNote = document.getElementById('scale-note');
+    let scaleMode = 'logical';
+    function applyScale() {
+      if (!image.naturalWidth) return;
+      if (scaleMode === 'pixel') {
+        image.style.width = `${image.naturalWidth / devicePixelRatio}px`;
+        scaleNote.textContent = `One captured raster pixel per current screen pixel (${devicePixelRatio}× display).`;
+      } else {
+        image.style.width = '1270px';
+        scaleNote.textContent = 'Reconstructs the original 1270×710 logical viewport; glyph edges may be resampled when the current display is not 1.5×.';
+      }
+    }
+    image.addEventListener('load', applyScale);
+    document.getElementById('controls').addEventListener('click', event => {
+      const button = event.target.closest('button[data-image]');
+      if (!button) return;
+      for (const item of document.querySelectorAll('button[data-image]')) item.setAttribute('aria-pressed', String(item === button));
+      image.src = button.dataset.image;
+      image.alt = button.textContent;
+    });
+    document.getElementById('scale-controls').addEventListener('click', event => {
+      const button = event.target.closest('button[data-scale]');
+      if (!button) return;
+      scaleMode = button.dataset.scale;
+      for (const item of document.querySelectorAll('button[data-scale]')) item.setAttribute('aria-pressed', String(item === button));
+      applyScale();
+    });
+    applyScale();
+  </script>
+</body>
+</html>

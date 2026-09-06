@@ -1,0 +1,13 @@
+{
+  "user": {"markdown":"Check the transcript rhythm with expanded output, ordinary prose, and a failed command."},
+  "events": [
+    {"type":"message","phase":"commentary","markdown":"I’ll inspect the build output and keep the relevant details visible. Commands should remain connected to the explanation without crowding one another."},
+    {"type":"tool","kind":"terminal","title":"Command","input":"git status --short","output":" M crates/harness_app/src/main.rs","status":"completed"},
+    {"type":"tool","kind":"web","title":"Searched the web","input":"Codex app server tools","output":"App Server documentation","results":[{"title":"App Server","url":"https://learn.chatgpt.com/docs/app-server"}],"status":"completed"},
+    {"type":"tool","kind":"terminal","title":"Command","input":"cargo test -j1 -p harness_app --quiet","output":"running 215 tests\ntest result: ok. 214 passed; 0 failed; 1 ignored\nfinished in 0.34s","status":"completed","expanded":true},
+    {"type":"tool","kind":"terminal","title":"Command","input":"rg -n 'terminal_output' crates/harness_app/src/missing.rs","output":"rg: crates/harness_app/src/missing.rs: No such file or directory (os error 2)","status":"failed","expanded":true},
+    {"type":"message","phase":"commentary","markdown":"The test run passed. The search failed because that file does not exist.\n\nThis is a separate paragraph; its spacing should stay unchanged. Inline code such as `terminal_output` keeps the configured code font."},
+    {"type":"tool","kind":"terminal","title":"Command","input":"rg -n 'terminal_output' crates/harness_app/src/main.rs","output":"","status":"completed"},
+    {"type":"message","phase":"final_answer","markdown":"The expanded panels remain distinct, while compact tools still read as one run."}
+  ]
+}

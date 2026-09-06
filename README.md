@@ -14,10 +14,11 @@ The default transcript is a hybrid of Zed's reading and editing surfaces:
   Block selection, registers, yank, search, and keyboard navigation. Its cursor
   and selections are projected onto the rich surface.
 
-The code-icon view switch exposes the same Editor as a raw diagnostic view; it
-is no longer required to obtain real Vim behavior. Both projections retain the
-same semantic position, use one history scrollbar at a time, and keep a real
-modal composer below the history. Product acceptance is defined in
+The old code-icon/raw transcript view has been removed. Rich paint and the
+input-only Editor share one semantic document and one history scrollbar, with
+a real modal composer below the history. Start with [HANDOFF.md](HANDOFF.md)
+for the current checkpoint, known limitations, and cross-machine setup.
+Product acceptance is defined in
 [`docs/quality-gates.md`](docs/quality-gates.md); a compiling slice is not by
 itself considered finished.
 
@@ -37,9 +38,9 @@ Then clone the compact private checkpoint with an authenticated GitHub CLI and
 build it from the repository root:
 
 ```sh
-gh repo clone sumeet/codex-harness
+git clone --branch harness/main git@github.com:sumeet/codex-harness.git
 cd codex-harness
-./script/run-standalone.sh
+HARNESS_BUILD_JOBS=1 ./script/run-standalone.sh
 ```
 
 The normal launcher first asks Cargo for an incremental optimized build, then
@@ -89,29 +90,34 @@ Replay fixtures do not require a live App Server and are useful for UI QA:
 
 ```sh
 ./script/run-standalone.sh --replay 12
-./script/run-standalone.sh --replay 120 --text
+./script/run-standalone.sh --replay 120
 ./script/run-standalone.sh --replay 10000
 ```
 
 ## Controls worth knowing
 
 - `Ctrl-W H/J/K/L` moves between the thread rail, composer, and transcript where
-  the current focus makes that direction meaningful; `Ctrl-B` toggles the rail.
+  the current focus makes that direction meaningful; `Ctrl-Shift-S` toggles the
+  rail globally in Harness (`Ctrl-B` remains an alias).
 - `Ctrl-N` starts a fresh task. `Ctrl-Enter` sends from the composer.
 - The rich transcript uses Zed's modal Editor for `j`/`k`, `gg`/`G`, motions,
   Visual (`v`), Visual Line (`V`), Visual Block (`Ctrl-V`), registers, yank,
   `/ ? n N`, and jumplist behavior. `z a` toggles the selected disclosure.
-- `:rich`, `:text`, `:reading`, `:mono`, `:compose`, `:tasks`, `:new`, `:stop`,
-  and `:perf` are Harness aliases. `:perf` copies a delta performance report
+- `:compose`, `:tasks`, `:new`, `:stop`, and `:perf` are Harness aliases.
+  `:perf` copies a delta performance report
   that distinguishes input arrival, input dispatch, input-to-present latency,
   and input-present cadence rather than adding permanent profiler chrome. The
   developer alias `:perf-j` runs 240 real Vim `j` inputs paced one per presented
-  frame, then copies that run's report. `--text` starts directly in the raw
-  Editor projection for repeatable QA; the code icon in the thread-rail toolbar
-  switches projections with the mouse. Standalone `* # g* g# gn gN` search
-  semantics are still active work rather than being silently claimed here.
-- `Enter` on an interactive request in Text focuses its shared form/approval
-  surface; `Escape` returns to the transcript.
+  frame, then copies that run's report.
+- In the composer, `Ctrl-V` pastes in Insert mode or with Vim disabled;
+  Normal/Visual mode keeps Vim's visual-block behavior. `Ctrl-Shift-V` and
+  `Shift-Insert` explicitly paste in all composer modes. Ordinary Vim yanks do
+  not overwrite the system clipboard; use `"+y`, `"*y`, or explicit GUI copy.
+- Escape lets Vim modes, forms, and overlays dismiss first, then stops active
+  Codex work. From Insert mode this normally means `Esc Esc`.
+- An idle, ready Codex thread ending in a stopped turn offers **Continue**.
+  This starts a new generation with no new user message; it does not restart
+  an interrupted process or send the draft.
 
 The composer is a real plaintext Zed Editor with Markdown and fenced-language
 syntax highlighting. Markdown punctuation remains visible and editable, and
@@ -140,16 +146,14 @@ Rich headers, diff styling, selection paint, and search highlights are
 viewport-bounded; underlying message text remains real selectable Buffer text.
 Approvals, permissions,
 request-user-input forms, MCP forms, and image previews are stable shared GPUI
-entities: Rich renders them inline, while the raw Editor projection anchors the
-same entities as supplemental blocks. Neither projection introduces a nested
-vertical history scrollbar.
+entities rendered inline. ChatGPT conversations also use the shared rich/Vim
+transcript; their transport and model catalog are provider-specific.
 
 ## Honest status
 
-Rich paint backed by native Editor/Vim state is the primary product direction;
-the raw Editor projection remains a diagnostic and accessibility escape hatch.
-Current work is closing selection and hit-testing parity across every rich
-renderer, consolidating every interactive surface across both projections, and
+Rich paint backed by native Editor/Vim state is the primary product direction.
+Current work is maintaining selection and hit-testing across every rich
+renderer and
 polishing long diffs, tools, reasoning, images, scrolling, and the always-visible
 composer in real windows. Full Ex command semantics, settings controls,
 live-turn/request endurance testing, and longer exploratory use across real
@@ -165,9 +169,8 @@ than rewriting it.
 Fast focused checks:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo test --offline -p harness_protocol
-CARGO_BUILD_JOBS=1 cargo test --offline -p harness_editor
-CARGO_BUILD_JOBS=1 cargo test --offline -p harness_app --bin harness
+cargo test -j1 -p harness_app -p harness_editor -p harness_protocol -p codex_app_server_client --quiet
+HARNESS_BUILD_JOBS=1 ./script/build-standalone.sh
 ```
 
 Use `./script/clippy` for repository linting, following the upstream Zed

@@ -1,0 +1,11 @@
+{
+  "user": {"markdown": "Inspect the output styling, but keep this a small visual change."},
+  "events": [
+    {"type":"message","phase":"commentary","markdown":"I’ll check the reference clients and preserve the transcript’s existing spacing and selection behavior."},
+    {"type":"tool","kind":"terminal","title":"Command","input":"rg -n 'interrupt|stopped' crates/harness_app/src/main.rs","output":"","status":"completed"},
+    {"type":"turn_completed","status":"interrupted"},
+    {"type":"message","phase":"commentary","markdown":"A deliberate Stop is a quiet landmark, not an error. Completed text and command output remain available.\n\nActual failures still keep their explanation below."},
+    {"type":"turn_completed","status":"failed","error":{"message":"The model connection closed","additionalDetails":"No automatic resubmission was attempted."}},
+    {"type":"turn_completed","status":"interrupted"}
+  ]
+}

@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plain-web reading-font matrix</title>
+  <style>
+    @font-face { font-family: PlexCondensed; src: url("fonts/IBMPlexSansCondensed-Light.ttf"); font-weight: 300; }
+    @font-face { font-family: PlexCondensed; src: url("fonts/IBMPlexSansCondensed-Regular.ttf"); font-weight: 400; }
+    @font-face { font-family: RobotoCondensed; src: url("fonts/RobotoCondensed-Light.ttf"); font-weight: 300; }
+    @font-face { font-family: RobotoCondensed; src: url("fonts/RobotoCondensed-Regular.ttf"); font-weight: 400; }
+    @font-face { font-family: PlexSans; src: url("fonts/IBMPlexSans-Light.ttf"); font-weight: 300; }
+    @font-face { font-family: PlexSans; src: url("fonts/IBMPlexSans-Regular.ttf"); font-weight: 400; }
+    @font-face { font-family: Roboto; src: url("fonts/Roboto-Light.ttf"); font-weight: 300; }
+    @font-face { font-family: Roboto; src: url("fonts/Roboto-Regular.ttf"); font-weight: 400; }
+    @font-face { font-family: NotoSans; src: url("fonts/NotoSans-Light.ttf"); font-weight: 300; }
+    @font-face { font-family: NotoSans; src: url("fonts/NotoSans-Regular.ttf"); font-weight: 400; }
+    :root { color-scheme: light; --size: 16px; --leading: 1.3125; color: #242529; background: #fafafa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    header { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 16px; padding: 10px 18px; border-bottom: 1px solid #c9c9ca; background: rgba(250,250,250,.96); }
+    h1 { margin: 0 auto 0 0; font-size: 15px; }
+    label { color: #58585a; font-size: 12px; }
+    select { margin-left: 5px; }
+    main { padding: 14px 18px 36px; }
+    section { display: grid; grid-template-columns: 170px minmax(0, 920px); gap: 14px; padding: 13px 0; border-bottom: 1px solid #dededf; }
+    .name { color: #58585a; font-size: 12px; line-height: 18px; }
+    .specimen { font-size: var(--size); line-height: var(--leading); font-synthesis: none; }
+    .specimen p { margin: 0; }
+    .specimen p + p { margin-top: 8px; }
+    code { padding: 1px 3px; border-radius: 3px; background: #ebebec; font: 14px/1.3125 monospace; }
+    .plex-condensed { font-family: PlexCondensed; }
+    .roboto-condensed { font-family: RobotoCondensed; }
+    .plex-sans { font-family: PlexSans; }
+    .roboto { font-family: Roboto; }
+    .noto { font-family: NotoSans; }
+    .w300 { font-weight: 300; }
+    .w400 { font-weight: 400; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Plain Helium: exact installed font files</h1>
+    <label>Size <select id="size"><option>15</option><option selected>16</option><option>17</option><option>18</option></select> px</label>
+    <label>Line height <select id="leading"><option>1.25</option><option selected>1.3125</option><option>1.4</option><option>1.5</option></select></label>
+  </header>
+  <main id="matrix"></main>
+  <template id="row">
+    <section><div class="name"></div><div class="specimen"><p>Audit the transcript UI after the latest update. Keep it compact, but don’t hide useful command output. Compare the renderer with the reference capture, fix the line-height regression, and run focused tests.</p><p>Please pay attention to <strong>hierarchy</strong>, <em>reading rhythm</em>, <code>inline code</code>, and the boundary between prose and tools. Hamburgefons · minimum rhythm · 0123456789 · Il1 | rn m.</p></div></section>
+  </template>
+  <script>
+    const families = [
+      ['IBM Plex Sans Condensed', 'plex-condensed'],
+      ['Roboto Condensed', 'roboto-condensed'],
+      ['IBM Plex Sans', 'plex-sans'],
+      ['Roboto', 'roboto'],
+      ['Noto Sans', 'noto'],
+    ];
+    const matrix = document.getElementById('matrix');
+    const template = document.getElementById('row');
+    for (const [name, className] of families) for (const weight of [300, 400]) {
+      const row = template.content.cloneNode(true);
+      row.querySelector('.name').textContent = `${name} · ${weight}`;
+      row.querySelector('.specimen').classList.add(className, `w${weight}`);
+      matrix.append(row);
+    }
+    document.getElementById('size').addEventListener('change', event => document.documentElement.style.setProperty('--size', `${event.target.value}px`));
+    document.getElementById('leading').addEventListener('change', event => document.documentElement.style.setProperty('--leading', event.target.value));
+  </script>
+</body>
+</html>

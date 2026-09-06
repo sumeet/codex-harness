@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+comparison_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+app_root="$(cd "$comparison_root/../.." && pwd)"
+profiles_root="$comparison_root/profiles"
+binary="$app_root/target/release-fast/harness"
+
+if [[ ${1:-} == "--list" || $# -eq 0 ]]; then
+  printf 'Usage: bash %s PROFILE\n\nProfiles:\n' "$0"
+  for profile in "$profiles_root"/*.json; do
+    printf '  %s\n' "$(basename "$profile")"
+  done
+  exit 0
+fi
+
+profile="$1"
+if [[ ! -f "$profile" ]]; then profile="$profiles_root/$profile"; fi
+if [[ ! -f "$profile" ]]; then
+  printf 'Unknown profile: %s\n' "$1" >&2
+  exit 2
+fi
+profile="$(cd "$(dirname "$profile")" && pwd)/$(basename "$profile")"
+if [[ ! -x "$binary" ]]; then
+  printf 'Build first: HARNESS_BUILD_JOBS=1 ./script/build-standalone.sh\n' >&2
+  exit 2
+fi
+
+comparison_state="$(mktemp -d "${TMPDIR:-/tmp}/harness-profile.XXXXXX")"
+mkdir -p "$comparison_state/config/harness/themes" "$comparison_state/cache" "$comparison_state/data" "$comparison_state/state"
+cp "$comparison_root/assets/delta-one.json" "$comparison_state/config/harness/themes/delta-one.json"
+printf 'Isolated comparison state: %s\n' "$comparison_state"
+cd "$app_root"
+exec env \
+  XDG_CONFIG_HOME="$comparison_state/config" \
+  XDG_CACHE_HOME="$comparison_state/cache" \
+  XDG_DATA_HOME="$comparison_state/data" \
+  XDG_STATE_HOME="$comparison_state/state" \
+  HARNESS_THEME="Delta One Light" \
+  HARNESS_COMPARISON_FIXTURE="$comparison_root/fixture.json" \
+  HARNESS_COMPARISON_PROFILE="$profile" \
+  "$binary"

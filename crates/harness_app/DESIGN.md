@@ -1,5 +1,9 @@
 # Harness interaction contract
 
+For implemented behavior and current handoff priorities, read
+[HANDOFF.md](../../HANDOFF.md). Sections below include historical design
+aspirations (notably the durable task ledger) that are not all implemented.
+
 Harness is one keyboard-first Codex session window. It is not an IDE shell and it does not expose
 Zed workspaces, ACP, account state, extensions, or a general-purpose code editor.
 
@@ -26,10 +30,9 @@ Every transcript item belongs to one of three presentation levels:
   uses only a quiet raised surface. Attribution labels are omitted when the
   speaker is already unambiguous.
 - **Routine activity** such as commands, searches, reads, and generic tool
-  calls forms consecutive activity stacks. A stack has one outer surface and
-  radius, line-height identity rows, and hairline separators. Expanding one row
-  inserts its evidence directly beneath that row without changing the stack's
-  outer gutter.
+  calls uses unboxed rows without repeated left rails. Small within-run gaps
+  keep adjacent commands readable; larger boundaries separate runs from prose.
+  Expanded output stays with its row. Failures retain an understated boundary.
 - **Semantic artifacts** such as diffs, images, and approvals receive one
   unnested surface when their structure benefits from it. Plans and reasoning
   remain lightweight structured narrative rather than ordinary tool cards.
@@ -117,7 +120,9 @@ There are five explicit focus modes: tasks, transcript, composer, search, and re
 
 - `Ctrl-h`, `Ctrl-k`, and `Ctrl-j` move to tasks, transcript, and composer.
 - Transcript `j/k`, `gg/G`, and `Ctrl-u/Ctrl-d` navigate blocks and pages.
-- `v` starts a blockwise visual selection. `y` copies one block or the visual range.
+- `v`, `V`, and `Ctrl-V` select characters, lines, and visual blocks through
+  native Vim. `y` writes Vim registers, not the system clipboard; `"+y` and
+  `"*y` explicitly copy there. Composer Insert-mode `Ctrl-V` pastes instead.
 - `Enter` or `za` folds the selected structured block. `r` toggles its raw protocol payload.
 - `/` searches the transcript; `n/N` move between matches.
 - `i`, `a`, or `o` returns to the real Zed/Vim composer.

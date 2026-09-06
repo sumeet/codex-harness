@@ -1,5 +1,9 @@
 # Harness product backlog
 
+Checkpoint status: see [HANDOFF.md](../../HANDOFF.md), updated 2026-09-05.
+This older ledger mixes implemented behavior and longer-term aspirations;
+unchecked entries below are not an authoritative inventory of missing code.
+
 This is the durable product backlog for the standalone Harness client. It is
 intentionally separate from `DESIGN.md`: that file describes the stable design
 contract, while this file records unfinished work and product decisions that
@@ -91,12 +95,10 @@ must survive conversation compaction and hand-offs.
   keep reconnecting state nearby without turning either into a status banner.
 - [ ] Normalize typography, padding, borders, radii, identity rows, and density
   across user messages, tool calls, diffs, images, queue rows, and the composer.
-- [ ] Make Markdown inline code consume the complete configured code typography
-  role, including size. GPUI currently lays out a `StyledText` line at one
-  uniform size, so Markdown's inline-code size refinement is discarded while
-  family and weight survive. Add geometry-correct mixed-size text runs rather
-  than splitting prose into flex fragments; preserve wrapping, baseline/line
-  height, source hit-testing, Vim cursor bounds, and selection.
+- [x] Make Markdown inline code consume the configured code typography role,
+  including size, through mixed-size text runs with matching wrapping,
+  baselines, hit-testing, and Vim selection. User accepted the improved font
+  rendering; retain this when changing transcript composition.
 - [ ] Apply three deliberate visual weights: nearly chrome-free narrative,
   separator-stacked routine activity, and one unnested surface for semantic
   artifacts. Preserve comfortable reading sizes; achieve density by removing

@@ -1,0 +1,18 @@
+{
+  "user": {"markdown": "Compare the flow between explanations, commands, and web searches."},
+  "events": [
+    {"type":"message","phase":"commentary","markdown":"I’ll check our bindings and look at how other harnesses get terminal-style output. You’re right that this should ideally be presentation behavior, not something the agent has to remember to request on every command."},
+    {"type":"tool","kind":"terminal","title":"Command","input":"cat /home/smt/.codex/skills/.system/openai-docs/SKILL.md","output":"","status":"completed"},
+    {"type":"tool","kind":"web","title":"Searched the web","input":"Codex terminal output","output":"","results":[{"title":"App Server","url":"https://learn.chatgpt.com/docs/app-server"}],"status":"completed"},
+    {"type":"message","phase":"commentary","markdown":"I’m using OpenAI Docs for the Codex execution constraints, and implementation code for the other harnesses. The important distinction is who controls execution: a client that owns the shell process can preserve terminal output for you while sending cleaned-up text to the model. Harness currently receives commands executed by Codex, so I’ll check how much control that path exposes."},
+    {"type":"tool","kind":"terminal","title":"Command","input":"git status --short; sed -n '20500,20555p' crates/harness_app/src/main.rs; rg -n 'ctrl-v|ctrl-shift-v' crates","output":"","status":"completed"},
+    {"type":"tool","kind":"web","title":"Searched the web","input":"Zed agent terminal rendering","output":"","results":[{"title":"Agent tools","url":"https://zed.dev/docs/ai/tools"},{"title":"Terminal","url":"https://zed.dev/docs/terminal"}],"status":"completed"},
+    {"type":"tool","kind":"terminal","title":"Command","input":"sed -n '1,245p' crates/acp_thread/src/terminal.rs; rg -n 'create_terminal|TerminalView' crates/agent_ui","output":"","status":"completed"},
+    {"type":"tool","kind":"web","title":"Searched the web","input":"Embedded terminal tool output","output":"","results":[{"title":"Terminal tool","url":"https://zed.dev/docs/ai/tools"}],"status":"completed"},
+    {"type":"tool","kind":"terminal","title":"Command","input":"sed -n '370,555p' crates/acp_thread/src/terminal.rs; sed -n '630,690p' crates/agent_ui/src/entry_view_state.rs","output":"","status":"completed"},
+    {"type":"tool","kind":"terminal","title":"Command","input":"curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/core/src/tool/bash.ts","output":"","status":"completed"},
+    {"type":"tool","kind":"web","title":"Searched the web","input":"Codex unified exec environment","output":"","results":[{"title":"Configuration","url":"https://learn.chatgpt.com/docs/config-file/config-reference"}],"status":"completed"},
+    {"type":"tool","kind":"terminal","title":"Command","input":"sed -n '1338,1385p' /tmp/codex-source/codex-rs/core/src/unified_exec/process_manager.rs","output":"","status":"completed"},
+    {"type":"message","phase":"commentary","markdown":"Zed has a concrete version of what you’re describing: its agent tool embeds a real terminal view for the user, then extracts plain text from the terminal buffer for the model. That’s more than styling a plain-text output box."}
+  ]
+}
