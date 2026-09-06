@@ -33,6 +33,7 @@ members = [
     "crates/cloud_api_types",
     "crates/cloud_llm_client",
     "crates/codex_app_server_client",
+    "crates/claude_acp_client",
     "crates/codestral",
     "crates/collab",
     "crates/collab_ui",
@@ -309,6 +310,7 @@ cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
 codex_app_server_client = { path = "crates/codex_app_server_client" }
+claude_acp_client = { path = "crates/claude_acp_client" }
 harness_app = { path = "crates/harness_app" }
 harness_editor = { path = "crates/harness_editor" }
 harness_protocol = { path = "crates/harness_protocol" }

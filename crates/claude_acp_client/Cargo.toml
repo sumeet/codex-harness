@@ -1,0 +1,27 @@
+[package]
+name = "claude_acp_client"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/claude_acp_client.rs"
+doctest = false
+
+[dependencies]
+async-channel.workspace = true
+async-process.workspace = true
+chrono.workspace = true
+codex_app_server_client.workspace = true
+futures.workspace = true
+futures-lite.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
