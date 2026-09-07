@@ -4,7 +4,7 @@ use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, Render, SharedString, StyledText, Window, div, prelude::*, px, relative,
 };
-use harness_editor::LocalEditor;
+use harness_editor::{LocalEditor, LocalEditorChanged};
 use serde_json::Value;
 use ui::{
     Clickable, Color, Disableable, Icon, IconName, IconSize, Label, LabelCommon, LabelSize,
@@ -16,6 +16,122 @@ use super::{
     RequestChoice, action_button, build_mcp_form_response, build_user_input_response,
     decision_button, mcp_form_field_hint, request_choice_visual, request_choices, shell_highlights,
 };
+
+gpui::actions!(
+    harness_prompt,
+    [
+        ConfirmPrompt,
+        CancelPrompt,
+        NextPromptAction,
+        PreviousPromptAction
+    ]
+);
+
+pub(crate) fn init_prompts(cx: &mut App) {
+    cx.bind_keys([
+        gpui::KeyBinding::new("enter", ConfirmPrompt, Some("HarnessPrompt")),
+        gpui::KeyBinding::new("escape", CancelPrompt, Some("HarnessPrompt")),
+        gpui::KeyBinding::new("tab", NextPromptAction, Some("HarnessPrompt")),
+        gpui::KeyBinding::new("down", NextPromptAction, Some("HarnessPrompt")),
+        gpui::KeyBinding::new("shift-tab", PreviousPromptAction, Some("HarnessPrompt")),
+        gpui::KeyBinding::new("up", PreviousPromptAction, Some("HarnessPrompt")),
+    ]);
+    cx.set_prompt_builder(|_, message, detail, actions, handle, window, cx| {
+        let view = cx.new(|cx| ConfirmationPrompt {
+            message: message.to_owned().into(),
+            detail: detail.map(|text| SharedString::from(text.to_owned())),
+            actions: actions.to_vec(),
+            selected: actions
+                .iter()
+                .position(gpui::PromptButton::is_cancel)
+                .unwrap_or(0),
+            focus: cx.focus_handle(),
+        });
+        handle.with_view(view, window, cx)
+    });
+}
+
+struct ConfirmationPrompt {
+    message: SharedString,
+    detail: Option<SharedString>,
+    actions: Vec<gpui::PromptButton>,
+    selected: usize,
+    focus: FocusHandle,
+}
+
+impl EventEmitter<gpui::PromptResponse> for ConfirmationPrompt {}
+
+impl Focusable for ConfirmationPrompt {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+impl Render for ConfirmationPrompt {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = (window.viewport_size().width - px(32.)).min(px(480.));
+        div()
+            .size_full()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::black().opacity(0.35))
+            .child(
+                div()
+                    .key_context("HarnessPrompt")
+                    .whitespace_normal()
+                    .track_focus(&self.focus)
+                    .on_action(cx.listener(|this, _: &ConfirmPrompt, _, cx| {
+                        if this.actions.get(this.selected).is_some() {
+                            cx.emit(gpui::PromptResponse(this.selected));
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &CancelPrompt, _, cx| {
+                        if let Some(index) =
+                            this.actions.iter().position(gpui::PromptButton::is_cancel)
+                        {
+                            cx.emit(gpui::PromptResponse(index));
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &NextPromptAction, _, cx| {
+                        if !this.actions.is_empty() {
+                            this.selected = (this.selected + 1) % this.actions.len();
+                            cx.notify();
+                        }
+                    }))
+                    .on_action(cx.listener(|this, _: &PreviousPromptAction, _, cx| {
+                        this.selected = this
+                            .selected
+                            .checked_sub(1)
+                            .unwrap_or_else(|| this.actions.len().saturating_sub(1));
+                        cx.notify();
+                    }))
+                    .child(
+                        ui::AlertModal::new("confirmation-prompt")
+                            .width(width)
+                            .title(self.message.clone())
+                            .children(self.detail.clone())
+                            .footer(div().flex().flex_col().p_3().gap_1().children(
+                                self.actions.iter().enumerate().map(|(index, action)| {
+                                    use ui::{ButtonCommon as _, FixedWidth as _};
+                                    ui::Button::new(index, action.label().clone())
+                                        .full_width()
+                                        .style(ui::ButtonStyle::Outlined)
+                                        .when(index == self.selected, |button| {
+                                            button.style(ui::ButtonStyle::Tinted(TintColor::Accent))
+                                        })
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.emit(gpui::PromptResponse(index));
+                                        }))
+                                }),
+                            )),
+                    ),
+            )
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Respond {
@@ -99,6 +215,13 @@ impl RequestSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.method == "claude/questions" && self.raw["native"] != raw["native"] {
+            self.selected_answers.clear();
+            self.editors.clear();
+            self.option_cursors.clear();
+            self.validation_error =
+                Some("Claude changed this request. Review the new questions.".into());
+        }
         self.kind = surface_kind(&method, &raw);
         self.method = method;
         self.raw = raw;
@@ -194,7 +317,7 @@ impl RequestSurface {
         cx.notify();
     }
 
-    pub(crate) fn choose(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn choose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.responding {
             return;
         }
@@ -214,9 +337,13 @@ impl RequestSurface {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
                 if let Some(answer) = answer {
-                    self.selected_answers.insert(question_id, vec![answer]);
-                    self.validation_error = None;
-                    cx.notify();
+                    self.select_answer(
+                        &question_id,
+                        answer,
+                        question["multiSelect"] == true,
+                        window,
+                        cx,
+                    );
                 }
             }
             SurfaceKind::Approval | SurfaceKind::McpUrl | SurfaceKind::McpUnsupported => {
@@ -235,6 +362,34 @@ impl RequestSurface {
                 }
             }
         }
+    }
+
+    fn select_answer(
+        &mut self,
+        identifier: &str,
+        answer: String,
+        multiple: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.responding {
+            return;
+        }
+        if self.method == "claude/questions"
+            && !multiple
+            && let Some(editor) = self.editors.get(identifier)
+        {
+            editor.update(cx, |editor, cx| editor.set_text("", window, cx));
+        }
+        toggle_answer(
+            self.selected_answers
+                .entry(identifier.to_owned())
+                .or_default(),
+            answer,
+            multiple,
+        );
+        self.validation_error = None;
+        cx.notify();
     }
 
     pub(crate) fn edit_current(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -298,8 +453,14 @@ impl RequestSurface {
                 (!text.is_empty()).then_some((id, text))
             })
             .collect::<HashMap<_, _>>();
-        build_user_input_response(&questions, Some(&self.selected_answers), &typed)
-            .map(|response| (response, "answered".into()))
+        build_user_input_response(&questions, Some(&self.selected_answers), &typed).map(
+            |mut response| {
+                if self.method == "claude/questions" {
+                    response["nativeDialog"] = self.raw["native"].clone();
+                }
+                (response, "answered".into())
+            },
+        )
     }
 
     fn build_mcp_form_response(&self, cx: &App) -> Result<(Value, String), String> {
@@ -357,12 +518,26 @@ impl RequestSurface {
             _ => Vec::new(),
         };
         for (key, secret) in fields {
-            self.editors.entry(key).or_insert_with(|| {
+            if !self.editors.contains_key(&key) {
                 let editor =
                     cx.new(|cx| LocalEditor::plain_single_line("Type an answer…", window, cx));
                 editor.update(cx, |editor, cx| editor.set_masked(secret, cx));
-                editor
-            });
+                let identifier = key.clone();
+                cx.subscribe(&editor, move |this, editor, _: &LocalEditorChanged, cx| {
+                    if this.method == "claude/questions"
+                        && !editor.read(cx).text(cx).trim().is_empty()
+                        && this.questions().iter().any(|question| {
+                            question_id(question) == identifier && question["multiSelect"] != true
+                        })
+                    {
+                        this.selected_answers.remove(&identifier);
+                    }
+                    this.validation_error = None;
+                    cx.notify();
+                })
+                .detach();
+                self.editors.insert(key, editor);
+            }
         }
     }
 
@@ -409,6 +584,13 @@ impl RequestSurface {
             .filter(|reason| !reason.trim().is_empty())
             .map(ToOwned::to_owned);
         let (primary, primary_is_command) = match self.method.as_str() {
+            "claude/permission" => (
+                Some(
+                    serde_json::to_string_pretty(&self.raw["input"])
+                        .unwrap_or_else(|error| format!("Could not display tool input: {error}")),
+                ),
+                false,
+            ),
             "item/commandExecution/requestApproval" => (
                 self.raw
                     .get("command")
@@ -562,6 +744,7 @@ impl RequestSurface {
                 .cloned()
                 .unwrap_or_default();
             let active = index == self.question_cursor;
+            let multiple = question["multiSelect"] == true;
             let selected = self.selected_answers.get(&id).cloned().unwrap_or_default();
             let option_cursor = self.option_cursors.get(&id).copied().unwrap_or(0);
             let mut option_rows = Vec::new();
@@ -608,14 +791,17 @@ impl RequestSurface {
                             .size(IconSize::XSmall)
                             .color(Color::Accent)
                     }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.question_cursor = index;
                         this.option_cursors
                             .insert(id_for_click.clone(), option_index);
-                        this.selected_answers
-                            .insert(id_for_click.clone(), vec![label_for_click.clone()]);
-                        this.validation_error = None;
-                        cx.notify();
+                        this.select_answer(
+                            &id_for_click,
+                            label_for_click.clone(),
+                            multiple,
+                            window,
+                            cx,
+                        );
                     }))
                     .into_any_element(),
                 );
@@ -646,6 +832,13 @@ impl RequestSurface {
                                     .color(Color::Muted),
                             ),
                     )
+                    .when(multiple, |this| {
+                        this.child(
+                            Label::new("Select all that apply")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    })
                     .children(option_rows)
                     .when_some(editor, |this, editor| {
                         this.child(
@@ -923,13 +1116,23 @@ impl Render for RequestSurface {
 
 fn surface_kind(method: &str, raw: &Value) -> SurfaceKind {
     match method {
-        "item/tool/requestUserInput" => SurfaceKind::UserInput,
+        "item/tool/requestUserInput" | "claude/questions" => SurfaceKind::UserInput,
         "mcpServer/elicitation/request" => match raw.get("mode").and_then(Value::as_str) {
             Some("form") => SurfaceKind::McpForm,
             Some("url") => SurfaceKind::McpUrl,
             _ => SurfaceKind::McpUnsupported,
         },
         _ => SurfaceKind::Approval,
+    }
+}
+
+fn toggle_answer(selected: &mut Vec<String>, answer: String, multiple: bool) {
+    if !multiple {
+        *selected = vec![answer];
+    } else if selected.contains(&answer) {
+        selected.retain(|value| value != &answer);
+    } else {
+        selected.push(answer);
     }
 }
 
@@ -1059,6 +1262,28 @@ pub(crate) fn surface_sync_decision(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn questions_share_a_surface_but_keep_single_and_multiple_selection_distinct() {
+        assert_eq!(
+            surface_kind("claude/questions", &Value::Null),
+            SurfaceKind::UserInput
+        );
+        assert_eq!(
+            surface_kind("item/tool/requestUserInput", &Value::Null),
+            SurfaceKind::UserInput
+        );
+        let mut selected = Vec::new();
+        toggle_answer(&mut selected, "Blue".into(), false);
+        toggle_answer(&mut selected, "Amber".into(), false);
+        assert_eq!(selected, ["Amber"]);
+        toggle_answer(&mut selected, "Blue".into(), true);
+        assert_eq!(selected, ["Amber", "Blue"]);
+        toggle_answer(&mut selected, "Amber".into(), true);
+        assert_eq!(selected, ["Blue"]);
+        toggle_answer(&mut selected, "Blue".into(), true);
+        assert!(selected.is_empty());
+    }
 
     #[test]
     fn semantic_permissions_are_compact_and_never_dump_json() {

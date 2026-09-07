@@ -24,6 +24,7 @@ use std::{
 
 use async_process::{Child, ChildStdin, ChildStdout, Command};
 use async_tungstenite::tungstenite::Message as WebSocketMessage;
+use async_tungstenite::tungstenite::protocol::WebSocketConfig;
 use futures::channel::oneshot;
 use futures::io::{AsyncRead, AsyncWrite};
 use futures_lite::{
@@ -36,6 +37,15 @@ use serde_json::{Value, json};
 use thiserror::Error;
 
 type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Error>>>>>;
+
+fn app_server_websocket_config() -> WebSocketConfig {
+    // App Server sends a history response as a single frame. Image-rich turns
+    // exceed tungstenite's 16 MiB frame default even within its 64 MiB message
+    // budget. Keep the total budget bounded, but allow it in one frame.
+    WebSocketConfig::default()
+        .max_frame_size(Some(64 * 1024 * 1024))
+        .max_message_size(Some(64 * 1024 * 1024))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
@@ -69,6 +79,8 @@ pub struct RpcError {
 #[serde(rename_all = "camelCase")]
 pub struct CodexThread {
     pub id: String,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -473,6 +485,8 @@ pub enum Error {
     MissingStdio,
     #[error("app-server transport closed")]
     TransportClosed,
+    #[error("app-server transport closed: {0}")]
+    TransportDisconnected(String),
     #[error("app-server response channel closed")]
     ResponseChannelClosed,
     #[error("app-server emitted invalid JSON: {0}")]
@@ -717,9 +731,13 @@ impl Client {
         let stdin = child.stdin.take().ok_or(Error::MissingStdio)?;
         let stdout = child.stdout.take().ok_or(Error::MissingStdio)?;
         let duplex = SplitDuplex::<ChildStdout, ChildStdin>::new(stdout, stdin);
-        let (websocket, _) = async_tungstenite::client_async("ws://localhost/rpc", duplex)
-            .await
-            .map_err(|error| Error::WebSocketHandshake(error.to_string()))?;
+        let (websocket, _) = async_tungstenite::client_async_with_config(
+            "ws://localhost/rpc",
+            duplex,
+            Some(app_server_websocket_config()),
+        )
+        .await
+        .map_err(|error| Error::WebSocketHandshake(error.to_string()))?;
         let (mut websocket_writer, mut websocket_reader) = futures::StreamExt::split(websocket);
 
         let (outbound_tx, outbound_rx) = async_channel::unbounded::<Value>();
@@ -1515,13 +1533,17 @@ async fn disconnect(
     events: &async_channel::Sender<Event>,
     reason: String,
 ) {
+    log::warn!("app-server transport disconnected: {reason}");
     let responders = pending
         .lock()
         .drain()
         .map(|(_, sender)| sender)
         .collect::<Vec<_>>();
     for responder in responders {
-        if responder.send(Err(Error::TransportClosed)).is_err() {
+        if responder
+            .send(Err(Error::TransportDisconnected(reason.clone())))
+            .is_err()
+        {
             log::debug!("app-server request future was dropped during disconnect");
         }
     }
@@ -1599,6 +1621,86 @@ fn parse_rpc_error(value: &Value) -> Result<RpcError, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_frame_above_default_limit_keeps_the_connection_readable() {
+        smol::block_on(async {
+            use async_tungstenite::tungstenite::protocol::Role;
+            let payload = "x".repeat(21 * 1024 * 1024);
+            let mut bytes = vec![0x81, 127];
+            bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(payload.as_bytes());
+            bytes.extend_from_slice(&[0x81, 2, b'o', b'k']);
+            let mut default_socket = async_tungstenite::WebSocketStream::from_raw_socket(
+                futures_lite::io::Cursor::new(bytes.clone()),
+                Role::Client,
+                None,
+            )
+            .await;
+            assert!(matches!(
+                futures::StreamExt::next(&mut default_socket).await,
+                Some(Err(async_tungstenite::tungstenite::Error::Capacity(_)))
+            ));
+
+            let mut socket = async_tungstenite::WebSocketStream::from_raw_socket(
+                futures_lite::io::Cursor::new(bytes),
+                Role::Client,
+                Some(app_server_websocket_config()),
+            )
+            .await;
+            assert_eq!(
+                futures::StreamExt::next(&mut socket)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                WebSocketMessage::Text(payload.into())
+            );
+            assert_eq!(
+                futures::StreamExt::next(&mut socket)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                WebSocketMessage::Text("ok".into())
+            );
+        });
+    }
+
+    #[test]
+    fn oversized_history_still_has_a_bounded_transport_budget() {
+        smol::block_on(async {
+            let mut header = vec![0x81, 127];
+            header.extend_from_slice(&(65_u64 * 1024 * 1024).to_be_bytes());
+            let mut socket = async_tungstenite::WebSocketStream::from_raw_socket(
+                futures_lite::io::Cursor::new(header),
+                async_tungstenite::tungstenite::protocol::Role::Client,
+                Some(app_server_websocket_config()),
+            )
+            .await;
+            assert!(matches!(
+                futures::StreamExt::next(&mut socket).await,
+                Some(Err(async_tungstenite::tungstenite::Error::Capacity(_)))
+            ));
+        });
+    }
+
+    #[test]
+    fn pending_history_request_receives_the_disconnect_cause() {
+        smol::block_on(async {
+            let pending = PendingRequests::default();
+            let (responder, response) = oneshot::channel();
+            pending.lock().insert(1, responder);
+            let (events, _receiver) = async_channel::unbounded();
+            disconnect(&pending, &events, "frame exceeds receive budget".into()).await;
+            assert!(
+                response
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("frame exceeds receive budget")
+            );
+        });
+    }
 
     fn daemon_lifecycle_json(status: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({

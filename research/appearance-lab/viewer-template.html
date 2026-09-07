@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Harness · Appearance lab</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #242424; background: #efefed; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header, main, footer { max-width: 1360px; margin: auto; padding: 18px 24px; }
+    header { padding-bottom: 12px; }
+    h1 { font-size: 22px; letter-spacing: -.025em; margin: 0 0 6px; }
+    p { margin: 0; line-height: 1.5; }
+    .intro, .note { color: #555; font-size: 13px; }
+    .controls { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; margin-top: 16px; }
+    label { display: grid; gap: 5px; font-size: 12px; font-weight: 600; }
+    select, button { font: inherit; color: inherit; border: 1px solid #a8a8a3; border-radius: 5px; background: #fafaf8; padding: 8px 10px; }
+    select { max-width: min(350px, 85vw); }
+    button { cursor: pointer; font-size: 13px; }
+    button[aria-pressed="true"] { background: #30352e; color: #fff; border-color: #30352e; }
+    button:focus-visible, select:focus-visible, a:focus-visible, .viewport:focus-visible { outline: 3px solid #5375b8; outline-offset: 3px; }
+    .experiments { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .experiments span { align-self: center; font-size: 12px; margin-right: 4px; }
+    main { padding-top: 0; }
+    .caption { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 16px; margin-bottom: 7px; }
+    h2 { font-size: 16px; margin: 0; }
+    .caption a { color: #405a86; font-size: 12px; }
+    #reason { font-size: 13px; min-height: 40px; margin-bottom: 8px; max-width: 1000px; }
+    .viewport { overflow: auto; border: 1px solid #a8a8a3; background: #dededb; }
+    .viewport img { display: block; width: 100%; max-width: none; height: auto; }
+    .details { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 12px; }
+    .details section { border-top: 1px solid #bcbcb6; padding-top: 10px; font-size: 13px; line-height: 1.5; }
+    h3 { font-size: 13px; margin: 0 0 5px; }
+    #parameters, #role-detail { overflow-wrap: anywhere; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; }
+    #role-detail { margin-top: 6px; }
+    #message { color: #82382f; }
+    footer { padding-top: 0; }
+    @media(max-width: 680px) { header, main, footer { padding-left: 12px; padding-right: 12px; } .details { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Appearance lab</h1>
+    <p class="intro">Eight authored references, four local experiments. These are native Harness captures of the same synthetic conversation—not browser-rendered imitations.</p>
+    <div class="controls">
+      <label>A · Reference<select id="reference"></select></label>
+      <label>B · Compare<select id="candidate"></select></label>
+      <label>Scene<select id="scene"><option value="reading">Reading + Rust</option><option value="states">Tools + diff + JSON</option></select></label>
+      <label>Size<select id="scale"><option value="fit">Fit width</option><option value="logical">Original 1280px width</option><option value="pixel">1:1 screen pixels</option></select></label>
+      <button id="show-a" aria-pressed="true">Show A</button>
+      <button id="show-b" aria-pressed="false">Show B</button>
+    </div>
+    <div class="experiments" aria-label="Controlled comparisons">
+      <span>Try a change:</span>
+      <button data-pair="flat">Flatter surfaces</button>
+      <button data-pair="quiet">Less chroma</button>
+      <button data-pair="sparse">Fewer syntax groups</button>
+      <button data-pair="warm-paper">Intermediate warm paper</button>
+    </div>
+  </header>
+  <main>
+    <div class="caption"><h2 id="current" aria-live="polite"></h2><a id="original" target="_blank" rel="noopener">Open full capture</a><span class="note">Press A / B to switch; settings and scroll position stay put.</span></div>
+    <p id="reason"></p>
+    <p id="message" role="status"></p>
+    <div class="viewport" tabindex="0" aria-label="Native capture, scrollable at original size"><img id="capture" alt="" width="1280" height="900"></div>
+    <div class="details">
+      <section><h3>What changed?</h3><p id="parameters"></p><details id="exact-changes"><summary>Exact changed roles and repairs</summary><p id="role-detail"></p></details></section>
+      <section><h3>Nominal contrast screen—not a certification</h3><p id="check"></p></section>
+    </div>
+  </main>
+  <footer><p class="note">Fixed typography and 1280×900 viewport, captured at 1× on an isolated virtual display. Fit mode resamples text. Hover, selection, scrolling, and live theme changes require the native preview. No theme has been deleted or replaced. See the lab README for generation controls, provenance, and known limits.</p></footer>
+  <script>
+    const data = __LAB_DATA__;
+    const element = id => document.getElementById(id);
+    const entries = data.manifest.entries;
+    const lookup = id => entries.find(entry => entry.id === id);
+    let showing = 'a';
+    for (const id of ['reference', 'candidate']) {
+      const select = element(id);
+      for (const kind of ['authored reference', 'experimental transformation']) {
+        const group = document.createElement('optgroup');
+        group.label = kind;
+        for (const entry of entries.filter(entry => entry.kind === kind)) {
+          const option = document.createElement('option');
+          option.value = entry.id;
+          option.textContent = entry.name;
+          group.append(option);
+        }
+        select.append(group);
+      }
+    }
+    element('reference').value = 'one-dark';
+    element('candidate').value = 'quiet';
+    function applyScale() {
+      const mode = element('scale').value;
+      element('capture').style.width = mode === 'fit' ? '100%' : `${1280 / (mode === 'pixel' ? devicePixelRatio : 1)}px`;
+    }
+    function render() {
+      const entry = lookup(element(showing === 'a' ? 'reference' : 'candidate').value);
+      const source = `captures/${entry.id}-${element('scene').value}.png`;
+      element('capture').src = source;
+      element('capture').alt = `${entry.name}, native ${element('scene').selectedOptions[0].text} fixture`;
+      element('original').href = source;
+      element('current').textContent = `${showing.toUpperCase()} · ${entry.name}`;
+      element('reason').textContent = entry.reason;
+      const settings = Object.entries(entry.parameters || {}).filter(([key]) => key !== 'repairs').map(([key, value]) => `${key} = ${value}`).join(', ');
+      const repairs = entry.parameters?.repairs || [];
+      element('parameters').textContent = entry.base
+        ? `Based on ${entry.base}. ${settings}. ${entry.changed_roles.length} top-level roles changed; ${repairs.length} foreground/capture contrast repairs.`
+        : `Unmodified bundled reference: ${entry.source}. A pilot example, not a claim that this represents an entire theme family.`;
+      element('exact-changes').hidden = !entry.base;
+      element('role-detail').textContent = `Changed roles: ${entry.changed_roles.join(', ')}. Foreground repairs: ${repairs.length ? repairs.join(', ') : 'none'}.`;
+      const audit = data.checks.themes.find(theme => theme.name === entry.name);
+      element('check').textContent = audit
+        ? `${audit.below_target.length} checked role pairs below 4.5:1; ${audit.unknown_pairs.length} with unknown backdrop. Reading background ${audit.background.slice(0, 7)}, relative luminance ${audit.background_luminance}. This includes authored choices; it is not a ranking of taste or a complete readability test.`
+        : 'No resolved-color checks available. Run lab.py resolve first.';
+      element('show-a').setAttribute('aria-pressed', String(showing === 'a'));
+      element('show-b').setAttribute('aria-pressed', String(showing === 'b'));
+      element('message').textContent = '';
+      applyScale();
+    }
+    for (const id of ['reference', 'candidate', 'scene']) element(id).addEventListener('change', render);
+    element('scale').addEventListener('change', applyScale);
+    addEventListener('resize', applyScale);
+    for (const side of ['a', 'b']) element(`show-${side}`).addEventListener('click', () => { showing = side; render(); });
+    for (const button of document.querySelectorAll('[data-pair]')) button.addEventListener('click', () => {
+      element('candidate').value = button.dataset.pair;
+      element('reference').value = button.dataset.pair === 'warm-paper' ? 'one-light' : 'one-dark';
+      showing = 'b';
+      render();
+    });
+    addEventListener('keydown', event => {
+      if (event.altKey || event.ctrlKey || event.metaKey || (event.target instanceof Element && event.target.matches('select, input, textarea, [contenteditable]'))) return;
+      if (event.key.toLowerCase() === 'a' || event.key.toLowerCase() === 'b') {
+        showing = event.key.toLowerCase();
+        render();
+        event.preventDefault();
+      }
+    });
+    element('capture').addEventListener('error', () => { element('message').textContent = 'Capture missing. Run lab.py capture for this prepared experiment.'; });
+    for (const entry of entries) for (const scene of ['reading', 'states']) {
+      const image = new Image();
+      image.src = `captures/${entry.id}-${scene}.png`;
+    }
+    render();
+  </script>
+</body>
+</html>

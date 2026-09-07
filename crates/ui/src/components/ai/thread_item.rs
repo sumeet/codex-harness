@@ -285,6 +285,7 @@ impl RenderOnce for ThreadItem {
             Label::new("•")
                 .size(LabelSize::Small)
                 .color(separator_color)
+                .flex_shrink_0()
         };
 
         let icon_id = format!("icon-{}", self.id);
@@ -486,6 +487,8 @@ impl RenderOnce for ThreadItem {
             .when(has_metadata, |this| {
                 this.child(
                     h_flex()
+                        .min_w_0()
+                        .w_full()
                         .gap_1p5()
                         .child(icon_container()) // Icon Spacing
                         .when(self.archived, |this| {
@@ -500,7 +503,16 @@ impl RenderOnce for ThreadItem {
                             |this| {
                                 this.when_some(self.project_name, |this, name| {
                                     this.child(
-                                        Label::new(name).size(LabelSize::Small).color(Color::Muted),
+                                        div()
+                                            .id("project-name")
+                                            .min_w_0()
+                                            .tooltip(Tooltip::text(name.clone()))
+                                            .child(
+                                                Label::new(name)
+                                                    .size(LabelSize::Small)
+                                                    .color(Color::Muted)
+                                                    .truncate(),
+                                            ),
                                     )
                                 })
                                 .when(
@@ -511,7 +523,8 @@ impl RenderOnce for ThreadItem {
                                     this.child(
                                         Label::new(paths)
                                             .size(LabelSize::Small)
-                                            .color(Color::Muted),
+                                            .color(Color::Muted)
+                                            .truncate(),
                                     )
                                 })
                                 .when(has_project_paths && has_worktree, |this| {
@@ -601,7 +614,8 @@ impl RenderOnce for ThreadItem {
                             this.child(
                                 Label::new(timestamp.clone())
                                     .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                    .color(Color::Muted)
+                                    .flex_shrink_0(),
                             )
                         }),
                 )

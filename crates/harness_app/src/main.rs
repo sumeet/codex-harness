@@ -57,6 +57,9 @@ use ui::{
 use uuid::Uuid;
 
 mod chatgpt_desktop;
+mod claude_native;
+mod claude_workspace;
+mod codex_history;
 mod codex_runtime;
 mod comparison_profile;
 mod image_surface;
@@ -144,7 +147,7 @@ const CHILD_HIERARCHY_REFRESH_DEBOUNCE: Duration = Duration::from_millis(80);
 const MAX_RECONNECT_ATTEMPTS: u8 = 3;
 const THIN_ATTACH_TRANSCRIPT_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 const ACTIVE_TRANSCRIPT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
-const HISTORY_CATCHUP_PAGE_TURNS: u32 = 4;
+const HISTORY_CATCHUP_PAGE_TURNS: u32 = 1;
 const MAX_HISTORY_CATCHUP_PAGES: usize = 10_000;
 const MAX_COMPOSER_IMAGES: usize = 8;
 const MAX_COMPOSER_IMAGE_BYTES: usize = 20 * 1024 * 1024;
@@ -1766,6 +1769,10 @@ fn transcript_item_shows_header(item: &TranscriptItem) -> bool {
     )
 }
 
+fn transcript_item_is_recap(item: &TranscriptItem) -> bool {
+    item.raw["type"] == "sessionRecap"
+}
+
 fn transcript_item_is_routine_activity(item: &TranscriptItem) -> bool {
     item.pending_request.is_none()
         && matches!(
@@ -1902,7 +1909,7 @@ fn transcript_item_header_title(item: &TranscriptItem) -> String {
             })
             .unwrap_or_else(|| transcript_item_fallback_identity(item))
     } else if item.kind == model::TranscriptKind::Web {
-        "Searched the web".into()
+        web_activity_header(&item.raw)
     } else {
         concrete_or_fallback_title(item, title)
     }
@@ -2283,6 +2290,7 @@ fn rich_command_data(item: &TranscriptItem) -> Option<RichCommandData> {
 
 fn render_command_visual_status(
     status: model::CommandExecutionStatus,
+    window: &Window,
     cx: &App,
 ) -> Option<(f32, AnyElement)> {
     match status {
@@ -2297,18 +2305,33 @@ fn render_command_visual_status(
             let label = exit_code
                 .map(|code| format!("exit {code}"))
                 .unwrap_or_else(|| "failed".to_owned());
-            let reserved_width = if exit_code.is_some() { 78. } else { 68. };
+            let settings = ThemeSettings::get_global(cx);
+            let font_size = harness_code_font_size(cx);
+            let run = gpui::TextRun {
+                len: label.len(),
+                font: Font {
+                    family: settings.agent_buffer_font_family().clone(),
+                    weight: settings.buffer_font.weight,
+                    ..Default::default()
+                },
+                color: cx.theme().status().error.into(),
+                ..Default::default()
+            };
+            let label_width = window
+                .text_system()
+                .shape_line(label.clone().into(), font_size, &[run], None)
+                .width;
+            let reserved_width = label_width.as_f32() + 8. + 25.;
             Some((
                 reserved_width,
                 div()
-                    .h(px(20.))
+                    .h(harness_code_row_height(cx))
                     .px_1()
                     .flex_none()
                     .flex()
                     .items_center()
                     .rounded_sm()
                     .font_harness_code(cx)
-                    .text_ui_xs(cx)
                     .text_color(cx.theme().status().error)
                     .bg(cx.theme().status().error_background.opacity(0.42))
                     .child(label)
@@ -2591,13 +2614,20 @@ fn diff_content_counts(content: &str) -> (usize, usize) {
 }
 
 fn file_change_summary(line: &str) -> Option<(&str, &str)> {
-    ["Added", "Modified", "Deleted", "Moved"]
-        .into_iter()
-        .find_map(|operation| {
-            line.strip_prefix(operation)
-                .and_then(|rest| rest.strip_prefix(" · "))
-                .map(|path| (operation, path))
-        })
+    [
+        "Added",
+        "Modified",
+        "Deleted",
+        "Moved",
+        "Proposed write",
+        "Proposed edit",
+    ]
+    .into_iter()
+    .find_map(|operation| {
+        line.strip_prefix(operation)
+            .and_then(|rest| rest.strip_prefix(" · "))
+            .map(|path| (operation, path))
+    })
 }
 
 fn file_change_presentations(content: &str) -> Vec<FileChangePresentation> {
@@ -2833,6 +2863,57 @@ fn compact_web_text(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn web_activity_header(raw: &Value) -> String {
+    let action = raw.get("action").unwrap_or(&Value::Null);
+    let value = |field| {
+        action
+            .get(field)
+            .and_then(Value::as_str)
+            .map(compact_web_text)
+            .filter(|text| !text.is_empty())
+    };
+    match action.get("type").and_then(Value::as_str) {
+        Some("openPage" | "open_page") => {
+            value("url").map_or_else(|| "Open page".into(), |url| format!("Open page · {url}"))
+        }
+        Some("findInPage" | "find_in_page") => {
+            let pattern = value("pattern").unwrap_or_else(|| "text".into());
+            value("url").map_or_else(
+                || format!("Find in page · {pattern}"),
+                |url| format!("Find · {pattern} · {url}"),
+            )
+        }
+        _ => {
+            let queries = web_search_presentation(raw).queries;
+            if queries.is_empty() {
+                "Web activity".into()
+            } else {
+                format!("Search · {}", queries.join(" · "))
+            }
+        }
+    }
+}
+
+fn web_activity_summary(raw: &Value) -> Option<String> {
+    let presentation = web_search_presentation(raw);
+    let mut parts = Vec::new();
+    if matches!(
+        raw.pointer("/action/type").and_then(Value::as_str),
+        Some("search") | None
+    ) && presentation.queries.len() > 1
+    {
+        parts.push(format!("{} queries", presentation.queries.len()));
+    }
+    if raw.get("results").is_some_and(Value::is_array) {
+        let count = presentation.results.len();
+        parts.push(format!(
+            "{count} {}",
+            if count == 1 { "result" } else { "results" }
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 #[cfg(test)]
 fn web_search_has_hidden_content(presentation: &WebSearchPresentation) -> bool {
     presentation.results.len() > WEB_RESULT_PREVIEW_COUNT
@@ -2869,6 +2950,25 @@ fn web_search_presentation(raw: &Value) -> WebSearchPresentation {
             .filter(|query| !query.is_empty())
     {
         queries.push(query);
+    }
+    match action.get("type").and_then(Value::as_str) {
+        Some("openPage" | "open_page") => {
+            queries = action
+                .get("url")
+                .and_then(Value::as_str)
+                .map(compact_web_text)
+                .into_iter()
+                .collect();
+        }
+        Some("findInPage" | "find_in_page") => {
+            queries = ["pattern", "url"]
+                .into_iter()
+                .filter_map(|field| action.get(field).and_then(Value::as_str))
+                .map(compact_web_text)
+                .filter(|text| !text.is_empty())
+                .collect();
+        }
+        _ => {}
     }
     let results = raw
         .get("results")
@@ -3188,8 +3288,16 @@ enum FocusMode {
 #[serde(rename_all = "snake_case")]
 enum WorkspaceMode {
     Chat,
+    Claude,
     #[default]
     Codex,
+}
+
+fn project_display_name(path: &Path, fallback: &str) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3198,6 +3306,7 @@ struct HarnessSessionState {
     workspace_mode: WorkspaceMode,
     selected_thread_id: Option<String>,
     selected_chat_id: Option<String>,
+    selected_claude_id: Option<String>,
     chat_new_draft: bool,
     pending_thread_cwd: Option<String>,
     sidebar_open: bool,
@@ -3209,6 +3318,7 @@ impl Default for HarnessSessionState {
             workspace_mode: WorkspaceMode::Codex,
             selected_thread_id: None,
             selected_chat_id: None,
+            selected_claude_id: None,
             chat_new_draft: false,
             pending_thread_cwd: None,
             sidebar_open: true,
@@ -3345,6 +3455,9 @@ struct ComposerSubmission {
 struct ComposerDraftStore {
     drafts: HashMap<String, String>,
     pending_sends: HashMap<String, Vec<PersistedPendingSend>>,
+    claude_pending_sends: HashMap<String, claude_workspace::PendingSend>,
+    claude_resolved_sends: HashSet<String>,
+    claude_accepted_sends: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3372,13 +3485,54 @@ fn load_composer_drafts() -> ComposerDraftStore {
 
 fn persist_composer_drafts(store: &ComposerDraftStore) -> anyhow::Result<()> {
     let path = composer_drafts_path().context("no user configuration directory is available")?;
+    persist_composer_drafts_at(&path, store)
+}
+
+fn read_composer_drafts_at(path: &Path) -> anyhow::Result<ComposerDraftStore> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ComposerDraftStore::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn persist_composer_drafts_at(path: &Path, store: &ComposerDraftStore) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     let parent = path
         .parent()
         .context("Harness drafts path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(store)?)?;
-    fs::rename(temporary, path)?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path.with_extension("lock"))?;
+    let metadata = lock.metadata()?;
+    anyhow::ensure!(
+        metadata.is_file()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o077 == 0,
+        "Unsafe composer draft lock"
+    );
+    lock.try_lock()
+        .context("Composer drafts are being saved by another window; retry shortly")?;
+    let latest = read_composer_drafts_at(path)?;
+    let mut merged = store.clone();
+    claude_workspace::merge_send_journal(&mut merged, &latest)?;
+    let temporary = path.with_extension(format!("{}.pending", Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(&merged)?)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -3388,6 +3542,50 @@ struct QueuedTurnSubmission {
     client_user_message_id: String,
     input: Value,
     preview_segments: Vec<QueuedPromptPreviewSegment>,
+}
+
+impl QueuedTurnSubmission {
+    fn preview_key(&self) -> String {
+        if self.client_user_message_id.is_empty() {
+            format!("queue:{}", self.id.as_deref().unwrap_or_default())
+        } else {
+            format!("client:{}", self.client_user_message_id)
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ExpandedQueuedPrompt {
+    input: Value,
+    segments: Vec<QueuedPromptPreviewSegment>,
+}
+
+impl ExpandedQueuedPrompt {
+    fn new(input: &Value) -> Self {
+        Self {
+            input: input.clone(),
+            segments: queued_submission_segments(input, false),
+        }
+    }
+}
+
+fn refresh_expanded_queued_prompts(
+    expanded: &mut HashMap<String, ExpandedQueuedPrompt>,
+    queued: &VecDeque<QueuedTurnSubmission>,
+) {
+    let current = queued
+        .iter()
+        .map(|entry| (entry.preview_key(), &entry.input))
+        .collect::<HashMap<_, _>>();
+    expanded.retain(|key, preview| {
+        let Some(input) = current.get(key) else {
+            return false;
+        };
+        if &preview.input != *input {
+            *preview = ExpandedQueuedPrompt::new(input);
+        }
+        true
+    });
 }
 
 fn pending_sends_for_thread(
@@ -3727,6 +3925,10 @@ fn queued_submission_image(block: &Value) -> Option<Arc<Image>> {
 }
 
 fn queued_submission_preview_segments(input: &Value) -> Vec<QueuedPromptPreviewSegment> {
+    queued_submission_segments(input, true)
+}
+
+fn queued_submission_segments(input: &Value, compact: bool) -> Vec<QueuedPromptPreviewSegment> {
     let mut image_index = 0;
     let mut segments = Vec::new();
 
@@ -3736,16 +3938,18 @@ fn queued_submission_preview_segments(input: &Value) -> Vec<QueuedPromptPreviewS
                 let text = block
                     .get("text")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .unwrap_or_default();
+                let text = if compact {
+                    text.split_whitespace().collect::<Vec<_>>().join(" ")
+                } else {
+                    text.to_owned()
+                };
                 if !text.is_empty() {
                     segments.push(QueuedPromptPreviewSegment::Text(text.into()));
                 }
             }
             Some("image" | "inputImage") => {
-                if image_index < QUEUED_PREVIEW_IMAGE_LIMIT {
+                if !compact || image_index < QUEUED_PREVIEW_IMAGE_LIMIT {
                     if let Some(image) = queued_submission_image(block) {
                         let dimensions = image_dimensions(image.bytes(), image.format());
                         segments.push(QueuedPromptPreviewSegment::Image { image, dimensions });
@@ -3971,10 +4175,11 @@ fn request_should_take_focus(
 
 fn request_header_title(method: &str) -> Option<&'static str> {
     match method {
+        "claude/permission" => Some("Claude permission · allow once or deny"),
         "item/commandExecution/requestApproval" | "execCommandApproval" => Some("Command approval"),
         "item/fileChange/requestApproval" | "applyPatchApproval" => Some("File change approval"),
         "item/permissions/requestApproval" => Some("Permission request"),
-        "item/tool/requestUserInput" => Some("Input requested"),
+        "item/tool/requestUserInput" | "claude/questions" => Some("Input requested"),
         "mcpServer/elicitation/request" => Some("MCP request"),
         _ => None,
     }
@@ -4037,6 +4242,7 @@ fn search_uses_native_editor(focus_mode: FocusMode, rich_vim_enabled: bool) -> b
 }
 
 struct HarnessApp {
+    claude: claude_workspace::ClaudeWorkspace,
     cwd: String,
     pending_thread_cwd: Option<String>,
     new_task_picker_open: bool,
@@ -4181,6 +4387,7 @@ struct HarnessApp {
     queue_start_generation: u64,
     queue_refresh_generation: u64,
     queue_operations: HashMap<String, QueueOperation>,
+    expanded_queued_prompts: HashMap<String, ExpandedQueuedPrompt>,
     queued_turns: VecDeque<QueuedTurnSubmission>,
     pending_send_flushes: HashSet<String>,
     pending_send_errors: HashMap<String, SharedString>,
@@ -6520,6 +6727,35 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn render_workspace_tab(&self, mode: WorkspaceMode, cx: &Context<Self>) -> AnyElement {
+        let (identifier, label) = match mode {
+            WorkspaceMode::Chat => ("workspace-chat", "Chat"),
+            WorkspaceMode::Codex => ("workspace-codex", "Codex"),
+            WorkspaceMode::Claude => ("workspace-claude", "Claude"),
+        };
+        let button = Button::new(identifier, label)
+            .size(ButtonSize::Compact)
+            .style(if self.workspace_mode == mode { ButtonStyle::Tinted(TintColor::Accent) } else { ButtonStyle::Subtle })
+            .on_click(cx.listener(move |this, _, _, cx| this.set_workspace_mode(mode, cx)))
+            .into_any_element();
+        let cwd = self.cwd.clone();
+        let replay_count = self.replay_count;
+        let mut session = self.session_state();
+        session.workspace_mode = mode;
+        right_click_menu(format!("{identifier}-context-menu"))
+            .trigger(move |_, _, _| button)
+            .menu(move |window, cx| {
+                let cwd = cwd.clone();
+                let session = session.clone();
+                ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.item(ContextMenuEntry::new("Open in New Window").handler(move |_, cx| {
+                        open_harness_window(cwd.clone(), replay_count, None, session.clone(), cx);
+                    }))
+                })
+            })
+            .into_any_element()
+    }
+
     fn render_chat_model_selector(&self, cx: &Context<Self>) -> AnyElement {
         let selected = self.selected_chat_model.as_deref();
         let selected_effort = self.selected_chat_effort.as_deref();
@@ -6785,6 +7021,34 @@ impl HarnessApp {
         send_blocked: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            let has_pending = self.claude.selected_draft_id.as_ref()
+                .is_some_and(|key| self.composer_drafts.claude_pending_sends.contains_key(key));
+            return div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .when(self.claude.projection.active, |this| {
+                    this.child(
+                        IconButton::new("stop-claude", IconName::Stop)
+                            .tooltip(Tooltip::text("Stop native Claude"))
+                            .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                    )
+                })
+                .child(
+                    IconButton::new("send-claude", IconName::Send)
+                        .disabled(send_blocked || (composer_empty && !has_pending))
+                        .tooltip(Tooltip::text(if has_pending {
+                            "Check or retry the previous send using its original ID"
+                        } else if self.claude.projection.active {
+                            "Add prompt to native Claude's queue"
+                        } else {
+                            "Send to native Claude"
+                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.send_claude(cx))),
+                )
+                .into_any_element();
+        }
         if self.workspace_mode == WorkspaceMode::Chat {
             let label = if self.chat_sending {
                 "Wait for the current ChatGPT response"
@@ -6890,10 +7154,11 @@ impl HarnessApp {
     }
 
     fn render_outbound_tray(
-        &self,
+        &mut self,
         pending_outbound: Option<AnyElement>,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        refresh_expanded_queued_prompts(&mut self.expanded_queued_prompts, &self.queued_turns);
         if (self.queued_turns.is_empty() && pending_outbound.is_none())
             || !queue_state_is_visible(
                 self.selected_thread_id.as_deref(),
@@ -6914,7 +7179,7 @@ impl HarnessApp {
             div()
                 .id("outbound-tray")
                 .flex_none()
-                .max_h(px(192.))
+                .max_h(px(if self.expanded_queued_prompts.is_empty() { 192. } else { 360. }))
                 .border_t_1()
                 .border_color(visuals.divider)
                 .bg(visuals.pending_surface)
@@ -6929,6 +7194,9 @@ impl HarnessApp {
                             .overflow_y_scroll()
                             .children(self.queued_turns.iter().enumerate().map(|(index, entry)| {
                             let client_id = entry.client_user_message_id.clone();
+                            let preview_key = entry.preview_key();
+                            let expanded_segments = self.expanded_queued_prompts.get(&preview_key).map(|preview| preview.segments.clone());
+                            let expanded = expanded_segments.is_some();
                             let queue_ready = entry.id.is_some();
                             let operation = operations.get(&client_id).copied();
                             let operation_pending = operation.is_some();
@@ -6957,6 +7225,8 @@ impl HarnessApp {
                             let weak_send = weak.clone();
                             let weak_remove = weak.clone();
                             let weak_drop = weak.clone();
+                            let weak_expand = weak.clone();
+                            let expanded_key = preview_key.clone();
                             let pending_controls = (!queue_ready && operation.is_none()).then(|| {
                                 let weak_retry = weak.clone();
                                 let weak_pending_edit = weak.clone();
@@ -7090,7 +7360,9 @@ impl HarnessApp {
                             let drag_style_target = target_client_id.clone();
                             let drop_predicate_target = target_client_id.clone();
                             let drop_target = target_client_id.clone();
-                            div()
+                            div().id(("queued-prompt-container", index)).flex_none().flex().flex_col()
+                                .when(index + 1 < queue_count, |this| this.border_b_1().border_color(colors.border_variant))
+                                .child(div()
                                 .id(("queued-prompt", index))
                                 .group("queued-prompt")
                                 .h(px(32.))
@@ -7103,9 +7375,6 @@ impl HarnessApp {
                                 .flex()
                                 .items_center()
                                 .gap_0p5()
-                                .when(index + 1 < queue_count, |this| {
-                                    this.border_b_1().border_color(colors.border_variant)
-                                })
                                 .drag_over::<DraggedQueuedTurn>(move |style, dragged, _, cx| {
                                     if dragged.client_user_message_id == drag_style_target {
                                         return style;
@@ -7139,6 +7408,22 @@ impl HarnessApp {
                                         .ok();
                                 })
                                 .child(drag_handle)
+                                .child(IconButton::new(("expand-queued-prompt", index), if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                    .shape(IconButtonShape::Square).size(ButtonSize::Compact).style(ButtonStyle::Subtle)
+                                    .aria_label(if expanded { "Collapse queued prompt" } else { "Read full queued prompt" })
+                                    .tooltip(Tooltip::text(if expanded { "Collapse prompt" } else { "Read full prompt without sending it" }))
+                                    .on_click(move |_, _, cx| {
+                                        if let Err(error) = weak_expand.update(cx, |this, cx| {
+                                            if this.expanded_queued_prompts.remove(&expanded_key).is_none()
+                                                && let Some(entry) = this.queued_turns.iter().find(|entry| entry.preview_key() == expanded_key)
+                                            {
+                                                this.expanded_queued_prompts.insert(expanded_key.clone(), ExpandedQueuedPrompt::new(&entry.input));
+                                            }
+                                            cx.notify();
+                                        }) {
+                                            log::warn!("Could not expand queued prompt: {error:#}");
+                                        }
+                                    }))
                                 .child(
                                     div()
                                         .flex_1()
@@ -7349,7 +7634,21 @@ impl HarnessApp {
                                                 )
                                             })
                                         }),
-                                )
+                                ))
+                                .when_some(expanded_segments, |this, segments| {
+                                    let copy_text = queued_submission_text(&entry.input);
+                                    this.child(div().id(("queued-prompt-full-text", index)).min_w_0().px_3().pb_2().flex().flex_col().gap_2()
+                                        .font_harness_reading(cx)
+                                        .child(Button::new(("copy-queued-prompt", index), "Copy text").style(ButtonStyle::Subtle).label_size(LabelSize::Small)
+                                            .on_click(move |_, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()))))
+                                        .children(segments.into_iter().map(|segment| match segment {
+                                            QueuedPromptPreviewSegment::Text(text) => div().min_w_0().w_full().whitespace_normal().child(text).into_any_element(),
+                                            QueuedPromptPreviewSegment::Image { image, dimensions } => {
+                                                let ratio = dimensions.map(|(width, height)| width as f32 / height.max(1) as f32).unwrap_or(1.);
+                                                gpui::img(image).w(px((120. * ratio).min(320.))).h(px(120.)).object_fit(ObjectFit::Contain).into_any_element()
+                                            }
+                                        })))
+                                })
                             })),
                     )
                 })
@@ -7879,11 +8178,6 @@ impl HarnessApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let session = if replay_count.is_some() {
-            HarnessSessionState::default()
-        } else {
-            session
-        };
         let explicitly_opened_thread = initial_thread_id.is_some();
         let initial_thread_id = initial_thread_id.or_else(|| session.selected_thread_id.clone());
         let workspace_mode = if explicitly_opened_thread {
@@ -7911,7 +8205,7 @@ impl HarnessApp {
         let composer = cx.new(|cx| LocalEditor::modal_composer(window, cx));
         let composer_drafts = load_composer_drafts();
         let composer_draft_thread_id = initial_thread_id.clone();
-        let queued_turns = initial_thread_id
+        let mut queued_turns = initial_thread_id
             .as_deref()
             .map(|thread_id| pending_sends_for_thread(&composer_drafts, thread_id))
             .unwrap_or_default();
@@ -8109,7 +8403,10 @@ impl HarnessApp {
         .detach();
         let mut model = match comparison_fixture_path() {
             Some(path) => match load_comparison_fixture(&path) {
-                Ok(model) => model,
+                Ok((model, fixture_queue)) => {
+                    queued_turns = fixture_queue;
+                    model
+                }
                 Err(error) => {
                     log::error!(
                         "failed to load interface comparison fixture {}: {error:#}",
@@ -8199,6 +8496,7 @@ impl HarnessApp {
         let palette_state = palette::load_state();
 
         let mut this = Self {
+            claude: claude_workspace::ClaudeWorkspace::new(session.selected_claude_id),
             cwd,
             pending_thread_cwd,
             new_task_picker_open: false,
@@ -8345,6 +8643,7 @@ impl HarnessApp {
             queue_start_generation: 0,
             queue_refresh_generation: 0,
             queue_operations: HashMap::new(),
+            expanded_queued_prompts: HashMap::new(),
             queued_turns,
             pending_send_flushes: HashSet::new(),
             pending_send_errors: HashMap::new(),
@@ -8583,10 +8882,13 @@ impl HarnessApp {
         if replay_count.is_none() {
             this.start_codex_update_watcher(cx);
             this.connect(cx);
-            if this.workspace_mode == WorkspaceMode::Chat {
-                this.refresh_chat_conversations(cx);
-                this.refresh_chat_models(cx);
-            }
+        }
+        if this.workspace_mode == WorkspaceMode::Chat {
+            this.refresh_chat_conversations(cx);
+            this.refresh_chat_models(cx);
+        }
+        if this.workspace_mode == WorkspaceMode::Claude {
+            this.refresh_claude(cx);
         }
         this
     }
@@ -8596,6 +8898,7 @@ impl HarnessApp {
             workspace_mode: self.workspace_mode,
             selected_thread_id: self.selected_thread_id.clone(),
             selected_chat_id: self.selected_chat_id.clone(),
+            selected_claude_id: self.claude.selected_id.clone(),
             chat_new_draft: self.chat_new_draft,
             pending_thread_cwd: self.pending_thread_cwd.clone(),
             sidebar_open: self.sidebar_open,
@@ -9099,18 +9402,20 @@ impl HarnessApp {
         let attach_cache_bytes = model::TranscriptModel::persisted_transcript_size(thread_id)
             .ok()
             .flatten();
+        // Older caches may contain a live suffix after a missing historical
+        // segment. Without a checked anchor, reconcile from the start once.
         let cached_protocol_ids = self
             .model
-            .items
+            .history_anchor
             .iter()
-            .filter_map(|item| item.protocol_id.clone())
-            .filter(|id| history_item_id_is_durable(id))
+            .filter(|id| self.model.items.iter().any(|item| item.protocol_id.as_ref() == Some(id)))
+            .cloned()
             .collect::<HashSet<_>>();
         if attach_cache_bytes.is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES) {
             // A thin attach is the only safe automatic path for an oversized
             // local transcript. If even that kills App Server, do not turn one
             // failure into a repeated OOM loop; Refresh remains an explicit
-            // retry and a successful attach clears this sentinel below.
+            // retry and completed history recovery clears this sentinel below.
             self.reconnect_attempts = MAX_RECONNECT_ATTEMPTS;
         }
         let thread_id = thread_id.to_owned();
@@ -9232,7 +9537,6 @@ impl HarnessApp {
                     this.attach_cache_bytes = None;
                     this.attaching_thread = false;
                     this.thread_read_only_reason = None;
-                    this.reconnect_attempts = 0;
                     this.error = None;
                     this.refresh_queued_turns(cx);
                     this.schedule_child_hierarchy_refresh(cx);
@@ -9246,14 +9550,22 @@ impl HarnessApp {
             }
 
             let history_started_at = Instant::now();
+            let history_tip = cx.background_spawn({
+                let path = attached.thread.path.clone();
+                let thread_id = thread_id.clone();
+                async move { codex_history::read_tip(path.as_deref(), &thread_id) }
+            }).await;
             let mut turns_desc = Vec::new();
             let mut seen_turn_ids = HashSet::new();
             let mut seen_cursors = HashSet::new();
             let mut found_overlap = false;
             let mut reached_history_start = false;
-            let mut catchup_error = None;
+            let mut catchup_error = history_tip.as_ref().err().map(ToString::to_string);
 
             for page_index in 0..MAX_HISTORY_CATCHUP_PAGES {
+                if catchup_error.is_some() {
+                    break;
+                }
                 if let Some(cursor) = cursor.as_ref()
                     && !seen_cursors.insert(cursor.clone())
                 {
@@ -9306,7 +9618,15 @@ impl HarnessApp {
             if !found_overlap && !reached_history_start && catchup_error.is_none() {
                 catchup_error = Some("History catch-up exceeded its safety page limit".into());
             }
+            if let Ok(Some(tip)) = history_tip
+                && let Err(error) = tip.verify_turns(&turns_desc)
+            {
+                catchup_error = Some(error.to_string());
+            }
             let fetched_entries = chronological_thread_item_entries(turns_desc);
+            let history_anchor = fetched_entries.iter().rev()
+                .find(|entry| history_item_id_is_durable(&entry.item.id))
+                .map(|entry| entry.item.id.clone());
             let entries = if found_overlap {
                 history_entries_from_last_durable_overlap(
                     fetched_entries,
@@ -9338,7 +9658,9 @@ impl HarnessApp {
                     .items
                     .get(this.selected_item)
                     .map(|item| item.key.clone());
-                let outcome = if found_overlap {
+                let outcome = if catchup_error.is_some() {
+                    model::ThreadHistoryMergeOutcome::default()
+                } else if found_overlap {
                     this.model
                         .merge_thread_item_entries_protecting(&entries, &protected_keys)
                 } else if reached_history_start {
@@ -9423,6 +9745,12 @@ impl HarnessApp {
                         }
                     }
                     this.set_transcript_history_complete(true);
+                    // Live events may have appended past a gap. Only a checked
+                    // server page can advance the persisted continuity anchor.
+                    this.model.history_anchor = history_anchor;
+                    // A live attach alone is not recovery: its first history
+                    // response may be what repeatedly closes the transport.
+                    this.reconnect_attempts = 0;
                     this.persist_transcript_in_background(&thread_id, cx);
                     this.error = None;
                     log::info!(
@@ -9920,7 +10248,7 @@ impl HarnessApp {
         let mut auto_focus_request: Option<(usize, String)> = None;
         for item_key in dirty {
             let item = self
-                .model
+                .active_transcript_model()
                 .items
                 .iter()
                 .find(|item| item.key == item_key)
@@ -9940,7 +10268,7 @@ impl HarnessApp {
             match surface_sync_decision(is_live, unresolved, responding, exists) {
                 SurfaceSyncDecision::Ignore | SurfaceSyncDecision::KeepResponding => {}
                 SurfaceSyncDecision::Remove => {
-                    self.remove_request_surface(&item_key, true, window, cx);
+                    self.remove_request_surface(&item_key, item.is_some(), window, cx);
                 }
                 SurfaceSyncDecision::Upsert => {
                     let (Some(item), Some(request)) = (item, request) else {
@@ -9971,7 +10299,7 @@ impl HarnessApp {
                         let focus_item_key = item_key.clone();
                         cx.on_focus_in(&surface_focus, window, move |this, _window, cx| {
                             if let Some(index) = this
-                                .model
+                                .active_transcript_model()
                                 .items
                                 .iter()
                                 .position(|item| item.key == focus_item_key)
@@ -10016,7 +10344,7 @@ impl HarnessApp {
                         composer_empty,
                         focus_mode,
                     ) && let Some(index) = self
-                        .model
+                        .active_transcript_model()
                         .items
                         .iter()
                         .position(|item| item.key == item_key)
@@ -10036,14 +10364,14 @@ impl HarnessApp {
             cx.defer_in(window, move |this, window, cx| {
                 let composer_empty = this.composer.read(cx).text(cx).trim().is_empty();
                 let Some(index) = this
-                    .model
+                    .active_transcript_model()
                     .items
                     .iter()
                     .position(|item| item.key == item_key)
                 else {
                     return;
                 };
-                let unresolved = this.model.items[index]
+                let unresolved = this.active_transcript_model().items[index]
                     .pending_request
                     .as_ref()
                     .is_some_and(|request| !request.resolved);
@@ -10090,6 +10418,37 @@ impl HarnessApp {
         event: RequestSurfaceRespond,
         cx: &mut Context<Self>,
     ) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            if let Some(item) = self
+                .claude
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.key == event.item_key)
+                && let Some(request) = item
+                    .pending_request
+                    .as_ref()
+                    .filter(|request| !request.resolved)
+            {
+                let action = match request.method.as_str() {
+                    "claude/questions" => {
+                        match claude_native::question_action(&item.raw["native"], &event.response) {
+                            Ok(action) => action,
+                            Err(error) => {
+                                self.claude.error = Some(error.to_string().into());
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    }
+                    "claude/permission" => json!({"method":"dialog_reply", "dialogId":request.id,
+                        "expectedDialog":item.raw["native"], "reply":event.response}),
+                    _ => return,
+                };
+                self.claude_action(action, Some(event.item_key), cx);
+            }
+            return;
+        }
         let Some(index) = self
             .model
             .items
@@ -10126,7 +10485,7 @@ impl HarnessApp {
 
     fn focus_selected_request_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item_key) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .map(|item| item.key.clone())
@@ -10142,14 +10501,15 @@ impl HarnessApp {
         } else {
             FocusMode::Request
         };
-        self.list_state.scroll_to_reveal_item(self.selected_item);
+        self.active_transcript_list_state()
+            .scroll_to_reveal_item(self.selected_item);
         surface.update(cx, |surface, cx| surface.focus(window, cx));
         cx.notify();
     }
 
     fn return_from_request(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
@@ -10168,6 +10528,10 @@ impl HarnessApp {
         dirty_items: &[usize],
         cx: &mut Context<Self>,
     ) -> bool {
+        // Codex can stream in the background while another provider owns the shared editor.
+        if self.workspace_mode != WorkspaceMode::Codex {
+            return true;
+        }
         let new_model_item_count = self.model.items.len();
         if new_model_item_count < old_model_item_count {
             return false;
@@ -10237,26 +10601,42 @@ impl HarnessApp {
     }
 
     fn active_transcript_model(&self) -> &TranscriptModel {
-        if self.workspace_mode == WorkspaceMode::Chat {
-            &self.chat_transcript
-        } else {
-            &self.model
+        match self.workspace_mode {
+            WorkspaceMode::Chat => &self.chat_transcript,
+            WorkspaceMode::Claude => &self.claude.transcript,
+            WorkspaceMode::Codex => &self.model,
         }
     }
 
     fn active_transcript_model_mut(&mut self) -> &mut TranscriptModel {
-        if self.workspace_mode == WorkspaceMode::Chat {
-            &mut self.chat_transcript
-        } else {
-            &mut self.model
+        match self.workspace_mode {
+            WorkspaceMode::Chat => &mut self.chat_transcript,
+            WorkspaceMode::Claude => &mut self.claude.transcript,
+            WorkspaceMode::Codex => &mut self.model,
         }
     }
 
     fn active_transcript_list_state(&self) -> &ListState {
-        if self.workspace_mode == WorkspaceMode::Chat {
-            &self.chat_list_state
-        } else {
-            &self.list_state
+        match self.workspace_mode {
+            WorkspaceMode::Chat => &self.chat_list_state,
+            WorkspaceMode::Claude => &self.claude.list,
+            WorkspaceMode::Codex => &self.list_state,
+        }
+    }
+
+    fn active_task_count(&self) -> usize {
+        match self.workspace_mode {
+            WorkspaceMode::Chat => self.chat_conversations.len(),
+            WorkspaceMode::Claude => self.claude.sessions.len(),
+            WorkspaceMode::Codex => self.sidebar_threads.len(),
+        }
+    }
+
+    fn active_sidebar_list_state(&self) -> &ListState {
+        match self.workspace_mode {
+            WorkspaceMode::Chat => &self.chat_sidebar_list_state,
+            WorkspaceMode::Claude => &self.claude.sidebar,
+            WorkspaceMode::Codex => &self.task_list_state,
         }
     }
 
@@ -10277,6 +10657,35 @@ impl HarnessApp {
             return;
         }
         self.workspace_mode = mode;
+        let draft_id = match mode {
+            WorkspaceMode::Claude => self.claude.selected_draft_id.clone().or_else(|| Some(format!(
+                "claude:{}",
+                self.claude.selected_id.as_deref().unwrap_or("new")
+            ))),
+            WorkspaceMode::Chat => Some(format!(
+                "chat:{}",
+                self.selected_chat_id.as_deref().unwrap_or("new")
+            )),
+            WorkspaceMode::Codex => self.selected_thread_id.clone(),
+        };
+        self.switch_composer_draft_context(draft_id, cx);
+        self.dirty_request_surfaces
+            .extend(self.request_surfaces.keys().cloned());
+        let requests: Vec<_> = self
+            .active_transcript_model()
+            .items
+            .iter()
+            .filter(|item| {
+                item.pending_request
+                    .as_ref()
+                    .is_some_and(|request| !request.resolved)
+            })
+            .map(|item| item.key.clone())
+            .collect();
+        if mode == WorkspaceMode::Claude {
+            self.live_request_keys.extend(requests.iter().cloned());
+        }
+        self.dirty_request_surfaces.extend(requests);
         self.focus_mode = FocusMode::Tasks;
         self.selected_task = 0;
         if mode == WorkspaceMode::Chat && self.chat_conversations.is_empty() {
@@ -10284,6 +10693,9 @@ impl HarnessApp {
         }
         if mode == WorkspaceMode::Chat && self.chat_models.is_empty() {
             self.refresh_chat_models(cx);
+        }
+        if mode == WorkspaceMode::Claude && self.claude.selected.is_none() {
+            self.refresh_claude(cx);
         }
         drop(self.sync_transcript_document(cx));
         self.rich_navigation_selection = None;
@@ -10733,6 +11145,10 @@ impl HarnessApp {
     }
 
     fn refresh_codex(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            self.refresh_claude(cx);
+            return;
+        }
         self.load_server_options(cx);
         self.refresh_threads(cx);
         self.start_codex_update_watcher(cx);
@@ -10867,6 +11283,13 @@ impl HarnessApp {
                     }
                 }
 
+                let Ok(history_path) = this.update(cx, |this, _| {
+                    this.sidebar_thread_by_id(&thread_id).and_then(|thread| thread.path.clone())
+                }) else { return; };
+                let history_tip = cx.background_spawn({
+                    let thread_id = thread_id.clone();
+                    async move { codex_history::read_tip(history_path.as_deref(), &thread_id) }
+                }).await;
                 let thread = match client.read_thread(&thread_id).await {
                     Ok(thread) => thread,
                     Err(error) => {
@@ -10875,10 +11298,22 @@ impl HarnessApp {
                     }
                 };
                 active = thread_has_active_turn(&thread);
+                let history_error = codex_history::snapshot_error(&history_tip, &thread);
                 if this
                     .update(cx, |this, cx| {
+                        if this.selected_thread_id.as_deref() != Some(thread_id.as_str())
+                            || this.thread_read_only_reason.is_none()
+                        {
+                            return;
+                        }
+                        let was_incomplete = !this.transcript_history_complete;
                         this.apply_read_only_thread_refresh(&thread, cx);
+                        this.set_transcript_history_complete(history_error.is_none());
+                        if was_incomplete || history_error.is_some() {
+                            this.error = history_error.map(Into::into);
+                        }
                         this.thread_snapshots.insert(thread);
+                        cx.notify();
                     })
                     .is_err()
                 {
@@ -11121,7 +11556,9 @@ impl HarnessApp {
         ) {
             self.reject_pending_requests(cx);
         }
-        self.switch_composer_draft_context(Some(thread_id.clone()), cx);
+        if self.workspace_mode == WorkspaceMode::Codex {
+            self.switch_composer_draft_context(Some(thread_id.clone()), cx);
+        }
         self.read_only_refresh_task = Task::ready(());
         if !preserve_background_work {
             self.turn_task = Task::ready(());
@@ -11215,10 +11652,16 @@ impl HarnessApp {
             return;
         }
 
+        let history_path = thread.path.clone();
         self.thread_open_task = cx.spawn(async move |this, cx| {
+            let history_tip = cx.background_spawn({
+                let thread_id = thread_id.clone();
+                async move { codex_history::read_tip(history_path.as_deref(), &thread_id) }
+            }).await;
             if !can_accept_direct_input {
                 match client.read_thread(&thread_id).await {
                     Ok(thread) => {
+                        let history_error = codex_history::snapshot_error(&history_tip, &thread);
                         let active = thread_has_active_turn(&thread);
                         this.update(cx, |this, cx| {
                             if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
@@ -11236,7 +11679,8 @@ impl HarnessApp {
                                 "This child task does not accept direct input.".into(),
                             );
                             this.schedule_read_only_refresh(active, cx);
-                            this.error = None;
+                            this.set_transcript_history_complete(history_error.is_none());
+                            this.error = history_error.map(Into::into);
                             this.complete_thread_open_request_routing(true, cx);
                             cx.notify();
                         })
@@ -11300,6 +11744,7 @@ impl HarnessApp {
                     }
                     match read {
                         Ok(thread) => {
+                            let history_error = codex_history::snapshot_error(&history_tip, &thread);
                             let active = thread_has_active_turn(&thread);
                             this.update(cx, |this, cx| {
                                 if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
@@ -11318,7 +11763,8 @@ impl HarnessApp {
                                         .into(),
                                 );
                                 this.schedule_read_only_refresh(active, cx);
-                                this.error = None;
+                                this.set_transcript_history_complete(history_error.is_none());
+                                this.error = history_error.map(Into::into);
                                 this.complete_thread_open_request_routing(true, cx);
                                 cx.notify();
                             })
@@ -11355,6 +11801,7 @@ impl HarnessApp {
             };
 
             let resumed_thread = resumed.thread.clone();
+            let history_error = codex_history::snapshot_error(&history_tip, &resumed_thread);
             this.update(cx, |this, cx| {
                 let update_started_at = Instant::now();
                 if this.selected_thread_id.as_deref() != Some(thread_id.as_str()) {
@@ -11371,7 +11818,8 @@ impl HarnessApp {
                 this.loading_thread = false;
                 this.attaching_thread = false;
                 this.thread_read_only_reason = None;
-                this.error = None;
+                this.set_transcript_history_complete(history_error.is_none());
+                this.error = history_error.map(Into::into);
                 this.complete_thread_open_request_routing(true, cx);
                 cx.notify();
                 if thread_load_diagnostics_enabled() {
@@ -11763,6 +12211,10 @@ impl HarnessApp {
     }
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            self.new_claude(window, cx);
+            return;
+        }
         if self.workspace_mode == WorkspaceMode::Chat {
             self.begin_new_chat(window, cx);
             return;
@@ -11971,6 +12423,10 @@ impl HarnessApp {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            self.send_claude(cx);
+            return;
+        }
         if self.workspace_mode == WorkspaceMode::Chat {
             self.send_chatgpt(window, cx);
             return;
@@ -12183,7 +12639,9 @@ impl HarnessApp {
                             this.selected_thread_id = Some(thread_id.clone());
                             this.pending_thread_cwd = None;
                             this.persist_session();
-                            if opened_thread.is_some() {
+                            if opened_thread.is_some()
+                                && this.workspace_mode == WorkspaceMode::Codex
+                            {
                                 this.switch_composer_draft_context(Some(thread_id), cx);
                             }
                             if let Some(opened_thread) = opened_thread.as_ref() {
@@ -12939,6 +13397,10 @@ impl HarnessApp {
     }
 
     fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode != WorkspaceMode::Codex {
+            self.send(window, cx);
+            return;
+        }
         let Some(turn_id) = self.model.current_turn_id.clone() else {
             self.send(window, cx);
             return;
@@ -13025,6 +13487,13 @@ impl HarnessApp {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            self.claude_action(json!({"method":"interrupt"}), None, cx);
+            return;
+        }
+        if self.workspace_mode != WorkspaceMode::Codex {
+            return;
+        }
         if self.turn_interrupt_pending {
             return;
         }
@@ -13199,7 +13668,7 @@ impl HarnessApp {
 
     fn move_request_question(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
@@ -13233,7 +13702,7 @@ impl HarnessApp {
 
     fn move_request_option(&mut self, delta: isize, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
@@ -13280,14 +13749,14 @@ impl HarnessApp {
         cx.notify();
     }
 
-    fn choose_current_request_option(&mut self, cx: &mut Context<Self>) {
+    fn choose_current_request_option(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
         {
-            entry.entity.update(cx, |surface, cx| surface.choose(cx));
+            entry.entity.update(cx, |surface, cx| surface.choose(window, cx));
             return;
         }
         let Some(item) = self.model.items.get(self.selected_item) else {
@@ -13366,12 +13835,12 @@ impl HarnessApp {
 
     fn choose_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
         {
-            entry.entity.update(cx, |surface, cx| surface.choose(cx));
+            entry.entity.update(cx, |surface, cx| surface.choose(window, cx));
             return;
         }
         let Some(item) = self.model.items.get(self.selected_item) else {
@@ -13532,7 +14001,7 @@ impl HarnessApp {
 
     fn submit_active_request(&mut self, cx: &mut Context<Self>) {
         if let Some(entry) = self
-            .model
+            .active_transcript_model()
             .items
             .get(self.selected_item)
             .and_then(|item| self.request_surfaces.get(&item.key))
@@ -14285,6 +14754,13 @@ impl HarnessApp {
                 self.selected_thread_id.as_deref(),
                 self.selected_task,
             );
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            self.selected_task = self
+                .claude
+                .sessions
+                .iter()
+                .position(|session| Some(&session.id) == self.claude.selected_id.as_ref())
+                .unwrap_or(self.selected_task);
         } else if let Some(selected_chat_id) = self.selected_chat_id.as_deref() {
             self.selected_task = self
                 .chat_conversations
@@ -14293,20 +14769,11 @@ impl HarnessApp {
                 .unwrap_or(self.selected_task);
         }
         self.transcript_focus.focus(window, cx);
-        let task_count = if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_conversations.len()
-        } else {
-            self.sidebar_threads.len()
-        };
+        let task_count = self.active_task_count();
         if task_count > 0 {
             self.selected_task = self.selected_task.min(task_count - 1);
-            if self.workspace_mode == WorkspaceMode::Chat {
-                self.chat_sidebar_list_state
-                    .scroll_to_reveal_item(self.selected_task);
-            } else {
-                self.task_list_state
-                    .scroll_to_reveal_item(self.selected_task);
-            }
+            self.active_sidebar_list_state()
+                .scroll_to_reveal_item(self.selected_task);
         }
         self.persist_session();
         cx.notify();
@@ -14383,11 +14850,7 @@ impl HarnessApp {
     }
 
     fn move_task_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let task_count = if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_conversations.len()
-        } else {
-            self.sidebar_threads.len()
-        };
+        let task_count = self.active_task_count();
         if task_count == 0 {
             return;
         }
@@ -14395,13 +14858,8 @@ impl HarnessApp {
             .selected_task
             .saturating_add_signed(delta)
             .min(task_count - 1);
-        if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_sidebar_list_state
-                .scroll_to_reveal_item(self.selected_task);
-        } else {
-            self.task_list_state
-                .scroll_to_reveal_item(self.selected_task);
-        }
+        self.active_sidebar_list_state()
+            .scroll_to_reveal_item(self.selected_task);
         cx.notify();
     }
 
@@ -14415,6 +14873,19 @@ impl HarnessApp {
     }
 
     fn toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            if self
+                .active_transcript_model()
+                .items
+                .get(self.selected_item)
+                .is_some_and(|item| self.request_surfaces.contains_key(&item.key))
+            {
+                self.focus_selected_request_surface(window, cx);
+            } else {
+                self.toggle_item_at(self.selected_item, window, cx);
+            }
+            return;
+        }
         if self.workspace_mode == WorkspaceMode::Chat {
             self.toggle_item_at(self.selected_item, window, cx);
             return;
@@ -14493,7 +14964,7 @@ impl HarnessApp {
         }
         self.active_transcript_list_state()
             .splice(index..index + 1, 1);
-        if self.workspace_mode == WorkspaceMode::Chat {
+        if self.workspace_mode != WorkspaceMode::Codex {
             drop(self.sync_transcript_document(cx));
         } else if rich_vim_experiment() {
             let item_count = self.active_transcript_model().items.len();
@@ -14563,7 +15034,13 @@ impl HarnessApp {
         cx.notify();
     }
 
-    fn open_selected_task(&mut self, cx: &mut Context<Self>) {
+    fn open_selected_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.workspace_mode == WorkspaceMode::Claude {
+            if let Some(session) = self.claude.sessions.get(self.selected_task).cloned() {
+                self.open_claude(session, window, cx);
+            }
+            return;
+        }
         if self.workspace_mode == WorkspaceMode::Chat {
             if let Some(conversation) = self.chat_conversations.get(self.selected_task) {
                 let id = conversation.id.clone();
@@ -14892,7 +15369,7 @@ impl HarnessApp {
     fn key_context(&self) -> KeyContext {
         let mut context = KeyContext::new_with_defaults();
         context.add("Harness");
-        if self.turn_active() {
+        if self.active_response() {
             context.add("HarnessTurnActive");
         }
         if self.local_escape_target_active() {
@@ -14929,6 +15406,14 @@ impl HarnessApp {
             || self.selected_thread_reported_active()
             || self.turn_start_pending
             || self.queue_start_pending
+    }
+
+    fn active_response(&self) -> bool {
+        match self.workspace_mode {
+            WorkspaceMode::Chat => self.chat_sending,
+            WorkspaceMode::Claude => self.claude.projection.active,
+            WorkspaceMode::Codex => self.turn_active(),
+        }
     }
 
     fn selected_thread_reported_active(&self) -> bool {
@@ -15029,10 +15514,7 @@ impl HarnessApp {
             child_thread_title(&thread)
         };
         let project = if row.depth == 0 {
-            Path::new(&thread.cwd)
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Codex".into())
+            project_display_name(Path::new(&thread.cwd), "Codex")
         } else {
             child_thread_identity(&thread)
         };
@@ -15164,7 +15646,7 @@ impl HarnessApp {
                 let entity = cx.new(|cx| {
                     Markdown::new_with_options(
                         source.to_string().into(),
-                        None,
+                        Some(harness_editor::language_registry(cx)),
                         None,
                         markdown::MarkdownOptions::default(),
                         cx,
@@ -15880,7 +16362,7 @@ impl HarnessApp {
                 let visual_status = (first_command_row && show_status_in_command_body)
                     .then_some(command_status)
                     .flatten()
-                    .and_then(|status| render_command_visual_status(status, cx));
+                    .and_then(|status| render_command_visual_status(status, window, cx));
                 let status_padding = visual_status
                     .as_ref()
                     .map(|(reserved_width, _)| *reserved_width)
@@ -15905,6 +16387,9 @@ impl HarnessApp {
                             rich_command_identity_icon(format!("rich-{index}"), command_status)
                                 .h(harness_routine_activity_row_height(cx)),
                         )
+                    })
+                    .when(!first_command_row, |this| {
+                        this.child(div().w(px(RICH_CARD_LEADING_WIDTH)).flex_none())
                     })
                     .child(
                         div()
@@ -16059,14 +16544,7 @@ impl HarnessApp {
                 .font_harness_code(cx)
                 .line_height(relative(1.35))
                 .text_color(colors.text)
-                .child(
-                    div()
-                        .w_full()
-                        .min_w_0()
-                        .px_1()
-                        .py_0p5()
-                        .child(command_region),
-                )
+                .child(div().w_full().min_w_0().pr_1().child(command_region))
                 .when_some(output_region, |this, output| this.child(output))
                 .into_any_element(),
         )
@@ -17097,7 +17575,8 @@ impl HarnessApp {
         let colors = cx.theme().colors().clone();
         let visuals = HarnessVisualTheme::from_zed(&colors, cx.theme().status());
         let narrow = window.viewport_size().width < px(720.);
-        let narrative = matches!(
+        let recap = transcript_item_is_recap(&item);
+        let narrative = recap || matches!(
             item.kind,
             model::TranscriptKind::User
                 | model::TranscriptKind::Agent
@@ -17178,33 +17657,12 @@ impl HarnessApp {
             item.command_execution_status(),
             Some(model::CommandExecutionStatus::Succeeded)
         );
-        let visible_status = item.display_status().map(ToOwned::to_owned);
+        let visible_status = item
+            .display_status()
+            .filter(|_| item.kind != model::TranscriptKind::Command)
+            .map(ToOwned::to_owned);
         let header_activity_summary: Option<SharedString> = match item.kind {
-            model::TranscriptKind::Web => item
-                .raw
-                .get("detail")
-                .and_then(Value::as_str)
-                .filter(|detail| !detail.trim().is_empty())
-                .map(SharedString::from)
-                .or_else(|| {
-                    let presentation = web_search_presentation(&item.raw);
-                    let query_count = presentation.queries.len();
-                    let source_count = presentation.results.len();
-                    Some(
-                        match (query_count, source_count) {
-                            (0, sources) => format!(
-                                "{sources} {}",
-                                if sources == 1 { "source" } else { "sources" }
-                            ),
-                            (queries, sources) => format!(
-                                "{queries} {} · {sources} {}",
-                                if queries == 1 { "query" } else { "queries" },
-                                if sources == 1 { "source" } else { "sources" },
-                            ),
-                        }
-                        .into(),
-                    )
-                }),
+            model::TranscriptKind::Web => web_activity_summary(&item.raw).map(SharedString::from),
             model::TranscriptKind::Plan => plan_progress(&item.raw)
                 .map(|(completed, total)| format!("{completed}/{total}").into()),
             _ => None,
@@ -17218,7 +17676,7 @@ impl HarnessApp {
         let header_command_status = (render_header && item.kind == model::TranscriptKind::Command)
             .then(|| item.command_execution_status())
             .flatten()
-            .and_then(|status| render_command_visual_status(status, cx));
+            .and_then(|status| render_command_visual_status(status, window, cx));
         let disclosure_weak = cx.weak_entity();
         let disclosure_item_key = item.key.clone();
         let is_disclosure = has_collapsible_content
@@ -17273,6 +17731,7 @@ impl HarnessApp {
             .cloned()
             .unwrap_or_default();
         let markdown = (narrative
+            && !recap
             && item.kind != model::TranscriptKind::Reasoning
             && item.expanded
             && !item.content.is_empty()
@@ -17376,6 +17835,11 @@ impl HarnessApp {
                     .child(element)
                     .into_any_element(),
             )
+        } else if recap {
+            Some(Self::render_plain_prose(
+                &item.content, index, rich_search.as_ref(), rich_navigation.as_ref(),
+                Some(rich_pointer_owner.clone()), cx,
+            ))
         } else {
             Some(match item.kind {
                 model::TranscriptKind::User
@@ -17510,9 +17974,7 @@ impl HarnessApp {
             })
             .when(!narrative && !compact_trace && !quiet_stop, |this| {
                 this.px_1()
-                    // Unboxed rows align with prose; bordered cards still
-                    // need their inner inset.
-                    .when(compact_routine_activity, |this| this.pl_0())
+                    .when(routine_activity, |this| this.pl_0())
                     .when(!routine_activity && !unboxed_media, |this| {
                         this.bg(visuals.tool_header_surface)
                     })
@@ -17608,9 +18070,7 @@ impl HarnessApp {
                 .absolute()
                 .top(px(1.))
                 .when(item.kind == model::TranscriptKind::Command, |this| {
-                    // The command body has 2px top padding. Align disclosure
-                    // with its first line, just like the ordinary header.
-                    this.top(px(2.) + (harness_routine_activity_row_height(cx) - px(18.)) / 2.)
+                    this.top((harness_routine_activity_row_height(cx) - px(18.)) / 2.)
                 })
                 .right(px(1.))
                 .size(px(18.))
@@ -17714,6 +18174,11 @@ impl HarnessApp {
                             .overflow_hidden()
                     },
                 )
+                .when(routine_activity, |this| {
+                    // Reserve the border even when unboxed so expanding a
+                    // command or changing its status cannot shift its header.
+                    this.border_1().border_color(gpui::transparent_black())
+                })
                 .when(compact_routine_activity, |this| this.overflow_hidden())
                 .when(expanded_routine_activity, |this| {
                     this.rounded_sm()
@@ -17848,6 +18313,8 @@ impl HarnessApp {
         }
         let response_active = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_sending
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            self.claude.projection.active
         } else {
             self.turn_active()
         };
@@ -17887,6 +18354,14 @@ impl HarnessApp {
 
 impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let composer_placeholder = match self.workspace_mode {
+            WorkspaceMode::Chat => "Ask ChatGPT…",
+            WorkspaceMode::Claude => "Ask Claude…",
+            WorkspaceMode::Codex => "Ask Codex…",
+        };
+        self.composer.update(cx, |editor, cx| {
+            editor.set_placeholder(composer_placeholder, window, cx)
+        });
         let transcript_input_only = rich_vim_experiment();
         self.transcript_editor.update(cx, |editor, cx| {
             editor.set_input_only(transcript_input_only, cx)
@@ -17938,6 +18413,9 @@ impl Render for HarnessApp {
                 || (self.selected_chat_id.is_none() && !self.chat_new_draft)
                 || self.chat_current_node.is_none()
                 || self.selected_chat_model.is_none()
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            !self.claude.projection.ready || self.claude.sending || self.claude.starting
+                || self.claude.settings_pending
         } else {
             composer_send_blocked(
                 composer_empty,
@@ -17949,7 +18427,28 @@ impl Render for HarnessApp {
                 || self.new_task_picker_open
         };
         let composer_status: Option<(SharedString, Color)> =
-            if self.workspace_mode == WorkspaceMode::Chat {
+            if self.workspace_mode == WorkspaceMode::Claude {
+                let status = if self.claude.starting {
+                    Some("Starting Claude…")
+                } else if self.claude.settings_pending {
+                    Some("Updating Claude settings…")
+                } else if self.claude.selected_draft_id.as_ref().is_some_and(|key| {
+                    self.composer_drafts.claude_pending_sends.contains_key(key)
+                }) {
+                    Some("Previous send not confirmed · draft kept")
+                } else if self.claude.projection.ready {
+                    None
+                } else if self.claude.selected_id.as_ref().is_some_and(|id| {
+                    self.claude.opening.contains(id)
+                }) {
+                    Some("Opening conversation…")
+                } else if self.claude.selected_id.is_some() {
+                    Some("Claude isn't connected · draft kept")
+                } else {
+                    None
+                };
+                status.map(|status| (status.into(), Color::Muted))
+            } else if self.workspace_mode == WorkspaceMode::Chat {
                 if self.chat_loading {
                     Some(("Loading ChatGPT conversation…".into(), Color::Muted))
                 } else {
@@ -17995,6 +18494,8 @@ impl Render for HarnessApp {
         let turn_active = self.turn_active();
         let response_active = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_sending
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            self.claude.projection.active
         } else {
             turn_active
         };
@@ -18047,6 +18548,8 @@ impl Render for HarnessApp {
                     )
                     .into_any_element()
             }
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            self.render_claude_sidebar(cx)
         } else if self.replay_count.is_some() {
             div()
                 .flex_1()
@@ -18187,6 +18690,8 @@ impl Render for HarnessApp {
             };
             let provider = if self.workspace_mode == WorkspaceMode::Chat {
                 "ChatGPT"
+            } else if self.workspace_mode == WorkspaceMode::Claude {
+                "Claude"
             } else {
                 "Codex"
             };
@@ -18285,10 +18790,16 @@ impl Render for HarnessApp {
             .vim_command_line
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
-        let context_usage = self.render_context_usage(cx);
-        let fast_mode_control = self.render_fast_mode_control(cx);
-        let model_selector = self.render_model_effort_selector(cx);
-        let permission_selector = self.render_permission_selector(cx);
+        let provider_controls = match self.workspace_mode {
+            WorkspaceMode::Claude => self.render_claude_controls(cx),
+            WorkspaceMode::Chat => self.render_chat_model_selector(cx),
+            WorkspaceMode::Codex => div().flex().items_center().gap_1()
+                .when_some(self.render_context_usage(cx), |row, control| row.child(control))
+                .when_some(self.render_fast_mode_control(cx), |row, control| row.child(control))
+                .child(self.render_permission_selector(cx))
+                .child(self.render_model_effort_selector(cx))
+                .into_any_element(),
+        };
         let composer_actions =
             self.render_composer_actions(turn_active, composer_empty, send_blocked, cx);
         let pending_outbound_proxy = self.render_pending_outbound_proxy(tail_offscreen, cx);
@@ -18609,6 +19120,8 @@ impl Render for HarnessApp {
 
         let surface_error = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_error.clone()
+        } else if self.workspace_mode == WorkspaceMode::Claude {
+            self.claude.error.clone()
         } else {
             self.error.clone()
         };
@@ -18639,7 +19152,7 @@ impl Render for HarnessApp {
                 cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
             )
             .on_action(cx.listener(|this, _: &NormalEscape, window, cx| {
-                if this.turn_active() && !this.local_escape_target_active() {
+                if this.active_response() && !this.local_escape_target_active() {
                     this.stop(cx);
                 } else if let Ok(action) = cx.build_action("vim::ClearOperators", None) {
                     window.dispatch_action(action, cx);
@@ -18662,8 +19175,8 @@ impl Render for HarnessApp {
                 }
             }))
             .on_action(
-                cx.listener(|this, _: &ChooseRequest, _, cx| {
-                    this.choose_current_request_option(cx)
+                cx.listener(|this, _: &ChooseRequest, window, cx| {
+                    this.choose_current_request_option(window, cx)
                 }),
             )
             .on_action(
@@ -18701,12 +19214,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &GoTop, _, cx| {
                 if this.focus_mode == FocusMode::Tasks {
                     this.selected_task = 0;
-                    if this.workspace_mode == WorkspaceMode::Chat {
-                        this.chat_sidebar_list_state
-                            .scroll_to(gpui::ListOffset::default());
-                    } else {
-                        this.task_list_state.scroll_to(gpui::ListOffset::default());
-                    }
+                    this.active_sidebar_list_state().scroll_to(gpui::ListOffset::default());
                 } else {
                     this.selected_item = 0;
                     this.active_transcript_list_state()
@@ -18716,13 +19224,8 @@ impl Render for HarnessApp {
             }))
             .on_action(cx.listener(|this, _: &GoBottom, window, cx| {
                 if this.focus_mode == FocusMode::Tasks {
-                    if this.workspace_mode == WorkspaceMode::Chat {
-                        this.selected_task = this.chat_conversations.len().saturating_sub(1);
-                        this.chat_sidebar_list_state.scroll_to_end();
-                    } else {
-                        this.selected_task = this.sidebar_threads.len().saturating_sub(1);
-                        this.task_list_state.scroll_to_end();
-                    }
+                    this.selected_task = this.active_task_count().saturating_sub(1);
+                    this.active_sidebar_list_state().scroll_to_end();
                 } else {
                     this.go_to_transcript_tail(window, cx);
                 }
@@ -18739,7 +19242,7 @@ impl Render for HarnessApp {
             .on_action(cx.listener(|this, _: &YankItem, _, cx| this.yank_selected(cx)))
             .on_action(cx.listener(|this, _: &PageUp, _, cx| this.scroll_page(-1., cx)))
             .on_action(cx.listener(|this, _: &PageDown, _, cx| this.scroll_page(1., cx)))
-            .on_action(cx.listener(|this, _: &OpenTask, _, cx| this.open_selected_task(cx)))
+            .on_action(cx.listener(|this, _: &OpenTask, window, cx| this.open_selected_task(window, cx)))
             .on_action(cx.listener(|this, _: &OpenSearch, window, cx| this.open_search(window, cx)))
             .on_action(cx.listener(|this, action: &VimSearch, window, cx| {
                 this.open_buffer_search(action.backwards, window, cx)
@@ -18849,10 +19352,14 @@ impl Render for HarnessApp {
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
                                         .aria_label("Refresh threads")
-                                        .tooltip(Tooltip::text(daemon_tooltip.clone()))
+                                        .tooltip(Tooltip::text(if self.workspace_mode == WorkspaceMode::Claude {
+                                            "Refresh saved Claude conversations and native workers. Does not start or resume Claude.".into()
+                                        } else { daemon_tooltip.clone() }))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if this.workspace_mode == WorkspaceMode::Chat {
                                                 this.refresh_chat_conversations(cx)
+                                            } else if this.workspace_mode == WorkspaceMode::Claude {
+                                                this.refresh_claude(cx)
                                             } else {
                                                 this.refresh_codex(cx)
                                             }
@@ -18864,7 +19371,8 @@ impl Render for HarnessApp {
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
                                         .disabled(
-                                            self.chat_sending || self.new_task_picker_open,
+                                            (self.workspace_mode == WorkspaceMode::Chat && self.chat_sending)
+                                                || self.claude.starting || self.new_task_picker_open,
                                         )
                                         .aria_label(if self.workspace_mode == WorkspaceMode::Chat {
                                             "Start a new ChatGPT conversation"
@@ -18886,30 +19394,9 @@ impl Render for HarnessApp {
                                 .gap_1()
                                 .border_b_1()
                                 .border_color(visuals.divider)
-                                .child(
-                                    Button::new("workspace-chat", "Chat")
-                                        .size(ButtonSize::Compact)
-                                        .style(if self.workspace_mode == WorkspaceMode::Chat {
-                                            ButtonStyle::Tinted(TintColor::Accent)
-                                        } else {
-                                            ButtonStyle::Subtle
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_workspace_mode(WorkspaceMode::Chat, cx)
-                                        })),
-                                )
-                                .child(
-                                    Button::new("workspace-codex", "Codex")
-                                        .size(ButtonSize::Compact)
-                                        .style(if self.workspace_mode == WorkspaceMode::Codex {
-                                            ButtonStyle::Tinted(TintColor::Accent)
-                                        } else {
-                                            ButtonStyle::Subtle
-                                        })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.set_workspace_mode(WorkspaceMode::Codex, cx)
-                                        })),
-                                ),
+                                .child(self.render_workspace_tab(WorkspaceMode::Chat, cx))
+                                .child(self.render_workspace_tab(WorkspaceMode::Codex, cx))
+                                .child(self.render_workspace_tab(WorkspaceMode::Claude, cx)),
                         )
                         .child(task_body),
                 )
@@ -18952,11 +19439,8 @@ impl Render for HarnessApp {
                             }),
                     )
                     .when(
-                        if self.workspace_mode == WorkspaceMode::Chat {
-                            self.chat_messages.is_empty()
-                        } else {
-                            self.model.items.is_empty()
-                        },
+                        self.active_transcript_model().items.is_empty()
+                            && !(self.workspace_mode == WorkspaceMode::Claude && self.claude.selected_creation.is_some()),
                         |this| {
                         this.child(
                             div()
@@ -18977,6 +19461,13 @@ impl Render for HarnessApp {
                                     } else {
                                         "Choose a ChatGPT conversation"
                                     }
+                                } else if self.workspace_mode == WorkspaceMode::Claude {
+                                    if self.claude.selected.is_some() {
+                                        claude_workspace::empty_state_message(
+                                            self.claude.projection.ready,
+                                            self.claude.selected_id.as_ref().and_then(|id| self.claude.statuses.get(id)).map(|status| &status.phase),
+                                        )
+                                    } else { "Choose a saved conversation, or use + to start Claude" }
                                 } else if self.loading_thread {
                                     "Loading task history…"
                                 } else if new_thread_needs_project {
@@ -18986,6 +19477,8 @@ impl Render for HarnessApp {
                                 }),
                         )
                     })
+                    .when(self.workspace_mode == WorkspaceMode::Claude && self.claude.selected_creation.is_some(),
+                        |this| this.child(self.render_claude_startup(cx)))
                     .when_some(
                         (self.workspace_mode == WorkspaceMode::Codex)
                             .then_some(outbound_tray)
@@ -19102,22 +19595,7 @@ impl Render for HarnessApp {
                                                     .flex()
                                                     .items_center()
                                                     .gap_1()
-                                                    .when(
-                                                        self.workspace_mode
-                                                            == WorkspaceMode::Codex,
-                                                        |this| {
-                                                            this.when_some(
-                                                                context_usage,
-                                                                |this, usage| this.child(usage),
-                                                            )
-                                                            .when_some(
-                                                                fast_mode_control,
-                                                                |this, control| this.child(control),
-                                                            )
-                                                            .child(permission_selector)
-                                                        },
-                                                    )
-                                                    .child(model_selector)
+                                                    .child(provider_controls)
                                                     .child(composer_actions),
                                             )
                                     }),
@@ -19471,6 +19949,20 @@ fn safe_request_rejection(method: &str, params: &Value) -> RequestReply {
 
 fn request_choices(method: &str, params: &Value) -> Vec<RequestChoice> {
     match method {
+        "claude/permission" => vec![
+            RequestChoice {
+                label: "Allow once".into(),
+                response: json!({"result":{"behavior":"allow","updatedInput":params["input"]}}),
+                completed_status: "allowed".into(),
+                tone: RequestChoiceTone::Allow,
+            },
+            RequestChoice {
+                label: "Deny".into(),
+                response: json!({"result":{"behavior":"deny","feedback":"Denied by user in Harness"}}),
+                completed_status: "denied".into(),
+                tone: RequestChoiceTone::Deny,
+            },
+        ],
         "item/commandExecution/requestApproval" => command_approval_decisions(params)
             .into_iter()
             .filter_map(command_decision_choice)
@@ -19995,6 +20487,9 @@ fn icon_for_kind(kind: model::TranscriptKind) -> IconName {
 /// Harness's protocol projector (`server · tool`), so this is semantic
 /// projection rather than a renderer-specific list of individual tool names.
 fn icon_for_item(item: &TranscriptItem) -> IconName {
+    if transcript_item_is_recap(item) {
+        return IconName::AiClaude;
+    }
     if item.kind != model::TranscriptKind::Tool {
         return icon_for_kind(item.kind);
     }
@@ -20387,11 +20882,20 @@ fn comparison_fixture_uses_zed_transcript_surface_value(
     fixture_present && surface.is_some_and(|value| value.eq_ignore_ascii_case("zed"))
 }
 
-fn load_comparison_fixture(path: &Path) -> anyhow::Result<TranscriptModel> {
+fn load_comparison_fixture(
+    path: &Path,
+) -> anyhow::Result<(TranscriptModel, VecDeque<QueuedTurnSubmission>)> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let fixture: Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-    comparison_fixture_model(&fixture)
+    let queued = fixture
+        .get("queued_prompts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(queued_submission_from_value)
+        .collect();
+    Ok((comparison_fixture_model(&fixture)?, queued))
 }
 
 fn comparison_fixture_model(fixture: &Value) -> anyhow::Result<TranscriptModel> {
@@ -20552,7 +21056,7 @@ fn comparison_fixture_tool(
                 "command": input,
                 "cwd": "/tmp/interface-comparison",
                 "status": status,
-                "exitCode": if status == "completed" { 0 } else { 1 },
+                "exitCode": event.get("exit_code").and_then(Value::as_i64).unwrap_or(if status == "completed" { 0 } else { 1 }),
             }),
             false,
         ),
@@ -20565,7 +21069,7 @@ fn comparison_fixture_tool(
                 "type": "webSearch",
                 "status": status,
                 "query": input,
-                "action": {"type": "search", "queries": [input]},
+                "action": event.get("action").cloned().unwrap_or_else(|| json!({"type": "search", "queries": [input]})),
                 "results": event.get("results").cloned().unwrap_or_else(|| json!([])),
             }),
             false,
@@ -21783,6 +22287,49 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Reads an explicitly supplied isolated Codex history recovery fixture"]
+    fn recovered_codex_history_restores_the_real_cache_gap() {
+        let directory = PathBuf::from(std::env::var("HARNESS_HISTORY_FIXTURE").expect("set HARNESS_HISTORY_FIXTURE"));
+        let thread: CodexThread = serde_json::from_slice(&fs::read(directory.join("recovered-thread.json")).unwrap()).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(directory.join("manifest.json")).unwrap()).unwrap();
+        let missing_id = manifest["missingId"].as_str().unwrap();
+        let newer_live_id = manifest["newerLiveId"].as_str().unwrap();
+        let cache: Value = serde_json::from_slice(&fs::read(directory.join("cache.json")).unwrap()).unwrap();
+        let mut transcript = model::TranscriptModel::default();
+        transcript.items = serde_json::from_value(cache["items"].clone()).unwrap();
+        let newer_index = transcript.items.iter().position(|item| item.protocol_id.as_deref() == Some(newer_live_id)).unwrap();
+        transcript.items.truncate(newer_index + 1);
+        assert!(!transcript.items.iter().any(|item| item.protocol_id.as_deref() == Some(missing_id)));
+        let mut turns_desc = thread.turns.clone();
+        turns_desc.reverse();
+        let entries = chronological_thread_item_entries(turns_desc);
+        let tip = codex_history::read_tip(thread.path.as_deref(), &thread.id).unwrap().unwrap();
+        tip.verify(&entries).unwrap();
+        let outcome = transcript.replace_thread_item_entries(&entries);
+        assert!(outcome.applied);
+        let recovered_index = transcript.items.iter().position(|item| item.protocol_id.as_deref() == Some(missing_id)).expect("missing CLI final answer must be restored");
+        let newer_index = transcript.items.iter().position(|item| item.protocol_id.as_deref() == Some(newer_live_id)).expect("newer live prompt must remain");
+        assert!(recovered_index < newer_index);
+    }
+
+    #[test]
+    fn history_recovery_keeps_a_gap_before_newer_cached_live_messages() {
+        let entries: Vec<ThreadItemEntry> = serde_json::from_value(json!([
+            {"turnId":"old","item":{"id":"verified","type":"agentMessage","text":"old answer"}},
+            {"turnId":"missing","item":{"id":"recovered","type":"agentMessage","text":"CLI answer"}},
+            {"turnId":"live","item":{"id":"live-cached","type":"agentMessage","text":"new live answer"}}
+        ])).unwrap();
+        let mut transcript = model::TranscriptModel::default();
+        transcript.merge_thread_item_entries(&[entries[0].clone(), entries[2].clone()]);
+        transcript.history_anchor = Some("verified".into());
+        let recovered = history_entries_from_last_durable_overlap(entries, &transcript.history_anchor.iter().cloned().collect::<HashSet<_>>());
+        let outcome = transcript.merge_thread_item_entries(&recovered);
+        assert!(outcome.applied);
+        assert_eq!(outcome.inserted, 1);
+        assert_eq!(transcript.items.iter().map(|item| item.content.as_str()).collect::<Vec<_>>(), ["old answer", "CLI answer", "new live answer"]);
+    }
+
+    #[test]
     fn append_only_history_hydration_preserves_existing_list_rows() {
         let append = model::ThreadHistoryMergeOutcome {
             applied: true,
@@ -22138,6 +22685,19 @@ mod tests {
                 QueuedPromptPreviewSegment::Text(after)
             ] if before.as_ref() == "before" && after.as_ref() == "after"
         ));
+        let many_images = Value::Array(
+            (0..QUEUED_PREVIEW_IMAGE_LIMIT + 2)
+                .map(|_| json!({"type": "image", "url": "data:image/png;base64,AQID"}))
+                .collect(),
+        );
+        assert_eq!(
+            queued_submission_preview_segments(&many_images).len(),
+            QUEUED_PREVIEW_IMAGE_LIMIT
+        );
+        assert_eq!(
+            ExpandedQueuedPrompt::new(&many_images).segments.len(),
+            QUEUED_PREVIEW_IMAGE_LIMIT + 2
+        );
     }
 
     #[test]
@@ -22150,6 +22710,73 @@ mod tests {
         assert!(move_queue_item(&mut upward, 3, 1));
         assert_eq!(upward, ["a", "d", "b", "c"]);
         assert!(!move_queue_item(&mut upward, 1, 1));
+    }
+
+    #[test]
+    fn expanded_queue_preserves_text_and_refreshes_after_edit_reorder_and_removal() {
+        let original =
+            "  Preserve indentation\n\nSecond paragraph with café and 日本語.\nLast line  ";
+        let mut queued = queued_submissions_from_response(&json!({"data": [
+            {"id": "queue-1", "clientUserMessageId": "client-1", "input": [{"type": "text", "text": original}]},
+            {"id": "queue-2", "clientUserMessageId": "client-2", "input": [{"type": "text", "text": "another prompt"}]}
+        ]}));
+        let entry = queued.front().expect("first queued prompt");
+        let key = entry.preview_key();
+        let mut expanded = HashMap::from([(key.clone(), ExpandedQueuedPrompt::new(&entry.input))]);
+        assert_eq!(queued_submission_text(&entry.input), original);
+        assert!(
+            matches!(expanded[&key].segments.first(), Some(QueuedPromptPreviewSegment::Text(text)) if text.as_ref() == original)
+        );
+        queued.swap(0, 1);
+        refresh_expanded_queued_prompts(&mut expanded, &queued);
+        assert!(expanded.contains_key(&key));
+        queued.back_mut().expect("reordered prompt").input =
+            json!([{"type": "text", "text": "Edited elsewhere\nNew last line"}]);
+        refresh_expanded_queued_prompts(&mut expanded, &queued);
+        assert!(
+            matches!(expanded[&key].segments.first(), Some(QueuedPromptPreviewSegment::Text(text)) if text.as_ref() == "Edited elsewhere\nNew last line")
+        );
+        queued.pop_back();
+        refresh_expanded_queued_prompts(&mut expanded, &queued);
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn web_headers_describe_queries_and_distinguish_open_and_find_actions() {
+        let search = json!({"action": {"type": "search", "queries": ["  color   theory ", "OKLab gamut"]}, "results": [{"title": "one"}, {"title": "two"}], "detail": "2 sources"});
+        assert_eq!(
+            web_activity_header(&search),
+            "Search · color theory · OKLab gamut"
+        );
+        assert_eq!(
+            web_activity_summary(&search).as_deref(),
+            Some("2 queries · 2 results")
+        );
+        let open = json!({"action": {"type": "openPage", "url": "https://example.test/color"}});
+        assert_eq!(
+            web_activity_header(&open),
+            "Open page · https://example.test/color"
+        );
+        assert_eq!(web_activity_summary(&open), None);
+        assert_eq!(
+            web_search_presentation(&open).queries,
+            ["https://example.test/color"]
+        );
+        let find = json!({"action": {"type": "findInPage", "pattern": "contrast", "url": "https://example.test/color"}});
+        assert_eq!(
+            web_activity_header(&find),
+            "Find · contrast · https://example.test/color"
+        );
+        assert_eq!(
+            web_search_presentation(&find).queries,
+            ["contrast", "https://example.test/color"]
+        );
+        assert_eq!(web_activity_summary(&json!({"query": "contrast"})), None);
+        assert_eq!(
+            web_activity_summary(&json!({"query": "contrast", "results": []})).as_deref(),
+            Some("0 results")
+        );
+        assert_eq!(web_activity_header(&json!({})), "Web activity");
     }
 
     #[test]
@@ -22170,6 +22797,9 @@ mod tests {
         assert!(renderer.contains(".on_drop("));
         assert!(renderer.contains(".id(\"outbound-tray\")"));
         assert!(renderer.contains(".when_some(pending_outbound"));
+        assert!(renderer.contains("refresh_expanded_queued_prompts("));
+        assert!(renderer.contains("Read full queued prompt"));
+        assert!(renderer.contains("copy-queued-prompt"));
         assert!(renderer.contains("IconName::SteeringWheel"));
         assert!(renderer.contains("IconName::InterruptAndRun"));
         assert!(renderer.contains(".pl_0()"));
@@ -23624,6 +24254,13 @@ mod tests {
     }
 
     #[test]
+    fn provider_project_names_use_the_same_short_path_label() {
+        assert_eq!(project_display_name(Path::new("/home/sumeet/cs"), "Unknown"), "cs");
+        assert_eq!(project_display_name(Path::new("/home/sumeet/cs/"), "Unknown"), "cs");
+        assert_eq!(project_display_name(Path::new("/"), "Filesystem"), "Filesystem");
+    }
+
+    #[test]
     fn healthy_background_history_repair_is_silent() {
         let source = include_str!("main.rs");
         let status = source
@@ -23950,6 +24587,11 @@ mod tests {
         assert!(item_renderer.contains("transcript_header_styled_text("));
         assert!(command_renderer.contains("shell_highlights(line, cx)"));
         assert!(command_renderer.contains("rich_command_identity_icon("));
+        assert!(command_renderer.contains(".when(!first_command_row"));
+        assert!(!command_status.contains(".text_ui_xs(cx)"));
+        assert!(command_status.contains(".shape_line("));
+        assert!(command_status.contains(".h(harness_code_row_height(cx))"));
+        assert!(item_renderer.contains(".filter(|_| item.kind != model::TranscriptKind::Command)"));
         assert!(source.contains("IconName::ToolTerminal"));
         assert!(source.contains("pulsating_between(0.42, 1.)"));
         assert!(source.contains("CommandExecutionStatus::Succeeded) => Color::Success"));
@@ -23958,7 +24600,7 @@ mod tests {
         assert!(command_status.contains("format!(\"exit {code}\")"));
         assert!(item_renderer.contains("!compact_trace && !routine_activity && !unboxed_media"));
         assert!(item_renderer.contains(".when(compact_routine_activity, |this|"));
-        assert!(item_renderer.contains(".when(compact_routine_activity, |this| this.pl_0())"));
+        assert!(item_renderer.contains(".when(routine_activity, |this| this.pl_0())"));
         assert!(item_renderer.contains(".when(expanded_routine_activity, |this|"));
         assert!(item_renderer.contains(".bg(visuals.tool_surface)"));
         assert!(item_renderer.contains("success_background.opacity(0.07)"));
@@ -24496,6 +25138,34 @@ mod tests {
             .expect("search jumps must reveal their item");
 
         assert!(pause < reveal);
+    }
+
+    #[test]
+    fn native_file_changes_feed_the_shared_diff_rows() {
+        let mut projection = claude_native::Projection::default();
+        projection.messages = vec![
+            json!({"type":"assistant","uuid":"a","message":{"content":[{"type":"tool_use","id":"write","name":"Write","input":{"file_path":"/tmp/fixture.rs","content":"fn main() {}\n"}}]}}),
+            json!({"type":"user","uuid":"b","message":{"content":[{"type":"tool_result","tool_use_id":"write","content":"Created"}]},"toolUseResult":{"type":"create","filePath":"/tmp/fixture.rs","content":"fn main() {}\n","structuredPatch":[]}}),
+        ];
+        let items = projection.items();
+        let entry = items.first().expect("native file change");
+        let data = rich_file_change_data(entry);
+        let presentation = data
+            .presentations
+            .first()
+            .expect("shared file presentation");
+        assert_eq!(presentation.operation, "Added");
+        assert_eq!(presentation.path, "/tmp/fixture.rs");
+        assert_eq!(file_change_counts(presentation), (1, 0));
+        assert!(
+            data.rows
+                .iter()
+                .any(|row| matches!(row, RichFileChangeRow::Line { .. }))
+        );
+        assert_eq!(
+            file_change_summary("Proposed write · /tmp/fixture.rs"),
+            Some(("Proposed write", "/tmp/fixture.rs"))
+        );
     }
 
     #[test]
@@ -25324,6 +25994,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Chat,
             selected_thread_id: Some("codex-thread".into()),
             selected_chat_id: Some("chat-thread".into()),
+            selected_claude_id: None,
             chat_new_draft: false,
             pending_thread_cwd: Some("/work/project".into()),
             sidebar_open: false,
@@ -25335,6 +26006,33 @@ mod tests {
         let legacy = serde_json::from_str::<HarnessSessionState>("{}")
             .expect("missing fields use forward-compatible defaults");
         assert_eq!(legacy, HarnessSessionState::default());
+    }
+
+    #[test]
+    fn native_claude_session_and_exact_single_use_permission_are_preserved() {
+        let state = HarnessSessionState {
+            workspace_mode: WorkspaceMode::Claude,
+            selected_claude_id: Some("native-host".into()),
+            ..Default::default()
+        };
+        let restored: HarnessSessionState =
+            serde_json::from_value(serde_json::to_value(&state).expect("serialize"))
+                .expect("restore");
+        assert_eq!(restored, state);
+        let input = json!({"file_path":"/project/file.rs", "content":"exact contents\n"});
+        let choices = request_choices("claude/permission", &json!({"input": input}));
+        assert_eq!(choices.len(), 2);
+        assert_eq!(
+            choices.first().map(|choice| &choice.response),
+            Some(&json!({"result":{"behavior":"allow","updatedInput":input}}))
+        );
+        assert_eq!(
+            choices
+                .last()
+                .map(|choice| &choice.response["result"]["behavior"]),
+            Some(&json!("deny"))
+        );
+        assert!(request_choices("claude/unknown-dialog", &json!({})).is_empty());
     }
 
     #[test]
@@ -25437,6 +26135,14 @@ mod tests {
         assert!(live_ready.contains("listed.updated_at.max(attached.thread.updated_at)"));
         assert!(live_ready.contains("this.attaching_thread = false"));
         assert!(live_ready.contains("this.refresh_queued_turns(cx)"));
+        assert!(!live_ready.contains("this.reconnect_attempts = 0"),
+            "history-triggered disconnects must not reset the retry budget at attach");
+        let (recovering, recovered) = reattach
+            .split_once("this.set_transcript_history_complete(true);")
+            .expect("successful catch-up must establish history continuity");
+        assert!(!recovering.contains("this.reconnect_attempts = 0"));
+        assert!(recovered.contains("this.reconnect_attempts = 0"));
+        assert_eq!(HISTORY_CATCHUP_PAGE_TURNS, 1);
     }
 
     #[test]
@@ -25831,6 +26537,111 @@ fn prewarm_harness_fonts(cx: &mut App) {
 }
 
 fn main() {
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-job-terminal") {
+        let result = std::env::args().nth(2).context("Missing native conversation identity")
+            .and_then(|identifier| claude_native::job_terminal(&identifier));
+        if let Err(error) = result {
+            eprintln!("Native Claude terminal: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-create-recover") {
+        let result = std::env::args_os().nth(2).context("Missing Claude creation request")
+            .and_then(|directory| claude_native::creation::recover(Path::new(&directory)))
+            .and_then(|session| Ok(serde_json::to_string(&session)?));
+        match result {
+            Ok(session) => println!("{session}"),
+            Err(error) => { eprintln!("Claude startup recovery: {error:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-create-worker") {
+        let result = std::env::args_os().nth(2).context("Missing Claude creation request")
+            .and_then(|directory| claude_native::creation::worker(Path::new(&directory)));
+        if let Err(error) = result {
+            eprintln!("Claude startup coordinator: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-continue" || argument == "--claude-check-history") {
+        let result = (|| -> anyhow::Result<String> {
+            let identifier = std::env::args().nth(2).context("Usage: --claude-continue CONVERSATION_UUID")?;
+            let catalog = claude_native::sessions()?;
+            let session = catalog.sessions.into_iter().find(|session| {
+                session.id == identifier || matches!(&session.source, claude_native::SessionSource::Native { conversation_id, .. } if conversation_id == &identifier)
+            }).context("Saved Claude conversation not found")?;
+            if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-check-history") {
+                Ok(serde_json::to_string_pretty(&claude_native::resume::check_restored_history(&session)?)?)
+            } else {
+                Ok(serde_json::to_string_pretty(&claude_native::resume::continue_conversation(&session)?)?)
+            }
+        })();
+        match result {
+            Ok(session) => println!("{session}"),
+            Err(error) => { eprintln!("Could not continue Claude: {error:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-wrap") {
+        let mut arguments = std::env::args_os().skip(2);
+        let result = arguments.next().context("Missing native adapter manifest")
+            .and_then(|manifest| claude_native::setup::wrap(Path::new(&manifest), arguments.collect()));
+        if let Err(error) = result { eprintln!("Native Claude launch failed: {error:#}"); std::process::exit(1); }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-setup") {
+        if std::env::args().nth(2).as_deref() == Some("prepare") {
+            match claude_native::setup::prepare().and_then(|path| Ok(serde_json::to_string(&path)?)) {
+                Ok(path) => println!("{path}"),
+                Err(error) => { eprintln!("Could not prepare native adapter: {error:#}"); std::process::exit(1); }
+            }
+            return;
+        }
+        let result = match std::env::args().nth(2).as_deref() {
+            Some("enable") => claude_native::setup::enable(),
+            Some("disable") => claude_native::setup::disable(),
+            Some("status") => Ok(claude_native::setup::status()),
+            _ => Err(anyhow::anyhow!("Usage: --claude-setup status|prepare|enable|disable")),
+        };
+        match result.and_then(|status| Ok(serde_json::to_string_pretty(&status)?)) {
+            Ok(status) => println!("{status}"),
+            Err(error) => { eprintln!("Native Claude setup failed: {error:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-list") {
+        match claude_native::sessions().and_then(|catalog| Ok(serde_json::to_string_pretty(&catalog)?)) {
+            Ok(catalog) => println!("{catalog}"),
+            Err(error) => { eprintln!("Could not list Claude sessions: {error:#}"); std::process::exit(1); }
+        }
+        return;
+    }
+    let mut native_arguments = std::env::args_os().skip(1);
+    if let Some(mode) = native_arguments.next()
+        && (mode == "--claude-host" || mode == "--claude-terminal" || mode == "--claude-new")
+    {
+        let result = native_arguments
+            .next()
+            .context("Native Claude mode requires a session directory")
+            .and_then(|directory| {
+                if mode == "--claude-host" {
+                    claude_native::host(Path::new(&directory))
+                } else if mode == "--claude-new" {
+                    let session = claude_native::start(PathBuf::from(directory))?;
+                    println!("{}", serde_json::to_string(&session)?);
+                    Ok(())
+                } else {
+                    claude_native::terminal(Path::new(&directory))
+                }
+            });
+        if let Err(error) = result {
+            eprintln!("Harness native Claude: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let scroll_diagnostics = std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
         .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"));
     let mut logger = env_logger::builder();
@@ -25841,6 +26652,20 @@ fn main() {
         logger.filter_module("gpui_scroll", log::LevelFilter::Info);
     }
     logger.init();
+    let mut arguments = std::env::args_os().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--export-appearance-catalog" {
+            let result = arguments
+                .next()
+                .context("--export-appearance-catalog requires a new output path")
+                .and_then(|path| theme_sources::export_appearance_catalog(Path::new(&path)));
+            if let Err(error) = result {
+                eprintln!("could not export appearance catalog: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     let comparison_fixture = comparison_fixture_path();
     if let Some(error) =
         comparison_profile::initialization_error(comparison_fixture.as_ref().is_some())
@@ -25859,7 +26684,13 @@ fn main() {
     let initial_thread_id = std::env::var("HARNESS_OPEN_THREAD")
         .ok()
         .filter(|thread_id| !thread_id.trim().is_empty());
-    let session = load_harness_session();
+    // Replay starts clean, but subsequent user-opened windows must preserve the
+    // explicitly selected provider and conversation rather than reset again.
+    let session = if replay_count.is_some() {
+        HarnessSessionState::default()
+    } else {
+        load_harness_session()
+    };
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .to_string_lossy()
@@ -25888,6 +26719,7 @@ fn main() {
         // Harness to the test-only base theme. Components still consume
         // semantic Harness roles derived from the active Zed theme.
         theme_settings::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+        request_surface::init_prompts(cx);
         let external_themes =
             theme_sources::load_external_themes(&theme::ThemeRegistry::global(cx));
         if !external_themes.errors.is_empty() {

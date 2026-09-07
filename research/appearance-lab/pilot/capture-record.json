@@ -1,0 +1,22 @@
+{
+  "binary_sha256": "bfc01f723e33b49f73b3382ccd328fe72db95b4e14a27f7c894d299d66847550",
+  "fixture_sha256": {
+    "reading": "75eadd1a2c7c8b7e2e28f1de88f14864371513e13d87150b7c92bfd438d9b241",
+    "states": "e8156c80081496808df8e3ad3d9119d36d885a22e6da932fec8376149e30ed09"
+  },
+  "viewport": {
+    "width": 1280,
+    "height": 900,
+    "scale": 1
+  },
+  "preferences": {
+    "theme": "Zedokai (Filter Octagon)",
+    "reading_font_family": "IBM Plex Sans Condensed",
+    "reading_font_size": 20.0,
+    "reading_font_weight": 400.0,
+    "code_font_family": "VictorMono Nerd Font",
+    "code_font_size": 17.0
+  },
+  "renderer": "Native GPUI, isolated Weston/Xvfb, 1x scale; compare color/layout, not live-display rasterization",
+  "entry_count": 12
+}

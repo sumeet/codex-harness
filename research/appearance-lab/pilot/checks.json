@@ -1,0 +1,1193 @@
+{
+  "scope": "Resolved ThemeColors, syntax, Harness surfaces, selected status roles, and local player; not an exhaustive rendering equivalence test",
+  "theme_count": 12,
+  "appearance_counts": {
+    "dark": 7,
+    "light": 5
+  },
+  "equal_exported_projection_groups": [],
+  "warning": "Equality is only within the exported role projection. Contrast checks are an incomplete nominal-color screen, not accessibility certification or a reason to delete an authored theme.",
+  "themes": [
+    {
+      "name": "Ayu Light",
+      "appearance": "light",
+      "background": "#fcfcfcff",
+      "background_luminance": 0.97345,
+      "background_oklab_lightness": 0.99107,
+      "background_oklab_chroma": 0.0,
+      "syntax_capture_count": 45,
+      "syntax_distinct_explicit_colors": 19,
+      "projection_fingerprint": "b8dc7055fa22aff12ee8a4f9caef45805a69aca71e32630a612ecb84b364c14b",
+      "below_target": [
+        {
+          "role": "muted prose",
+          "ratio": 3.207,
+          "below_4_5": true
+        },
+        {
+          "role": "status/error",
+          "ratio": 2.798,
+          "below_4_5": true
+        },
+        {
+          "role": "status/warning",
+          "ratio": 1.893,
+          "below_4_5": true
+        },
+        {
+          "role": "status/success",
+          "ratio": 2.423,
+          "below_4_5": true
+        },
+        {
+          "role": "status/info",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 2.431,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/attribute",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/boolean",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.128,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 3.261,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constant",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constructor",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis.strong",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/enum",
+          "ratio": 2.297,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/function",
+          "ratio": 1.887,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 2.431,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/keyword",
+          "ratio": 2.288,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/label",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/link_text",
+          "ratio": 2.297,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/link_uri",
+          "ratio": 2.423,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/number",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/operator",
+          "ratio": 2.284,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 1.981,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 2.288,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation",
+          "ratio": 4.398,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.bracket",
+          "ratio": 4.398,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.delimiter",
+          "ratio": 4.398,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 4.398,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 4.398,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.special",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/selector",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/selector.pseudo",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string",
+          "ratio": 2.419,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 3.261,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.regex",
+          "ratio": 2.224,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.special",
+          "ratio": 1.751,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.special.symbol",
+          "ratio": 2.297,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/tag",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/text.literal",
+          "ratio": 2.297,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/type",
+          "ratio": 2.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.parameter",
+          "ratio": 3.295,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variant",
+          "ratio": 2.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.plus",
+          "ratio": 2.232,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.minus",
+          "ratio": 2.787,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_added_surface/foreground",
+          "ratio": 4.326,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_deleted_surface/foreground",
+          "ratio": 4.231,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Everforest Dark Medium (regular)",
+      "appearance": "dark",
+      "background": "#2d353bff",
+      "background_luminance": 0.0342,
+      "background_oklab_lightness": 0.32387,
+      "background_oklab_chroma": 0.01528,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 10,
+      "projection_fingerprint": "1cce20d931f1b5bf7373f89a9ad816e375e0a16e58a9e6e6d3adea56c450babd",
+      "below_target": [
+        {
+          "role": "muted prose",
+          "ratio": 3.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 3.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 3.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation",
+          "ratio": 3.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.delimiter",
+          "ratio": 3.842,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 3.842,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "GitHub Light",
+      "appearance": "light",
+      "background": "#ffffffff",
+      "background_luminance": 1.0,
+      "background_oklab_lightness": 1.0,
+      "background_oklab_chroma": 0.0,
+      "syntax_capture_count": 47,
+      "syntax_distinct_explicit_colors": 8,
+      "projection_fingerprint": "e2ed41ff0c14915cf61e29fb2211ff86e2e9be0c9e2d57456a3c98772a83855b",
+      "below_target": [],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Gruvbox Dark",
+      "appearance": "dark",
+      "background": "#282828ff",
+      "background_luminance": 0.02122,
+      "background_oklab_lightness": 0.27685,
+      "background_oklab_chroma": 0.0,
+      "syntax_capture_count": 47,
+      "syntax_distinct_explicit_colors": 16,
+      "projection_fingerprint": "261cdfea19f043973fa2bb4a29b0598b3c9771306b7d542e2d2f22c8d00bb746",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 4.306,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/function.builtin",
+          "ratio": 4.266,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/keyword",
+          "ratio": 4.266,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 3.043,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 4.266,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.minus",
+          "ratio": 4.286,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Lab · Fewer syntax groups",
+      "appearance": "dark",
+      "background": "#282c33ff",
+      "background_luminance": 0.02491,
+      "background_oklab_lightness": 0.29207,
+      "background_oklab_chroma": 0.01398,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 6,
+      "projection_fingerprint": "db80d0d326c2758ac9c21f28468e91bc46371b115092f6a9f6785508a439f4bc",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.322,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/keyword",
+          "ratio": 4.325,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_added_surface/foreground",
+          "ratio": 3.673,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_deleted_surface/foreground",
+          "ratio": 3.719,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Lab · Flatter surfaces",
+      "appearance": "dark",
+      "background": "#282c33ff",
+      "background_luminance": 0.02491,
+      "background_oklab_lightness": 0.29207,
+      "background_oklab_chroma": 0.01398,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 18,
+      "projection_fingerprint": "1a443cd94a8974451386780f902ec8dddafc726eae9e65c90087b5a291aeca63",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.322,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/keyword",
+          "ratio": 4.325,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 2.567,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 4.325,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.special",
+          "ratio": 2.893,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/title",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.parameter",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.minus",
+          "ratio": 4.386,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_added_surface/foreground",
+          "ratio": 3.673,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_deleted_surface/foreground",
+          "ratio": 3.719,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Lab · Intermediate warm paper",
+      "appearance": "light",
+      "background": "#aba494ff",
+      "background_luminance": 0.37347,
+      "background_oklab_lightness": 0.72008,
+      "background_oklab_chroma": 0.024,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 18,
+      "projection_fingerprint": "3cf7701e5b2b4cfe351a1e7eabf2662c67a1e97e03a3e8c8feb49fd4e57765f0",
+      "below_target": [],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Lab · Lower syntax chroma",
+      "appearance": "dark",
+      "background": "#282c33ff",
+      "background_luminance": 0.02491,
+      "background_oklab_lightness": 0.29207,
+      "background_oklab_chroma": 0.01398,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 17,
+      "projection_fingerprint": "41846064db28da40bbaa7b12b16514573939e220884c78daf1fe34720da28851",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.326,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 4.223,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 4.082,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 2.58,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 4.42,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 4.42,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 4.42,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.special",
+          "ratio": 3.003,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 4.223,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/title",
+          "ratio": 4.42,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.parameter",
+          "ratio": 4.42,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_added_surface/foreground",
+          "ratio": 3.673,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_deleted_surface/foreground",
+          "ratio": 3.719,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Nord Dark",
+      "appearance": "dark",
+      "background": "#2e3440ff",
+      "background_luminance": 0.03407,
+      "background_oklab_lightness": 0.32437,
+      "background_oklab_chroma": 0.02294,
+      "syntax_capture_count": 27,
+      "syntax_distinct_explicit_colors": 10,
+      "projection_fingerprint": "97dccda40fa0cca984cf9373746ccf945b37daa3e12a1e353204422a6e8b978b",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 3.053,
+          "below_4_5": true
+        },
+        {
+          "role": "status/success",
+          "ratio": 4.121,
+          "below_4_5": true
+        },
+        {
+          "role": "status/info",
+          "ratio": 3.1,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 3.1,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 1.693,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 1.693,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/number",
+          "ratio": 4.409,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 3.1,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "One Dark",
+      "appearance": "dark",
+      "background": "#282c33ff",
+      "background_luminance": 0.02491,
+      "background_oklab_lightness": 0.29207,
+      "background_oklab_chroma": 0.01398,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 18,
+      "projection_fingerprint": "24184d0a321b3696e542b6f77fcc303963df0750b60697a31780edbed4bd9236",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.322,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 4.072,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/keyword",
+          "ratio": 4.325,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 2.567,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 4.325,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.special",
+          "ratio": 2.893,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 4.24,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/title",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.parameter",
+          "ratio": 4.242,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.minus",
+          "ratio": 4.386,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_added_surface/foreground",
+          "ratio": 3.673,
+          "below_4_5": true
+        },
+        {
+          "role": "selected/diff_deleted_surface/foreground",
+          "ratio": 3.719,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "One Light",
+      "appearance": "light",
+      "background": "#fafafaff",
+      "background_luminance": 0.95597,
+      "background_oklab_lightness": 0.9851,
+      "background_oklab_chroma": 0.0,
+      "syntax_capture_count": 46,
+      "syntax_distinct_explicit_colors": 19,
+      "projection_fingerprint": "89067d05b0e32fd77893cf3c33d85a8e09f39974208b2dafd9d69ceb1f8f7645",
+      "below_target": [
+        {
+          "role": "status/error",
+          "ratio": 3.594,
+          "below_4_5": true
+        },
+        {
+          "role": "status/warning",
+          "ratio": 3.291,
+          "below_4_5": true
+        },
+        {
+          "role": "status/success",
+          "ratio": 3.017,
+          "below_4_5": true
+        },
+        {
+          "role": "status/info",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.216,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/attribute",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/boolean",
+          "ratio": 3.997,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.414,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 3.88,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constant",
+          "ratio": 3.063,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constructor",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis.strong",
+          "ratio": 3.997,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/enum",
+          "ratio": 3.988,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/function",
+          "ratio": 3.804,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 4.216,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/label",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/link_text",
+          "ratio": 3.804,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/link_uri",
+          "ratio": 3.988,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/number",
+          "ratio": 3.997,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/operator",
+          "ratio": 3.988,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 2.484,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 3.621,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 3.621,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.markup",
+          "ratio": 3.621,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/selector",
+          "ratio": 3.017,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/selector.pseudo",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string",
+          "ratio": 3.031,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.escape",
+          "ratio": 3.88,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.regex",
+          "ratio": 3.996,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.special",
+          "ratio": 3.996,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.special.symbol",
+          "ratio": 3.996,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/tag",
+          "ratio": 3.84,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/text.literal",
+          "ratio": 3.031,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/title",
+          "ratio": 3.621,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/type",
+          "ratio": 3.988,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.parameter",
+          "ratio": 3.621,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.special",
+          "ratio": 3.997,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variant",
+          "ratio": 3.804,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.plus",
+          "ratio": 3.071,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/diff.minus",
+          "ratio": 3.514,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    },
+    {
+      "name": "Rosé Pine Dawn",
+      "appearance": "light",
+      "background": "#faf4edff",
+      "background_luminance": 0.9114,
+      "background_oklab_lightness": 0.96987,
+      "background_oklab_chroma": 0.01132,
+      "syntax_capture_count": 39,
+      "syntax_distinct_explicit_colors": 9,
+      "projection_fingerprint": "383371d77c9ba094362fea1f1346c1b0bcc55888d85ce5300da7f51663129985",
+      "below_target": [
+        {
+          "role": "muted prose",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "status/error",
+          "ratio": 3.841,
+          "below_4_5": true
+        },
+        {
+          "role": "status/warning",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "status/hint",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/attribute",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/boolean",
+          "ratio": 2.604,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment",
+          "ratio": 2.727,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/comment.doc",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constant",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/constructor",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/emphasis.strong",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/function",
+          "ratio": 2.604,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/hint",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/label",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/link_text",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/number",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/operator",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/predictive",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/preproc",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/primary",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/property",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.bracket",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.delimiter",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.list_marker",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/punctuation.special",
+          "ratio": 4.024,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/string.regex",
+          "ratio": 3.469,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/tag",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/text.literal",
+          "ratio": 2.052,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/title",
+          "ratio": 3.841,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/type",
+          "ratio": 3.136,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variable.special",
+          "ratio": 3.841,
+          "below_4_5": true
+        },
+        {
+          "role": "syntax/variant",
+          "ratio": 2.604,
+          "below_4_5": true
+        }
+      ],
+      "unknown_pairs": []
+    }
+  ]
+}

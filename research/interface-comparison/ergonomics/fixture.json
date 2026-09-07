@@ -1,0 +1,16 @@
+{
+  "user": {"markdown": "Check tool alignment, readable exit labels, web activity, and full queued prompts."},
+  "events": [
+    {"type": "tool", "kind": "terminal", "title": "Shell", "input": "cargo test -p harness_protocol", "output": "120 tests passed", "status": "completed", "expanded": false},
+    {"type": "tool", "kind": "terminal", "title": "Shell", "input": "cargo test -p harness_app -- --test-threads=1", "output": "Stopped by user", "status": "failed", "exit_code": 130, "expanded": false},
+    {"type": "tool", "kind": "terminal", "title": "Shell", "input": "env HARNESS_CHATGPT_DESKTOP_VERSION=0.0.0-test cargo test -j1 --profile release-fast -p harness_app -- --test-threads=1\nprintf 'This explicit continuation line must align beneath the command text'", "output": "A fixture failure, not an executed command.", "status": "failed", "exit_code": 130, "expanded": true},
+    {"type": "tool", "kind": "terminal", "title": "Shell", "input": "printf 'An expanded successful command'", "output": "Completed successfully", "status": "completed", "expanded": true},
+    {"type": "tool", "kind": "web", "title": "Web", "input": "color theory", "output": "Two results", "action": {"type": "search", "queries": ["perceptual color spaces", "intermediate lightness contrast"]}, "results": [{"title": "Color space reference", "url": "https://example.test/color"}, {"title": "Contrast reference", "url": "https://example.test/contrast"}], "expanded": false},
+    {"type": "tool", "kind": "web", "title": "Web", "input": "https://example.test/color", "output": "A page was opened, not searched.", "action": {"type": "openPage", "url": "https://example.test/color"}, "results": [{"title": "Color space reference", "url": "https://example.test/color"}], "expanded": true},
+    {"type": "tool", "kind": "web", "title": "Web", "input": "contrast", "output": "Find the word in the opened page.", "action": {"type": "findInPage", "url": "https://example.test/color", "pattern": "contrast"}, "expanded": false}
+  ],
+  "queued_prompts": [
+    {"id": "queued-first", "clientUserMessageId": "fixture-first", "input": [{"type": "text", "text": "Read this entire queued prompt without sending it.\n\nThe second paragraph should wrap to the available width and preserve its place when the row is expanded or collapsed. This is a synthetic fixture; none of its instructions should run.\n\n  Indented detail: preserve café and 日本語.\n\nLast line: FULL PROMPT END."}]},
+    {"id": "queued-second", "clientUserMessageId": "fixture-second", "input": [{"type": "text", "text": "A second saved idea.\n\nExpanding the first prompt must not hide the controls for this one."}]}
+  ]
+}

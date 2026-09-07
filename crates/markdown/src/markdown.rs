@@ -4113,8 +4113,10 @@ impl MarkdownElementBuilder {
     }
 
     fn push_image_child(&mut self, child: impl IntoElement) {
+        if let Some(entry) = self.div_stack.last_mut() {
+            entry.line_break_mode = LineBreakMode::FlexWrap;
+        }
         self.modify_current_div(|el| el.flex().flex_row().flex_wrap().items_start());
-        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
         self.append_child(child.into_any_element());
     }
 
@@ -4496,7 +4498,14 @@ impl MarkdownElementBuilder {
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
         });
-        self.append_child(text.into_any());
+        // Text measured directly in a wrapping flex row can retain its
+        // unbounded intrinsic width. Constrain it before laying out its glyphs.
+        let text = if self.uses_flex_line_breaks() {
+            div().min_w_0().max_w_full().child(text).into_any_element()
+        } else {
+            text.into_any()
+        };
+        self.append_child(text);
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -5824,6 +5833,59 @@ mod tests {
         assert!(text.contains("before"));
         assert!(text.contains("after"));
         assert_eq!(resolved_urls.borrow().as_slice(), ["\u{e000}"]);
+        let before = rendered
+            .lines
+            .first()
+            .expect("text before image")
+            .layout
+            .bounds();
+        let after = rendered
+            .lines
+            .last()
+            .expect("text after image")
+            .layout
+            .bounds();
+        assert_eq!(before.top(), after.top());
+        assert!(before.right() < after.left());
+    }
+
+    #[gpui::test]
+    fn test_long_text_around_inline_image_wraps_to_container_width(cx: &mut TestAppContext) {
+        let image = test_image(cx);
+        let text = concat!(
+            "A long paragraph with **emphasis**, `inline code`, and café ",
+            "should remain readable beside an attached image. ",
+        )
+        .repeat(8);
+        let attachment = "[![](https://example.com/image.png)](https://example.com/full.png)";
+        for source in [
+            format!("{attachment} {text}"),
+            format!("{text} {attachment}"),
+            format!("{text} {attachment} {text}"),
+        ] {
+            let rendered = render_markdown_with_sized_image_resolver(
+                &source,
+                {
+                    let image = image.clone();
+                    move |_, _| Some((ImageSource::Render(image.clone()), px(120.), px(30.)))
+                },
+                cx,
+            );
+            let bounds = rendered.bounds_for_source_range(0..source.len());
+            assert!(bounds.len() > 1, "long image paragraphs should wrap");
+            for bounds in bounds {
+                assert!(
+                    bounds.left() >= px(0.) && bounds.right() <= px(600.),
+                    "image paragraph text must stay within the container: {bounds:?}"
+                );
+            }
+            for line in rendered.lines.iter() {
+                assert!(
+                    line.layout.bounds().size.height > line.layout.line_height(),
+                    "long text on either side of the image should occupy multiple rows"
+                );
+            }
+        }
     }
 
     #[gpui::test]

@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "one-dark",
+      "name": "One Dark",
+      "kind": "authored reference",
+      "reason": "Cool, layered baseline",
+      "source": "assets/themes/one/one.json",
+      "changed_roles": []
+    },
+    {
+      "id": "one-light",
+      "name": "One Light",
+      "kind": "authored reference",
+      "reason": "Light counterpart; useful controlled pair",
+      "source": "assets/themes/one/one.json",
+      "changed_roles": []
+    },
+    {
+      "id": "gruvbox",
+      "name": "Gruvbox Dark",
+      "kind": "authored reference",
+      "reason": "Warm dark environment and earthy syntax",
+      "source": "assets/themes/gruvbox/gruvbox.json",
+      "changed_roles": []
+    },
+    {
+      "id": "everforest",
+      "name": "Everforest Dark Medium (regular)",
+      "kind": "authored reference",
+      "reason": "Cool dark surfaces with green and warm syntax accents",
+      "source": "assets/themes/everforest/everforest-regular.json",
+      "changed_roles": []
+    },
+    {
+      "id": "nord",
+      "name": "Nord Dark",
+      "kind": "authored reference",
+      "reason": "Cool, restrained syntax relationships",
+      "source": "assets/themes/nord/nord.json",
+      "changed_roles": []
+    },
+    {
+      "id": "github",
+      "name": "GitHub Light",
+      "kind": "authored reference",
+      "reason": "Neutral light surfaces, different syntax assignment",
+      "source": "assets/themes/github-theme/github_theme.json",
+      "changed_roles": []
+    },
+    {
+      "id": "ayu",
+      "name": "Ayu Light",
+      "kind": "authored reference",
+      "reason": "Warm accents on a light reading plane",
+      "source": "assets/themes/ayu/ayu.json",
+      "changed_roles": []
+    },
+    {
+      "id": "rose-pine",
+      "name": "Rosé Pine Dawn",
+      "kind": "authored reference",
+      "reason": "Warm light surfaces and softer color relationships",
+      "source": "assets/themes/rose-pine/rose-pine-dawn.json",
+      "changed_roles": []
+    },
+    {
+      "id": "flat",
+      "name": "Lab · Flatter surfaces",
+      "kind": "experimental transformation",
+      "reason": "Same syntax, foregrounds, and status colors; neutral surfaces converge on the reading plane.",
+      "base": "One Dark",
+      "parameters": {
+        "surface_flatness": 1.0
+      },
+      "changed_roles": [
+        "background",
+        "editor.subheader.background",
+        "element.active",
+        "element.background",
+        "element.disabled",
+        "element.hover",
+        "element.selected",
+        "elevated_surface.background",
+        "panel.background",
+        "status_bar.background",
+        "surface.background",
+        "tab.inactive_background",
+        "tab_bar.background",
+        "terminal.background",
+        "title_bar.background",
+        "title_bar.inactive_background"
+      ]
+    },
+    {
+      "id": "quiet",
+      "name": "Lab · Lower syntax chroma",
+      "kind": "experimental transformation",
+      "reason": "Same syntax assignments and approximate lightness; chroma is reduced in OKLab.",
+      "base": "One Dark",
+      "parameters": {
+        "syntax_chroma": 0.25
+      },
+      "changed_roles": [
+        "syntax"
+      ]
+    },
+    {
+      "id": "sparse",
+      "name": "Lab · Fewer syntax groups",
+      "kind": "experimental transformation",
+      "reason": "Keywords, strings, and comments keep their colors; other syntax becomes editor foreground. This intentionally changes assignments.",
+      "base": "One Dark",
+      "parameters": {
+        "sparse": true
+      },
+      "changed_roles": [
+        "syntax"
+      ]
+    },
+    {
+      "id": "warm-paper",
+      "name": "Lab · Intermediate warm paper",
+      "kind": "experimental transformation",
+      "reason": "Light-branch stress case, not a dark-to-light interpolation. Foregrounds are explicitly adjusted to a 4.5:1 normal-surface target; nested states still need separate checks.",
+      "base": "One Light",
+      "parameters": {
+        "lightness": 0.72,
+        "repairs": [
+          "text.muted",
+          "text.placeholder",
+          "text.accent",
+          "icon.muted",
+          "icon.accent",
+          "error",
+          "warning",
+          "success",
+          "info",
+          "hint",
+          "syntax/attribute",
+          "syntax/boolean",
+          "syntax/comment",
+          "syntax/comment.doc",
+          "syntax/constant",
+          "syntax/constructor",
+          "syntax/emphasis",
+          "syntax/emphasis.strong",
+          "syntax/enum",
+          "syntax/function",
+          "syntax/hint",
+          "syntax/keyword",
+          "syntax/label",
+          "syntax/link_text",
+          "syntax/link_uri",
+          "syntax/number",
+          "syntax/operator",
+          "syntax/predictive",
+          "syntax/preproc",
+          "syntax/property",
+          "syntax/punctuation.bracket",
+          "syntax/punctuation.delimiter",
+          "syntax/punctuation.list_marker",
+          "syntax/punctuation.markup",
+          "syntax/punctuation.special",
+          "syntax/selector",
+          "syntax/selector.pseudo",
+          "syntax/string",
+          "syntax/string.escape",
+          "syntax/string.regex",
+          "syntax/string.special",
+          "syntax/string.special.symbol",
+          "syntax/tag",
+          "syntax/text.literal",
+          "syntax/title",
+          "syntax/type",
+          "syntax/variable.parameter",
+          "syntax/variable.special",
+          "syntax/variant",
+          "syntax/diff.plus",
+          "syntax/diff.minus"
+        ]
+      },
+      "changed_roles": [
+        "background",
+        "editor.background",
+        "editor.gutter.background",
+        "editor.subheader.background",
+        "element.active",
+        "element.background",
+        "element.disabled",
+        "element.hover",
+        "element.selected",
+        "elevated_surface.background",
+        "error",
+        "hint",
+        "icon.accent",
+        "icon.muted",
+        "info",
+        "panel.background",
+        "status_bar.background",
+        "success",
+        "surface.background",
+        "syntax",
+        "tab.active_background",
+        "tab.inactive_background",
+        "tab_bar.background",
+        "terminal.background",
+        "text.accent",
+        "text.muted",
+        "text.placeholder",
+        "title_bar.background",
+        "title_bar.inactive_background",
+        "toolbar.background",
+        "warning"
+      ]
+    }
+  ],
+  "preferences": {
+    "theme": "Zedokai (Filter Octagon)",
+    "reading_font_family": "IBM Plex Sans Condensed",
+    "reading_font_size": 20.0,
+    "reading_font_weight": 400.0,
+    "code_font_family": "VictorMono Nerd Font",
+    "code_font_size": 17.0
+  },
+  "capture": {
+    "width": 1280,
+    "height": 900,
+    "scale": 1
+  },
+  "scope": "Pilot exemplars and local transformations, not a validated reduction of the full catalog."
+}

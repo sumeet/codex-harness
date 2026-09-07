@@ -154,6 +154,10 @@ struct HarnessLanguageSet {
 
 impl Global for HarnessLanguageSet {}
 
+pub fn language_registry(cx: &App) -> Arc<LanguageRegistry> {
+    cx.global::<HarnessLanguageSet>().registry.clone()
+}
+
 impl HarnessLanguageSet {
     fn new(cx: &mut App) -> anyhow::Result<Self> {
         let registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
@@ -353,6 +357,14 @@ impl LocalEditor {
 
     pub fn text(&self, cx: &App) -> String {
         self.editor.read(cx).text(cx)
+    }
+
+    pub fn set_placeholder(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |editor, cx| {
+            if editor.placeholder_text(cx).as_deref() != Some(text) {
+                editor.set_placeholder_text(text, window, cx);
+            }
+        });
     }
 
     pub fn set_text(

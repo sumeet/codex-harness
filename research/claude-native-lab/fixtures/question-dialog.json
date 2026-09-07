@@ -1,0 +1,53 @@
+{
+  "id": "dialog-question-fixture",
+  "kind": "permission_ask_user_question",
+  "payload": {
+    "requestId": "tool-question-fixture",
+    "toolName": "AskUserQuestion",
+    "input": {
+      "metadata": {"source": "harness-question-fixture"},
+      "questions": [
+        {
+          "question": "Which marker do you prefer?",
+          "header": "Marker",
+          "options": [
+            {"label": "Blue", "description": "A cool-toned marker."},
+            {"label": "Amber", "description": "A warm-toned marker."}
+          ],
+          "multiSelect": false
+        },
+        {
+          "question": "Which checks should run?",
+          "header": "Checks",
+          "options": [
+            {"label": "Unit", "description": "Check individual functions."},
+            {"label": "Integration", "description": "Check the complete workflow."}
+          ],
+          "multiSelect": true
+        }
+      ]
+    },
+    "permissionResult": {"behavior": "ask", "message": "Answer questions?"},
+    "questions": [
+      {
+        "question": "Which marker do you prefer?",
+        "header": "Marker",
+        "options": [
+          {"label": "Blue", "description": "A cool-toned marker."},
+          {"label": "Amber", "description": "A warm-toned marker."}
+        ],
+        "multiSelect": false
+      },
+      {
+        "question": "Which checks should run?",
+        "header": "Checks",
+        "options": [
+          {"label": "Unit", "description": "Check individual functions."},
+          {"label": "Integration", "description": "Check the complete workflow."}
+        ],
+        "multiSelect": true
+      }
+    ]
+  },
+  "hideWhile": ["panel"]
+}

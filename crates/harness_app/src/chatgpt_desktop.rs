@@ -9,7 +9,6 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    process::Command,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -663,18 +662,35 @@ fn installed_desktop_version() -> Option<String> {
     static VERSION: OnceLock<Option<String>> = OnceLock::new();
     VERSION
         .get_or_init(|| {
-            ["codex-desktop", "/opt/codex-desktop/codex-desktop"]
-                .into_iter()
-                .find_map(|program| {
-                    let output = Command::new(program).arg("--version").output().ok()?;
-                    output
-                        .status
-                        .success()
-                        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-                })
-                .filter(|version| valid_desktop_version(version))
+            // The desktop launcher can open/focus a window even for --version.
+            // Its top-level version file identifies Electron, not ChatGPT.
+            let path = "/opt/codex-desktop/resources/codex-linux-build-info.json";
+            match fs::read(path) {
+                Ok(bytes) => match desktop_version_from_build_info(&bytes) {
+                    Ok(version) => Some(version),
+                    Err(error) => {
+                        log::warn!("could not decode desktop version from {path}: {error:#}");
+                        None
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    log::warn!("could not read desktop version from {path}: {error}");
+                    None
+                }
+            }
         })
         .clone()
+}
+
+fn desktop_version_from_build_info(bytes: &[u8]) -> anyhow::Result<String> {
+    let metadata: Value = serde_json::from_slice(bytes).context("decoding build metadata")?;
+    metadata
+        .pointer("/upstreamDmg/appVersion")
+        .and_then(Value::as_str)
+        .filter(|version| valid_desktop_version(version))
+        .map(str::to_owned)
+        .context("build metadata has no valid upstream app version")
 }
 
 fn valid_desktop_version(version: &str) -> bool {
@@ -1496,6 +1512,33 @@ mod tests {
                 .chars()
                 .any(|character| character >= '\u{e000}' && character <= '\u{f8ff}')
         );
+    }
+
+    #[test]
+    fn desktop_build_metadata_uses_app_version_not_runtime_or_packager_version() {
+        let metadata = br#"{
+            "upstreamDmg": {"appVersion": "26.803.41515"},
+            "electronVersion": "42.3.0",
+            "source": {"version": "0.11.1"}
+        }"#;
+        assert_eq!(
+            desktop_version_from_build_info(metadata).expect("valid app version"),
+            "26.803.41515"
+        );
+    }
+
+    #[test]
+    fn desktop_build_metadata_rejects_missing_invalid_or_non_string_app_version() {
+        for metadata in [
+            r#"{}"#,
+            r#"{"electronVersion":"42.3.0","source":{"version":"0.11.1"}}"#,
+            r#"{"upstreamDmg":{"appVersion":12}}"#,
+            r#"{"upstreamDmg":{"appVersion":""}}"#,
+            r#"{"upstreamDmg":{"appVersion":"26.803.41515\r\nInjected: header"}}"#,
+            "not json",
+        ] {
+            assert!(desktop_version_from_build_info(metadata.as_bytes()).is_err());
+        }
     }
 
     #[test]

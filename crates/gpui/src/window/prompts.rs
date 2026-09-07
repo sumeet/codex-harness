@@ -105,6 +105,7 @@ impl Render for FallbackPromptRenderer {
             .cursor_default()
             .track_focus(&self.focus)
             .w_72()
+            .whitespace_normal()
             .bg(white())
             .rounded_lg()
             .overflow_hidden()
@@ -115,7 +116,7 @@ impl Render for FallbackPromptRenderer {
                     .flex()
                     .flex_row()
                     .justify_around()
-                    .child(div().overflow_hidden().child(self.message.clone())),
+                    .child(div().w_full().min_w_0().child(self.message.clone())),
             )
             .children(self.detail.clone().map(|detail| {
                 div()
@@ -125,7 +126,7 @@ impl Render for FallbackPromptRenderer {
                     .justify_around()
                     .text_sm()
                     .mb_2()
-                    .child(div().child(detail))
+                    .child(div().w_full().min_w_0().child(detail))
             }))
             .children(self.actions.iter().enumerate().map(|(ix, action)| {
                 div()

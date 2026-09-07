@@ -1,0 +1,10 @@
+{
+  "user": {"markdown": "Inspect success, failure, and changed code. These are synthetic fixture results, not commands being executed."},
+  "events": [
+    {"type": "message", "markdown": "## Meaning across states\n\nDiagnostics should stand out without making ordinary content disappear. Inspect the added and removed lines as well as their background tints."},
+    {"type": "tool", "kind": "terminal", "title": "Command", "input": "cargo test --lib appearance", "output": "", "status": "completed"},
+    {"type": "tool", "kind": "terminal", "title": "Command", "input": "cargo check --example preview", "output": "error[E0308]: expected a readable foreground\n  --> src/appearance.rs:24:9\n   |\n24 |     selected_text(background)\n   |     ^^^^^^^^^^^^^^^^^^^^^^^^^ check the composed surface", "status": "failed", "expanded": true},
+    {"type": "tool", "kind": "edit", "title": "Edited appearance settings", "input": "src/appearance.rs", "output": "Modified · src/appearance.rs\n--- a/src/appearance.rs\n+++ b/src/appearance.rs\n@@ -12,4 +12,4 @@\n-    let surface = palette.background;\n+    let surface = roles.reading_plane;\n     let foreground = roles.body_text;\n-    let syntax_groups = 12;\n+    let syntax_groups = 4;", "status": "completed", "expanded": true},
+    {"type": "message", "markdown": "**Review questions:** Can you locate the failure quickly? Are additions and removals distinguishable? Test selection in the native preview; this screenshot does not exercise it.\n\n```json\n{\n  \"reading_plane\": \"warm\",\n  \"syntax_groups\": 4,\n  \"preserve_diagnostics\": true\n}\n```"}
+  ]
+}

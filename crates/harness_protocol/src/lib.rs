@@ -214,6 +214,8 @@ pub fn command_for_display(command: &str) -> Cow<'_, str> {
 struct PersistedTranscript {
     version: u32,
     thread_id: String,
+    #[serde(default)]
+    history_anchor: Option<String>,
     items: Vec<TranscriptItem>,
 }
 
@@ -1654,6 +1656,8 @@ pub enum UserContentBlock {
 #[derive(Default)]
 pub struct TranscriptModel {
     pub items: Vec<TranscriptItem>,
+    // A live suffix can follow a gap; only verified history may advance this.
+    pub history_anchor: Option<String>,
     item_indices: HashMap<String, usize>,
     user_image_sources: HashMap<String, Vec<UserImageSource>>,
     user_content_blocks: HashMap<String, Vec<UserContentBlock>>,
@@ -1715,6 +1719,7 @@ impl TranscriptModel {
 
     pub fn clear(&mut self) {
         self.items.clear();
+        self.history_anchor = None;
         self.item_indices.clear();
         self.user_image_sources.clear();
         self.user_content_blocks.clear();
@@ -2251,6 +2256,7 @@ impl TranscriptModel {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: thread_id.to_string(),
+            history_anchor: self.history_anchor.clone(),
             // Persistence is an invariant boundary, not a byte-for-byte dump
             // of potentially corrupt in-memory identity state. Older builds
             // could append a second copy of a restored history; never write
@@ -2304,6 +2310,7 @@ impl TranscriptModel {
 
     fn restore_persisted_snapshot(&mut self, snapshot: PersistedTranscript) -> usize {
         self.clear();
+        self.history_anchor = snapshot.history_anchor;
         self.items = normalize_transcript_items(
             snapshot
                 .items
@@ -2663,15 +2670,14 @@ impl TranscriptModel {
                                 status: status.clone(),
                                 was_active,
                             });
-                            if matches!(status.as_str(), "failed" | "interrupted") {
-                                let kind = if status == "failed" {
-                                    TranscriptKind::Error
-                                } else {
-                                    TranscriptKind::Review
-                                };
+                            if status == "failed" {
+                                let turn_id = turn_id.to_owned();
+                                let index = self.upsert_turn_failure(&turn_id, turn);
+                                outcome.dirty.insert(index);
+                            } else if status == "interrupted" {
                                 let index = self.upsert_generated(
                                     format!("turn-completion:{turn_id}"),
-                                    kind,
+                                    TranscriptKind::Review,
                                     format!("Turn {}", protocol_status_text(&status)),
                                     render_turn_completion(&turn, &status),
                                     turn,
@@ -2891,14 +2897,10 @@ impl TranscriptModel {
                             .map(ToOwned::to_owned);
                     }
                     "error" => {
-                        let turn_id = string_at(&params, "/turnId").unwrap_or("unknown");
-                        let index = self.upsert_generated(
-                            format!("error:{turn_id}"),
-                            TranscriptKind::Error,
-                            "Codex error",
-                            pretty_json(&params),
-                            params,
-                        );
+                        let turn_id = string_at(&params, "/turnId")
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        let index = self.upsert_turn_failure(&turn_id, params);
                         outcome.dirty.insert(index);
                     }
                     _ => {}
@@ -3197,6 +3199,27 @@ impl TranscriptModel {
                 .insert(self.items[index].key.clone(), incoming_user_content_blocks);
         }
         Some(index)
+    }
+
+    fn upsert_turn_failure(&mut self, turn_id: &str, raw: Value) -> usize {
+        // The terminal error and turn/completed describe the same failure.
+        // Share an identity so separate delivery batches cannot create two cards.
+        let key = format!("turn-failure:{turn_id}");
+        let previous = self
+            .item_indices
+            .get(&key)
+            .and_then(|index| self.items.get(*index))
+            .map(|item| &item.raw);
+        let raw = merge_turn_failure_payload(previous, raw);
+        let index = self.upsert_generated(
+            key,
+            TranscriptKind::Error,
+            "Turn failed",
+            render_turn_completion(&raw, "failed"),
+            raw,
+        );
+        self.items[index].status = Some("failed".into());
+        index
     }
 
     fn upsert_generated(
@@ -4444,7 +4467,25 @@ fn normalize_transcript_items(items: Vec<TranscriptItem>) -> Vec<TranscriptItem>
     unique.reverse();
 
     let mut normalized: Vec<TranscriptItem> = Vec::with_capacity(unique.len());
+    let mut failures: HashMap<String, usize> = HashMap::new();
     for mut item in unique {
+        if let Some(turn_id) = terminal_failure_turn_id(&item).map(ToOwned::to_owned) {
+            if let Some(previous) = failures
+                .get(&turn_id)
+                .and_then(|index| normalized.get_mut(*index))
+            {
+                previous.raw = merge_turn_failure_payload(Some(&previous.raw), item.raw);
+                previous.content = render_turn_completion(&previous.raw, "failed");
+                previous.event_count = previous.event_count.saturating_add(item.event_count);
+                continue;
+            }
+            item.key = format!("turn-failure:{turn_id}");
+            item.title = "Turn failed".into();
+            item.status = Some("failed".into());
+            item.raw = merge_turn_failure_payload(None, item.raw);
+            item.content = render_turn_completion(&item.raw, "failed");
+            failures.insert(turn_id, normalized.len());
+        }
         item.normalize_stop_presentation();
         if is_context_compaction_item(&item)
             && let Some(previous) = normalized.last_mut()
@@ -5601,10 +5642,60 @@ fn plan_title(params: &Value) -> String {
     "Plan".into()
 }
 
+fn terminal_failure_turn_id(item: &TranscriptItem) -> Option<&str> {
+    if item.kind != TranscriptKind::Error {
+        return None;
+    }
+    if item.key.starts_with("error:") && item.raw.get("willRetry") == Some(&Value::Bool(false)) {
+        return string_at(&item.raw, "/turnId");
+    }
+    if (item.key.starts_with("turn-completion:") || item.key.starts_with("turn-failure:"))
+        && item.status.as_deref() == Some("failed")
+    {
+        return string_at(&item.raw, "/id").or_else(|| string_at(&item.raw, "/turnId"));
+    }
+    None
+}
+
+fn merge_turn_failure_payload(previous: Option<&Value>, incoming: Value) -> Value {
+    let mut merged = previous
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let notification = incoming.get("willRetry").is_some() && incoming.get("id").is_none();
+    let completed = merged.get("status").and_then(Value::as_str) == Some("failed");
+    let mut error = merged
+        .get("error")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(incoming_error) = incoming.get("error").and_then(Value::as_object) {
+        for (key, value) in incoming_error {
+            let missing = error.get(key).is_none_or(Value::is_null);
+            if !value.is_null() && (missing || !(notification && completed)) {
+                error.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    if let Some(incoming) = incoming.as_object() {
+        merged.extend(incoming.clone());
+    }
+    if notification && incoming.get("harnessErrorNotification").is_none() {
+        // Completion payloads can omit notification-only diagnostics. Retain
+        // the original notification even after the terminal snapshot arrives.
+        merged.insert("harnessErrorNotification".into(), incoming);
+    }
+    merged.insert("error".into(), Value::Object(error));
+    Value::Object(merged)
+}
+
 fn render_turn_completion(turn: &Value, status: &str) -> String {
     let mut sections = Vec::new();
     if let Some(message) = string_at(turn, "/error/message").filter(|message| !message.is_empty()) {
         sections.push(message.to_string());
+    }
+    if turn.get("willRetry").and_then(Value::as_bool) == Some(false) {
+        sections.push("Not retrying automatically.".into());
     }
     if let Some(details) =
         string_at(turn, "/error/additionalDetails").filter(|details| !details.is_empty())
@@ -5615,7 +5706,10 @@ fn render_turn_completion(turn: &Value, status: &str) -> String {
         .pointer("/error/codexErrorInfo")
         .filter(|info| !info.is_null())
     {
-        sections.push(format!("Error details\n{}", pretty_json(info)));
+        sections.push(match info.as_str() {
+            Some(code) => format!("Error code: {code}"),
+            None => format!("Error details\n{}", pretty_json(info)),
+        });
     }
     if sections.is_empty() {
         sections.push(if status == "interrupted" {
@@ -7508,6 +7602,7 @@ mod tests {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
+            history_anchor: None,
             items: vec![user, wrapper, retry, agent],
         };
         let mut model = TranscriptModel::replay(5);
@@ -7548,6 +7643,7 @@ mod tests {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
+            history_anchor: None,
             items: vec![prefix, stale, middle, complete],
         };
         let mut model = TranscriptModel::default();
@@ -7612,6 +7708,25 @@ mod tests {
                 .len(),
             merged.len()
         );
+    }
+
+    #[test]
+    fn history_anchor_survives_live_appends_and_legacy_caches_have_no_proof() {
+        let old: PersistedTranscript = serde_json::from_value(json!({
+            "version": SNAPSHOT_VERSION, "thread_id": "thread", "items": []
+        })).unwrap();
+        assert!(old.history_anchor.is_none());
+
+        let mut model = TranscriptModel::default();
+        model.history_anchor = Some("verified-item".into());
+        model.items.push(replay_item(0, TranscriptKind::Agent, "Codex", "new live item", json!(null)));
+        let prepared = model.prepare_transcript_snapshot("anchor-test").unwrap();
+        let snapshot: PersistedTranscript = serde_json::from_slice(&prepared.serialized).unwrap();
+        assert_eq!(snapshot.history_anchor.as_deref(), Some("verified-item"));
+        model.restore_persisted_snapshot(snapshot);
+        assert_eq!(model.history_anchor.as_deref(), Some("verified-item"));
+        model.clear();
+        assert!(model.history_anchor.is_none());
     }
 
     #[test]
@@ -9330,6 +9445,7 @@ mod tests {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
+            history_anchor: None,
             items: local.items.iter().map(item_for_snapshot).collect(),
         };
         let mut restored = TranscriptModel::default();
@@ -9642,6 +9758,7 @@ mod tests {
         model.restore_persisted_snapshot(PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
+            history_anchor: None,
             items: vec![stopped, with_error, unrelated],
         });
         assert_eq!(model.items[0].title, "Stopped");
@@ -9684,6 +9801,7 @@ mod tests {
         let snapshot = PersistedTranscript {
             version: SNAPSHOT_VERSION,
             thread_id: "thread-1".into(),
+            history_anchor: None,
             items: model.items.clone(),
         };
         model.restore_persisted_snapshot(snapshot);
@@ -10027,6 +10145,192 @@ mod tests {
     }
 
     #[test]
+    fn capacity_failure_notifications_share_one_card_in_either_delivery_order() {
+        let notification = json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "willRetry": false,
+            "error": {
+                "message": "Selected model is at capacity. Please try a different model.",
+                "codexErrorInfo": "serverOverloaded",
+                "additionalDetails": "Capacity exhausted",
+                "misalignment": null
+            }
+        });
+        let completion = json!({
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-1",
+                "status": "failed",
+                "items": [],
+                "error": {
+                    "message": "Selected model is at capacity. Please try a different model.",
+                    "codexErrorInfo": "serverOverloaded",
+                    "additionalDetails": null
+                }
+            }
+        });
+        for reverse in [false, true] {
+            let mut model = TranscriptModel {
+                current_turn_id: Some("turn-1".into()),
+                ..Default::default()
+            };
+            let mut events = vec![
+                Event::Notification {
+                    method: "error".into(),
+                    params: notification.clone(),
+                },
+                Event::Notification {
+                    method: "turn/completed".into(),
+                    params: completion.clone(),
+                },
+            ];
+            if reverse {
+                events.reverse();
+            }
+            for event in events {
+                let outcome = model.apply_batch(vec![event], Some("thread-1"));
+                assert_eq!(model.items.len(), 1);
+                assert!(outcome.dirty.contains(&0));
+            }
+            let failure = &model.items[0];
+            assert_eq!(failure.key, "turn-failure:turn-1");
+            assert_eq!(failure.title, "Turn failed");
+            assert_eq!(failure.status.as_deref(), Some("failed"));
+            assert_eq!(failure.event_count, 2);
+            assert_eq!(
+                failure
+                    .content
+                    .matches("Selected model is at capacity")
+                    .count(),
+                1
+            );
+            assert!(failure.content.contains("Capacity exhausted"));
+            assert!(failure.content.contains("Not retrying automatically."));
+            assert!(failure.content.contains("Error code: serverOverloaded"));
+            assert!(!failure.content.contains("willRetry"));
+            assert_eq!(
+                failure.raw.get("harnessErrorNotification"),
+                Some(&notification)
+            );
+            assert_eq!(model.raw_events.len(), 2);
+            assert!(model.current_turn_id.is_none());
+        }
+    }
+
+    #[test]
+    fn failed_completion_without_error_keeps_notification_details_and_identity() {
+        let mut model = TranscriptModel::default();
+        for (method, params) in [
+            (
+                "error",
+                json!({
+                    "threadId": "thread-1", "turnId": "turn-1", "willRetry": false,
+                    "error": {"message": "Capacity exhausted", "codexErrorInfo": "serverOverloaded"}
+                }),
+            ),
+            (
+                "turn/completed",
+                json!({
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "failed", "error": null}
+                }),
+            ),
+        ] {
+            model.apply_batch(
+                vec![Event::Notification {
+                    method: method.into(),
+                    params,
+                }],
+                Some("thread-1"),
+            );
+        }
+        assert_eq!(model.items.len(), 1);
+        assert!(model.items[0].content.starts_with("Capacity exhausted"));
+        assert_eq!(model.item_indices.get("turn-failure:turn-1"), Some(&0));
+    }
+
+    #[test]
+    fn cached_duplicate_failures_collapse_and_normalization_is_idempotent() {
+        let notification = json!({
+            "threadId": "thread-1", "turnId": "turn-1", "willRetry": false,
+            "error": {"message": "Capacity exhausted", "additionalDetails": "Original diagnostic"}
+        });
+        let mut error = replay_item(
+            0,
+            TranscriptKind::Error,
+            "Codex error",
+            "old JSON",
+            notification.clone(),
+        );
+        error.key = "error:turn-1".into();
+        let mut completion = replay_item(
+            1,
+            TranscriptKind::Error,
+            "Turn failed",
+            "Capacity exhausted",
+            json!({
+                "id": "turn-1", "status": "failed", "error": {"message": "Capacity exhausted"}
+            }),
+        );
+        completion.key = "turn-completion:turn-1".into();
+        completion.status = Some("failed".into());
+        let mut model = TranscriptModel::default();
+        model.restore_persisted_snapshot(PersistedTranscript {
+            version: SNAPSHOT_VERSION,
+            thread_id: "thread-1".into(),
+            history_anchor: None,
+            items: vec![error, completion],
+        });
+        assert_eq!(model.items.len(), 1);
+        assert_eq!(model.item_indices.get("turn-failure:turn-1"), Some(&0));
+        assert!(model.items[0].content.contains("Original diagnostic"));
+        let normalized_again = normalize_transcript_items(model.items.clone());
+        assert_eq!(normalized_again[0].raw, model.items[0].raw);
+        assert_eq!(
+            normalized_again[0].raw.get("harnessErrorNotification"),
+            Some(&notification)
+        );
+
+        let mut notification_model = TranscriptModel::default();
+        notification_model.apply_batch(
+            vec![Event::Notification {
+                method: "error".into(),
+                params: notification,
+            }],
+            Some("thread-1"),
+        );
+        let notification_only = normalize_transcript_items(notification_model.items);
+        let normalized_twice = normalize_transcript_items(notification_only.clone());
+        assert_eq!(normalized_twice[0].raw, notification_only[0].raw);
+    }
+
+    #[test]
+    fn unrelated_turn_failures_and_interruption_remain_separate() {
+        let mut model = TranscriptModel::default();
+        for turn_id in ["turn-1", "turn-2"] {
+            model.apply_batch(
+                vec![Event::Notification {
+                    method: "error".into(),
+                    params: json!({
+                        "threadId": "thread-1", "turnId": turn_id, "willRetry": false,
+                        "error": {"message": "Capacity exhausted"}
+                    }),
+                }],
+                Some("thread-1"),
+            );
+        }
+        model.apply_batch(vec![Event::Notification {
+            method: "turn/completed".into(),
+            params: json!({"threadId": "thread-1", "turn": {"id": "turn-2", "status": "interrupted"}}),
+        }], Some("thread-1"));
+        assert_eq!(model.items.len(), 3);
+        assert_eq!(model.items[0].kind, TranscriptKind::Error);
+        assert_eq!(model.items[1].kind, TranscriptKind::Error);
+        assert!(model.items[2].is_quiet_stop());
+    }
+
+    #[test]
     fn final_codex_errors_and_general_warnings_remain_transcript_items() {
         let mut model = TranscriptModel::default();
         let outcome = model.apply_batch(
@@ -10053,7 +10357,7 @@ mod tests {
 
         assert_eq!(model.items.len(), 2);
         assert!(outcome.transient_turn_status.is_none());
-        assert_eq!(model.items[0].title, "Codex error");
+        assert_eq!(model.items[0].title, "Turn failed");
         assert_eq!(model.items[1].title, "Codex warning");
     }
 

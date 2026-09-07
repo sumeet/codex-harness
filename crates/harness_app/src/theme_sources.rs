@@ -13,6 +13,8 @@ use http_client::{AsyncBody, HttpClient};
 use serde::Deserialize;
 use theme::ThemeRegistry;
 
+use crate::visual_theme::HarnessVisualTheme;
+
 const ZED_THEME_CATALOG_URL: &str =
     "https://api.zed.dev/extensions?max_schema_version=1&provides=themes";
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
@@ -314,6 +316,95 @@ fn load_external_theme_roots(
     report
 }
 
+pub(crate) fn export_appearance_catalog(path: &Path) -> anyhow::Result<()> {
+    let registry = ThemeRegistry::new(Box::new(assets::Assets));
+    theme_settings::load_bundled_themes(&registry);
+    let report = load_external_themes(&registry);
+    if !report.errors.is_empty() {
+        bail!("theme catalog is incomplete:\n{}", report.errors.join("\n"));
+    }
+    let themes = registry
+        .list_names()
+        .iter()
+        .map(|name| appearance_snapshot(registry.get(name)?.as_ref()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let catalog = serde_json::json!({
+        "schema_version": 1,
+        "color_encoding": "unpremultiplied sRGB RGBA floats",
+        "scope": "Resolved ThemeColors, syntax, Harness surfaces, selected status roles, and local player; not an exhaustive rendering equivalence test",
+        "external_files_loaded": report.files_loaded,
+        "themes": themes,
+    });
+    // An audit must not overwrite an earlier capture or a user's theme file.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating appearance export {}", path.display()))?;
+    serde_json::to_writer_pretty(file, &catalog).context("writing appearance export")
+}
+
+fn appearance_snapshot(theme: &theme::Theme) -> anyhow::Result<serde_json::Value> {
+    let rgba = |color: gpui::Hsla| {
+        let color = gpui::Rgba::from(color);
+        [color.r, color.g, color.b, color.a]
+    };
+    let colors = theme
+        .colors()
+        .iter()
+        .map(|(field, color)| (field.as_ref().to_owned(), serde_json::json!(rgba(color))))
+        .collect::<serde_json::Map<_, _>>();
+    let mut syntax = serde_json::Map::new();
+    let mut index = 0usize;
+    while let Some(highlight) = theme.syntax().get(index) {
+        let name = theme
+            .syntax()
+            .get_capture_name(index)
+            .context("syntax highlight is missing its capture name")?;
+        syntax.insert(
+            name.to_owned(),
+            serde_json::json!({
+                "color": highlight.color.map(rgba),
+                "background": highlight.background_color.map(rgba),
+                "font_style": highlight.font_style,
+                "font_weight": highlight.font_weight.map(|weight| weight.0),
+            }),
+        );
+        index += 1;
+    }
+    let status = theme.status();
+    let visual = HarnessVisualTheme::from_zed(theme.colors(), status);
+    Ok(serde_json::json!({
+        "name": theme.name.as_ref(),
+        "appearance": if theme.appearance().is_light() { "light" } else { "dark" },
+        "colors": colors,
+        "syntax": syntax,
+        "window_background": format!("{:?}", theme.window_background_appearance()),
+        "harness": {
+            "canvas": rgba(visual.canvas), "transcript": rgba(visual.transcript),
+            "rail": rgba(visual.rail), "raised_surface": rgba(visual.raised_surface),
+            "tool_surface": rgba(visual.tool_surface), "tool_header_surface": rgba(visual.tool_header_surface),
+            "tool_border": rgba(visual.tool_border), "pending_surface": rgba(visual.pending_surface),
+            "error_surface": rgba(visual.error_surface), "error_border": rgba(visual.error_border),
+            "selection_surface": rgba(visual.selection_surface),
+            "diff_added_surface": rgba(visual.diff_added_surface),
+            "diff_deleted_surface": rgba(visual.diff_deleted_surface),
+            "divider": rgba(visual.divider), "strong_divider": rgba(visual.strong_divider),
+        },
+        "status": {
+            "error": rgba(status.error), "warning": rgba(status.warning),
+            "success": rgba(status.success), "info": rgba(status.info),
+            "hint": rgba(status.hint), "error_background": rgba(status.error_background),
+            "warning_background": rgba(status.warning_background),
+            "success_background": rgba(status.success_background),
+        },
+        "local_player": theme.players().0.first().map(|player| serde_json::json!({
+            "cursor": rgba(player.cursor), "selection": rgba(player.selection),
+            "background": rgba(player.background),
+        })),
+    }))
+}
+
 fn collect_theme_json(directory: &Path, depth: usize, output: &mut Vec<PathBuf>) {
     // Installed extension layouts are `installed/<id>/themes/*.json`; four
     // levels also leave room for a pack to group variants without permitting
@@ -353,6 +444,43 @@ mod tests {
     use assets::Assets;
     use gpui::AssetSource as _;
     use uuid::Uuid;
+
+    #[test]
+    fn appearance_export_preserves_resolved_surfaces_and_syntax_assignments() {
+        let registry = ThemeRegistry::new(Box::new(()));
+        theme_settings::load_user_theme(&registry, br##"{
+            "name": "Audit", "author": "Fixture", "themes": [{
+                "name": "Audit", "appearance": "dark", "style": {
+                    "editor.background": "#102030", "surface.background": "#304050",
+                    "syntax": {"function": {"color": "#abcdef", "font_style": "italic", "font_weight": 700}}
+                }
+            }]
+        }"##).expect("valid audit fixture");
+        let theme = registry.get("Audit").expect("audit theme");
+        let snapshot = appearance_snapshot(&theme).expect("snapshot");
+        assert_eq!(
+            snapshot["harness"]["transcript"],
+            snapshot["colors"]["editor_background"]
+        );
+        assert_eq!(
+            snapshot["harness"]["tool_surface"],
+            snapshot["harness"]["tool_header_surface"]
+        );
+        assert_ne!(
+            snapshot["harness"]["tool_surface"],
+            snapshot["harness"]["transcript"]
+        );
+        assert_eq!(snapshot["syntax"]["function"]["font_style"], "Italic");
+        assert_eq!(snapshot["syntax"]["function"]["font_weight"], 700.0);
+        assert!(
+            snapshot["colors"]["text"].is_array(),
+            "omitted roles must be resolved"
+        );
+        assert!(
+            snapshot.get("id").is_none(),
+            "random runtime IDs must not enter the audit"
+        );
+    }
 
     #[test]
     fn installed_zed_pack_is_loaded_from_its_themes_directory() {

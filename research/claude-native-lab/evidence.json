@@ -1,0 +1,463 @@
+{
+  "date": "2026-09-06",
+  "status": "experimental_harness_native_workspace_shared_transcript",
+  "nativeVersion": "2.1.263",
+  "platform": "linux-x86_64",
+  "nodeVersion": "26.7.0",
+  "originalSha256": "b9c407e36847bcb24b953b1390f240c840ae6c99e10a76475d2fadc5d5c4adca",
+  "patchedSha256": "333c83debd83564cf31cd99e3d5f4eee2256557dd771df528b870b2910978abf",
+  "installedBinaryUnchanged": true,
+  "testNativeProcessesStoppedAfterVerification": true,
+  "nativeSourceModule": "/$bunfs/root/chunk-s5gs13rj.js",
+  "injectedBytes": 634,
+  "extractedModuleCount": 1818,
+  "offlineTests": {
+    "command": "node --test research/claude-native-lab/bridge.test.mjs research/claude-native-lab/preload.test.mjs research/claude-native-lab/supervisor.test.mjs",
+    "passed": 26,
+    "failed": 0
+  },
+  "supervisorDiscoveryFollowup": {
+    "report": "SUPERVISOR-AUDIT.md#follow-up-native-discovery-and-non-disruptive-setup",
+    "privateEvidenceRoot": "/tmp/harness-claude-supervisor.2MJ8Bw",
+    "productionBackendChanged": false,
+    "nativeJsonListingIncludesDormantJobs": true,
+    "listingAndProbeDidNotWakeStoppedJobs": true,
+    "readOnlyProbe": "supervisor_catalog.mjs",
+    "directSocketBindingWithoutRelay": true,
+    "endpointMetadataVersion": 1,
+    "validates": ["job_id", "pid", "boot_id", "process_start_ticks", "uid", "executable", "workspace", "private_real_socket", "protocol", "conversation_uuid", "epoch", "event_cursor", "endpoint_unchanged_after_handshake"],
+    "stagedHandover": {
+      "originalUninstrumentedWorkerPid": 996683,
+      "nativeJobId": "e866aff0",
+      "sessionId": "e866aff0-7a5a-4c06-b8e5-608a9c3bcc75",
+      "keepWorkersPreservedOriginalPid": true,
+      "migratedWorkerPid": 998924,
+      "preservedLocalHistoryMessages": 4,
+      "otherJobId": "f6c71021",
+      "otherWorkerPidUnchanged": 997116,
+      "activeWorkAcrossSupervisorHandoverTested": false,
+      "existingCorporateWrapperCompositionTested": false
+    },
+    "missingHistoryFault": {
+      "nativeAttachRefusedMissingHistory": false,
+      "reproducedWithLocalCommandHistory": true,
+      "reproducedAfterAssistantReply": true,
+      "emptyWorkerPid": 1000275,
+      "sameConversationUuid": true,
+      "snapshotMessages": 0,
+      "ptyTimeoutMeansTuiStayedOpenNotRefusal": true,
+      "originalTranscriptRestoredAndHashChecked": true,
+      "recoveredWorkerPid": 1000571,
+      "recoveredMessages": 11,
+      "submittedUserUuidAndAssistantMarkerPreserved": true,
+      "guardedWakeImplemented": false
+    },
+    "modelPromptsSubmitted": 1,
+    "guiLaunched": false,
+    "testProcessesStopped": true,
+    "userHarnessPidLeftRunning": 906724
+  },
+  "supervisorAudit": {
+    "report": "SUPERVISOR-AUDIT.md",
+    "officialLaunchSeam": "https://code.claude.com/docs/en/corporate-launcher",
+    "loader": "documented_process_wrapper_plus_version_gated_private_preload",
+    "defaultHarnessBackendChanged": false,
+    "privateEvidenceRoot": "/tmp/harness-claude-supervisor.BXREBU",
+    "modelPromptsSubmitted": 9,
+    "coldWorkerPid": 988517,
+    "promotedStandbyPid": 990031,
+    "liveChecksPassedPerWorker": [4, 4],
+    "independentSocketClientProcesses": 8,
+    "eventsPerClientByRun": [156, 158],
+    "sameOrderAndNoGapsInCommonInterval": true,
+    "nativeSessionId": "b6eb99ef-b399-4a0f-ab31-cf3335c0235a",
+    "realHarnessFrontends": 2,
+    "harnessComposerRoundtripNativePid": 991236,
+    "secondFrontendSawPromptAndResponse": true,
+    "guiQualification": "Isolated fixture catalogs and raw-byte socket relay; production supervisor discovery and Native terminal button not migrated",
+    "stockUnconfiguredTerminalAttach": true,
+    "forcedIdleWorkerCrash": {
+      "pid": 991236,
+      "recoveredAutomaticallyWithinMilliseconds": 30000,
+      "recoveredAutomatically": false,
+      "explicitRespawnPid": 992948,
+      "sameSessionId": true,
+      "messageCountBeforeAndAfter": 32,
+      "harnessManualReconnectPassed": true
+    },
+    "competingRespawns": {
+      "requests": 2,
+      "successfulResponses": 2,
+      "finalWorkerPid": 992947,
+      "maximumObservedOwners": 1,
+      "samples": 60,
+      "sampleIntervalMilliseconds": 100,
+      "sameSessionAndSavedMessageUuids": true,
+      "globalAtomicOwnershipProven": false
+    },
+    "unsupportedCandidate": {
+      "version": "2.1.243-musl",
+      "sha256": "9e10f7c2b42e4a6ff22d49bf88151d6b4ad7a034deb90554e28174196189fe08",
+      "refusedBeforeLaunch": true,
+      "existingWorkerPidAndEpochUnchanged": true,
+      "newVersionLiveUpgradeTested": false
+    },
+    "initialFailures": [
+      "ordinary_worker_only_preload_missed_warm_standby_fixed_by_delayed_assignment",
+      "resume_with_extra_flags_created_new_identity_instead_of_continuing_requested_one",
+      "immediate_respawn_of_unmaterialized_copy_did_not_restore_in_memory_copied_history"
+    ],
+    "nativeJobsAndTransientSupervisorsStopped": true,
+    "testFrontendsRelayAndPrivateDisplayStopped": true,
+    "userHarnessPidLeftRunning": 906724,
+    "userGlobalSettingsAndInstalledBinaryUnchanged": true
+  },
+  "concurrencyAudit": {
+    "report": "CONCURRENCY-AUDIT.md",
+    "productionFixesInThisPass": false,
+    "nativeOwnership": {
+      "disposableForkSessionId": "ff157bdc-bc46-43a7-a4c0-46d9cbcf079c",
+      "seedWasStoppedDisposableLab": true,
+      "modelPromptsSubmitted": 0,
+      "preloadedAndStockInteractiveOwners": [984159, 984949],
+      "simultaneousUninstrumentedInteractiveOwners": [984949, 985342],
+      "bothUninstrumentedOwnersReachedPromptWithSameId": true,
+      "transcriptCorruptionTested": false,
+      "nativeBackgroundJob": "ff157bdc",
+      "nativeBackgroundWorkerPid": 985755,
+      "stockResumeWhileBackgroundOwned": {
+        "exitCode": 1,
+        "directedUserToAttachOrStop": true
+      },
+      "testProcessesConfirmedAbsent": [984159, 984949, 985342, 985730, 985746, 985755],
+      "transientSupervisorExited": true,
+      "disposableConversationAndStoppedJobRetained": true,
+      "installedBinaryHashUnchangedAfterTest": true,
+      "supervisorWorkerPreloadRetentionTested": false,
+      "supervisorRetentionFollowup": "See supervisorAudit for the subsequent successful live experiment",
+      "simultaneousSupervisorStartRaceTested": false
+    },
+    "syntheticProbe": {
+      "command": "node research/claude-native-lab/probe_concurrency.mjs",
+      "nativeStores": "synthetic",
+      "transport": "real Unix sockets",
+      "promptAndApprovalClientProcesses": 8,
+      "eventSubscribersInOneProcess": 8,
+      "sameIdAdmissions": 1,
+      "duplicateAcknowledgements": 7,
+      "distinctAdmissions": 8,
+      "racingDialogResolutions": 1,
+      "staleDialogRepliesRejected": 7,
+      "orderedEventsPerSubscriber": 250,
+      "admissionsAfterPostAdmissionExceptionAndRetry": 2,
+      "adapterReplacementRejectsOldEpoch": true,
+      "adapterReplacementReadmitsSameIdWithNewEpoch": true,
+      "firstRunFullSnapshotBytes": 1117099,
+      "firstRunSynchronousPublishMsByClients": {"1": 5.5, "4": 11.8, "8": 16.4},
+      "performanceQualification": "Single synthetic Node measurements, not native Bun throughput or a sustained load benchmark",
+      "successfulExitDoesNotMeanFindingsFixed": true
+    },
+    "inspectionOnlyFindings": [
+      "shared_frontend_draft_and_session_snapshots_have_no_cross_process_transaction",
+      "fixed_temporary_json_paths_can_collide_between_writers",
+      "bridge_serializes_full_transcript_per_client_synchronously",
+      "rust_projection_does_not_enforce_event_sequence_cursor",
+      "mutating_rpc_epoch_and_session_binding_are_optional_in_raw_bridge"
+    ]
+  },
+  "harnessIntegration": {
+    "workspace": "Claude",
+    "renderer": "shared TranscriptModel / render_transcript_list_item / render_item",
+    "appTests": {"passed": 249, "failed": 0, "ignored": 1},
+    "transcriptAudit": "TRANSCRIPT-AUDIT.md",
+    "liveNativePid": 954360,
+    "liveSessionId": "a1a180ff-2da3-4829-800d-5ce95405c7f6",
+    "verified": [
+      "native_session_started_by_embedded_harness_host",
+      "shared_composer_prompt_reached_native_claude",
+      "shared_markdown_and_code_rendering",
+      "native_write_permission_approved_through_shared_request_surface",
+      "frontend_restart_reconnected_to_same_native_pid_and_history",
+      "native_terminal_attach_and_detach_preserved_session",
+      "native_write_and_edit_metadata_projected_to_shared_file_diff_rows",
+      "expanded_edit_visually_showed_one_addition_and_one_deletion",
+      "native_bash_failure_rendered_actual_exit_7",
+      "fresh_final_build_host_has_remote_control_disabled",
+      "fresh_final_build_host_rejects_stale_epoch_before_action",
+      "lifecycle_v1_host_starts_stock_native_without_model_prompt",
+      "duplicate_host_launch_rejected_without_affecting_live_owner",
+      "corrupt_catalog_record_warns_without_hiding_healthy_or_missing_runtime_records",
+      "lifecycle_v1_gui_connects_to_same_native_host",
+      "lifecycle_v1_native_exit_stops_host_and_publishes_exit_marker",
+      "live_sigkill_of_idle_host_detected_despite_stale_attached_marker",
+      "native_child_exited_after_live_host_sigkill",
+      "unsent_draft_survived_host_crash_and_manual_reconnect",
+      "reconnect_and_send_on_crashed_host_did_not_start_replacement_or_consume_draft",
+      "available_stopped_unavailable_sidebar_labels_visible_beside_long_paths",
+      "stopped_and_missing_runtime_screens_do_not_suggest_native_setup",
+      "opening_missing_runtime_record_does_not_recreate_its_directory"
+    ],
+    "privateScreenshots": [
+      "/tmp/harness-claude-ui.jlO0Q0/manual-permission.png",
+      "/tmp/harness-claude-ui.jlO0Q0/audited-connected.png",
+      "/tmp/harness-claude-ui.jlO0Q0/native-edit-diff.png",
+      "/tmp/harness-claude-harden.cUtkDq/lifecycle-ready.png",
+      "/tmp/harness-claude-harden.cUtkDq/lifecycle-crashed.png",
+      "/tmp/harness-claude-harden.cUtkDq/lifecycle-reconnect-after-crash.png",
+      "/tmp/harness-claude-harden.cUtkDq/lifecycle-final-stopped.png",
+      "/tmp/harness-claude-harden.cUtkDq/lifecycle-final-unavailable.png"
+    ],
+    "notClaimed": ["all_tool_and_dialog_parity", "nested_agent_or_artifact_editor_ui", "live_web_and_mcp_result_coverage", "image_submission", "hot_attach_or_reboot_recovery", "global_native_conversation_ownership_lock"]
+  },
+  "liveRuns": [
+    {
+      "loader": "native-supervisor-process-wrapper-preload",
+      "pid": 988517,
+      "sessionId": "9b7dd5c1-241e-4c17-9244-17a331663675",
+      "report": "/tmp/harness-claude-supervisor.BXREBU/jobs/9b7dd5c1/988517/checks-AL4ruW/report.json",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 2,
+      "pendingPermissionInterruptMilliseconds": 39
+    },
+    {
+      "loader": "native-supervisor-promoted-standby-preload",
+      "pid": 990031,
+      "sessionId": "b6eb99ef-b399-4a0f-ab31-cf3335c0235a",
+      "report": "/tmp/harness-claude-supervisor.BXREBU/jobs/b6eb99ef/990031/checks-1MumPb/report.json",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 12,
+      "pendingPermissionInterruptMilliseconds": 26
+    },
+    {
+      "pid": 912274,
+      "sessionId": "ded81f32-2b7f-4c5d-9123-dec5db87c07a",
+      "report": "/tmp/harness-claude-lab.zpdPIo/checks-5xtFph/report.json",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 2,
+      "pendingPermissionInterruptMilliseconds": 40,
+      "additionalManualChecksPassed": [
+        "socket_prompt_rendered_in_native_terminal",
+        "terminal_prompt_observed_on_socket",
+        "socket_permission_answer_dismissed_native_terminal_dialog",
+        "terminal_permission_answer_observed_on_socket",
+        "native_ask_user_question_answer",
+        "native_artifact_create_and_update"
+      ],
+      "loader": "binary-patch"
+    },
+    {
+      "pid": 916101,
+      "sessionId": "456615e2-8c9c-44fb-953f-1828466fd502",
+      "report": "/tmp/harness-claude-lab.zhmIAO/checks-FBkPVr/report.json",
+      "launchedWith": "research/claude-native-lab/launch.mjs",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 11,
+      "pendingPermissionInterruptMilliseconds": 23,
+      "loader": "binary-patch"
+    },
+    {
+      "loader": "stock-preload",
+      "pid": 934839,
+      "sessionId": "d5163d52-d4eb-4c2e-af55-17a1a03e9c35",
+      "report": "/tmp/harness-claude-lab.gBSItg/checks-hKLB7Q/report.json",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 2,
+      "pendingPermissionInterruptMilliseconds": 19,
+      "additionalManualChecksPassed": ["read_existing_private_artifact_revision_2"]
+    },
+    {
+      "loader": "stock-preload",
+      "pid": 937171,
+      "sessionId": "bc1d1978-eca7-4ba9-be6d-b7a001016ec5",
+      "report": "/tmp/harness-claude-lab.Ut72In/checks-HHPpop/report.json",
+      "launchedWith": "research/claude-native-lab/launch.mjs",
+      "checksPassed": 4,
+      "checksFailed": 0,
+      "textDeltaCount": 2,
+      "pendingPermissionInterruptMilliseconds": 23
+    }
+  ],
+  "automatedLiveChecks": [
+    "deny_write_and_reject_stale_approval",
+    "approve_with_modified_tool_input",
+    "streaming_and_retry_deduplication",
+    "disconnect_reconnect_pending_permission_and_interrupt_same_process"
+  ],
+  "artifact": {
+    "userExplicitlyApprovedPublication": true,
+    "containsProjectOrPersonalData": false,
+    "artifactId": "af38d499-0cec-47b0-bc50-8b26ed69a39d",
+    "url": "https://claude.ai/code/artifact/af38d499-0cec-47b0-bc50-8b26ed69a39d",
+    "audience": "owner",
+    "creation": {
+      "updated": false,
+      "version": "1788706194-3622",
+      "liveSubscription": "arming"
+    },
+    "update": {
+      "updated": true,
+      "version": "1788706305-ae80",
+      "liveSubscription": "connected"
+    },
+    "visuallyInspectedHostedPage": false,
+    "renderedInsideHarness": false,
+    "stockPreloadRead": {
+      "passed": true,
+      "revision": 2,
+      "capture": "/tmp/harness-claude-lab.gBSItg/artifact-read.jsonl",
+      "newPublication": false
+    }
+  },
+  "privateCapturesNotIncludedInRepository": [
+    "/tmp/harness-claude-lab.zpdPIo/terminal-interop-fixed.jsonl",
+    "/tmp/harness-claude-lab.zpdPIo/terminal-approval.jsonl",
+    "/tmp/harness-claude-lab.zpdPIo/artifact-allow.jsonl",
+    "/tmp/harness-claude-lab.zpdPIo/artifact-update-allow.jsonl",
+    "/tmp/harness-claude-lab.zpdPIo/question-answer.jsonl",
+    "/tmp/harness-claude-compare.6W0YJs/remote-frames.jsonl",
+    "/tmp/harness-claude-compare.6W0YJs/remote-permission.jsonl"
+  ],
+  "knownFailedProbe": {
+    "report": "/tmp/harness-claude-lab.zpdPIo/checks-T1IHvp/report.json",
+    "cause": "Native standalone-sleep guard ended the tool before reconnect; invalid active-turn test precondition, not proof that disconnect cancels the turn",
+    "replacement": "Disconnect with a verified pending native file permission, then reconnect and interrupt"
+  },
+  "notEstablished": [
+    "hot_attach_to_unmodified_running_claude",
+    "complete_harness_provider_feature_parity",
+    "native_host_crash_or_reboot_recovery",
+    "crash_safe_prompt_admission_or_durable_replay",
+    "complete_native_product_state_or_artifact_editor_protocol",
+    "foreground_and_background_agents_or_teams",
+    "mcp_elicitation",
+    "images_and_file_attachments",
+    "compatibility_with_other_claude_versions_or_platforms",
+    "model_effort_compaction_or_general_session_management_RPC",
+    "native_supervisor_migration_retaining_preload_bridge",
+    "transparent_future_updates_without_adapter_maintenance"
+  ],
+  "preferredLoader": "stock-executable-with-process-local-bun-preload",
+  "remoteControlDuringLocalBridgeLiveSuites": {
+    "enabled": false,
+    "connected": false
+  },
+  "preload": {
+    "current": {
+      "claudeVersion": "2.1.263",
+      "bunVersion": "1.4.1",
+      "registryModule": "/$bunfs/root/chunk-fnj287e8.js",
+      "registryExport": "Hs",
+      "runtimeContract": "verified"
+    },
+    "older": {
+      "claudeVersion": "2.1.243-musl",
+      "bunVersion": "1.4.0",
+      "sha256": "9e10f7c2b42e4a6ff22d49bf88151d6b4ad7a034deb90554e28174196189fe08",
+      "preloadRan": true,
+      "registryDiscovered": true,
+      "controllerFoundBySeparateReadOnlyProbe": true,
+      "bridgeSupported": false,
+      "reason": "No native Ink subscribeLayout callback; scope/turn contracts also differ",
+      "report": "/tmp/harness-claude-lab.HUo4UF/preload-status.json"
+    },
+    "defaultUnknownBuildPolicy": "refuse; --probe-unverified allows only a fresh disposable compatibility experiment",
+    "discoveryUsesHardcodedChunkOrFunctionName": false,
+    "discoveryParsesStructuralMarkers": true,
+    "usesInternalReactStateAndNativeMethods": true,
+    "childBootstrapEnvironmentConsumed": true,
+    "patchFallbackPreparation": "/tmp/harness-claude-lab.rjieOm/preparation.json",
+    "patchFallbackMatchesPriorPatchedHash": true
+  },
+  "resumeChecks": [
+    {
+      "previouslyUninstrumentedStockSession": true,
+      "previousPid": 935301,
+      "newPid": 937379,
+      "sessionId": "99ab48a2-c07d-44c5-abcd-25d48d62d65c",
+      "priorReplyPresentInSnapshot": true,
+      "modelRecalledPriorMarker": true,
+      "remoteControlRestoredFromPersistedSession": true,
+      "status": "/tmp/harness-claude-compare.6W0YJs/resumed-stock-status.json",
+      "capture": "/tmp/harness-claude-compare.6W0YJs/resumed-stock-events.jsonl"
+    },
+    {
+      "packagedResume": true,
+      "previousPid": 937171,
+      "newPid": 937757,
+      "sessionId": "bc1d1978-eca7-4ba9-be6d-b7a001016ec5",
+      "preExitMessageIdsRetained": 26,
+      "preExitMessageCount": 26,
+      "modelRecalledPriorMarker": true,
+      "remoteControl": false,
+      "report": "/tmp/harness-claude-lab.ORPsCy/resume-report.json"
+    },
+    {
+      "activeOwnerRejectedByLauncher": true,
+      "unknownBuildRejectedByDefault": true
+    }
+  ],
+  "clearCheck": {
+    "pid": 937757,
+    "oldSessionId": "bc1d1978-eca7-4ba9-be6d-b7a001016ec5",
+    "newSessionId": "0f862ab5-6dd3-4a47-9f5e-52773645a23a",
+    "sameSocketClientObservedSessionChange": true,
+    "postClearTranscriptEmpty": true,
+    "postClearPromptCompleted": true,
+    "report": "/tmp/harness-claude-lab.ORPsCy/clear-report.json"
+  },
+  "remoteControlProbe": {
+    "nativeBinaryUnmodified": true,
+    "noPreload": true,
+    "initialSessionId": "session_01BRMCrdehoMKZtFEt8Veb6M",
+    "initialChecksPassed": ["native_reply", "write_denied_over_subscriber_websocket"],
+    "packagedSessionId": "session_01NToPujNShWhbdbjHeAw3Wp",
+    "packagedChecksPassed": 2,
+    "report": "/tmp/harness-claude-compare.6W0YJs/remote-check-KgMMvN/report.json",
+    "ingressObservedAs": "peer-origin message, not directly typed user input",
+    "permissionDenialHonored": true,
+    "emptyResultArrivedBeforeAssistantText": true,
+    "failedPackagedProbe": {
+      "capture": "/tmp/harness-claude-compare.6W0YJs/remote-check-zn2rHw/frames.jsonl",
+      "cause": "Probe expected assistant text inside result.result; native turn succeeded but result was empty and separate assistant event followed",
+      "fixed": true
+    },
+    "credentialsCopiedOrPrinted": false,
+    "firstPartyIdentitySpoofed": false,
+    "fullFeatureCoverageEstablished": false
+  },
+  "additionalAlternatives": [
+    {
+      "surface": "native_per_session_messaging_socket",
+      "evidence": "Live metadata and installed handler inspection only",
+      "features": ["peer_user_message", "rename", "delivery_status", "idle_notice", "artifact_reply_handoff"],
+      "generalTranscriptSubscriptionFound": false
+    },
+    {
+      "surface": "native_supervisor",
+      "evidence": "Installed dispatch inspection and live background-owned resume refusal",
+      "scope": "Stronger lifecycle candidate; worker preload retention, simultaneous ownership races, and full semantic app-server not verified"
+    },
+    {
+      "surface": "react_devtools_global_hook",
+      "evidence": "Live stock preload registration",
+      "rendererCallbacksObserved": false
+    },
+    {
+      "surface": "bun_plugin_loader",
+      "evidence": "Stock --version probe",
+      "onResolveObserved": true,
+      "onLoadObserved": false,
+      "productionTransformAttempted": false
+    },
+    {
+      "surface": "installed_2.1.243_glibc",
+      "evidence": "Plain --version and preload --version both exited 139",
+      "notAttributedToPreload": true
+    }
+  ]
+}

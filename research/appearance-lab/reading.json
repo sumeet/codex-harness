@@ -1,0 +1,7 @@
+{
+  "user": {"markdown": "Compare the appearance, not the layout. Keep reading, code, and controls easy to distinguish."},
+  "events": [
+    {"type": "message", "markdown": "## Read, inspect, decide\n\nThe same **content**, *typography*, and `inline code` appear in every reference. Notice what draws your attention first: the prose, the syntax, or the surrounding interface.\n\n```rust\n// Preserve meaning, even when the colors change.\nstruct Sample { name: String, score: f32 }\n\nfn select(samples: &[Sample], minimum: f32) -> Vec<&Sample> {\n    samples.iter()\n        .filter(|sample| sample.score >= minimum)\n        .collect()\n}\n\nlet label = \"A warmer environment, the same code\";\nlet enabled = true;\n```\n\nA quiet appearance can use **fewer color groups** or **less chroma**. Those are different edits. A [link](https://example.com) should remain identifiable without taking over the paragraph."},
+    {"type": "tool", "kind": "terminal", "title": "Command", "input": "rg -n 'surface|syntax' src/appearance.rs", "output": "", "status": "completed"}
+  ]
+}

@@ -32,6 +32,7 @@ wayland = [
     "gpui/wayland",
 ]
 x11 = [
+    "gpui/x11",
     "gpui_wgpu",
     "ashpd",
 
