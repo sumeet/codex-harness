@@ -303,6 +303,18 @@ actions!(
     ]
 );
 
+/// Enters Insert mode for an editor with Vim enabled, without requiring a
+/// focused dispatch tree. Editors without an active Vim addon are unchanged.
+pub fn enter_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+    let vim = editor
+        .read(cx)
+        .addon::<VimAddon>()
+        .map(|addon| addon.entity.clone());
+    if let Some(vim) = vim {
+        vim.update(cx, |vim, cx| vim.switch_mode(Mode::Insert, false, window, cx));
+    }
+}
+
 /// Initializes the `vim` crate.
 pub fn init(cx: &mut App) {
     VimGlobals::register(cx);

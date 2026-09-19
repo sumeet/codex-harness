@@ -131,6 +131,7 @@ actions!(
         CopyPerformanceReport,
         RunPerformanceBenchmark,
         NormalEscape,
+        CloseImagePreview,
         ChooseApproval,
         OpenRequestSurface,
         ReturnFromRequest,
@@ -3021,6 +3022,18 @@ fn web_result_domain(url: &str) -> Option<String> {
         .next()
         .filter(|domain| !domain.is_empty())
         .map(|domain| domain.trim_start_matches("www.").to_owned())
+}
+
+fn transcript_link_url(destination: &str) -> anyhow::Result<http_client::Url> {
+    if Path::new(destination).is_absolute() {
+        // Platform URL openers require a scheme, even for a local document.
+        // Using the URL encoder also keeps spaces, # and % in filenames literal.
+        http_client::Url::from_file_path(destination)
+            .map_err(|()| anyhow::anyhow!("Could not convert the file path to a URL"))
+    } else {
+        http_client::Url::parse(destination)
+            .context("The link is not an absolute file path or a valid URL")
+    }
 }
 
 fn reasoning_summary_lines(content: &str) -> Vec<String> {
@@ -7153,6 +7166,31 @@ impl HarnessApp {
             .into_any_element()
     }
 
+    fn toggle_queued_prompt(&mut self, preview_key: &str, cx: &mut Context<Self>) {
+        if self.expanded_queued_prompts.remove(preview_key).is_none()
+            && let Some(entry) = self
+                .queued_turns
+                .iter()
+                .find(|entry| entry.preview_key() == preview_key)
+        {
+            self.expanded_queued_prompts.insert(
+                preview_key.to_owned(),
+                ExpandedQueuedPrompt::new(&entry.input),
+            );
+        }
+        cx.notify();
+    }
+
+    fn open_transcript_link(&mut self, destination: &str, cx: &mut Context<Self>) {
+        match transcript_link_url(destination) {
+            Ok(target) => cx.open_url(target.as_str()),
+            Err(error) => {
+                self.error = Some(format!("Could not open link: {error:#}").into());
+                cx.notify();
+            }
+        }
+    }
+
     fn render_outbound_tray(
         &mut self,
         pending_outbound: Option<AnyElement>,
@@ -7226,6 +7264,7 @@ impl HarnessApp {
                             let weak_remove = weak.clone();
                             let weak_drop = weak.clone();
                             let weak_expand = weak.clone();
+                            let weak_preview = weak.clone();
                             let expanded_key = preview_key.clone();
                             let pending_controls = (!queue_ready && operation.is_none()).then(|| {
                                 let weak_retry = weak.clone();
@@ -7365,7 +7404,7 @@ impl HarnessApp {
                                 .child(div()
                                 .id(("queued-prompt", index))
                                 .group("queued-prompt")
-                                .h(px(32.))
+                                .h(px(36.))
                                 .flex_none()
                                 // The handle owns the edge gutter; applying the
                                 // row's normal content inset before it made the
@@ -7408,28 +7447,21 @@ impl HarnessApp {
                                         .ok();
                                 })
                                 .child(drag_handle)
-                                .child(IconButton::new(("expand-queued-prompt", index), if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
-                                    .shape(IconButtonShape::Square).size(ButtonSize::Compact).style(ButtonStyle::Subtle)
-                                    .aria_label(if expanded { "Collapse queued prompt" } else { "Read full queued prompt" })
-                                    .tooltip(Tooltip::text(if expanded { "Collapse prompt" } else { "Read full prompt without sending it" }))
-                                    .on_click(move |_, _, cx| {
-                                        if let Err(error) = weak_expand.update(cx, |this, cx| {
-                                            if this.expanded_queued_prompts.remove(&expanded_key).is_none()
-                                                && let Some(entry) = this.queued_turns.iter().find(|entry| entry.preview_key() == expanded_key)
-                                            {
-                                                this.expanded_queued_prompts.insert(expanded_key.clone(), ExpandedQueuedPrompt::new(&entry.input));
-                                            }
-                                            cx.notify();
-                                        }) {
-                                            log::warn!("Could not expand queued prompt: {error:#}");
-                                        }
-                                    }))
                                 .child(
                                     div()
+                                        .id(("queued-prompt-preview", index))
                                         .flex_1()
                                         .min_w_0()
                                         .overflow_hidden()
                                         .whitespace_nowrap()
+                                        .cursor_pointer()
+                                        .on_click(move |_, _, cx| {
+                                            if let Err(error) = weak_preview.update(cx, |this, cx| {
+                                                this.toggle_queued_prompt(&preview_key, cx);
+                                            }) {
+                                                log::warn!("Could not expand queued prompt: {error:#}");
+                                            }
+                                        })
                                         .flex()
                                         .items_center()
                                         .gap_1()
@@ -7497,6 +7529,8 @@ impl HarnessApp {
                                                                 ("steer-queued-prompt", index),
                                                                 IconName::SteeringWheel,
                                                             )
+                                                            .icon_size(IconSize::Small)
+                                                            .icon_color(Color::Muted)
                                                             .shape(IconButtonShape::Square)
                                                             .size(ButtonSize::Compact)
                                                             .style(ButtonStyle::Subtle)
@@ -7531,8 +7565,10 @@ impl HarnessApp {
                                                 this.child(
                                                     IconButton::new(
                                                         ("send-queued-prompt", index),
-                                                        IconName::InterruptAndRun,
+                                                        if active_turn { IconName::InterruptAndRun } else { IconName::Send },
                                                     )
+                                                    .icon_size(IconSize::Small)
+                                                    .icon_color(Color::Muted)
                                                     .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
@@ -7580,6 +7616,8 @@ impl HarnessApp {
                                                         ("edit-queued-prompt", index),
                                                         IconName::Pencil,
                                                     )
+                                                    .icon_size(IconSize::Small)
+                                                    .icon_color(Color::Muted)
                                                     .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
@@ -7608,14 +7646,16 @@ impl HarnessApp {
                                                 this.child(
                                                     IconButton::new(
                                                         ("remove-queued-prompt", index),
-                                                        IconName::Trash,
+                                                        IconName::Close,
                                                     )
+                                                    .icon_size(IconSize::Small)
+                                                    .icon_color(Color::Muted)
                                                     .shape(IconButtonShape::Square)
                                                     .size(ButtonSize::Compact)
                                                     .style(ButtonStyle::Subtle)
                                                     .disabled(operation_pending)
-                                                    .aria_label("Remove queued prompt")
-                                                    .tooltip(Tooltip::text("Remove queued prompt"))
+                                                    .aria_label("Cancel queued prompt")
+                                                    .tooltip(Tooltip::text("Cancel this queued prompt without stopping the active response"))
                                                     .on_click({
                                                         let client_id = entry
                                                             .client_user_message_id
@@ -7634,7 +7674,20 @@ impl HarnessApp {
                                                 )
                                             })
                                         }),
-                                ))
+                                )
+                                .child(div().flex_none().ml_1().pl_1().border_l_1().border_color(colors.border_variant)
+                                    .child(IconButton::new(("expand-queued-prompt", index), if expanded { IconName::ChevronDown } else { IconName::ChevronRight })
+                                        .shape(IconButtonShape::Square).size(ButtonSize::Compact).style(ButtonStyle::Subtle)
+                                        .icon_size(IconSize::XSmall).icon_color(Color::Muted)
+                                        .aria_label(if expanded { "Collapse queued prompt" } else { "Read full queued prompt" })
+                                        .tooltip(Tooltip::text(if expanded { "Collapse prompt" } else { "Read full prompt without sending it" }))
+                                        .on_click(move |_, _, cx| {
+                                            if let Err(error) = weak_expand.update(cx, |this, cx| {
+                                                this.toggle_queued_prompt(&expanded_key, cx);
+                                            }) {
+                                                log::warn!("Could not expand queued prompt: {error:#}");
+                                            }
+                                        }))))
                                 .when_some(expanded_segments, |this, segments| {
                                     let copy_text = queued_submission_text(&entry.input);
                                     this.child(div().id(("queued-prompt-full-text", index)).min_w_0().px_3().pb_2().flex().flex_col().gap_2()
@@ -9990,6 +10043,9 @@ impl HarnessApp {
         }
         self.track_live_request_updates(&live_request_ids, old_len, new_len, &dirty_items);
         self.track_image_surface_updates(old_len, new_len, &dirty_items);
+        // Capture mutable image files on receipt, even when the window is not
+        // drawing. Waiting for a later render may miss another overwrite.
+        self.sync_image_surfaces(cx);
         if outcome.refresh_threads {
             if let Some(thread_id) = self.selected_thread_id.clone() {
                 self.persist_transcript_in_background(&thread_id, cx);
@@ -10227,7 +10283,24 @@ impl HarnessApp {
                     let surface = if let Some(surface) = self.image_surfaces.get(&item_key) {
                         surface.clone()
                     } else {
-                        let surface = cx.new(|_| ImageSurface::new(&raw));
+                        let thread_id = self.selected_thread_id.as_deref().unwrap_or("preview");
+                        let identity = format!("codex:{thread_id}:{item_key}");
+                        let surface = cx.new(|cx| ImageSurface::new(&raw, identity, cx));
+                        cx.observe(&surface, {
+                            let item_key = item_key.clone();
+                            move |this, _, cx| {
+                                if let Some(index) = this
+                                    .model
+                                    .items
+                                    .iter()
+                                    .position(|item| item.key == item_key)
+                                {
+                                    this.list_state.splice(index..index + 1, 1);
+                                }
+                                cx.notify();
+                            }
+                        })
+                        .detach();
                         self.image_surfaces
                             .insert(item_key.clone(), surface.clone());
                         surface
@@ -15375,6 +15448,9 @@ impl HarnessApp {
         if self.local_escape_target_active() {
             context.add("HarnessLocalEscape");
         }
+        if self.expanded_user_image.is_some() {
+            context.add("HarnessImagePreview");
+        }
         if self.search_visible {
             context.add("HarnessSearchVisible");
         }
@@ -16950,7 +17026,11 @@ impl HarnessApp {
             let owner = cx.weak_entity();
             element = element.on_url_click(move |url, _, cx| {
                 let Some(source) = expanded_images.get(url.as_ref()).cloned() else {
-                    cx.open_url(&url);
+                    if let Err(error) = owner.update(cx, |this, cx| {
+                        this.open_transcript_link(&url, cx);
+                    }) {
+                        log::warn!("Could not open transcript link: {error:#}");
+                    }
                     return;
                 };
                 owner
@@ -17775,7 +17855,14 @@ impl HarnessApp {
                 style.selection_background_color =
                     rich_navigation_markdown_highlight_background(navigation, cx);
             }
-            let mut element = MarkdownElement::new(markdown, style);
+            let owner = cx.weak_entity();
+            let mut element = MarkdownElement::new(markdown, style).on_url_click(move |url, _, cx| {
+                if let Err(error) = owner.update(cx, |this, cx| {
+                    this.open_transcript_link(&url, cx);
+                }) {
+                    log::warn!("Could not open transcript link: {error:#}");
+                }
+            });
             if rich_vim_experiment() {
                 let source = item.content.clone();
                 let logical =
@@ -18504,7 +18591,20 @@ impl Render for HarnessApp {
         let list_state = self.active_transcript_list_state().clone();
         let task_list_state = self.task_list_state.clone();
         let command_palette = self.command_palette.clone();
-        let expanded_user_image = self.expanded_user_image.clone();
+        let expanded_user_image = self.expanded_user_image.as_ref().map(|source| {
+            image_surface::lightbox_image(source, window, cx).map(|image| {
+                let dimensions = image.size(0);
+                let viewport = window.viewport_size();
+                let dimensions = image_surface::lightbox_size(
+                    (
+                        u32::from(dimensions.width) as f32,
+                        u32::from(dimensions.height) as f32,
+                    ),
+                    (f32::from(viewport.width), f32::from(viewport.height)),
+                );
+                (image, dimensions)
+            })
+        });
         let appearance_settings = self
             .appearance_settings_open
             .then(|| self.render_appearance_settings(window, cx));
@@ -19138,6 +19238,10 @@ impl Render for HarnessApp {
             // transcript fallbacks and compact activity text now honor the
             // same configured weight as rich Markdown.
             .font_harness_ui(cx)
+            .on_action(cx.listener(|this, _: &CloseImagePreview, _, cx| {
+                this.expanded_user_image = None;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &Send, window, cx| this.send(window, cx)))
             .on_action(cx.listener(|this, _: &Steer, window, cx| this.steer(window, cx)))
             .on_action(
@@ -19674,47 +19778,47 @@ impl Render for HarnessApp {
                             .on_mouse_down(
                                 gpui::MouseButton::Left,
                                 cx.listener(|this, _, _, cx| {
+                                    cx.stop_propagation();
                                     this.expanded_user_image = None;
                                     cx.notify();
                                 }),
                             )
+                            .when(image.is_none(), |this| {
+                                this.child(
+                                    Label::new("Image is loading or unavailable").color(Color::Muted),
+                                )
+                            })
+                            .when_some(image, |this, (image, (width, height))| {
+                                this.child(
+                                    gpui::img(image)
+                                        .w(px(width))
+                                        .h(px(height))
+                                        .object_fit(ObjectFit::Contain)
+                                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        }),
+                                )
+                            })
                             .child(
                                 div()
-                                    .relative()
-                                    .w(relative(0.94))
-                                    .h(relative(0.9))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
+                                    .absolute()
+                                    .top_4()
+                                    .right_4()
+                                    .rounded_sm()
+                                    .bg(colors.editor_background.opacity(0.9))
                                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
                                         cx.stop_propagation()
                                     })
                                     .child(
-                                        gpui::img(image)
-                                            .size_full()
-                                            .object_fit(ObjectFit::ScaleDown),
-                                    )
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .top_0()
-                                            .right_0()
-                                            .rounded_sm()
-                                            .bg(colors.editor_background.opacity(0.9))
-                                            .child(
-                                                IconButton::new(
-                                                    "close-user-image-preview",
-                                                    IconName::Close,
-                                                )
-                                                .shape(IconButtonShape::Square)
-                                                .size(ButtonSize::Default)
-                                                .style(ButtonStyle::Subtle)
-                                                .aria_label("Close image preview")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.expanded_user_image = None;
-                                                    cx.notify();
-                                                })),
-                                            ),
+                                        IconButton::new("close-user-image-preview", IconName::Close)
+                                            .shape(IconButtonShape::Square)
+                                            .size(ButtonSize::Default)
+                                            .style(ButtonStyle::Subtle)
+                                            .aria_label("Close image preview")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.expanded_user_image = None;
+                                                cx.notify();
+                                            })),
                                     ),
                             ),
                     )
@@ -21098,7 +21202,8 @@ fn comparison_fixture_tool(
                 "id": id,
                 "type": "imageView",
                 "status": status,
-                "path": "/home/smt/harness/interface-comparison/assets/transcript-reference.svg",
+                "path": event.get("path").and_then(Value::as_str)
+                    .unwrap_or("/home/smt/harness/interface-comparison/assets/transcript-reference.svg"),
             }),
             true,
         ),
@@ -21224,6 +21329,12 @@ fn harness_keybindings() -> Vec<KeyBinding> {
             "escape",
             NormalEscape,
             Some("Editor && VimControl && vim_mode == normal"),
+        ),
+        KeyBinding::new("escape", CloseImagePreview, Some("HarnessImagePreview")),
+        KeyBinding::new(
+            "escape",
+            CloseImagePreview,
+            Some("HarnessImagePreview > Editor"),
         ),
         KeyBinding::new("j", MoveDown, Some("HarnessTranscript || HarnessTasks")),
         KeyBinding::new("k", MoveUp, Some("HarnessTranscript || HarnessTasks")),
@@ -21720,6 +21831,29 @@ mod tests {
         let projection = rich_navigation_item_projection(&model, 2).expect("selectable stop");
         assert_eq!(projection.body_text(), "Stopped");
         assert_eq!(projection.text, "Stopped");
+    }
+
+    #[test]
+    fn image_preview_escape_overrides_editor_modes_only_while_open() {
+        let keymap = gpui::Keymap::new(harness_keybindings());
+        let keystrokes = [Keystroke::parse("escape").expect("valid shortcut")];
+        for mode in ["insert", "normal", "visual"] {
+            for open in [false, true] {
+                let contexts = [
+                    KeyContext::parse(if open { "Harness HarnessImagePreview" } else { "Harness" })
+                        .expect("valid root context"),
+                    KeyContext::parse(&format!("Editor VimControl vim_mode={mode}"))
+                        .expect("valid editor context"),
+                ];
+                let (bindings, pending) = keymap.bindings_for_input(&keystrokes, &contexts);
+                assert!(!pending);
+                assert_eq!(
+                    bindings.first().is_some_and(|binding| binding.action().partial_eq(&CloseImagePreview)),
+                    open,
+                    "preview {open}, mode {mode}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -22780,6 +22914,42 @@ mod tests {
     }
 
     #[test]
+    fn transcript_file_links_are_encoded_as_file_urls() {
+        for path in [
+            "/tmp/preview.html",
+            "/tmp/My sketches/queue #1 100%.html",
+            "/tmp/ébauche.html",
+        ] {
+            let target = transcript_link_url(path).expect("absolute file link");
+            assert_eq!(target.scheme(), "file");
+            assert_eq!(target.to_file_path().expect("file path"), Path::new(path));
+            assert_eq!(target.fragment(), None);
+        }
+        assert_eq!(
+            transcript_link_url("/tmp/My sketches/queue #1 100%.html")
+                .expect("file URL")
+                .as_str(),
+            "file:///tmp/My%20sketches/queue%20%231%20100%25.html"
+        );
+    }
+
+    #[test]
+    fn transcript_links_preserve_urls_and_reject_unresolved_paths() {
+        for destination in [
+            "https://example.com/sketches?q=one%20two#preview",
+            "file:///tmp/My%20sketches/preview.html",
+            "mailto:hello@example.com",
+        ] {
+            assert_eq!(
+                transcript_link_url(destination).expect("URL").as_str(),
+                destination
+            );
+        }
+        assert!(transcript_link_url("relative/preview.html").is_err());
+        assert!(transcript_link_url("").is_err());
+    }
+
+    #[test]
     fn queued_prompt_rows_use_drag_handles_without_ordinal_or_arrow_chrome() {
         let source = include_str!("main.rs");
         let renderer = source
@@ -22802,6 +22972,13 @@ mod tests {
         assert!(renderer.contains("copy-queued-prompt"));
         assert!(renderer.contains("IconName::SteeringWheel"));
         assert!(renderer.contains("IconName::InterruptAndRun"));
+        assert!(renderer.contains("Cancel queued prompt"));
+        assert!(renderer.contains("this.toggle_queued_prompt(&preview_key, cx)"));
+        let cancel = renderer.find("remove-queued-prompt").expect("direct cancel button");
+        let caret = renderer.find("expand-queued-prompt").expect("expansion button");
+        assert!(cancel < caret, "disclosure follows the direct queue actions");
+        assert!(!renderer.contains("visible_on_hover"));
+        assert!(!renderer.contains("PopoverMenu"));
         assert!(renderer.contains(".pl_0()"));
         assert!(renderer.contains(".pr_2p5()"));
         assert!(!renderer.contains(".px_2p5()"));

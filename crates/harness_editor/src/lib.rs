@@ -286,7 +286,7 @@ impl LocalEditor {
             let languages = cx.global::<HarnessLanguageSet>();
             (languages.registry.clone(), languages.markdown.clone())
         };
-        let editor = cx.new(move |cx| {
+        let editor = cx.new(|cx| {
             // Zed's agent composer begins as a small writing surface rather
             // than collapsing to a status-bar-sized single row. The footer is
             // now outside this Editor's layout, so three intrinsic rows no
@@ -310,6 +310,12 @@ impl LocalEditor {
             }
             apply_typography_profile_to_editor(&mut editor, typography_profile, window, cx);
             editor
+        });
+        // Vim registers its addon through observe_new. Initialize only this
+        // composer after registration, without relying on startup focus or a
+        // dispatch tree that may not have been rendered yet.
+        cx.defer_in(window, |this, window, cx| {
+            vim::enter_insert_mode(&this.editor, window, cx);
         });
         cx.subscribe(&editor, |this, _, event, cx| {
             if matches!(event, EditorEvent::BufferEdited) {

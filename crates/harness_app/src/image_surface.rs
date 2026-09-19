@@ -1,13 +1,18 @@
 use std::{
     collections::HashSet,
+    fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
+use anyhow::Context as _;
 use gpui::{
-    AnyElement, Context, ImageSource, IntoElement, ObjectFit, Render, SharedString, StyledImage,
-    Window, div, prelude::*,
+    AnyElement, App, Context, Image, ImageFormat, ImageSource, IntoElement, ObjectFit, Render,
+    RenderImage, SharedString, StyledImage, Task, Window, div, prelude::*,
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use ui::{Color, Icon, IconName, IconSize, Label, LabelCommon, LabelSize};
 
 const IMAGE_PREVIEW_MAX_WIDTH: f32 = 384.;
@@ -21,10 +26,12 @@ const IMAGE_PLACEHOLDER_ROWS: u32 = 3;
 enum ImageAvailability {
     Present {
         path: PathBuf,
+        image: Arc<Image>,
         dimensions: Option<(u32, u32)>,
     },
+    Loading(PathBuf),
     MissingPath,
-    MissingFile(PathBuf),
+    Unavailable(PathBuf, String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,21 +64,69 @@ pub(crate) fn keys_to_sync(
 
 pub(crate) struct ImageSurface {
     availability: ImageAvailability,
+    path: Option<PathBuf>,
+    snapshot_identity: String,
+    load_task: Task<()>,
 }
 
 impl ImageSurface {
-    pub(crate) fn new(raw: &Value) -> Self {
-        Self {
-            availability: availability_from_raw(raw),
-        }
+    pub(crate) fn new(raw: &Value, snapshot_identity: String, cx: &mut Context<Self>) -> Self {
+        let mut surface = Self {
+            availability: ImageAvailability::MissingPath,
+            path: None,
+            snapshot_identity,
+            load_task: Task::ready(()),
+        };
+        surface.update(raw, cx);
+        surface
     }
 
     pub(crate) fn update(&mut self, raw: &Value, cx: &mut Context<Self>) {
-        let availability = availability_from_raw(raw);
-        if self.availability != availability {
-            self.availability = availability;
-            cx.notify();
+        let path = image_path(raw);
+        if self.path == path && !matches!(self.availability, ImageAvailability::Unavailable(..)) {
+            return;
         }
+        self.path = path.clone();
+        let Some(path) = path else {
+            self.availability = ImageAvailability::MissingPath;
+            self.load_task = Task::ready(());
+            cx.notify();
+            return;
+        };
+        self.availability = ImageAvailability::Loading(path.clone());
+        let cache_path = dirs::cache_dir().map(|root| {
+            snapshot_path(
+                &root.join("harness/image-snapshots"),
+                &self.snapshot_identity,
+                &path,
+            )
+        });
+        let load = cx.background_spawn(async move {
+            match load_snapshot(&path, cache_path.as_deref()) {
+                Ok(image) => ImageAvailability::Present {
+                    dimensions: super::image_dimensions(&image.bytes, image.format),
+                    path,
+                    image,
+                },
+                Err(error) => {
+                    log::warn!(
+                        "could not load transcript image {}: {error:#}",
+                        path.display()
+                    );
+                    ImageAvailability::Unavailable(path, error.to_string())
+                }
+            }
+        });
+        self.load_task = cx.spawn(async move |this, cx| {
+            let availability = load.await;
+            if let Err(error) = this.update(cx, |this, cx| {
+                this.availability = availability;
+                cx.notify();
+            }) {
+                log::debug!("image surface closed while loading: {error}");
+            }
+        });
+        cx.notify();
     }
 
     pub(crate) fn preview_size(&self) -> (f32, f32) {
@@ -80,8 +135,8 @@ impl ImageSurface {
 
     pub(crate) fn preview_source(&self) -> Option<ImageSource> {
         match &self.availability {
-            ImageAvailability::Present { path, .. } => Some(path.clone().into()),
-            ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => None,
+            ImageAvailability::Present { image, .. } => Some(image.clone().into()),
+            _ => None,
         }
     }
 }
@@ -93,19 +148,111 @@ fn image_path(raw: &Value) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn availability_from_raw(raw: &Value) -> ImageAvailability {
-    classify_path(image_path(raw), Path::is_file)
+fn snapshot_path(root: &Path, identity: &str, path: &Path) -> PathBuf {
+    let mut digest = Sha256::new();
+    digest.update(identity.as_bytes());
+    digest.update([0]);
+    digest.update(path.as_os_str().as_encoded_bytes());
+    root.join(format!("{:x}", digest.finalize()))
 }
 
-fn classify_path(path: Option<PathBuf>, is_file: impl FnOnce(&Path) -> bool) -> ImageAvailability {
-    match path {
-        Some(path) if is_file(&path) => ImageAvailability::Present {
-            dimensions: image::image_dimensions(&path).ok(),
-            path,
-        },
-        Some(path) => ImageAvailability::MissingFile(path),
-        None => ImageAvailability::MissingPath,
+fn read_image(path: &Path) -> anyhow::Result<Arc<Image>> {
+    const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_IMAGE_BYTES,
+        "Image exceeds 64 MiB"
+    );
+    let format = image::guess_format(&bytes)
+        .ok()
+        .and_then(|format| ImageFormat::from_mime_type(format.to_mime_type()))
+        .or_else(|| {
+            std::str::from_utf8(&bytes)
+                .ok()
+                .filter(|text| text.trim_start().starts_with("<svg") || text.contains("<svg "))
+                .map(|_| ImageFormat::Svg)
+        })
+        .context("Unsupported image format")?;
+    Ok(Arc::new(Image::from_bytes(format, bytes)))
+}
+
+fn load_snapshot(path: &Path, cache_path: Option<&Path>) -> anyhow::Result<Arc<Image>> {
+    if let Some(cache_path) = cache_path {
+        match read_image(cache_path) {
+            Ok(image) => return Ok(image),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error.context("Cannot read saved image snapshot")),
+        }
     }
+    let image = read_image(path).context("Image file is unavailable or unreadable")?;
+    if let Some(cache_path) = cache_path {
+        // A filename is mutable, but a transcript event is not. Publish once,
+        // atomically, so reopening a thread cannot replace an earlier view with
+        // the latest screenshot (or race another Harness window's snapshot).
+        match persist_snapshot(cache_path, &image.bytes) {
+            Ok(()) => return read_image(cache_path),
+            Err(error) => log::warn!("could not save image snapshot: {error:#}"),
+        }
+    }
+    Ok(image)
+}
+
+fn persist_snapshot(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let directory = path
+        .parent()
+        .context("Image snapshot has no parent directory")?;
+    fs::create_dir_all(directory)?;
+    let temporary = directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| match fs::hard_link(&temporary, path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            result => result,
+        });
+    if let Err(error) = fs::remove_file(&temporary) {
+        log::warn!(
+            "could not remove image snapshot temporary {}: {error}",
+            temporary.display()
+        );
+    }
+    result?;
+    Ok(())
+}
+
+pub(crate) fn lightbox_image(
+    source: &ImageSource,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Arc<RenderImage>> {
+    match source {
+        ImageSource::Image(image) => image.clone().use_render_image(window, cx),
+        ImageSource::Render(image) => Some(image.clone()),
+        ImageSource::Resource(resource) => window
+            .use_asset::<gpui::ImgResourceLoader>(resource, cx)
+            .and_then(Result::ok),
+        ImageSource::Custom(load) => load(window, cx).and_then(Result::ok),
+    }
+}
+
+pub(crate) fn lightbox_size(image: (f32, f32), viewport: (f32, f32)) -> (f32, f32) {
+    let scale = ((viewport.0 - 48.).max(1.) / image.0.max(1.))
+        .min((viewport.1 - 48.).max(1.) / image.1.max(1.))
+        .min(1.);
+    (image.0 * scale, image.1 * scale)
 }
 
 fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
@@ -122,7 +269,7 @@ fn preview_size(dimensions: Option<(u32, u32)>) -> (f32, f32) {
 fn preview_size_for_availability(availability: &ImageAvailability) -> (f32, f32) {
     match availability {
         ImageAvailability::Present { dimensions, .. } => preview_size(*dimensions),
-        ImageAvailability::MissingPath | ImageAvailability::MissingFile(_) => (
+        _ => (
             IMAGE_PREVIEW_FALLBACK_WIDTH,
             IMAGE_ROW_HEIGHT * IMAGE_PLACEHOLDER_ROWS as f32,
         ),
@@ -169,9 +316,9 @@ fn placeholder(title: impl Into<SharedString>, detail: Option<SharedString>) -> 
 impl Render for ImageSurface {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let content = match &self.availability {
-            ImageAvailability::Present { path, .. } => {
+            ImageAvailability::Present { path, image, .. } => {
                 let unreadable_path = path_label(path);
-                gpui::img(path.clone())
+                gpui::img(image.clone())
                     .size_full()
                     .object_fit(ObjectFit::ScaleDown)
                     .with_loading(|| placeholder("Loading image…", None))
@@ -181,8 +328,9 @@ impl Render for ImageSurface {
                     .into_any_element()
             }
             ImageAvailability::MissingPath => placeholder("No local image path was provided", None),
-            ImageAvailability::MissingFile(path) => {
-                placeholder("Image file is unavailable", Some(path_label(path)))
+            ImageAvailability::Loading(_) => placeholder("Loading image…", None),
+            ImageAvailability::Unavailable(path, error) => {
+                placeholder(error.clone(), Some(path_label(path)))
             }
         };
 
@@ -221,26 +369,41 @@ mod tests {
     }
 
     #[test]
-    fn path_availability_distinguishes_present_missing_and_absent() {
-        let present = classify_path(Some(PathBuf::from("preview.png")), |_| true);
-        assert_eq!(
-            present,
-            ImageAvailability::Present {
-                path: PathBuf::from("preview.png"),
-                dimensions: None,
-            }
+    fn image_snapshots_survive_overwrites_deletion_and_reopening() -> anyhow::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("harness-image-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        let path = root.join("same.png");
+        let cache = root.join("snapshots");
+        let first_key = snapshot_path(&cache, "thread:first-view", &path);
+        let second_key = snapshot_path(&cache, "thread:second-view", &path);
+        // Equal dimensions and byte counts must not disguise changed pixels.
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])).save(&path)?;
+        let first = load_snapshot(&path, Some(&first_key))?;
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 255, 0, 255])).save(&path)?;
+        let second = load_snapshot(&path, Some(&second_key))?;
+        assert_ne!(first.id, second.id);
+        assert_eq!(load_snapshot(&path, Some(&first_key))?, first);
+        fs::remove_file(&path)?;
+        assert_eq!(load_snapshot(&path, Some(&first_key))?, first);
+        assert_eq!(load_snapshot(&path, Some(&second_key))?, second);
+        assert!(load_snapshot(&path, None).is_err());
+        assert_ne!(
+            first_key,
+            snapshot_path(&cache, "another-thread:first-view", &path)
         );
+        // A competing window must not overwrite an already published snapshot.
+        persist_snapshot(&first_key, &second.bytes)?;
+        assert_eq!(read_image(&first_key)?, first);
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
 
-        let missing = classify_path(Some(PathBuf::from("missing.png")), |_| false);
-        assert_eq!(
-            missing,
-            ImageAvailability::MissingFile(PathBuf::from("missing.png"))
-        );
-
-        assert_eq!(
-            classify_path(None, |_| true),
-            ImageAvailability::MissingPath
-        );
+    #[test]
+    fn lightbox_hit_area_fits_the_picture_not_the_viewport() {
+        assert_eq!(lightbox_size((100., 80.), (1000., 700.)), (100., 80.));
+        assert_eq!(lightbox_size((2000., 1000.), (1048., 748.)), (1000., 500.));
+        assert_eq!(lightbox_size((1000., 2000.), (1048., 748.)), (350., 700.));
     }
 
     #[test]

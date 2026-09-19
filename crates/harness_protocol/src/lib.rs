@@ -4799,6 +4799,17 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
     let protocol_id = string_at(&raw, "/id").unwrap_or("unknown-item").to_string();
     let protocol_kind = string_at(&raw, "/type").unwrap_or("unknown");
     let kind = kind_from_protocol(protocol_kind);
+    let status = raw
+        .get("status")
+        .and_then(protocol_status)
+        .unwrap_or_else(|| {
+            if completed {
+                "completed"
+            } else {
+                "in progress"
+            }
+            .into()
+        });
     let expanded = match kind {
         TranscriptKind::Command => command_exit_code(&raw).is_some_and(|exit_code| exit_code != 0),
         TranscriptKind::Tool => tool_result_failed(&raw),
@@ -4808,18 +4819,18 @@ fn item_from_protocol(raw: Value, completed: bool) -> TranscriptItem {
         key: protocol_id.clone(),
         protocol_id: Some(protocol_id),
         kind,
-        title: title_from_protocol(protocol_kind, &raw),
-        status: if protocol_kind == "contextCompaction" {
-            // Compaction is a point-in-time history landmark. Treating an item
-            // without an explicit status as an active operation leaves a
-            // permanent, misleading `running` badge in restored histories.
-            Some("completed".into())
+        title: if protocol_kind == "contextCompaction" {
+            match status.as_str() {
+                "completed" => "Context compacted",
+                "failed" => "Context compaction failed",
+                "interrupted" | "cancelled" | "canceled" => "Context compaction interrupted",
+                _ => "Compacting context…",
+            }
+            .into()
         } else {
-            raw.get("status")
-                .and_then(protocol_status)
-                .or_else(|| completed.then(|| "completed".into()))
-                .or_else(|| Some("in progress".into()))
+            title_from_protocol(protocol_kind, &raw)
         },
+        status: Some(status),
         content: content_from_protocol(protocol_kind, &raw),
         raw: bounded_raw_payload(raw),
         event_count: 1,
@@ -6247,6 +6258,42 @@ mod tests {
             item.kind == TranscriptKind::Trace
                 && string_at(&item.raw, "/type") == Some("contextCompaction")
         }));
+    }
+
+    #[test]
+    fn context_compaction_tracks_start_completion_and_restore() {
+        let mut model = TranscriptModel::default();
+        for (method, expected) in [
+            ("item/started", "Compacting context…"),
+            ("item/completed", "Context compacted"),
+        ] {
+            model.apply_batch(
+                vec![Event::Notification {
+                    method: method.into(),
+                    params: json!({"threadId": "thread-1", "turnId": "turn-1",
+                        "item": {"id": "compaction-1", "type": "contextCompaction"}}),
+                }],
+                Some("thread-1"),
+            );
+            assert_eq!(model.items.len(), 1);
+            assert_eq!(model.items[0].title, expected);
+        }
+        let restored = item_from_protocol(
+            json!({"id": "old-compaction", "type": "contextCompaction"}),
+            true,
+        );
+        assert_eq!(restored.title, "Context compacted");
+        for (status, title) in [
+            ("failed", "Context compaction failed"),
+            ("interrupted", "Context compaction interrupted"),
+            ("inProgress", "Compacting context…"),
+        ] {
+            let item = item_from_protocol(
+                json!({"id": "compaction", "type": "contextCompaction", "status": status}),
+                true,
+            );
+            assert_eq!(item.title, title);
+        }
     }
 
     #[test]
