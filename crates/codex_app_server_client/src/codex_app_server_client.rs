@@ -599,6 +599,12 @@ pub struct Client {
 impl Client {
     pub fn launch(codex: impl AsRef<OsStr>) -> Result<Self, Error> {
         let mut command = Command::new(codex);
+        #[cfg(windows)]
+        {
+            use async_process::windows::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())

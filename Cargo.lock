@@ -8360,11 +8360,13 @@ dependencies = [
  "sha2",
  "smol",
  "sysinfo 0.37.2",
+ "tempfile",
  "theme",
  "theme_settings",
  "ui",
  "ui_input",
  "uuid",
+ "windows 0.61.3",
  "zed_actions",
 ]
 
@@ -8399,6 +8401,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "codex_app_server_client",
+ "dirs",
  "pulldown-cmark 0.13.0",
  "serde",
  "serde_json",

@@ -3504,6 +3504,10 @@ fn transcript_snapshot_path(thread_id: &str) -> anyhow::Result<PathBuf> {
     {
         anyhow::bail!("invalid transcript thread id");
     }
+    #[cfg(windows)]
+    let state_root = dirs::data_local_dir()
+        .ok_or_else(|| anyhow::anyhow!("no local application data directory is available"))?;
+    #[cfg(not(windows))]
     let state_root = std::env::var_os("XDG_STATE_HOME")
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)

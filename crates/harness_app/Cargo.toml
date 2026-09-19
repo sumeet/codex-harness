@@ -32,7 +32,6 @@ http_client.workspace = true
 log.workspace = true
 libc.workspace = true
 markdown.workspace = true
-portable-pty.workspace = true
 release_channel.workspace = true
 reqwest_client.workspace = true
 semver.workspace = true
@@ -48,6 +47,15 @@ ui.workspace = true
 ui_input.workspace = true
 uuid.workspace = true
 zed_actions.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+portable-pty.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "harness"

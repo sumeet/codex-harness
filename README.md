@@ -29,6 +29,58 @@ and a lightweight standalone host for the extracted Zed command-palette core.
 
 ## Build
 
+### Windows
+
+Use the native PowerShell launcher from the repository root:
+
+```powershell
+.\script\run-standalone.ps1
+```
+
+Install Rust through `rustup`, Visual Studio Build Tools with the **Desktop
+development with C++** workload and a Windows SDK, and CMake. The launcher
+loads the Visual Studio build environment and builds `target/release-fast/harness.exe`.
+The first build downloads and compiles the dependencies; later launches use
+Cargo's incremental build. Windows builds exclude the Claude integration.
+
+Install and sign in to the standalone Codex CLI:
+
+```powershell
+irm https://chatgpt.com/codex/install.ps1 | iex
+codex login
+```
+
+Harness finds the standalone installation automatically. Set `HARNESS_CODEX_PATH`
+to use another Codex executable. Windows runs an owned App Server over stdio;
+it does not require a detached daemon. Daemon update/restart controls are unavailable
+in this mode. Logs are saved under `%LOCALAPPDATA%\harness\logs` and transcript
+caches under `%LOCALAPPDATA%\harness\transcripts`.
+
+The same environment flags apply in PowerShell, for example:
+
+```powershell
+$env:HARNESS_BUILD_JOBS = '2'
+$env:HARNESS_PROFILE = 'dev'
+.\script\run-standalone.ps1 --replay 12
+```
+
+Use `.\script\build-standalone.ps1` to build without launching. Windows defaults
+to two compiler workers; close Harness before rebuilding its executable.
+
+After the first build, add a Start menu shortcut with:
+
+```powershell
+.\script\install-start-menu.ps1
+```
+
+Press the **Windows key**, type **Harness**, and open **Codex Harness**. You can
+right-click the search result to pin it to Start or the taskbar. The shortcut
+opens the built app directly without a terminal or a build check. Rebuild after
+changing the source; rerun the installer if you move the checkout or change the
+build profile. Use the PowerShell launcher when you need captured startup logs.
+
+### Linux
+
 Install the normal Zed Linux build prerequisites, Rust through `rustup`, and a
 recent CMake. The repository pins its Rust toolchain. The `codex` executable
 must be installed and authenticated because Harness starts `codex app-server`

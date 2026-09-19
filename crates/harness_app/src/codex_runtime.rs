@@ -294,8 +294,28 @@ fn command_arguments_equal(arguments: &[OsString], expected: &[&str]) -> bool {
             .all(|(argument, expected)| argument == OsStr::new(expected))
 }
 
+pub fn executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("HARNESS_CODEX_PATH") {
+        return PathBuf::from(path);
+    }
+    #[cfg(windows)]
+    if let Some(directory) = dirs::data_local_dir() {
+        let executable = directory.join("Programs/OpenAI/Codex/bin/codex.exe");
+        if executable.is_file() {
+            return executable;
+        }
+    }
+    PathBuf::from("codex")
+}
+
 fn codex_command() -> Command {
-    let mut command = Command::new("codex");
+    let mut command = Command::new(executable());
+    #[cfg(windows)]
+    {
+        use async_process::windows::CommandExt as _;
+        use windows::Win32::System::Threading::CREATE_NO_WINDOW;
+        command.creation_flags(CREATE_NO_WINDOW.0);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

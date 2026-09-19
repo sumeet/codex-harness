@@ -1,4 +1,5 @@
 #![deny(warnings)]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::{
     cell::Cell,
@@ -23,7 +24,7 @@ use file_icons::FileIcons;
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{
     AnimationExt, AnyElement, App, AppContext as _, Bounds, ClipboardEntry, Context, Entity,
-    FocusHandle, Focusable, FollowMode, Font, FontStyle, FontWeight, Image, ImageFormat,
+    FocusHandle, Focusable, FollowMode, Font, FontWeight, Image, ImageFormat,
     ImageSource, IntoElement, KeyBinding, KeyContext, Keystroke, ListAlignment, ListSizingBehavior,
     ListState, Modifiers, MouseButton, MouseUpEvent, ObjectFit, PlatformInput, Render, ScrollDelta,
     ScrollHandle, ScrollWheelEvent, SharedString, StyledImage, StyledText, Task, TextRenderingMode,
@@ -57,7 +58,9 @@ use ui::{
 use uuid::Uuid;
 
 mod chatgpt_desktop;
+#[cfg(unix)]
 mod claude_native;
+#[cfg(unix)]
 mod claude_workspace;
 mod codex_history;
 mod codex_runtime;
@@ -2382,7 +2385,7 @@ fn compact_file_panel_path(path: &str) -> String {
     {
         return relative.to_string_lossy().into_owned();
     }
-    if let Some(home) = std::env::var_os("HOME")
+    if let Some(home) = dirs::home_dir()
         && let Ok(relative) = Path::new(path).strip_prefix(home)
     {
         return format!("~/{}", relative.to_string_lossy());
@@ -3301,6 +3304,7 @@ enum FocusMode {
 #[serde(rename_all = "snake_case")]
 enum WorkspaceMode {
     Chat,
+    #[cfg(unix)]
     Claude,
     #[default]
     Codex,
@@ -3319,6 +3323,7 @@ struct HarnessSessionState {
     workspace_mode: WorkspaceMode,
     selected_thread_id: Option<String>,
     selected_chat_id: Option<String>,
+    #[cfg(unix)]
     selected_claude_id: Option<String>,
     chat_new_draft: bool,
     pending_thread_cwd: Option<String>,
@@ -3331,6 +3336,7 @@ impl Default for HarnessSessionState {
             workspace_mode: WorkspaceMode::Codex,
             selected_thread_id: None,
             selected_chat_id: None,
+            #[cfg(unix)]
             selected_claude_id: None,
             chat_new_draft: false,
             pending_thread_cwd: None,
@@ -3468,8 +3474,11 @@ struct ComposerSubmission {
 struct ComposerDraftStore {
     drafts: HashMap<String, String>,
     pending_sends: HashMap<String, Vec<PersistedPendingSend>>,
+    #[cfg(unix)]
     claude_pending_sends: HashMap<String, claude_workspace::PendingSend>,
+    #[cfg(unix)]
     claude_resolved_sends: HashSet<String>,
+    #[cfg(unix)]
     claude_accepted_sends: HashSet<String>,
 }
 
@@ -3501,6 +3510,7 @@ fn persist_composer_drafts(store: &ComposerDraftStore) -> anyhow::Result<()> {
     persist_composer_drafts_at(&path, store)
 }
 
+#[cfg(any(unix, test))]
 fn read_composer_drafts_at(path: &Path) -> anyhow::Result<ComposerDraftStore> {
     match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
@@ -3511,40 +3521,58 @@ fn read_composer_drafts_at(path: &Path) -> anyhow::Result<ComposerDraftStore> {
 
 fn persist_composer_drafts_at(path: &Path, store: &ComposerDraftStore) -> anyhow::Result<()> {
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    #[cfg(windows)]
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    #[cfg(windows)]
+    use windows::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
     let parent = path
         .parent()
         .context("Harness drafts path has no parent directory")?;
     fs::create_dir_all(parent)?;
-    let lock = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path.with_extension("lock"))?;
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    let lock = options.open(path.with_extension("lock"))?;
     let metadata = lock.metadata()?;
+    anyhow::ensure!(metadata.is_file(), "Unsafe composer draft lock");
+    #[cfg(unix)]
     anyhow::ensure!(
-        metadata.is_file()
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0,
+        metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o077 == 0,
+        "Unsafe composer draft lock"
+    );
+    #[cfg(windows)]
+    anyhow::ensure!(
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
         "Unsafe composer draft lock"
     );
     lock.try_lock()
         .context("Composer drafts are being saved by another window; retry shortly")?;
+    #[cfg(unix)]
     let latest = read_composer_drafts_at(path)?;
-    let mut merged = store.clone();
+    let merged = store.clone();
+    #[cfg(unix)]
+    let mut merged = merged;
+    #[cfg(unix)]
     claude_workspace::merge_send_journal(&mut merged, &latest)?;
     let temporary = path.with_extension(format!("{}.pending", Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temporary)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temporary)?;
     file.write_all(&serde_json::to_vec_pretty(&merged)?)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
+    #[cfg(unix)]
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -4255,6 +4283,7 @@ fn search_uses_native_editor(focus_mode: FocusMode, rich_vim_enabled: bool) -> b
 }
 
 struct HarnessApp {
+    #[cfg(unix)]
     claude: claude_workspace::ClaudeWorkspace,
     cwd: String,
     pending_thread_cwd: Option<String>,
@@ -6744,6 +6773,7 @@ impl HarnessApp {
         let (identifier, label) = match mode {
             WorkspaceMode::Chat => ("workspace-chat", "Chat"),
             WorkspaceMode::Codex => ("workspace-codex", "Codex"),
+            #[cfg(unix)]
             WorkspaceMode::Claude => ("workspace-claude", "Claude"),
         };
         let button = Button::new(identifier, label)
@@ -7034,6 +7064,7 @@ impl HarnessApp {
         send_blocked: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             let has_pending = self.claude.selected_draft_id.as_ref()
                 .is_some_and(|key| self.composer_drafts.claude_pending_sends.contains_key(key));
@@ -8549,6 +8580,7 @@ impl HarnessApp {
         let palette_state = palette::load_state();
 
         let mut this = Self {
+            #[cfg(unix)]
             claude: claude_workspace::ClaudeWorkspace::new(session.selected_claude_id),
             cwd,
             pending_thread_cwd,
@@ -8940,6 +8972,7 @@ impl HarnessApp {
             this.refresh_chat_conversations(cx);
             this.refresh_chat_models(cx);
         }
+        #[cfg(unix)]
         if this.workspace_mode == WorkspaceMode::Claude {
             this.refresh_claude(cx);
         }
@@ -8951,6 +8984,7 @@ impl HarnessApp {
             workspace_mode: self.workspace_mode,
             selected_thread_id: self.selected_thread_id.clone(),
             selected_chat_id: self.selected_chat_id.clone(),
+            #[cfg(unix)]
             selected_claude_id: self.claude.selected_id.clone(),
             chat_new_draft: self.chat_new_draft,
             pending_thread_cwd: self.pending_thread_cwd.clone(),
@@ -9012,7 +9046,13 @@ impl HarnessApp {
     }
 
     fn start_codex_update_watcher(&mut self, cx: &mut Context<Self>) {
-        if self.replay_count.is_some() {
+        if self.replay_count.is_some()
+            || self
+                .client
+                .as_deref()
+                .and_then(Client::managed_daemon_info)
+                .is_none()
+        {
             return;
         }
         self.codex_update_watch_task = cx.spawn(async move |this, cx| {
@@ -9298,7 +9338,13 @@ impl HarnessApp {
             .or_else(|| std::env::var("HARNESS_OPEN_THREAD").ok());
         self.server_task = cx.spawn(async move |this, cx| {
             let result = async {
-                let client = Rc::new(Client::launch_managed("codex").await?);
+                #[cfg(unix)]
+                let client = Client::launch_managed(codex_runtime::executable()).await?;
+                // Windows hosts can prohibit detached daemons through their Job Object.
+                // An owned stdio server works in those hosts and exits with this window.
+                #[cfg(windows)]
+                let client = Client::launch(codex_runtime::executable())?;
+                let client = Rc::new(client);
                 client
                     .initialize("harness", "Harness", env!("CARGO_PKG_VERSION"))
                     .await?;
@@ -9320,6 +9366,7 @@ impl HarnessApp {
 
             let client = match result {
                 Ok((client, threads, child_threads)) => {
+                    log::info!("Connected to Codex App Server ({} threads)", threads.len());
                     if this
                         .update(cx, |this, cx| {
                             this.client = Some(client.clone());
@@ -10491,6 +10538,7 @@ impl HarnessApp {
         event: RequestSurfaceRespond,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             if let Some(item) = self
                 .claude
@@ -10676,6 +10724,7 @@ impl HarnessApp {
     fn active_transcript_model(&self) -> &TranscriptModel {
         match self.workspace_mode {
             WorkspaceMode::Chat => &self.chat_transcript,
+            #[cfg(unix)]
             WorkspaceMode::Claude => &self.claude.transcript,
             WorkspaceMode::Codex => &self.model,
         }
@@ -10684,6 +10733,7 @@ impl HarnessApp {
     fn active_transcript_model_mut(&mut self) -> &mut TranscriptModel {
         match self.workspace_mode {
             WorkspaceMode::Chat => &mut self.chat_transcript,
+            #[cfg(unix)]
             WorkspaceMode::Claude => &mut self.claude.transcript,
             WorkspaceMode::Codex => &mut self.model,
         }
@@ -10692,6 +10742,7 @@ impl HarnessApp {
     fn active_transcript_list_state(&self) -> &ListState {
         match self.workspace_mode {
             WorkspaceMode::Chat => &self.chat_list_state,
+            #[cfg(unix)]
             WorkspaceMode::Claude => &self.claude.list,
             WorkspaceMode::Codex => &self.list_state,
         }
@@ -10700,6 +10751,7 @@ impl HarnessApp {
     fn active_task_count(&self) -> usize {
         match self.workspace_mode {
             WorkspaceMode::Chat => self.chat_conversations.len(),
+            #[cfg(unix)]
             WorkspaceMode::Claude => self.claude.sessions.len(),
             WorkspaceMode::Codex => self.sidebar_threads.len(),
         }
@@ -10708,6 +10760,7 @@ impl HarnessApp {
     fn active_sidebar_list_state(&self) -> &ListState {
         match self.workspace_mode {
             WorkspaceMode::Chat => &self.chat_sidebar_list_state,
+            #[cfg(unix)]
             WorkspaceMode::Claude => &self.claude.sidebar,
             WorkspaceMode::Codex => &self.task_list_state,
         }
@@ -10731,6 +10784,7 @@ impl HarnessApp {
         }
         self.workspace_mode = mode;
         let draft_id = match mode {
+            #[cfg(unix)]
             WorkspaceMode::Claude => self.claude.selected_draft_id.clone().or_else(|| Some(format!(
                 "claude:{}",
                 self.claude.selected_id.as_deref().unwrap_or("new")
@@ -10755,6 +10809,7 @@ impl HarnessApp {
             })
             .map(|item| item.key.clone())
             .collect();
+        #[cfg(unix)]
         if mode == WorkspaceMode::Claude {
             self.live_request_keys.extend(requests.iter().cloned());
         }
@@ -10767,6 +10822,7 @@ impl HarnessApp {
         if mode == WorkspaceMode::Chat && self.chat_models.is_empty() {
             self.refresh_chat_models(cx);
         }
+        #[cfg(unix)]
         if mode == WorkspaceMode::Claude && self.claude.selected.is_none() {
             self.refresh_claude(cx);
         }
@@ -11218,6 +11274,7 @@ impl HarnessApp {
     }
 
     fn refresh_codex(&mut self, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             self.refresh_claude(cx);
             return;
@@ -12284,6 +12341,7 @@ impl HarnessApp {
     }
 
     fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             self.new_claude(window, cx);
             return;
@@ -12496,6 +12554,7 @@ impl HarnessApp {
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             self.send_claude(cx);
             return;
@@ -13560,6 +13619,7 @@ impl HarnessApp {
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             self.claude_action(json!({"method":"interrupt"}), None, cx);
             return;
@@ -14827,19 +14887,27 @@ impl HarnessApp {
                 self.selected_thread_id.as_deref(),
                 self.selected_task,
             );
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            self.selected_task = self
-                .claude
-                .sessions
-                .iter()
-                .position(|session| Some(&session.id) == self.claude.selected_id.as_ref())
-                .unwrap_or(self.selected_task);
-        } else if let Some(selected_chat_id) = self.selected_chat_id.as_deref() {
-            self.selected_task = self
-                .chat_conversations
-                .iter()
-                .position(|conversation| conversation.id == selected_chat_id)
-                .unwrap_or(self.selected_task);
+        } else {
+            match self.workspace_mode {
+                #[cfg(unix)]
+                WorkspaceMode::Claude => {
+                    self.selected_task = self
+                        .claude
+                        .sessions
+                        .iter()
+                        .position(|session| Some(&session.id) == self.claude.selected_id.as_ref())
+                        .unwrap_or(self.selected_task);
+                }
+                _ => {
+                    if let Some(selected_chat_id) = self.selected_chat_id.as_deref() {
+                        self.selected_task = self
+                            .chat_conversations
+                            .iter()
+                            .position(|conversation| conversation.id == selected_chat_id)
+                            .unwrap_or(self.selected_task);
+                    }
+                }
+            }
         }
         self.transcript_focus.focus(window, cx);
         let task_count = self.active_task_count();
@@ -14946,6 +15014,7 @@ impl HarnessApp {
     }
 
     fn toggle_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             if self
                 .active_transcript_model()
@@ -15107,10 +15176,11 @@ impl HarnessApp {
         cx.notify();
     }
 
-    fn open_selected_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_selected_task(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(unix)]
         if self.workspace_mode == WorkspaceMode::Claude {
             if let Some(session) = self.claude.sessions.get(self.selected_task).cloned() {
-                self.open_claude(session, window, cx);
+                self.open_claude(session, _window, cx);
             }
             return;
         }
@@ -15484,9 +15554,29 @@ impl HarnessApp {
             || self.queue_start_pending
     }
 
+    fn new_task_starting(&self) -> bool {
+        #[cfg(unix)]
+        if self.claude.starting {
+            return true;
+        }
+        self.new_task_picker_open
+    }
+
+    fn claude_startup_visible(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.workspace_mode == WorkspaceMode::Claude && self.claude.selected_creation.is_some()
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     fn active_response(&self) -> bool {
         match self.workspace_mode {
             WorkspaceMode::Chat => self.chat_sending,
+            #[cfg(unix)]
             WorkspaceMode::Claude => self.claude.projection.active,
             WorkspaceMode::Codex => self.turn_active(),
         }
@@ -18398,13 +18488,7 @@ impl HarnessApp {
         if index < transcript_len {
             return self.render_item(index, window, cx);
         }
-        let response_active = if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_sending
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            self.claude.projection.active
-        } else {
-            self.turn_active()
-        };
+        let response_active = self.active_response();
         if index != transcript_len || !response_active {
             return div().into_any_element();
         }
@@ -18443,6 +18527,7 @@ impl Render for HarnessApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let composer_placeholder = match self.workspace_mode {
             WorkspaceMode::Chat => "Ask ChatGPT…",
+            #[cfg(unix)]
             WorkspaceMode::Claude => "Ask Claude…",
             WorkspaceMode::Codex => "Ask Codex…",
         };
@@ -18479,10 +18564,12 @@ impl Render for HarnessApp {
         let transcript_foreground = comparison_profile::profile()
             .and_then(|profile| profile.transcript_foreground(&colors))
             .unwrap_or(colors.text);
-        let daemon_tooltip = managed_daemon_tooltip(
-            self.client.as_deref().and_then(Client::managed_daemon_info),
-            self.connecting,
-        );
+        let daemon_info = self.client.as_deref().and_then(Client::managed_daemon_info);
+        let daemon_tooltip = if self.client.is_some() && daemon_info.is_none() {
+            "Connected to a local Codex App Server".into()
+        } else {
+            managed_daemon_tooltip(daemon_info, self.connecting)
+        };
         let compact = window.viewport_size().width < px(COMPACT_SIDEBAR_THRESHOLD);
         let sidebar_visible = self.sidebar_open && (!compact || self.sidebar_user_override);
         let composer_text = self.composer.read(cx).text(cx);
@@ -18500,92 +18587,104 @@ impl Render for HarnessApp {
                 || (self.selected_chat_id.is_none() && !self.chat_new_draft)
                 || self.chat_current_node.is_none()
                 || self.selected_chat_model.is_none()
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            !self.claude.projection.ready || self.claude.sending || self.claude.starting
-                || self.claude.settings_pending
         } else {
-            composer_send_blocked(
-                composer_empty,
-                self.loading_thread,
-                self.settings_update_pending,
-                self.thread_read_only_reason.is_some(),
-                self.client.is_some() || self.replay_count.is_some(),
-            ) || new_thread_needs_project
-                || self.new_task_picker_open
-        };
-        let composer_status: Option<(SharedString, Color)> =
-            if self.workspace_mode == WorkspaceMode::Claude {
-                let status = if self.claude.starting {
-                    Some("Starting Claude…")
-                } else if self.claude.settings_pending {
-                    Some("Updating Claude settings…")
-                } else if self.claude.selected_draft_id.as_ref().is_some_and(|key| {
-                    self.composer_drafts.claude_pending_sends.contains_key(key)
-                }) {
-                    Some("Previous send not confirmed · draft kept")
-                } else if self.claude.projection.ready {
-                    None
-                } else if self.claude.selected_id.as_ref().is_some_and(|id| {
-                    self.claude.opening.contains(id)
-                }) {
-                    Some("Opening conversation…")
-                } else if self.claude.selected_id.is_some() {
-                    Some("Claude isn't connected · draft kept")
-                } else {
-                    None
-                };
-                status.map(|status| (status.into(), Color::Muted))
-            } else if self.workspace_mode == WorkspaceMode::Chat {
-                if self.chat_loading {
-                    Some(("Loading ChatGPT conversation…".into(), Color::Muted))
-                } else {
-                    None
+            match self.workspace_mode {
+                #[cfg(unix)]
+                WorkspaceMode::Claude => {
+                    !self.claude.projection.ready
+                        || self.claude.sending
+                        || self.claude.starting
+                        || self.claude.settings_pending
                 }
-            } else if let Some(error) = self.composer_attachment_error.clone() {
-                Some((error, Color::Warning))
-            } else if let Some(status) = self.performance_status.clone() {
-                Some((status, Color::Muted))
-            } else if self.loading_thread {
-                Some(("Loading task history…".into(), Color::Muted))
-            } else if self.attaching_thread {
-                Some((
-                    if self
-                        .attach_cache_bytes
-                        .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
-                    {
-                        "Restoring live session…".into()
-                    } else {
-                        "Connecting live…".into()
-                    },
-                    Color::Muted,
-                ))
-            } else if self.selected_thread_id.is_some()
-                && !self.transcript_history_complete
-                && !self.history_hydrating
-            {
-                Some((
-                    "Task history incomplete · refresh to retry".into(),
-                    Color::Warning,
-                ))
-            } else if self.settings_update_pending {
-                Some(("Updating task settings…".into(), Color::Muted))
-            } else if self.thread_read_only_reason.is_some() {
-                Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
-            } else if self.connecting {
-                Some(("Connecting…".into(), Color::Muted))
-            } else if self.client.is_none() && self.replay_count.is_none() {
-                Some(("Offline · refresh to reconnect".into(), Color::Warning))
-            } else {
-                None
-            };
-        let turn_active = self.turn_active();
-        let response_active = if self.workspace_mode == WorkspaceMode::Chat {
-            self.chat_sending
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            self.claude.projection.active
-        } else {
-            turn_active
+                _ => {
+                    composer_send_blocked(
+                        composer_empty,
+                        self.loading_thread,
+                        self.settings_update_pending,
+                        self.thread_read_only_reason.is_some(),
+                        self.client.is_some() || self.replay_count.is_some(),
+                    ) || new_thread_needs_project
+                        || self.new_task_picker_open
+                }
+            }
         };
+        let composer_status: Option<(SharedString, Color)> = {
+            match self.workspace_mode {
+                #[cfg(unix)]
+                WorkspaceMode::Claude => {
+                    let status = if self.claude.starting {
+                        Some("Starting Claude…")
+                    } else if self.claude.settings_pending {
+                        Some("Updating Claude settings…")
+                    } else if self.claude.selected_draft_id.as_ref().is_some_and(|key| {
+                        self.composer_drafts.claude_pending_sends.contains_key(key)
+                    }) {
+                        Some("Previous send not confirmed · draft kept")
+                    } else if self.claude.projection.ready {
+                        None
+                    } else if self
+                        .claude
+                        .selected_id
+                        .as_ref()
+                        .is_some_and(|id| self.claude.opening.contains(id))
+                    {
+                        Some("Opening conversation…")
+                    } else if self.claude.selected_id.is_some() {
+                        Some("Claude isn't connected · draft kept")
+                    } else {
+                        None
+                    };
+                    status.map(|status| (status.into(), Color::Muted))
+                }
+                _ => {
+                    if self.workspace_mode == WorkspaceMode::Chat {
+                        if self.chat_loading {
+                            Some(("Loading ChatGPT conversation…".into(), Color::Muted))
+                        } else {
+                            None
+                        }
+                    } else if let Some(error) = self.composer_attachment_error.clone() {
+                        Some((error, Color::Warning))
+                    } else if let Some(status) = self.performance_status.clone() {
+                        Some((status, Color::Muted))
+                    } else if self.loading_thread {
+                        Some(("Loading task history…".into(), Color::Muted))
+                    } else if self.attaching_thread {
+                        Some((
+                            if self
+                                .attach_cache_bytes
+                                .is_some_and(|bytes| bytes >= THIN_ATTACH_TRANSCRIPT_CACHE_BYTES)
+                            {
+                                "Restoring live session…".into()
+                            } else {
+                                "Connecting live…".into()
+                            },
+                            Color::Muted,
+                        ))
+                    } else if self.selected_thread_id.is_some()
+                        && !self.transcript_history_complete
+                        && !self.history_hydrating
+                    {
+                        Some((
+                            "Task history incomplete · refresh to retry".into(),
+                            Color::Warning,
+                        ))
+                    } else if self.settings_update_pending {
+                        Some(("Updating task settings…".into(), Color::Muted))
+                    } else if self.thread_read_only_reason.is_some() {
+                        Some(("Read-only · Ctrl-N for a new thread".into(), Color::Warning))
+                    } else if self.connecting {
+                        Some(("Connecting…".into(), Color::Muted))
+                    } else if self.client.is_none() && self.replay_count.is_none() {
+                        Some(("Offline · refresh to reconnect".into(), Color::Warning))
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        let turn_active = self.turn_active();
+        let response_active = self.active_response();
         self.sync_turn_tail_indicator(turn_active);
         self.sync_chat_tail_indicator(self.chat_sending);
         let list_state = self.active_transcript_list_state().clone();
@@ -18648,51 +18747,57 @@ impl Render for HarnessApp {
                     )
                     .into_any_element()
             }
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            self.render_claude_sidebar(cx)
-        } else if self.replay_count.is_some() {
-            div()
-                .flex_1()
-                .min_h_0()
-                .child(self.render_replay_task(cx))
-                .into_any_element()
-        } else if self.sidebar_threads.is_empty() {
-            div()
-                .flex_1()
-                .min_h_0()
-                .p_4()
-                .text_sm()
-                .text_color(colors.text_muted)
-                .child(if self.connecting {
-                    "Connecting to Codex…"
-                } else {
-                    "No tasks"
-                })
-                .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .min_h_0()
-                .relative()
-                .flex()
-                .flex_col()
-                .child(
-                    list(
-                        task_list_state.clone(),
-                        cx.processor(|this, index, _, cx| this.render_task(index, cx)),
-                    )
-                    .flex_1()
-                    .min_h_0(),
-                )
-                .custom_scrollbars(
-                    Scrollbars::new(ScrollAxes::Vertical)
-                        .id("task-list-scrollbar")
-                        .with_thumb_color(colors.text_muted.opacity(0.5))
-                        .tracked_scroll_handle(&task_list_state),
-                    window,
-                    cx,
-                )
-                .into_any_element()
+            match self.workspace_mode {
+                #[cfg(unix)]
+                WorkspaceMode::Claude => self.render_claude_sidebar(cx),
+                _ => {
+                    if self.replay_count.is_some() {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.render_replay_task(cx))
+                            .into_any_element()
+                    } else if self.sidebar_threads.is_empty() {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .p_4()
+                            .text_sm()
+                            .text_color(colors.text_muted)
+                            .child(if self.connecting {
+                                "Connecting to Codex…"
+                            } else {
+                                "No tasks"
+                            })
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                list(
+                                    task_list_state.clone(),
+                                    cx.processor(|this, index, _, cx| this.render_task(index, cx)),
+                                )
+                                .flex_1()
+                                .min_h_0(),
+                            )
+                            .custom_scrollbars(
+                                Scrollbars::new(ScrollAxes::Vertical)
+                                    .id("task-list-scrollbar")
+                                    .with_thumb_color(colors.text_muted.opacity(0.5))
+                                    .tracked_scroll_handle(&task_list_state),
+                                window,
+                                cx,
+                            )
+                            .into_any_element()
+                    }
+                }
+            }
         };
         let following_tail = list_state.is_following_tail();
         // Vim motions intentionally pause automatic tail following so a
@@ -18790,10 +18895,12 @@ impl Render for HarnessApp {
             };
             let provider = if self.workspace_mode == WorkspaceMode::Chat {
                 "ChatGPT"
-            } else if self.workspace_mode == WorkspaceMode::Claude {
-                "Claude"
             } else {
-                "Codex"
+                match self.workspace_mode {
+                    #[cfg(unix)]
+                    WorkspaceMode::Claude => "Claude",
+                    _ => "Codex",
+                }
             };
             div()
                 .id("offscreen-tail-status")
@@ -18891,6 +18998,7 @@ impl Render for HarnessApp {
             .map(VimCommandLine::prompt)
             .unwrap_or_default();
         let provider_controls = match self.workspace_mode {
+            #[cfg(unix)]
             WorkspaceMode::Claude => self.render_claude_controls(cx),
             WorkspaceMode::Chat => self.render_chat_model_selector(cx),
             WorkspaceMode::Codex => div().flex().items_center().gap_1()
@@ -19220,10 +19328,12 @@ impl Render for HarnessApp {
 
         let surface_error = if self.workspace_mode == WorkspaceMode::Chat {
             self.chat_error.clone()
-        } else if self.workspace_mode == WorkspaceMode::Claude {
-            self.claude.error.clone()
         } else {
-            self.error.clone()
+            match self.workspace_mode {
+                #[cfg(unix)]
+                WorkspaceMode::Claude => self.claude.error.clone(),
+                _ => self.error.clone(),
+            }
         };
 
         div()
@@ -19456,17 +19566,25 @@ impl Render for HarnessApp {
                                         .size(ButtonSize::Default)
                                         .style(ButtonStyle::Subtle)
                                         .aria_label("Refresh threads")
-                                        .tooltip(Tooltip::text(if self.workspace_mode == WorkspaceMode::Claude {
+                                        .tooltip(Tooltip::text({ match self.workspace_mode {
+#[cfg(unix)]
+WorkspaceMode::Claude => {
                                             "Refresh saved Claude conversations and native workers. Does not start or resume Claude.".into()
-                                        } else { daemon_tooltip.clone() }))
+                                        },
+_ => { daemon_tooltip.clone() },
+} }))
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if this.workspace_mode == WorkspaceMode::Chat {
                                                 this.refresh_chat_conversations(cx)
-                                            } else if this.workspace_mode == WorkspaceMode::Claude {
+                                            } else { match this.workspace_mode {
+#[cfg(unix)]
+WorkspaceMode::Claude => {
                                                 this.refresh_claude(cx)
-                                            } else {
+                                            },
+_ => {
                                                 this.refresh_codex(cx)
-                                            }
+                                            },
+} }
                                         })),
                                 )
                                 .child(
@@ -19476,7 +19594,7 @@ impl Render for HarnessApp {
                                         .style(ButtonStyle::Subtle)
                                         .disabled(
                                             (self.workspace_mode == WorkspaceMode::Chat && self.chat_sending)
-                                                || self.claude.starting || self.new_task_picker_open,
+                                                || self.new_task_starting(),
                                         )
                                         .aria_label(if self.workspace_mode == WorkspaceMode::Chat {
                                             "Start a new ChatGPT conversation"
@@ -19500,7 +19618,11 @@ impl Render for HarnessApp {
                                 .border_color(visuals.divider)
                                 .child(self.render_workspace_tab(WorkspaceMode::Chat, cx))
                                 .child(self.render_workspace_tab(WorkspaceMode::Codex, cx))
-                                .child(self.render_workspace_tab(WorkspaceMode::Claude, cx)),
+                                .map(|tabs| {
+                                    #[cfg(unix)]
+                                    let tabs = tabs.child(self.render_workspace_tab(WorkspaceMode::Claude, cx));
+                                    tabs
+                                }),
                         )
                         .child(task_body),
                 )
@@ -19544,7 +19666,7 @@ impl Render for HarnessApp {
                     )
                     .when(
                         self.active_transcript_model().items.is_empty()
-                            && !(self.workspace_mode == WorkspaceMode::Claude && self.claude.selected_creation.is_some()),
+                            && !(self.claude_startup_visible()),
                         |this| {
                         this.child(
                             div()
@@ -19565,24 +19687,32 @@ impl Render for HarnessApp {
                                     } else {
                                         "Choose a ChatGPT conversation"
                                     }
-                                } else if self.workspace_mode == WorkspaceMode::Claude {
+                                } else { match self.workspace_mode {
+#[cfg(unix)]
+WorkspaceMode::Claude => {
                                     if self.claude.selected.is_some() {
                                         claude_workspace::empty_state_message(
                                             self.claude.projection.ready,
                                             self.claude.selected_id.as_ref().and_then(|id| self.claude.statuses.get(id)).map(|status| &status.phase),
                                         )
                                     } else { "Choose a saved conversation, or use + to start Claude" }
-                                } else if self.loading_thread {
+                                },
+_ => if self.loading_thread {
                                     "Loading task history…"
                                 } else if new_thread_needs_project {
                                     "Choose a project folder to start a Codex thread"
                                 } else {
                                     "What should we build?"
-                                }),
+                                },
+} }),
                         )
                     })
-                    .when(self.workspace_mode == WorkspaceMode::Claude && self.claude.selected_creation.is_some(),
-                        |this| this.child(self.render_claude_startup(cx)))
+                    .map(|content| {
+                        #[cfg(unix)]
+                        let content = content.when(self.claude_startup_visible(),
+                            |this| this.child(self.render_claude_startup(cx)));
+                        content
+                    })
                     .when_some(
                         (self.workspace_mode == WorkspaceMode::Codex)
                             .then_some(outbound_tray)
@@ -25318,6 +25448,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_file_changes_feed_the_shared_diff_rows() {
         let mut projection = claude_native::Projection::default();
         projection.messages = vec![
@@ -26171,6 +26302,7 @@ mod tests {
             workspace_mode: WorkspaceMode::Chat,
             selected_thread_id: Some("codex-thread".into()),
             selected_chat_id: Some("chat-thread".into()),
+            #[cfg(unix)]
             selected_claude_id: None,
             chat_new_draft: false,
             pending_thread_cwd: Some("/work/project".into()),
@@ -26186,9 +26318,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_claude_session_and_exact_single_use_permission_are_preserved() {
         let state = HarnessSessionState {
             workspace_mode: WorkspaceMode::Claude,
+            #[cfg(unix)]
             selected_claude_id: Some("native-host".into()),
             ..Default::default()
         };
@@ -26349,6 +26483,44 @@ mod tests {
         let encoded = serde_json::to_vec(&store).unwrap();
         let decoded: ComposerDraftStore = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.drafts.get("thread-a").unwrap(), "unfinished");
+    }
+
+    #[test]
+    fn composer_draft_files_replace_and_lock_on_disk() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("drafts.json");
+        let mut store = ComposerDraftStore::default();
+        store.drafts.insert("thread".into(), "first".into());
+        persist_composer_drafts_at(&path, &store)?;
+        store.drafts.insert("thread".into(), "second".into());
+        persist_composer_drafts_at(&path, &store)?;
+        assert_eq!(read_composer_drafts_at(&path)?.drafts, store.drafts);
+
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.try_lock()?;
+        store.drafts.insert("thread".into(), "blocked".into());
+        assert!(persist_composer_drafts_at(&path, &store).is_err());
+        assert_eq!(
+            read_composer_drafts_at(&path)?
+                .drafts
+                .get("thread")
+                .map(String::as_str),
+            Some("second")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn composer_draft_save_rejects_a_directory_as_its_lock() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("drafts.json");
+        fs::create_dir(path.with_extension("lock"))?;
+        assert!(persist_composer_drafts_at(&path, &ComposerDraftStore::default()).is_err());
+        assert!(!path.exists());
+        Ok(())
     }
 
     #[test]
@@ -26687,6 +26859,7 @@ fn open_harness_window(
 
 #[cfg(target_os = "linux")]
 fn prewarm_harness_fonts(cx: &mut App) {
+    use gpui::FontStyle;
     let settings = theme::theme_settings(cx);
     let ui_font = settings.ui_font(cx).clone();
     let buffer_font = settings.buffer_font(cx).clone();
@@ -26714,110 +26887,176 @@ fn prewarm_harness_fonts(cx: &mut App) {
 }
 
 fn main() {
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-job-terminal") {
-        let result = std::env::args().nth(2).context("Missing native conversation identity")
-            .and_then(|identifier| claude_native::job_terminal(&identifier));
-        if let Err(error) = result {
-            eprintln!("Native Claude terminal: {error:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-create-recover") {
-        let result = std::env::args_os().nth(2).context("Missing Claude creation request")
-            .and_then(|directory| claude_native::creation::recover(Path::new(&directory)))
-            .and_then(|session| Ok(serde_json::to_string(&session)?));
-        match result {
-            Ok(session) => println!("{session}"),
-            Err(error) => { eprintln!("Claude startup recovery: {error:#}"); std::process::exit(1); }
-        }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-create-worker") {
-        let result = std::env::args_os().nth(2).context("Missing Claude creation request")
-            .and_then(|directory| claude_native::creation::worker(Path::new(&directory)));
-        if let Err(error) = result {
-            eprintln!("Claude startup coordinator: {error:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-continue" || argument == "--claude-check-history") {
-        let result = (|| -> anyhow::Result<String> {
-            let identifier = std::env::args().nth(2).context("Usage: --claude-continue CONVERSATION_UUID")?;
-            let catalog = claude_native::sessions()?;
-            let session = catalog.sessions.into_iter().find(|session| {
-                session.id == identifier || matches!(&session.source, claude_native::SessionSource::Native { conversation_id, .. } if conversation_id == &identifier)
-            }).context("Saved Claude conversation not found")?;
-            if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-check-history") {
-                Ok(serde_json::to_string_pretty(&claude_native::resume::check_restored_history(&session)?)?)
-            } else {
-                Ok(serde_json::to_string_pretty(&claude_native::resume::continue_conversation(&session)?)?)
-            }
-        })();
-        match result {
-            Ok(session) => println!("{session}"),
-            Err(error) => { eprintln!("Could not continue Claude: {error:#}"); std::process::exit(1); }
-        }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-wrap") {
-        let mut arguments = std::env::args_os().skip(2);
-        let result = arguments.next().context("Missing native adapter manifest")
-            .and_then(|manifest| claude_native::setup::wrap(Path::new(&manifest), arguments.collect()));
-        if let Err(error) = result { eprintln!("Native Claude launch failed: {error:#}"); std::process::exit(1); }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-setup") {
-        if std::env::args().nth(2).as_deref() == Some("prepare") {
-            match claude_native::setup::prepare().and_then(|path| Ok(serde_json::to_string(&path)?)) {
-                Ok(path) => println!("{path}"),
-                Err(error) => { eprintln!("Could not prepare native adapter: {error:#}"); std::process::exit(1); }
+    #[cfg(unix)]
+    {
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-job-terminal")
+        {
+            let result = std::env::args()
+                .nth(2)
+                .context("Missing native conversation identity")
+                .and_then(|identifier| claude_native::job_terminal(&identifier));
+            if let Err(error) = result {
+                eprintln!("Native Claude terminal: {error:#}");
+                std::process::exit(1);
             }
             return;
         }
-        let result = match std::env::args().nth(2).as_deref() {
-            Some("enable") => claude_native::setup::enable(),
-            Some("disable") => claude_native::setup::disable(),
-            Some("status") => Ok(claude_native::setup::status()),
-            _ => Err(anyhow::anyhow!("Usage: --claude-setup status|prepare|enable|disable")),
-        };
-        match result.and_then(|status| Ok(serde_json::to_string_pretty(&status)?)) {
-            Ok(status) => println!("{status}"),
-            Err(error) => { eprintln!("Native Claude setup failed: {error:#}"); std::process::exit(1); }
-        }
-        return;
-    }
-    if std::env::args_os().nth(1).is_some_and(|argument| argument == "--claude-list") {
-        match claude_native::sessions().and_then(|catalog| Ok(serde_json::to_string_pretty(&catalog)?)) {
-            Ok(catalog) => println!("{catalog}"),
-            Err(error) => { eprintln!("Could not list Claude sessions: {error:#}"); std::process::exit(1); }
-        }
-        return;
-    }
-    let mut native_arguments = std::env::args_os().skip(1);
-    if let Some(mode) = native_arguments.next()
-        && (mode == "--claude-host" || mode == "--claude-terminal" || mode == "--claude-new")
-    {
-        let result = native_arguments
-            .next()
-            .context("Native Claude mode requires a session directory")
-            .and_then(|directory| {
-                if mode == "--claude-host" {
-                    claude_native::host(Path::new(&directory))
-                } else if mode == "--claude-new" {
-                    let session = claude_native::start(PathBuf::from(directory))?;
-                    println!("{}", serde_json::to_string(&session)?);
-                    Ok(())
-                } else {
-                    claude_native::terminal(Path::new(&directory))
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-create-recover")
+        {
+            let result = std::env::args_os()
+                .nth(2)
+                .context("Missing Claude creation request")
+                .and_then(|directory| claude_native::creation::recover(Path::new(&directory)))
+                .and_then(|session| Ok(serde_json::to_string(&session)?));
+            match result {
+                Ok(session) => println!("{session}"),
+                Err(error) => {
+                    eprintln!("Claude startup recovery: {error:#}");
+                    std::process::exit(1);
                 }
-            });
-        if let Err(error) = result {
-            eprintln!("Harness native Claude: {error:#}");
-            std::process::exit(1);
+            }
+            return;
         }
-        return;
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-create-worker")
+        {
+            let result = std::env::args_os()
+                .nth(2)
+                .context("Missing Claude creation request")
+                .and_then(|directory| claude_native::creation::worker(Path::new(&directory)));
+            if let Err(error) = result {
+                eprintln!("Claude startup coordinator: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        if std::env::args_os().nth(1).is_some_and(|argument| {
+            argument == "--claude-continue" || argument == "--claude-check-history"
+        }) {
+            let result = (|| -> anyhow::Result<String> {
+                let identifier = std::env::args()
+                    .nth(2)
+                    .context("Usage: --claude-continue CONVERSATION_UUID")?;
+                let catalog = claude_native::sessions()?;
+                let session = catalog.sessions.into_iter().find(|session| {
+                session.id == identifier || matches!(&session.source, claude_native::SessionSource::Native { conversation_id, .. } if conversation_id == &identifier)
+            }).context("Saved Claude conversation not found")?;
+                if std::env::args_os()
+                    .nth(1)
+                    .is_some_and(|argument| argument == "--claude-check-history")
+                {
+                    Ok(serde_json::to_string_pretty(
+                        &claude_native::resume::check_restored_history(&session)?,
+                    )?)
+                } else {
+                    Ok(serde_json::to_string_pretty(
+                        &claude_native::resume::continue_conversation(&session)?,
+                    )?)
+                }
+            })();
+            match result {
+                Ok(session) => println!("{session}"),
+                Err(error) => {
+                    eprintln!("Could not continue Claude: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-wrap")
+        {
+            let mut arguments = std::env::args_os().skip(2);
+            let result = arguments
+                .next()
+                .context("Missing native adapter manifest")
+                .and_then(|manifest| {
+                    claude_native::setup::wrap(Path::new(&manifest), arguments.collect())
+                });
+            if let Err(error) = result {
+                eprintln!("Native Claude launch failed: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-setup")
+        {
+            if std::env::args().nth(2).as_deref() == Some("prepare") {
+                match claude_native::setup::prepare()
+                    .and_then(|path| Ok(serde_json::to_string(&path)?))
+                {
+                    Ok(path) => println!("{path}"),
+                    Err(error) => {
+                        eprintln!("Could not prepare native adapter: {error:#}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            let result = match std::env::args().nth(2).as_deref() {
+                Some("enable") => claude_native::setup::enable(),
+                Some("disable") => claude_native::setup::disable(),
+                Some("status") => Ok(claude_native::setup::status()),
+                _ => Err(anyhow::anyhow!(
+                    "Usage: --claude-setup status|prepare|enable|disable"
+                )),
+            };
+            match result.and_then(|status| Ok(serde_json::to_string_pretty(&status)?)) {
+                Ok(status) => println!("{status}"),
+                Err(error) => {
+                    eprintln!("Native Claude setup failed: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        if std::env::args_os()
+            .nth(1)
+            .is_some_and(|argument| argument == "--claude-list")
+        {
+            match claude_native::sessions()
+                .and_then(|catalog| Ok(serde_json::to_string_pretty(&catalog)?))
+            {
+                Ok(catalog) => println!("{catalog}"),
+                Err(error) => {
+                    eprintln!("Could not list Claude sessions: {error:#}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        let mut native_arguments = std::env::args_os().skip(1);
+        if let Some(mode) = native_arguments.next()
+            && (mode == "--claude-host" || mode == "--claude-terminal" || mode == "--claude-new")
+        {
+            let result = native_arguments
+                .next()
+                .context("Native Claude mode requires a session directory")
+                .and_then(|directory| {
+                    if mode == "--claude-host" {
+                        claude_native::host(Path::new(&directory))
+                    } else if mode == "--claude-new" {
+                        let session = claude_native::start(PathBuf::from(directory))?;
+                        println!("{}", serde_json::to_string(&session)?);
+                        Ok(())
+                    } else {
+                        claude_native::terminal(Path::new(&directory))
+                    }
+                });
+            if let Err(error) = result {
+                eprintln!("Harness native Claude: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
     }
     let scroll_diagnostics = std::env::var_os("GPUI_SCROLL_DIAGNOSTICS")
         .is_some_and(|value| !value.is_empty() && value != std::ffi::OsStr::new("0"));
