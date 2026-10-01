@@ -724,7 +724,7 @@ impl Client {
         let codex = codex.as_ref();
         let managed_daemon = start_managed_daemon(codex).await?;
 
-        let mut command = Command::new(codex);
+        let mut command = Command::new(&managed_daemon.managed_codex_path);
         command
             .args(["app-server", "proxy", "--sock"])
             .arg(&managed_daemon.socket_path)
@@ -1281,9 +1281,9 @@ fn parse_daemon_lifecycle(stdout: &[u8]) -> Result<ManagedDaemonInfo, Error> {
             "cliVersion, managedCodexVersion, and appServerVersion must be present".into(),
         ));
     }
-    if lifecycle.cli_version != lifecycle.managed_codex_version
-        || lifecycle.cli_version != lifecycle.app_server_version
-    {
+    // The launcher CLI can update independently; the proxy uses the managed
+    // binary, so only that binary needs to match the running server.
+    if lifecycle.managed_codex_version != lifecycle.app_server_version {
         return Err(Error::InvalidDaemonLifecycle(format!(
             "version mismatch: cliVersion={}, managedCodexVersion={}, appServerVersion={}",
             lifecycle.cli_version, lifecycle.managed_codex_version, lifecycle.app_server_version,
@@ -1757,6 +1757,41 @@ mod tests {
             parse_daemon_lifecycle(&serde_json::to_vec(&older_lifecycle).unwrap()).is_ok(),
             "older informational backend and pid fields must remain accepted"
         );
+    }
+
+    #[test]
+    fn accepts_independently_updated_launcher_cli() -> Result<(), Box<dyn std::error::Error>> {
+        for status in ["started", "alreadyRunning"] {
+            for cli_version in ["0.159.3", "0.161.0"] {
+                let lifecycle = json!({
+                    "status": status,
+                    "managedCodexPath": "/opt/codex/bin/codex",
+                    "managedCodexVersion": "0.160.0",
+                    "socketPath": "/tmp/codex/app-server-control.sock",
+                    "cliVersion": cli_version,
+                    "appServerVersion": "0.160.0"
+                });
+                let info = parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle)?)?;
+                assert_eq!(info.cli_version, cli_version);
+                assert_eq!(info.managed_codex_version, "0.160.0");
+                assert_eq!(info.app_server_version, "0.160.0");
+                assert_eq!(info.already_running, status == "alreadyRunning");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_managed_binary_drift_even_when_cli_matches_server()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut lifecycle: Value =
+            serde_json::from_slice(&daemon_lifecycle_json("alreadyRunning"))?;
+        lifecycle["managedCodexVersion"] = json!("0.152.0");
+        assert!(matches!(
+            parse_daemon_lifecycle(&serde_json::to_vec(&lifecycle)?),
+            Err(Error::InvalidDaemonLifecycle(details)) if details.contains("version mismatch")
+        ));
+        Ok(())
     }
 
     #[test]

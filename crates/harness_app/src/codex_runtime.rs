@@ -43,6 +43,7 @@ struct DaemonRuntime {
     #[serde(default)]
     backend: Option<String>,
     managed_codex_path: PathBuf,
+    managed_codex_version: String,
     socket_path: PathBuf,
     cli_version: String,
     app_server_version: String,
@@ -100,13 +101,13 @@ fn restart_required_update(
             runtime.cli_version
         );
     }
-    if runtime.app_server_version == installed_version {
+    if runtime.app_server_version == runtime.managed_codex_version {
         return Ok(None);
     }
 
     Ok(Some(AvailableUpdate {
-        installed_version: installed_version.to_owned(),
-        latest_version: installed_version.to_owned(),
+        installed_version: runtime.managed_codex_version.clone(),
+        latest_version: runtime.managed_codex_version,
         update_action: None,
         app_server_version: Some(runtime.app_server_version),
         app_server_managed: Some(runtime.backend.is_some()),
@@ -453,6 +454,7 @@ mod tests {
         let runtime = DaemonRuntime {
             backend: None,
             managed_codex_path: PathBuf::from("/opt/codex/current/codex"),
+            managed_codex_version: "0.153.0".into(),
             socket_path: PathBuf::from("/tmp/codex.sock"),
             cli_version: "0.153.0".into(),
             app_server_version: "0.152.1".into(),
@@ -471,6 +473,7 @@ mod tests {
         let runtime = DaemonRuntime {
             backend: Some("pid".into()),
             managed_codex_path: PathBuf::from("/opt/codex/current/codex"),
+            managed_codex_version: "0.153.0".into(),
             socket_path: PathBuf::from("/tmp/codex.sock"),
             cli_version: "0.153.0".into(),
             app_server_version: "0.153.0".into(),
@@ -481,6 +484,40 @@ mod tests {
                 .expect("consistent versions")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn independent_cli_updates_do_not_require_a_server_restart() -> anyhow::Result<()> {
+        for cli_version in ["0.159.3", "0.161.0"] {
+            let runtime: DaemonRuntime = serde_json::from_value(json!({
+                "backend": "pid",
+                "managedCodexPath": "/opt/codex/current/codex",
+                "managedCodexVersion": "0.160.0",
+                "socketPath": "/tmp/codex.sock",
+                "cliVersion": cli_version,
+                "appServerVersion": "0.160.0"
+            }))?;
+            assert!(restart_required_update(cli_version, runtime)?.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn server_restart_targets_the_managed_version() -> anyhow::Result<()> {
+        let runtime: DaemonRuntime = serde_json::from_value(json!({
+            "backend": "pid",
+            "managedCodexPath": "/opt/codex/current/codex",
+            "managedCodexVersion": "0.160.0",
+            "socketPath": "/tmp/codex.sock",
+            "cliVersion": "0.159.3",
+            "appServerVersion": "0.159.3"
+        }))?;
+        let update = restart_required_update("0.159.3", runtime)?.context("outdated server")?;
+        assert_eq!(update.installed_version, "0.160.0");
+        assert_eq!(update.latest_version, "0.160.0");
+        assert_eq!(update.app_server_version.as_deref(), Some("0.159.3"));
+        assert_eq!(update.app_server_managed, Some(true));
+        Ok(())
     }
 
     #[test]

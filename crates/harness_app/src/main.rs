@@ -4554,8 +4554,10 @@ fn managed_daemon_version_mismatch(error: &anyhow::Error) -> bool {
 
 fn codex_connection_error(error: &anyhow::Error, reconnect_exhausted: bool) -> SharedString {
     if managed_daemon_version_mismatch(error) {
-        return "Codex was upgraded while its App Server was still running. Finish any active Codex turns, run `codex app-server daemon restart`, then refresh tasks."
-            .into();
+        return format!(
+            "The running Codex App Server does not match its managed binary ({error}). Finish any active Codex turns, run `codex app-server daemon restart`, then refresh tasks."
+        )
+        .into();
     }
     if reconnect_exhausted {
         format!("Could not reconnect to Codex: {error}. Refresh the task list to try again.").into()
@@ -22123,7 +22125,9 @@ mod tests {
         ));
         assert!(managed_daemon_version_mismatch(&error));
         let message = codex_connection_error(&error, false);
-        assert!(message.contains("Codex was upgraded"));
+        assert!(message.contains("does not match its managed binary"));
+        assert!(message.contains("managedCodexVersion=0.152.1"));
+        assert!(message.contains("appServerVersion=0.151.0"));
         assert!(message.contains("codex app-server daemon restart"));
         assert!(!message.contains("Reconnecting"));
     }
